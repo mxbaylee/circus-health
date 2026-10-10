@@ -6,7 +6,7 @@ import {
 } from './clinical-operation.ts';
 import { collectionClinicalProjectionContextAsync } from './intake-review-collection-session.ts';
 import {
-  tryBorrowPreparedCollectionClinicalPolicy,
+  tryBorrowPreparedCollectionClinicalPolicyAsync,
   checkedRetainedCollectionClinicalPolicyContext,
   type RetainedCollectionClinicalPolicy,
 } from './intake-report-group-collection.ts';
@@ -824,6 +824,8 @@ function verifiedIdentityPublication(context: Context, stored: Rows) {
     );
   };
 }
+/** Unpublished work keeps the original signed union. Its caller closes that same
+ * proof at the response or publication boundary, not at every host turn. */
 function runNativeIdentityWork<T>(
   context: Context,
   stored: Rows,
@@ -831,18 +833,20 @@ function runNativeIdentityWork<T>(
   assertBorrowed?: () => void,
 ) {
   const db = context.db;
+  context.assertCurrent();
+  stored.retainArtifacts([]);
   return runClinicalReviewWork(work, {
     capture() {
       context.assertCurrent();
-      stored.assertArtifacts();
       assertBorrowed?.();
-      const stamp = reviewPreparationStamp(db);
-      if (stamp === undefined) reject('Identity scope preparation requires current authority');
+      const stamp = reviewPreparationStamp(db),
+        methods = reviewPreparationMethodStamp(db);
+      if (stamp === undefined || methods === undefined)
+        reject('Identity scope preparation requires current authority');
       return () => {
         context.assertCurrent();
-        if (reviewPreparationStamp(db) !== stamp)
+        if (reviewPreparationStamp(db) !== stamp || reviewPreparationMethodStamp(db) !== methods)
           reject('Identity scope changed during preparation');
-        stored.assertArtifacts();
         assertBorrowed?.();
       };
     },
@@ -963,15 +967,9 @@ async function nativeIdentitySpeculativePhase(context: Context, stored: Rows) {
     throw error;
   }
 }
-async function build(
-  context: Context,
-  original: Awaited<ReturnType<typeof evidence>>,
-  stored: Rows,
-) {
-  withIntakeWork(context.db, 'warm', () => recordIntakeWork('identityPreviewFullPreparations'));
-  const { db, root, profileId, id, view, workflow, group, scope } = context;
-  const currentSelf = selfSnapshot(db),
-    people = selectedIdentityPeopleSnapshots(db);
+async function prepareIdentityPrerequisites(context: Context, stored: Rows) {
+  const { db, root, profileId, id, view, workflow } = context;
+  stored.retainArtifacts([]);
   const prerequisites = disposableSqlite('fictional-identity-prerequisites-');
   try {
     context.assertCurrent();
@@ -1012,6 +1010,7 @@ async function build(
       },
     );
     assertSelectionCurrent();
+    await stored.withVerifiedTerminal({ assertCurrent: context.assertCurrent }, () => undefined);
     let after = -1;
     for (;;) {
       const page = prerequisites.db
@@ -1020,11 +1019,9 @@ async function build(
       if (!page.length) break;
       for (const row of page) {
         context.assertCurrent();
-        stored.assertArtifacts();
         const grounding = identityGroundingGeneration(db);
         const assertPreparationCurrent = () => {
           context.assertCurrent();
-          stored.assertArtifacts();
           if (identityGroundingGeneration(db) !== grounding)
             reject('Identity grounding changed during prerequisite preparation');
         };
@@ -1040,9 +1037,21 @@ async function build(
         after = Number(row.ordinal);
       }
     }
+    await stored.withVerifiedTerminal({ assertCurrent: context.assertCurrent }, () => undefined);
   } finally {
     prerequisites.close();
   }
+}
+async function build(
+  context: Context,
+  original: Awaited<ReturnType<typeof evidence>>,
+  stored: Rows,
+) {
+  withIntakeWork(context.db, 'warm', () => recordIntakeWork('identityPreviewFullPreparations'));
+  const { db, root, profileId, id, view, workflow, group, scope } = context;
+  const currentSelf = selfSnapshot(db),
+    people = selectedIdentityPeopleSnapshots(db);
+  await prepareIdentityPrerequisites(context, stored);
   using phase = await nativeIdentitySpeculativePhase(context, stored);
   let cached:
     | {
@@ -1124,7 +1133,7 @@ async function build(
         if (identityGroundingGeneration(db) !== grounding)
           reject('Identity grounding changed during occurrence preparation');
       };
-      const borrowed = tryBorrowPreparedCollectionClinicalPolicy(
+      const borrowed = await tryBorrowPreparedCollectionClinicalPolicyAsync(
         db,
         root,
         profileId,
@@ -1133,11 +1142,19 @@ async function build(
         assertPreparationCurrent,
       );
       if (borrowed) {
+        cached = { proposalId, borrowed };
         const checkedBorrow = checkedRetainedCollectionClinicalPolicyContext(db, borrowed);
+        cached.checkedBorrow = checkedBorrow;
         phase.assertCurrent();
-        stored.retainArtifacts(checkedBorrow.verifiedArtifacts());
+        await run(
+          (function* () {
+            for (const artifact of checkedBorrow.verifiedArtifacts()) {
+              stored.retainArtifacts([artifact]);
+              yield;
+            }
+          })(),
+        );
         phase.assertCurrent();
-        cached = { proposalId, borrowed, checkedBorrow };
       } else {
         const selected = await prepareCollectionClinicalReviewAsync(
           db,
@@ -1153,8 +1170,18 @@ async function build(
           );
         cached = { proposalId, selected };
         assertPreparationCurrent();
-        stored.retainArtifacts(
-          (await collectionClinicalProjectionContextAsync(selected.session)).verifiedArtifacts(),
+        const projection = await collectionClinicalProjectionContextAsync(
+          selected.session,
+          undefined,
+          assertPreparationCurrent,
+        );
+        await run(
+          (function* () {
+            for (const artifact of projection.verifiedArtifacts()) {
+              stored.retainArtifacts([artifact]);
+              yield;
+            }
+          })(),
         );
         assertPreparationCurrent();
       }
@@ -1387,7 +1414,7 @@ async function build(
   } finally {
     closeCached();
   }
-  stored.assertArtifacts();
+  phase.assertCurrent();
   // A report with no current occurrence still inspects all retained receipts.
   if (!receipts) receipts = await run(scope.receiptsWork!());
   const dates = originalSubjectBirthDateEvidence(
@@ -1515,7 +1542,7 @@ async function build(
           context.assertCurrent();
           if (reviewPreparationStamp(db) !== stamp)
             reject('Identity scope changed during preparation');
-          stored.assertArtifacts();
+          phase.assertCurrent();
         };
       },
     },
@@ -1842,6 +1869,7 @@ async function writeSnapshot(
     if (purpose === 'preview' && current?.proof.sha256 !== exact.proof.sha256)
       await catalog.bindCurrentIdentityScope(scope.groupId, exact.reader);
     withIntakeWork(context.db, 'warm', () => recordIntakeWork('identitySnapshotAliasHits'));
+    await stored.withVerifiedTerminal({ assertCurrent: context.assertCurrent }, () => undefined);
     return;
   }
   const warnings = await retainIdentityWarningContent({
@@ -1978,9 +2006,12 @@ async function writeSnapshot(
   } finally {
     delta.close();
   }
+  await stored.withVerifiedTerminal({ assertCurrent: context.assertCurrent }, () => undefined);
 }
 async function collectGroupIdentity(context: Context, stored: Rows) {
-  const run = <T>(work: Generator<void, T, void>) => runNativeIdentityWork(context, stored, work);
+  await prepareIdentityPrerequisites(context, stored);
+  using phase = await nativeIdentitySpeculativePhase(context, stored);
+  const run = <T>(work: Generator<void, T, void>) => phase.run(work);
   let inspections = 0;
   const step = () =>
     ++inspections % 16 === 0
@@ -2016,21 +2047,13 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
         if (pending) await pending;
         if (!cached || cached.proposalId !== occurrence.proposalId) {
           cached?.session.close();
-          await prepareCollectionClinicalReviewDependencies(
-            context.db,
-            context.root,
-            context.profileId,
-            context.id,
-            occurrence.proposalId,
-            { assertRunning: context.assertCurrent },
-          );
           const selected = await prepareCollectionClinicalReviewAsync(
             context.db,
             context.root,
             context.profileId,
             context.id,
             occurrence.proposalId,
-            { assertRunning: context.assertCurrent },
+            { assertRunning: phase.assertCurrent },
           );
           if (selected.status !== 'ready')
             return reject('Prepare this exact retained clinical occurrence before identity review');
@@ -2039,8 +2062,18 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
             session: selected.session,
           };
           context.assertCurrent();
-          stored.retainArtifacts(
-            (await collectionClinicalProjectionContextAsync(selected.session)).verifiedArtifacts(),
+          const projection = await collectionClinicalProjectionContextAsync(
+            selected.session,
+            undefined,
+            phase.assertCurrent,
+          );
+          await run(
+            (function* () {
+              for (const artifact of projection.verifiedArtifacts()) {
+                stored.retainArtifacts([artifact]);
+                yield;
+              }
+            })(),
           );
           context.assertCurrent();
         }
@@ -2112,7 +2145,7 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
       return answer;
     })(),
   );
-  stored.assertArtifacts();
+  await phase.finish();
   return { ...collected, hasUnstructuredIdentityQuestion, currentRefusal };
 }
 function peoplePreview(db: DatabaseSync) {
@@ -2457,7 +2490,7 @@ async function getNativeIntakeIdentityReviewInner(
           currentRefusal: initial.currentRefusal,
         }),
       );
-      stored.assertArtifacts();
+      await stored.withVerifiedTerminal({ assertCurrent: context.assertCurrent }, () => undefined);
       return {
         ...assessment,
         scope: null,
@@ -2526,7 +2559,11 @@ async function getNativeIntakeIdentityReviewInner(
           .prepare("DELETE FROM rows WHERE section NOT IN ('initialIssues','initialExplicit')")
           .run();
         built = await build(context, freshOriginal, stored);
-      } else stored.assertArtifacts();
+      } else
+        await stored.withVerifiedTerminal(
+          { assertCurrent: context.assertCurrent },
+          () => undefined,
+        );
       const catalog = createReportSnapshotCatalog(db, context.file, {
         catalog: 'report.snapshots',
         catalogArea: 'builds',

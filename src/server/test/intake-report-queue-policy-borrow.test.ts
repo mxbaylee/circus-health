@@ -27,6 +27,7 @@ import {
   checkedRetainedCollectionClinicalPolicyContext,
   openCollectionReportQueue,
   tryBorrowPreparedCollectionClinicalPolicy,
+  tryBorrowPreparedCollectionClinicalPolicyAsync,
   tryBorrowRetainedCollectionClinicalPolicy,
 } from '../intake-report-group-collection.ts';
 import { runExclusiveClinicalOperation } from '../clinical-operation.ts';
@@ -446,6 +447,150 @@ test('prepared policy borrow refuses a same-byte original replacement before adm
         null,
         () => {},
       ),
+    );
+  });
+});
+
+test('cooperative prepared borrow checks the original physical proof without host stat fanout', async (t) => {
+  const f = await retained(t);
+  clearCollectionQueueReviews(f.db);
+  const queue = await openCollectionReportQueue(f.db, f.root, f.profileId);
+  const guard = queue.capturePreparedGuard();
+  await queue.reviewMember(f.source.id, f.members[0]!, undefined, undefined, guard);
+  queue.close({ retainReview: true });
+  await runExclusiveClinicalOperation(f.db, async () => {
+    const sync = tryBorrowPreparedCollectionClinicalPolicy(
+      f.db,
+      f.root,
+      f.profileId,
+      f.source.id,
+      null,
+      () => {},
+    );
+    assert.ok(sync);
+    const original = [
+      ...checkedRetainedCollectionClinicalPolicyContext(f.db, sync).verifiedArtifacts(),
+    ].find((artifact) => artifact.id === f.source.id)!;
+    sync.close();
+    const stat = nodeFs.statSync;
+    let hostStats = 0;
+    const observe = ((path, ...options) => {
+      if (String(path) === original.path) hostStats++;
+      return Reflect.apply(stat, nodeFs, [path, ...options]);
+    }) as typeof nodeFs.statSync;
+    assert.equal(Reflect.set(nodeFs, 'statSync', observe), true);
+    syncBuiltinESMExports();
+    let selected: Awaited<ReturnType<typeof tryBorrowPreparedCollectionClinicalPolicyAsync>>;
+    try {
+      let hostTurn = false;
+      const tick = immediate().then(() => {
+        hostTurn = true;
+      });
+      selected = await tryBorrowPreparedCollectionClinicalPolicyAsync(
+        f.db,
+        f.root,
+        f.profileId,
+        f.source.id,
+        null,
+        () => {},
+      );
+      assert.ok(selected);
+      assert.equal(hostTurn, true, 'the actual worker admits another host turn');
+      await tick;
+      assert.equal(hostStats, 0, 'complete source proof is checked off-thread');
+    } finally {
+      assert.equal(Reflect.set(nodeFs, 'statSync', stat), true);
+      syncBuiltinESMExports();
+    }
+    assert.ok(selected);
+    const checked = checkedRetainedCollectionClinicalPolicyContext(f.db, selected);
+    const member = f.members[0]!;
+    assert.ok(checked.record(member.recordId, member.candidateId, member.candidateVersionId));
+    selected.close();
+    const bytes = readFileSync(original.path);
+    const identity = nodeFs.statSync(original.path, { bigint: true }).ctimeNs;
+    writeFileSync(original.path, bytes);
+    assert.notEqual(nodeFs.statSync(original.path, { bigint: true }).ctimeNs, identity);
+    await assert.rejects(
+      tryBorrowPreparedCollectionClinicalPolicyAsync(
+        f.db,
+        f.root,
+        f.profileId,
+        f.source.id,
+        null,
+        () => {},
+      ),
+    );
+  });
+});
+
+test('cooperative prepared borrow releases its pinned owner after interrupted admission without eviction', async (t) => {
+  const f = await retained(t);
+  clearCollectionQueueReviews(f.db);
+  const queue = await openCollectionReportQueue(f.db, f.root, f.profileId);
+  const guard = queue.capturePreparedGuard();
+  await queue.reviewMember(f.source.id, f.members[0]!, undefined, undefined, guard);
+  queue.close({ retainReview: true });
+  await runExclusiveClinicalOperation(f.db, async () => {
+    let interrupted = false;
+    let interruptions = 0;
+    const pending = tryBorrowPreparedCollectionClinicalPolicyAsync(
+      f.db,
+      f.root,
+      f.profileId,
+      f.source.id,
+      null,
+      () => {
+        if (interrupted) {
+          interruptions++;
+          throw Error('Fictional admission interruption');
+        }
+      },
+    );
+    interrupted = true;
+    await assert.rejects(pending, { code: 'SOURCE_CHANGED' });
+    assert.equal(interruptions, 1, 'the pending admission reaches the interruption guard');
+    const selected = await tryBorrowPreparedCollectionClinicalPolicyAsync(
+      f.db,
+      f.root,
+      f.profileId,
+      f.source.id,
+      null,
+      () => {},
+    );
+    assert.ok(selected, 'the registered owner is available only after its pin is released');
+    selected.close();
+  });
+});
+
+test('cooperative prepared borrow releases its pinned owner when a real close interrupts admission', async (t) => {
+  const f = await retained(t);
+  clearCollectionQueueReviews(f.db);
+  const queue = await openCollectionReportQueue(f.db, f.root, f.profileId);
+  const guard = queue.capturePreparedGuard();
+  await queue.reviewMember(f.source.id, f.members[0]!, undefined, undefined, guard);
+  queue.close({ retainReview: true });
+  await runExclusiveClinicalOperation(f.db, async () => {
+    const pending = tryBorrowPreparedCollectionClinicalPolicyAsync(
+      f.db,
+      f.root,
+      f.profileId,
+      f.source.id,
+      null,
+      () => {},
+    );
+    clearCollectionReportQueues(f.db);
+    await assert.rejects(pending);
+    assert.equal(
+      tryBorrowPreparedCollectionClinicalPolicy(
+        f.db,
+        f.root,
+        f.profileId,
+        f.source.id,
+        null,
+        () => {},
+      ),
+      undefined,
     );
   });
 });

@@ -757,6 +757,18 @@ uses the same complete worker proof before returning a ready session. The
 private consumed-source rows are sealed against scratch replacement. Synchronous
 session callers still check all consumed physical identities on the request thread; these paths
 remain outside the cooperative host-read claim.
+
+Native identity preparation borrows prepared clinical policy through an async,
+pinned queue owner and verifies the original complete session proof in a worker.
+Unpublished identity work retains the same signed artifact union across bounded
+host turns; it checks logical authority, method and request continuity at those
+turns, then cooperatively closes the complete original proof at snapshot and
+response boundaries. Source replacement does not obtain a fresh baseline.
+Prerequisite preparation verifies the union around the whole prerequisite pass,
+not once per proposal. The final confirmation transaction still performs its
+synchronous physical check; this preparation path does not establish closure
+after callback-capable durable publication, which remains open in CRS-231.
+
 Worker proofs retain the original identities and reject managed application
 writes through their final handoff. They do not provide an atomic filesystem
 snapshot against unrelated host processes: an unmanaged rewrite after its page

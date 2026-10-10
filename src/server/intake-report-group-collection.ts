@@ -445,9 +445,13 @@ type CheckedRetainedPolicy = Readonly<{
   ): import('../shared/intake.ts').IntakeReviewRecord | undefined;
   verifiedArtifacts(): Iterable<VerifiedClinicalArtifact>;
 }>;
+type RetainedPolicyAdmission = Omit<RetainedCollectionClinicalPolicy, 'close'> & {
+  checked: CheckedRetainedPolicy;
+  verifyPhysicalEvidence(): Promise<void>;
+};
 const checkedRetainedPolicies = new WeakMap<
   RetainedCollectionClinicalPolicy,
-  { db: DatabaseSync; checked: CheckedRetainedPolicy }
+  { db: DatabaseSync; checked: CheckedRetainedPolicy; verifyPhysicalEvidence(): Promise<void> }
 >();
 /** Exact private borrow provenance; this never grants physical publication authority alone. */
 export function checkedRetainedCollectionClinicalPolicyContext(
@@ -497,6 +501,35 @@ export function tryBorrowPreparedCollectionClinicalPolicy(
       queue.tryBorrowReview(intakeId, proposalId, assertOwner, assertOwnerCurrent),
   );
 }
+/** The owned queue remains pinned while its original complete proof is checked off-thread. */
+export async function tryBorrowPreparedCollectionClinicalPolicyAsync(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  proposalId: string | null,
+  assertRunning: () => void,
+): Promise<RetainedCollectionClinicalPolicy | undefined> {
+  const borrowed = borrowCompletedCollectionPolicy(
+    db,
+    root,
+    profileId,
+    assertRunning,
+    (queue, assertOwner, assertOwnerCurrent) =>
+      queue.tryBorrowPreparedReview(intakeId, proposalId, assertOwner, assertOwnerCurrent, true) ??
+      queue.tryBorrowReview(intakeId, proposalId, assertOwner, assertOwnerCurrent, true),
+  );
+  if (!borrowed) return undefined;
+  try {
+    const proof = checkedRetainedPolicies.get(borrowed)!;
+    await proof.verifyPhysicalEvidence();
+    proof.checked.assertAuthorityCurrent();
+    return borrowed;
+  } catch (error) {
+    borrowed.close();
+    throw error;
+  }
+}
 function borrowCompletedCollectionPolicy(
   db: DatabaseSync,
   root: string,
@@ -506,9 +539,7 @@ function borrowCompletedCollectionPolicy(
     queue: QueueCache['queue'],
     assertOwner: () => void,
     assertOwnerCurrent: () => void,
-  ) =>
-    | (Omit<RetainedCollectionClinicalPolicy, 'close'> & { checked: CheckedRetainedPolicy })
-    | undefined,
+  ) => RetainedPolicyAdmission | undefined,
 ): RetainedCollectionClinicalPolicy | undefined {
   const operation = currentClinicalOperation(db);
   assertClinicalOperation(db, operation);
@@ -556,9 +587,9 @@ function borrowCompletedCollectionPolicy(
       close();
       return miss();
     }
-    const { checked, ...methods } = borrowed;
+    const { checked, verifyPhysicalEvidence, ...methods } = borrowed;
     const result = { ...methods, close };
-    checkedRetainedPolicies.set(result, { db, checked });
+    checkedRetainedPolicies.set(result, { db, checked, verifyPhysicalEvidence });
     withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueuePolicyBorrowHits'));
     return result;
   } catch (error) {
@@ -1670,9 +1701,8 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       proposalId: string | null,
       assertOwner: () => void,
       assertOwnerCurrent: () => void,
-    ):
-      | (Omit<RetainedCollectionClinicalPolicy, 'close'> & { checked: CheckedRetainedPolicy })
-      | undefined {
+      cooperative = false,
+    ): RetainedPolicyAdmission | undefined {
       const proof = preparedReview;
       if (
         !proof ||
@@ -1720,7 +1750,17 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         projection = collectionClinicalProjectionContext(proof.selected.session);
         assertAuthorityCurrent();
       };
-      assertCurrent();
+      const verifyPhysicalEvidence = async () => {
+        assertAuthorityCurrent();
+        projection = await collectionClinicalProjectionContextAsync(
+          proof.selected.session,
+          undefined,
+          assertAuthorityCurrent,
+        );
+        assertAuthorityCurrent();
+      };
+      if (!cooperative) assertCurrent();
+      else assertAuthorityCurrent();
       const checked = Object.freeze({
         assertAuthorityCurrent,
         record(recordId: string, candidateId: string, candidateVersionId: string) {
@@ -1740,6 +1780,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       });
       return {
         checked,
+        verifyPhysicalEvidence,
         assertCurrent,
         record(recordId, candidateId, candidateVersionId) {
           assertCurrent();
@@ -1759,9 +1800,8 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       proposalId: string | null,
       assertOwner: () => void,
       assertOwnerCurrent: () => void,
-    ):
-      | (Omit<RetainedCollectionClinicalPolicy, 'close'> & { checked: CheckedRetainedPolicy })
-      | undefined {
+      cooperative = false,
+    ): RetainedPolicyAdmission | undefined {
       const key = canonicalLiteral([intakeId, proposalId]),
         stamp = reviewReadStamp(db);
       if (
@@ -1817,7 +1857,17 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         assertBorrowedAuthorityCurrent();
       };
       // Once selected, stale physical/source/callback observations refuse, never fall back.
-      assertBorrowedCurrent();
+      const verifyPhysicalEvidence = async () => {
+        assertBorrowedAuthorityCurrent();
+        projection = await collectionClinicalProjectionContextAsync(
+          selected.session,
+          undefined,
+          assertBorrowedAuthorityCurrent,
+        );
+        assertBorrowedAuthorityCurrent();
+      };
+      if (!cooperative) assertBorrowedCurrent();
+      else assertBorrowedAuthorityCurrent();
       const checked = Object.freeze({
         assertAuthorityCurrent: assertBorrowedAuthorityCurrent,
         record(recordId: string, candidateId: string, candidateVersionId: string) {
@@ -1838,6 +1888,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       });
       return {
         checked,
+        verifyPhysicalEvidence,
         assertCurrent: assertBorrowedCurrent,
         record(recordId, candidateId, candidateVersionId) {
           assertBorrowedCurrent();

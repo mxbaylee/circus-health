@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import nodeFs, { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { runExclusiveClinicalOperation } from '../clinical-operation.ts';
@@ -22,6 +23,72 @@ import {
 } from '../intake-identity-preview-cache.ts';
 import { ensureProfileDirectories, profileOriginal } from '../profile-storage.ts';
 import { fixture } from './intake-identity-native-fixture.ts';
+
+test(
+  'native identity snapshot work does not synchronously sweep its complete retained proof',
+  { timeout: 30_000 },
+  async (t) => {
+    const f = await fixture(t, true, 3, false, undefined, undefined, true);
+    const stat = nodeFs.statSync;
+    let proofStats = 0;
+    const observe = ((path, ...options) => {
+      if (new Error().stack?.includes('clinical-review-artifact-proof.ts')) proofStats++;
+      return Reflect.apply(stat, nodeFs, [path, ...options]);
+    }) as typeof nodeFs.statSync;
+    assert.equal(Reflect.set(nodeFs, 'statSync', observe), true);
+    syncBuiltinESMExports();
+    try {
+      const cold = await f.review();
+      assert.ok(cold.scopeReference, JSON.stringify(cold));
+      clearNativeIdentityPreviews(f.db);
+      const current = await f.review();
+      assert.deepEqual(current, cold);
+      assert.equal(
+        proofStats,
+        0,
+        'preparation and reuse close original signed evidence off-thread',
+      );
+    } finally {
+      assert.equal(Reflect.set(nodeFs, 'statSync', stat), true);
+      syncBuiltinESMExports();
+    }
+  },
+);
+
+test(
+  'native identity snapshot closes its original proof after callback-capable cooperative work',
+  { timeout: 30_000 },
+  async (t) => {
+    const f = await fixture(t, true, 3, false, undefined, undefined, true);
+    await f.review();
+    await f.review();
+    clearNativeIdentityPreviews(f.db);
+    const reference = getRetainedIntakeOriginalReference(f.db, f.root, f.profileId, f.original.id);
+    const bytes = readFileSync(reference.path);
+    let rewrites = 0;
+    await assert.rejects(
+      runExclusiveClinicalOperation(
+        f.db,
+        (operation) =>
+          getNativeIntakeIdentityReview(f.db, f.root, f.profileId, f.original.id, f.groupId, {
+            operation,
+          }),
+        {
+          assertRunning: () => {
+            const stack = new Error().stack;
+            if (!rewrites && stack?.includes('writeSnapshot')) {
+              writeFileSync(reference.path, bytes);
+              rewrites++;
+            }
+          },
+        },
+      ),
+      { code: 'SOURCE_CHANGED' },
+    );
+    assert.equal(rewrites, 1, 'the real snapshot work must reach the injected original rewrite');
+    assert.equal(nativeIdentityPreviewCounts(f.db).entries, 0);
+  },
+);
 
 test(
   'native identity reuses its first complete build only within a stable request',
