@@ -5,6 +5,9 @@ import { HttpError, revision, type Database } from './database.ts';
 import { canonicalLiteral, cloneLiteral } from './intake-format.ts';
 import {
   collectionClinicalProjectionContextAsync,
+  consumeCollectionClinicalAcceptanceGroup,
+  type CollectionClinicalAcceptanceGroupHandoff,
+  type CollectionClinicalAcceptanceProjectionHandoff,
   type CollectionClinicalReviewSession,
 } from './intake-review-collection-session.ts';
 import {
@@ -55,6 +58,7 @@ import type { IntakeEnvelopeSource } from './intake-authority.ts';
 
 export interface NativeAcceptanceGroupMember {
   session: CollectionClinicalReviewSession;
+  handoff?: CollectionClinicalAcceptanceGroupHandoff;
   expectedVersion: number;
   reviewToken: string;
   decisions: readonly IntakeReviewDecision[];
@@ -87,6 +91,7 @@ export async function prepareNativeIntakeAcceptanceGroup(
   if (!input.members.length || input.members.length > 100)
     throw new HttpError(400, 'REPORT_ACCEPTANCE_INPUT', 'Select 1–100 proposal blocks');
   const members = [] as (NativeAcceptanceGroupMember & {
+    projectionHandoff?: CollectionClinicalAcceptanceProjectionHandoff;
     context: Awaited<ReturnType<typeof collectionClinicalProjectionContextAsync>>;
     source: Awaited<
       ReturnType<typeof collectionClinicalProjectionContextAsync>
@@ -96,7 +101,11 @@ export async function prepareNativeIntakeAcceptanceGroup(
   })[];
   for (const member of input.members) {
     input.assertRunning?.();
-    const context = await collectionClinicalProjectionContextAsync(member.session);
+    const transferred = member.handoff
+      ? consumeCollectionClinicalAcceptanceGroup(member.handoff, member.session, db, profileId)
+      : undefined;
+    const context =
+      transferred?.context ?? (await collectionClinicalProjectionContextAsync(member.session));
     input.assertRunning?.();
     if (
       context.db !== db ||
@@ -118,7 +127,14 @@ export async function prepareNativeIntakeAcceptanceGroup(
         'VERSION_CONFLICT',
         'This intake changed. Reload it before continuing.',
       );
-    members.push({ ...member, context, source, version, decisions });
+    members.push({
+      ...member,
+      context,
+      source,
+      version,
+      decisions,
+      projectionHandoff: transferred?.handoff,
+    });
   }
   const count = members.reduce((sum, m) => sum + m.decisions.length, 0),
     bytes = members.reduce((sum, m) => sum + Number(m.context.proposal.inputFile.bytes), 0),
@@ -146,7 +162,8 @@ export async function prepareNativeIntakeAcceptanceGroup(
   const assertCurrent = () => {
     input.assertRunning?.();
     for (const member of members) {
-      member.context.assertCurrent();
+      if (member.projectionHandoff) member.context.assertAuthorityCurrent();
+      else member.context.assertCurrent();
       const current = intakeSourceVersion(db, member.source.id);
       if (
         current.version !== member.version.version ||
@@ -219,7 +236,11 @@ export async function prepareNativeIntakeAcceptanceGroup(
       db,
       root,
       profileId,
-      members.map((m) => ({ session: m.session, decisions: m.decisions })),
+      members.map((m) => ({
+        session: m.session,
+        decisions: m.decisions,
+        handoff: m.projectionHandoff,
+      })),
     ),
     at = new Date().toISOString();
   const prepared: Array<{

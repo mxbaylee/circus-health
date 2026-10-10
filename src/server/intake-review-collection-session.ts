@@ -2,7 +2,8 @@ import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { createHash } from 'node:crypto';
 import { inlineReviewRecordIssuesWork, reviewRecordIssues } from './intake-review-issue-state.ts';
 import type { DatabaseSync } from 'node:sqlite';
-import { HttpError } from './database.ts';
+import { HttpError, managedDatabaseMethodEpoch } from './database.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import {
   selectedReportGroupLinks,
@@ -101,6 +102,176 @@ const projectionContexts = new WeakMap<
   CollectionClinicalReviewSession,
   CollectionClinicalProjectionContext
 >();
+declare const acceptanceHandoff: unique symbol;
+export interface CollectionClinicalAcceptancePreparation {
+  readonly [acceptanceHandoff]: 'review';
+}
+export interface CollectionClinicalAcceptanceGroupHandoff {
+  readonly [acceptanceHandoff]: 'group';
+}
+export interface CollectionClinicalAcceptanceProjectionHandoff {
+  readonly [acceptanceHandoff]: 'projection';
+}
+type AcceptanceHandoff =
+  | CollectionClinicalAcceptancePreparation
+  | CollectionClinicalAcceptanceGroupHandoff
+  | CollectionClinicalAcceptanceProjectionHandoff;
+type AcceptanceHandoffState = {
+  stage: 'review' | 'group' | 'projection';
+  session: CollectionClinicalReviewSession;
+  context: CollectionClinicalProjectionContext;
+  methodEpoch: NonNullable<ReturnType<typeof managedDatabaseMethodEpoch>>;
+  stamp: string;
+  signal?: AbortSignal;
+  assertRunning?: () => void;
+};
+const acceptanceHandoffs = new WeakMap<AcceptanceHandoff, AcceptanceHandoffState>();
+function acceptanceCapability<T extends AcceptanceHandoff>(value: AcceptanceHandoffState): T {
+  const capability = Object.freeze({}) as T;
+  acceptanceHandoffs.set(capability, value);
+  return capability;
+}
+export type CollectionClinicalAcceptancePreparationResult =
+  | Exclude<CollectionClinicalReviewResult, { status: 'ready' }>
+  | { status: 'prepared'; preparation: CollectionClinicalAcceptancePreparation };
+/** Host preparation retains the original proof. Only the acceptance projection's
+ * complete retained union may close its physical verification. */
+export function deferCollectionClinicalAcceptanceReview(
+  result: CollectionClinicalReviewResult,
+  signal?: AbortSignal,
+  assertRunning?: () => void,
+): CollectionClinicalAcceptancePreparationResult {
+  if (result.status !== 'ready') return result;
+  const context = projectionContexts.get(result.session);
+  if (!context) throw Error('Foreign selected clinical review session');
+  context.assertAuthorityCurrent();
+  const methodEpoch = managedDatabaseMethodEpoch(context.db),
+    stamp = reviewReadStamp(context.db);
+  if (!methodEpoch || !stamp) throw Error('Acceptance review handoff unavailable');
+  return {
+    status: 'prepared',
+    preparation: acceptanceCapability<CollectionClinicalAcceptancePreparation>({
+      stage: 'review',
+      session: result.session,
+      context,
+      methodEpoch,
+      stamp,
+      signal,
+      assertRunning,
+    }),
+  };
+}
+export function disposeCollectionClinicalAcceptanceReview(
+  preparation: CollectionClinicalAcceptancePreparation,
+) {
+  const value = acceptanceHandoffs.get(preparation);
+  acceptanceHandoffs.delete(preparation);
+  value?.session.close();
+}
+function consumeAcceptanceHandoff(
+  capability: AcceptanceHandoff,
+  stage: AcceptanceHandoffState['stage'],
+  db: DatabaseSync,
+  profileId: string,
+  session?: CollectionClinicalReviewSession,
+) {
+  const value = acceptanceHandoffs.get(capability);
+  acceptanceHandoffs.delete(capability);
+  if (!value || value.stage !== stage) throw Error('Acceptance review handoff unavailable');
+  try {
+    if (
+      value.context.db !== db ||
+      value.context.profileId !== profileId ||
+      (session && value.session !== session)
+    )
+      throw Error('Foreign acceptance review handoff');
+    value.signal?.throwIfAborted();
+    assertAcceptanceHandoffCurrent(value);
+    value.assertRunning?.();
+    assertAcceptanceHandoffCurrent(value);
+    return value;
+  } catch (error) {
+    value.session.close();
+    throw error;
+  }
+}
+function assertAcceptanceHandoffCurrent(value: AcceptanceHandoffState) {
+  value.signal?.throwIfAborted();
+  if (
+    managedDatabaseMethodEpoch(value.context.db) !== value.methodEpoch ||
+    reviewReadStamp(value.context.db) !== value.stamp
+  )
+    throw new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
+  value.context.assertAuthorityCurrent();
+  value.signal?.throwIfAborted();
+}
+export function consumeCollectionClinicalAcceptanceReview(
+  preparation: CollectionClinicalAcceptancePreparation,
+  db: DatabaseSync,
+  profileId: string,
+) {
+  const value = consumeAcceptanceHandoff(preparation, 'review', db, profileId);
+  return {
+    session: value.session,
+    context: value.context,
+    handoff: acceptanceCapability<CollectionClinicalAcceptanceGroupHandoff>({
+      ...value,
+      stage: 'group',
+    }),
+  };
+}
+export function consumeCollectionClinicalAcceptanceGroup(
+  handoff: CollectionClinicalAcceptanceGroupHandoff,
+  session: CollectionClinicalReviewSession,
+  db: DatabaseSync,
+  profileId: string,
+) {
+  const value = consumeAcceptanceHandoff(handoff, 'group', db, profileId, session);
+  return {
+    context: value.context,
+    handoff: acceptanceCapability<CollectionClinicalAcceptanceProjectionHandoff>({
+      ...value,
+      stage: 'projection',
+    }),
+  };
+}
+/** The singleton reducer may inspect the exact forwarded context, but cannot
+ * consume or replace the projection's one-use proof. */
+export function inspectCollectionClinicalAcceptanceProjection(
+  handoff: CollectionClinicalAcceptanceProjectionHandoff,
+  session: CollectionClinicalReviewSession,
+  db: DatabaseSync,
+  profileId: string,
+) {
+  const value = acceptanceHandoffs.get(handoff);
+  if (!value) throw Error('Foreign acceptance projection handoff');
+  try {
+    if (
+      value.stage !== 'projection' ||
+      value.session !== session ||
+      value.context.db !== db ||
+      value.context.profileId !== profileId
+    )
+      throw Error('Foreign acceptance projection handoff');
+    value.signal?.throwIfAborted();
+    assertAcceptanceHandoffCurrent(value);
+    value.assertRunning?.();
+    assertAcceptanceHandoffCurrent(value);
+    return value.context;
+  } catch (error) {
+    acceptanceHandoffs.delete(handoff);
+    value.session.close();
+    throw error;
+  }
+}
+export function consumeCollectionClinicalAcceptanceProjection(
+  handoff: CollectionClinicalAcceptanceProjectionHandoff,
+  session: CollectionClinicalReviewSession,
+  db: DatabaseSync,
+  profileId: string,
+) {
+  return consumeAcceptanceHandoff(handoff, 'projection', db, profileId, session).context;
+}
 /** Host-only exact verified source context; a presentation page cannot mint acceptance authority. */
 export function collectionClinicalProjectionContext(
   session: CollectionClinicalReviewSession,

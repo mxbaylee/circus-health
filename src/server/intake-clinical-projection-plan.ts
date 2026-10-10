@@ -23,6 +23,8 @@ import { matchingClinicalSourceCanonicals } from './intake-clinical-source-index
 import {
   collectionClinicalProjectionContext,
   collectionClinicalProjectionContextAsync,
+  consumeCollectionClinicalAcceptanceProjection,
+  type CollectionClinicalAcceptanceProjectionHandoff,
   type CollectionClinicalReviewSession,
   type CollectionClinicalProjectionContext,
 } from './intake-review-collection-session.ts';
@@ -109,7 +111,7 @@ export async function prepareCollectionClinicalProjectionWithEvidence(
   profileId: string,
   session: CollectionClinicalReviewSession,
   decisions: IntakeReviewDecision[],
-  options: { reviewed?: boolean } = {},
+  options: { reviewed?: boolean; handoff?: CollectionClinicalAcceptanceProjectionHandoff } = {},
 ) {
   return prepareCollectionClinicalProjectionGroupWithEvidence(db, root, profileId, [
     { session, decisions, ...options },
@@ -123,13 +125,14 @@ export async function prepareCollectionClinicalProjectionGroupWithEvidence(
     session: CollectionClinicalReviewSession;
     decisions: IntakeReviewDecision[];
     reviewed?: boolean;
+    handoff?: CollectionClinicalAcceptanceProjectionHandoff;
   }[],
 ) {
   const selected = members.map((member) => ({
     ...member,
     decisions: structuredClone(member.decisions),
   }));
-  const contexts = await prepareProjectionContexts(selected);
+  const contexts = await prepareProjectionContexts(selected, db, profileId);
   const pairScopes = validatePreparedEvidencePairs(db, selected, contexts);
   const evidence = selected.some((member) =>
     member.decisions.some((decision) => decision.comparisons?.length),
@@ -165,7 +168,7 @@ export async function prepareCollectionClinicalTerminalPairProjectionWithEvidenc
   if (decision.action !== 'skip' || !decision.comparisons?.length)
     throw new HttpError(400, 'IMPORT_REVIEW', 'Choose a reviewed terminal evidence relationship');
   const members = [{ session, decisions: [structuredClone(decision)] }],
-    contexts = await prepareProjectionContexts(members),
+    contexts = await prepareProjectionContexts(members, db, profileId),
     pairScopes = validatePreparedEvidencePairs(db, members, contexts),
     evidence = await prepareDuplicateEvidenceSnapshots(db, members);
   try {
@@ -187,10 +190,26 @@ export async function prepareCollectionClinicalTerminalPairProjectionWithEvidenc
     throw error;
   }
 }
-async function prepareProjectionContexts(members: { session: CollectionClinicalReviewSession }[]) {
+async function prepareProjectionContexts(
+  members: {
+    session: CollectionClinicalReviewSession;
+    handoff?: CollectionClinicalAcceptanceProjectionHandoff;
+  }[],
+  db: DatabaseSync,
+  profileId: string,
+) {
   const contexts: CollectionClinicalProjectionContext[] = [];
   for (const member of members)
-    contexts.push(await collectionClinicalProjectionContextAsync(member.session));
+    contexts.push(
+      member.handoff
+        ? consumeCollectionClinicalAcceptanceProjection(
+            member.handoff,
+            member.session,
+            db,
+            profileId,
+          )
+        : await collectionClinicalProjectionContextAsync(member.session),
+    );
   for (const context of contexts) context.assertAuthorityCurrent();
   return contexts;
 }

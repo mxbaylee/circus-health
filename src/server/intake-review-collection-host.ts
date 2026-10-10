@@ -98,6 +98,9 @@ import {
 import {
   createCollectionClinicalReviewSessionWork,
   collectionClinicalProjectionContextAsync,
+  deferCollectionClinicalAcceptanceReview,
+  disposeCollectionClinicalAcceptanceReview,
+  type CollectionClinicalAcceptancePreparationResult,
   type CollectionClinicalReviewResult,
 } from './intake-review-collection-session.ts';
 import {
@@ -350,6 +353,20 @@ export async function prepareCollectionClinicalReviewAsync(
   );
 }
 
+/** Acceptance verifies the original consumed-artifact union before derived preparation. */
+export async function prepareCollectionClinicalReviewForAcceptanceAsync(
+  ...input: Parameters<typeof prepareCollectionClinicalReview>
+): Promise<CollectionClinicalAcceptancePreparationResult> {
+  return prepareCollectionClinicalReviewAsyncResult(
+    input,
+    async (result) =>
+      deferCollectionClinicalAcceptanceReview(result, input[5]?.signal, input[5]?.assertRunning),
+    (result) => {
+      if (result.status === 'prepared')
+        disposeCollectionClinicalAcceptanceReview(result.preparation);
+    },
+  );
+}
 /** Correction support consumes this opaque preparation after its intervening caller checks. */
 export async function prepareCollectionClinicalReviewForCorrectionSupportAsync(
   ...input: Parameters<typeof prepareCollectionClinicalReviewWork>

@@ -55,6 +55,8 @@ import {
 } from './intake-lookup-frontier-observer.ts';
 import {
   collectionClinicalProjectionContext,
+  inspectCollectionClinicalAcceptanceProjection,
+  type CollectionClinicalAcceptanceProjectionHandoff,
   type CollectionClinicalReviewSession,
 } from './intake-review-collection-session.ts';
 import {
@@ -480,6 +482,7 @@ export async function prepareNativeIntakeAcceptance(
   profileId: string,
   input: {
     session: CollectionClinicalReviewSession;
+    projectionHandoff?: CollectionClinicalAcceptanceProjectionHandoff;
     expectedVersion: number;
     reviewToken?: string;
     decisions: readonly IntakeReviewDecision[];
@@ -517,7 +520,14 @@ export async function prepareNativeIntakeAcceptance(
     assertRunning?: () => void;
   },
 ) {
-  const context = collectionClinicalProjectionContext(input.session),
+  const context = input.projectionHandoff
+      ? inspectCollectionClinicalAcceptanceProjection(
+          input.projectionHandoff,
+          input.session,
+          db,
+          profileId,
+        )
+      : collectionClinicalProjectionContext(input.session),
     file = context.proposal.file,
     before = intakeSourceVersion(db, file.id),
     view = openIntakeCollectionEnvelope(db, file),
@@ -550,7 +560,8 @@ export async function prepareNativeIntakeAcceptance(
   if (proposalId && !proposal) throw Error('Selected acceptance proposal is missing');
   const assertCurrent = () => {
     input.assertRunning?.();
-    context.assertCurrent();
+    if (input.projectionHandoff) context.assertAuthorityCurrent();
+    else context.assertCurrent();
     const current = intakeSourceVersion(db, file.id);
     if (current.version !== before.version || current.logicalBinding !== before.logicalBinding)
       throw new HttpError(
@@ -566,7 +577,7 @@ export async function prepareNativeIntakeAcceptance(
     profileId,
     input.session,
     decisions,
-    { reviewed },
+    { reviewed, handoff: input.projectionHandoff },
   );
   try {
     const clinical = preparedClinicalProjectionResult(projection),

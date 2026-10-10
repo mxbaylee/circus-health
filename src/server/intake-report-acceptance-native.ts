@@ -28,9 +28,10 @@ import {
 import { prepareCollectionWorkflowReadiness } from './intake-workflow-readiness.ts';
 import {
   prepareCollectionClinicalReviewAsync,
+  prepareCollectionClinicalReviewForAcceptanceAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
-import { collectionClinicalProjectionContextAsync } from './intake-review-collection-session.ts';
+import { consumeCollectionClinicalAcceptanceReview } from './intake-review-collection-session.ts';
 import {
   prepareNativeIntakeAcceptanceGroup,
   type NativeAcceptanceGroupMember,
@@ -208,7 +209,7 @@ export async function applyNativeAcceptanceGroup(
               'SELECTION_REVIEW_CHANGED',
               'This selection could not be reviewed. Refresh its exact record before saving.',
             );
-          const result = await prepareCollectionClinicalReviewAsync(
+          const result = await prepareCollectionClinicalReviewForAcceptanceAsync(
             db,
             root,
             profileId,
@@ -216,16 +217,19 @@ export async function applyNativeAcceptanceGroup(
             block.proposalId,
             { assertRunning },
           );
-          if (result.status !== 'ready')
+          if (result.status !== 'prepared')
             throw new HttpError(
               409,
               'REVIEW_PREPARATION_REQUIRED',
               'Prepare the selected clinical evidence before accepting records',
             );
-          sessions.push(result.session);
-          const session = result.session,
-            context = await collectionClinicalProjectionContextAsync(session),
-            view = openIntakeCollectionEnvelope(db, { id: block.intakeId }),
+          const { session, context, handoff } = consumeCollectionClinicalAcceptanceReview(
+            result.preparation,
+            db,
+            profileId,
+          );
+          sessions.push(session);
+          const view = openIntakeCollectionEnvelope(db, { id: block.intakeId }),
             intake = view.child(view.root(), 'intake')!,
             flow = view.child(intake, 'workflow');
           for (const selection of block.selections) {
@@ -281,6 +285,7 @@ export async function applyNativeAcceptanceGroup(
           const evidence = readRetainedPlanEvidence(db, profileId, block.intakeId);
           members.push({
             session,
+            handoff,
             expectedVersion: options.retainResult ? version.version : block.intakeVersion,
             reviewToken:
               options.retainResult || reviewedAtEntry.has(block)

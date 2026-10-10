@@ -806,6 +806,18 @@ private consumed-source rows are sealed against scratch replacement. Synchronous
 session callers still check all consumed physical identities on the request thread; these paths
 remain outside the cooperative host-read claim.
 
+Native acceptance carries each prepared session's original consumed-artifact
+identities into the complete projection union through private, one-use handoffs.
+These handoffs retain the exact database, profile, session, SQL method epoch and
+read interval; they do not issue a new physical baseline. Intermediate handoffs
+check live authority and cancellation before and after callback-capable guards.
+The complete retained union must still pass its late physical verification before
+derived callbacks or an accepted result can escape. This avoids redundant
+per-session physical sweeps during handoff, not the union's final verification.
+Synchronous union checks remain in projection preparation and publication; this
+path does not yet establish fully cooperative physical verification throughout
+acceptance.
+
 Native identity preparation borrows prepared clinical policy through an async,
 pinned queue owner and verifies the original complete session proof in a worker.
 Unpublished identity work retains the same signed artifact union across bounded
