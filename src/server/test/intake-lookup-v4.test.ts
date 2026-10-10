@@ -1735,13 +1735,17 @@ test('native point lookups have no workflow recount or auxiliary churn writes; l
     'op',
     'fake',
   );
+  const forgedProjection = /native source projection binding|disposable projection mutation/;
+  assert.throws(() => maximumIntakeDiscoveryOrder(db), forgedProjection);
+  assert.throws(() => retainedIntakeAcceptance(db, 'op'), forgedProjection);
+  clearIntakeLookupCache(db);
+  await prepareIntakeLookupIndices(db);
   assert.equal(maximumIntakeDiscoveryOrder(db), 47);
   assert.equal((retainedIntakeAcceptance(db, 'op') as { marker: string }).marker, 'retained');
   db.prepare('UPDATE __record_intake_lookup_sources SET identity_first=NULL WHERE source_id=?').run(
     source.id,
   );
   // The projection event witness can refuse this forgery before native binding is read.
-  const forgedProjection = /native source projection binding|disposable projection mutation/;
   assert.throws(() => maximumIntakeDiscoveryOrder(db), forgedProjection);
   assert.throws(() => indexedIntakeIdentityConfirmations(db), forgedProjection);
   clearIntakeLookupCache(db);

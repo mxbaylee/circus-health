@@ -24,7 +24,7 @@ import { readDurablePackageInventory } from '../intake-package-state.ts';
 import { clearPackageSourceSession } from '../intake-package-session.ts';
 import { clearIntakeStateCache } from '../intake-state-storage.ts';
 import { intakeSourceVersion } from '../intake-state-access.ts';
-import { runExclusiveClinicalOperation } from '../clinical-operation.ts';
+import { currentClinicalOperation, runExclusiveClinicalOperation } from '../clinical-operation.ts';
 import { reviewReadStamp } from '../intake-clinical-review-read-cache.ts';
 import { handleIntakeRoute } from '../intake-routes.ts';
 import { zipFixture, type ZipFixtureEntry } from '../../tests/fixtures/zip.ts';
@@ -103,6 +103,10 @@ async function heldConversion(
   void terminal.then(entered.resolve);
   t.signal.addEventListener('abort', release.resolve, { once: true });
   await entered.promise;
+  if (!held) {
+    const outcome = await terminal;
+    if ('error' in outcome) throw outcome.error;
+  }
   assert.ok(held, 'actual accepted conversion checkpoint reached');
   return { terminal, release: release.resolve, source };
 }
@@ -570,7 +574,13 @@ for (const kind of ['invalid', 'resolve', 'limit'] as const)
       const open = fs.openSync;
       const openMock = t.mock.method(fs, 'openSync', (...args: Parameters<typeof open>) => {
         const fd = open(...args);
-        if (!triggered && String(args[0]).endsWith('/fictional.json')) {
+        // Child conversion now opens its own lease while it owns publication.
+        // Overlap the later unowned literal read, not a detached nested conversion.
+        if (
+          !triggered &&
+          String(args[0]).endsWith('/fictional.json') &&
+          !currentClinicalOperation(f.db)
+        ) {
           triggered = true;
           heldPromise = heldConversion(t, f, conversionSource);
           void heldPromise.catch(reached.resolve);

@@ -3,6 +3,7 @@ import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter, once } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -764,6 +765,7 @@ for (const native of [false, true])
         NonNullable<Parameters<typeof createAssistant>[0]['bridgeFactory']>
       >[0];
       const bridges: { callbacks: Callbacks; tools: HealthTool[] }[] = [];
+      const progress = new EventEmitter();
       let genericExtensionCalls = 0;
       const repair = intakeDraftRepairAssistantExtensions();
       const genericTool: HealthTool = {
@@ -790,7 +792,9 @@ for (const native of [false, true])
         databases: new Map([[profileId, db]]),
         availability: () => ({ available: true, readiness: 'ready' }),
         connectionCheck: () => ({ available: true, readiness: 'ready' }),
-        journalWriter: () => {},
+        journalWriter: () => {
+          progress.emit('change');
+        },
         ...(!native ? { actionExtensions: extensions } : {}),
         bridgeFactory(callbacks) {
           const bridge = {
@@ -807,6 +811,7 @@ for (const native of [false, true])
             close() {},
           };
           bridges.push(bridge);
+          progress.emit('change');
           return bridge;
         },
       };
@@ -829,11 +834,10 @@ for (const native of [false, true])
         }
         rmSync(root, { recursive: true, force: true });
       });
-      const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
       const waitForBridge = async (count: number) => {
-        for (let attempt = 0; attempt < 20000 && bridges.length < count; attempt++) {
+        while (bridges.length < count) {
           if (chat?.status === 'failed') break;
-          await tick();
+          await once(progress, 'change', { signal: t.signal });
         }
         assert.equal(bridges.length, count, chat?.error || undefined);
       };

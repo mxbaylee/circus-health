@@ -8,7 +8,9 @@ import {
   rmSync,
   writeFileSync,
   readSync,
+  realpathSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
@@ -57,7 +59,7 @@ test(
   'large stored and deflated ZIP members retain exact bytes with bounded worker chunks and direct PDF read parity',
   { timeout: 240_000 },
   async (t) => {
-    const root = mkdtempSync(join('/tmp', 'fictional-large-package-'));
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'fictional-large-package-'));
     const profileId = 'fictional-large-profile';
     const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
     attachPersonalDurability(db, { root, profileId });
@@ -158,8 +160,9 @@ test(
       assert.ok(counters.readBytes < MIB, 'member is never read into a whole parent buffer');
       assert.ok(counters.bufferHashBytes < MIB);
       assert.equal(counters.streamHashBytes, counters.streamReadBytes);
-      assert.equal(counters.inspectionBufferBytes, 3 * 256 * 1024);
-      assert.equal(counters.streamReadBytes, 3 * member.bytes);
+      // Stage, publication, native-conversion lease, then evidence verification.
+      assert.equal(counters.inspectionBufferBytes, 4 * 256 * 1024);
+      assert.equal(counters.streamReadBytes, 4 * member.bytes);
       const original: Awaited<ReturnType<typeof readIntakeEvidence>> = await readIntakeEvidence({
         db,
         root,
@@ -202,7 +205,7 @@ test(
   'late large-member CRC failure retains original and exposes partial streamed work without publishing a child',
   { timeout: 120_000 },
   async (t) => {
-    const root = mkdtempSync(join('/tmp', 'fictional-large-corrupt-'));
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'fictional-large-corrupt-'));
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const pdfPath = join(root, 'fictional.pdf');
     const failurePdf = writeLargeFictionalPdf(pdfPath, 26 * MIB);

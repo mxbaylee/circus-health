@@ -193,7 +193,16 @@ export function intakeSourceMetadata(db: DatabaseSync, id: string): IntakeSource
     // objects, including descriptor-shaped objects, remain ordinary values.
     if (view) {
       const intake = view.child(view.root(), 'intake');
-      if (intake && view.child(intake, field)) continue;
+      if (intake) {
+        if (view.child(intake, field)) continue;
+        const selected = view.field(intake, field, { bytes: 16384 });
+        if (
+          selected.kind === 'value' &&
+          selected.value !== null &&
+          typeof selected.value === 'object'
+        )
+          continue;
+      }
     } else continue;
     if (!isIntakeCompactScalar(scalar) || scalar.field !== field)
       throw Error('Source metadata scalar requires native evidence');
@@ -285,6 +294,9 @@ export function intakeFirstLocatorMatcher(
   }
   if (source.locatorType !== 'object') return () => false;
   if (view.child(intake, 'locator')) return () => false;
+  const selected = view.field(intake, 'locator', { bytes: 16384 });
+  if (selected.kind === 'value' && selected.value !== null && typeof selected.value === 'object')
+    return () => false;
   const value: unknown = JSON.parse(source.locator);
   if (!isIntakeCompactScalar(value) || value.field !== 'locator') return () => false;
   const cell = intakeEnvelopeFilenameCell(view, intake, 'locator');
