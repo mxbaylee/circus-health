@@ -5,24 +5,43 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StatementSync } from 'node:sqlite';
-import { openDatabase, transaction } from '../database.ts';
-import { ensureProfileDirectories } from '../profile-storage.ts';
-import { registerIntakeFile } from '../intake-state-access.ts';
-import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
-import { prepareIntakeSourceDependencyHeaders } from '../intake-source-text-dependencies.ts';
-import { readIntakeSourcePin } from '../intake-source-pin.ts';
-import { runIntakeSourceExtractionOperation } from '../intake-source-extraction-operation.ts';
-import { getIntakeSourceText, publishIntakeSourceText } from '../intake-source-text.ts';
-import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import type { SourceTextEvidence } from '../../shared/intake-source-text.ts';
-import { packetSourceAncestry, packetSourceAncestryWork } from '../packet-source-ancestry.ts';
-import { iterateIntakeSourceAncestry } from '../intake-source-ancestry.ts';
-import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
-import {
+
+// Install before production imports so captured native reads remain observable.
+const originalNativeGet = StatementSync.prototype.get;
+let observeNativeGet: typeof StatementSync.prototype.get | undefined;
+const observableNativeGet = function (
+  this: StatementSync,
+  ...args: Parameters<StatementSync['get']>
+) {
+  return Reflect.apply(observeNativeGet ?? originalNativeGet, this, args);
+} as typeof StatementSync.prototype.get;
+StatementSync.prototype.get = observableNativeGet;
+test.after(() => {
+  observeNativeGet = undefined;
+  StatementSync.prototype.get = originalNativeGet;
+});
+
+const { openDatabase, transaction } = await import('../database.ts');
+const { ensureProfileDirectories } = await import('../profile-storage.ts');
+const { registerIntakeFile } = await import('../intake-state-access.ts');
+const { memoryRecordAuthority } = await import('./helpers/intake-authority-fixture.ts');
+const { prepareIntakeSourceDependencyHeaders } =
+  await import('../intake-source-text-dependencies.ts');
+const { readIntakeSourcePin } = await import('../intake-source-pin.ts');
+const { runIntakeSourceExtractionOperation } =
+  await import('../intake-source-extraction-operation.ts');
+const { getIntakeSourceText, publishIntakeSourceText } = await import('../intake-source-text.ts');
+const { intakeWorkCounters } = await import('../intake-work-accounting.ts');
+const { packetSourceAncestry, packetSourceAncestryWork } =
+  await import('../packet-source-ancestry.ts');
+const { iterateIntakeSourceAncestry } = await import('../intake-source-ancestry.ts');
+const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+const {
   openIntakeCollectionEnvelope,
   prepareIntakeEnvelopeFieldMutation,
   stageIntakeEnvelopeFieldMutation,
-} from '../intake-collection-envelope.ts';
+} = await import('../intake-collection-envelope.ts');
 
 const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 function fixture(t: test.TestContext, parents: (string | null | number)[]) {
@@ -90,14 +109,17 @@ const evidence: SourceTextEvidence = {
 
 test('legacy ancestry selects each checked edge once without repeating accepted authority reads', (t) => {
   const f = fixture(t, [null, 'fictional-0', 'fictional-1']);
-  const originalGet = StatementSync.prototype.get,
+  const originalGet = originalNativeGet,
     originalRead = f.authority.storage.read;
   let selections = 0,
     checks = 0,
     heads = 0;
-  t.mock.method(StatementSync.prototype, 'get', function (this: StatementSync, ...args: unknown[]) {
+  t.after(() => {
+    observeNativeGet = undefined;
+  });
+  observeNativeGet = function (this: StatementSync, ...args: unknown[]) {
     if (typeof args[0] === 'string' && args[0].startsWith('fictional-')) {
-      if (this.sourceSQL === 'SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
+      if (this.sourceSQL === 'SELECT id,kind,sha256,details_json FROM main.source_files WHERE id=?')
         selections++;
       if (
         this.sourceSQL ===
@@ -106,7 +128,7 @@ test('legacy ancestry selects each checked edge once without repeating accepted 
         checks++;
     }
     return Reflect.apply(originalGet, this, args);
-  });
+  } as typeof StatementSync.prototype.get;
   t.mock.method(f.authority.storage, 'read', function (name: string) {
     if (name === 'head') heads++;
     return Reflect.apply(originalRead, f.authority.storage, [name]);
@@ -125,27 +147,32 @@ test('legacy ancestry selects each checked edge once without repeating accepted 
   assert.equal(heads, 6, 'each check reads the genuine accepted HEAD once');
   assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
   assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+  observeNativeGet = undefined;
   t.mock.restoreAll();
 });
 
 test('native ancestry selects each checked edge once and keeps its post-yield recheck', async (t) => {
   const f = fixture(t, [null]);
   await buildIntakeCollectionEnvelope(f.db, { id: f.id });
-  const original = StatementSync.prototype.get;
+  const original = originalNativeGet;
   let selections = 0;
-  t.mock.method(StatementSync.prototype, 'get', function (this: StatementSync, ...args: unknown[]) {
+  t.after(() => {
+    observeNativeGet = undefined;
+  });
+  observeNativeGet = function (this: StatementSync, ...args: unknown[]) {
     if (
-      this.sourceSQL === 'SELECT id,kind,sha256,details_json FROM source_files WHERE id=?' &&
+      this.sourceSQL === 'SELECT id,kind,sha256,details_json FROM main.source_files WHERE id=?' &&
       args[0] === f.id
     )
       selections++;
     return Reflect.apply(original, this, args);
-  });
+  } as typeof StatementSync.prototype.get;
   assert.deepEqual(
     [...iterateIntakeSourceAncestry(f.db, f.profileId, f.id)],
     [{ id: f.id, parentId: undefined }],
   );
   assert.equal(selections, 2, 'the check and recheck each select source metadata once');
+  observeNativeGet = undefined;
   t.mock.restoreAll();
 
   const walk = iterateIntakeSourceAncestry(f.db, f.profileId, f.id);

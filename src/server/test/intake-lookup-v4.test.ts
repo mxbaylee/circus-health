@@ -6,15 +6,38 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { openDatabase, transaction, json } from '../database.ts';
-import { recordDurabilityStatus } from '../record-versions.ts';
-import {
-  memoryRecordAuthority,
-  registerRawIntakeFixture,
-} from './helpers/intake-authority-fixture.ts';
-import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
-import { buildVerifiedWorkflowSummary } from '../intake-workflow-state.ts';
-import {
+// Install before production imports so captured native reads remain observable.
+const originalNativeGet = StatementSync.prototype.get;
+const originalNativePrepare = DatabaseSync.prototype.prepare;
+let observeNativeGet: typeof StatementSync.prototype.get | undefined;
+let observeNativePrepare: typeof DatabaseSync.prototype.prepare | undefined;
+const observableNativeGet = function (
+  this: StatementSync,
+  ...args: Parameters<StatementSync['get']>
+) {
+  return Reflect.apply(observeNativeGet ?? originalNativeGet, this, args);
+} as typeof StatementSync.prototype.get;
+StatementSync.prototype.get = observableNativeGet;
+DatabaseSync.prototype.prepare = function (
+  this: DatabaseSync,
+  ...args: Parameters<DatabaseSync['prepare']>
+) {
+  return Reflect.apply(observeNativePrepare ?? originalNativePrepare, this, args);
+} as typeof DatabaseSync.prototype.prepare;
+test.after(() => {
+  observeNativeGet = undefined;
+  observeNativePrepare = undefined;
+  StatementSync.prototype.get = originalNativeGet;
+  DatabaseSync.prototype.prepare = originalNativePrepare;
+});
+
+const { openDatabase, transaction, json } = await import('../database.ts');
+const { recordDurabilityStatus } = await import('../record-versions.ts');
+const { memoryRecordAuthority, registerRawIntakeFixture } =
+  await import('./helpers/intake-authority-fixture.ts');
+const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+const { buildVerifiedWorkflowSummary } = await import('../intake-workflow-state.ts');
+const {
   maximumIntakeDiscoveryOrder,
   retainedIntakeAcceptance,
   indexedIntakeIdentityConfirmations,
@@ -27,25 +50,23 @@ import {
   nativeIntakeReceiptAppendBasis,
   retainNativeIntakeReceiptAppend,
   nativeIntakeLookupCatalogHeadBindingsEqual,
-} from '../intake-lookup-projection.ts';
-import {
-  openIntakeIdentityReference,
-  intakeIdentityTargetMembership,
-} from '../intake-identity-reference.ts';
-import { createIntakeStateStorage } from '../intake-state-storage.ts';
-import { clearIntakeCollectionCache } from '../intake-state-collections.ts';
-import { intakeWorkCounters } from '../intake-work-accounting.ts';
-import {
+} = await import('../intake-lookup-projection.ts');
+const { openIntakeIdentityReference, intakeIdentityTargetMembership } =
+  await import('../intake-identity-reference.ts');
+const { createIntakeStateStorage } = await import('../intake-state-storage.ts');
+const { clearIntakeCollectionCache } = await import('../intake-state-collections.ts');
+const { intakeWorkCounters } = await import('../intake-work-accounting.ts');
+const {
   openIntakeCollectionEnvelope,
   prepareIntakeEnvelopeFieldMutation,
   stageIntakeEnvelopeFieldMutation,
   selectedEnvelopeStore,
-} from '../intake-collection-envelope.ts';
-import { prepareIntakeEnvelopeMutation } from '../intake-envelope-mutation.ts';
-import { proposalLookupIndexContributions } from '../intake-lookup-proposal.ts';
-import { schemaKey } from '../intake-envelope-schema.ts';
-import { ownershipIntakeScopes } from '../ownership-intake-scopes.ts';
-import {
+} = await import('../intake-collection-envelope.ts');
+const { prepareIntakeEnvelopeMutation } = await import('../intake-envelope-mutation.ts');
+const { proposalLookupIndexContributions } = await import('../intake-lookup-proposal.ts');
+const { schemaKey } = await import('../intake-envelope-schema.ts');
+const { ownershipIntakeScopes } = await import('../ownership-intake-scopes.ts');
+const {
   prepareIntakeLookupIndices,
   intakeDiscoveryRevision,
   assertIntakeDiscoveryRevision,
@@ -53,7 +74,7 @@ import {
   preparedIntakeDiscoveryRevision,
   INTAKE_LOOKUP_INDEX_COLLECTION,
   INTAKE_LOOKUP_INDEX_POLICY,
-} from '../intake-lookup-state.ts';
+} = await import('../intake-lookup-state.ts');
 
 const summaryOptions = { mappingVersion: 'fictional-v1', isSourceContextVersion: () => false };
 
@@ -155,37 +176,54 @@ for (const mode of ['direct', 'fallback'] as const)
       marker: 'first',
     });
     assert.equal(retainedIntakeAcceptance(f.db, 'fictional-missing'), null);
-    const original = StatementSync.prototype.get;
+    const original = originalNativeGet;
     let changed = false;
-    StatementSync.prototype.get = function (
+    const changeCompetingOriginal = () => {
+      changed = true;
+      transaction(f.db, () =>
+        f.db
+          .prepare('UPDATE source_files SET rowid=0 WHERE id=?')
+          .run('fictional-competing-original'),
+      );
+    };
+    observeNativeGet = function (
       this: StatementSync,
       ...parameters: Parameters<StatementSync['get']>
     ) {
       const row = Reflect.apply(original, this, parameters);
       if (
         !changed &&
-        this.sourceSQL ===
-          (mode === 'direct'
-            ? 'SELECT total_changes() AS count'
-            : 'SELECT id,kind,sha256,details_json FROM source_files WHERE id=?') &&
+        mode === 'direct' &&
+        this.sourceSQL === 'SELECT total_changes() AS count' &&
         new Error().stack?.includes('recordChunks')
       ) {
-        changed = true;
-        transaction(f.db, () =>
-          f.db
-            .prepare('UPDATE source_files SET rowid=0 WHERE id=?')
-            .run('fictional-competing-original'),
-        );
+        changeCompetingOriginal();
       }
       return row;
     } as typeof StatementSync.prototype.get;
+    // Compilation can run callbacks; the subsequent captured read cannot.
+    observeNativePrepare = function (
+      this: DatabaseSync,
+      ...parameters: Parameters<DatabaseSync['prepare']>
+    ) {
+      const statement = Reflect.apply(originalNativePrepare, this, parameters);
+      if (
+        !changed &&
+        mode === 'fallback' &&
+        parameters[0] === 'SELECT id,kind,sha256,details_json FROM main.source_files WHERE id=?' &&
+        new Error().stack?.includes('recordChunks')
+      )
+        changeCompetingOriginal();
+      return statement;
+    } as typeof DatabaseSync.prototype.prepare;
     try {
       assert.throws(
         () => retainedIntakeAcceptance(f.db, 'fictional-target'),
         /native catalog frontier changed|projection answer witness changed/,
       );
     } finally {
-      StatementSync.prototype.get = original;
+      observeNativeGet = undefined;
+      observeNativePrepare = undefined;
     }
     assert.equal(changed, true, 'The competing original must change during payload hydration');
     await prepareIntakeLookupIndices(f.db);
