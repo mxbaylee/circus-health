@@ -2548,6 +2548,38 @@ function segmentIndexValid(value: unknown): value is RecordSegmentIndex {
     (index.count === 0 ? index.head === null : refValid(index.head))
   );
 }
+function readRecordSegmentPage(
+  storage: RecordStorage,
+  ref: RecordObjectReference,
+  commit: RecordCommitV2,
+  expected: number,
+): RecordSegmentPage {
+  if (!refValid(ref) || ref.bytes > SEGMENT_PAGE_BYTES) fail('invalid segment page reference');
+  const page = parseRecordJson<RecordSegmentPage>(readObject(storage, ref) as unknown as string);
+  recordVersionWork('segmentIndexPagesRead');
+  if (
+    !page ||
+    Object.keys(page).sort().join(',') !==
+      'firstSegment,format,operationId,previous,profileId,schemaVersion,segments,sequence' ||
+    page.format !== 'health-record-segment-page-v1' ||
+    page.profileId !== commit.profileId ||
+    page.schemaVersion !== commit.schemaVersion ||
+    page.sequence !== commit.sequence ||
+    page.operationId !== commit.operationId ||
+    !Number.isSafeInteger(page.firstSegment) ||
+    page.firstSegment < 0 ||
+    !Array.isArray(page.segments) ||
+    !page.segments.length ||
+    page.segments.length > SEGMENT_REFERENCE_WINDOW ||
+    page.firstSegment + page.segments.length !== expected ||
+    (page.firstSegment === 0 ? page.previous !== null : !refValid(page.previous))
+  )
+    fail('invalid segment page binding, order or count');
+  recordVersionWorkMaximum('maxSegmentReferencesBuffered', page.segments.length);
+  for (const segment of page.segments) if (!refValid(segment)) fail('invalid segment reference');
+  return page;
+}
+
 /** Authenticated forward order over bounded immutable manifest pages. Legacy commits retain their old per-object decoder boundary. */
 export function* iterateRecordCommitSegments(
   storage: RecordStorage,
@@ -2562,6 +2594,20 @@ export function* iterateRecordCommitSegments(
   }
   if (commit.format !== COMMIT_FORMAT || !segmentIndexValid(commit.segments))
     fail('unsupported segment index');
+  let first = commit.segments.head
+    ? readRecordSegmentPage(storage, commit.segments.head, commit, commit.segments.count)
+    : undefined;
+  if (first?.firstSegment === 0) {
+    // A complete authenticated page already supplies the bounded forward spool.
+    // Validate every reference above before exposing even its first member.
+    recordVersionWork('segmentReferencesSpooled', first.segments.length);
+    for (const segment of first.segments) {
+      recordVersionWork('segmentReferencesReplayed');
+      yield segment;
+    }
+    return;
+  }
+  recordVersionWork('segmentOrderingScratchOpened');
   const scratch = disposableSqlite('circus-record-segments-');
   try {
     // This private ordering index is consumed on this connection and discarded.
@@ -2573,35 +2619,14 @@ export function* iterateRecordCommitSegments(
     );
     const insert = scratch.db.prepare('INSERT INTO segments VALUES(?,?)');
     let ref = commit.segments.head,
-      expected = commit.segments.count;
+      expected = commit.segments.count,
+      preparedPage = first;
+    first = undefined;
     while (ref) {
-      if (!refValid(ref) || ref.bytes > SEGMENT_PAGE_BYTES) fail('invalid segment page reference');
-      const page = parseRecordJson<RecordSegmentPage>(
-        readObject(storage, ref) as unknown as string,
-      );
-      recordVersionWork('segmentIndexPagesRead');
-      if (
-        !page ||
-        Object.keys(page).sort().join(',') !==
-          'firstSegment,format,operationId,previous,profileId,schemaVersion,segments,sequence' ||
-        page.format !== 'health-record-segment-page-v1' ||
-        page.profileId !== commit.profileId ||
-        page.schemaVersion !== commit.schemaVersion ||
-        page.sequence !== commit.sequence ||
-        page.operationId !== commit.operationId ||
-        !Number.isSafeInteger(page.firstSegment) ||
-        page.firstSegment < 0 ||
-        !Array.isArray(page.segments) ||
-        !page.segments.length ||
-        page.segments.length > SEGMENT_REFERENCE_WINDOW ||
-        page.firstSegment + page.segments.length !== expected ||
-        (page.firstSegment === 0 ? page.previous !== null : !refValid(page.previous))
-      )
-        fail('invalid segment page binding, order or count');
-      recordVersionWorkMaximum('maxSegmentReferencesBuffered', page.segments.length);
+      const page = preparedPage ?? readRecordSegmentPage(storage, ref, commit, expected);
+      preparedPage = undefined;
       for (let ordinal = 0; ordinal < page.segments.length; ordinal++) {
         const segment = page.segments[ordinal];
-        if (!refValid(segment)) fail('invalid segment reference');
         insert.run(page.firstSegment + ordinal, JSON.stringify(segment));
         recordVersionWork('segmentReferencesSpooled');
       }

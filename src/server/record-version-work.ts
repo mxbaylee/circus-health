@@ -18,6 +18,7 @@ const empty = () => ({
   ancestryReferencesReplayed: 0,
   segmentIndexPagesRead: 0,
   segmentIndexPagesWritten: 0,
+  segmentOrderingScratchOpened: 0,
   segmentReferencesSpooled: 0,
   segmentReferencesReplayed: 0,
   maxSegmentReferencesBuffered: 0,
@@ -56,7 +57,9 @@ type Phase = 'operation' | 'reconstruction';
 /** Logical work inside record-versions.ts, including temporary rebuild
  * connections. Counts overlap by activity (encoding includes serialization),
  * retain failed attempts, and exclude SQL VM work, encryption and consumers'
- * own codecs. No records, identities or paths are retained. */
+ * own codecs. Segment spooling includes a complete bounded page retained in
+ * memory; ordering scratch openings count only the actual disk-backed path.
+ * No records, identities or paths are retained. */
 export function createRecordVersionWorkCounters() {
   return { operation: empty(), reconstruction: empty() };
 }
