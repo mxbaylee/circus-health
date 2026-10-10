@@ -34,8 +34,8 @@ test('prepared index seal shares one bounded piece budget across tiny rows', asy
   await appendTiny(index);
   checks = 0;
   await index.seal();
-  // Each row signs one header, SQL, three type frames and two scalar values.
-  assert.equal(checks, 4 + 2 * ((ROWS * 7) / 64));
+  // Seven signed pieces per row, plus the original guards around private COMMIT.
+  assert.equal(checks, 6 + 2 * ((ROWS * 7) / 64));
   const rows = [...index.inspect()];
   assert.equal(rows.length, ROWS);
   for (let id = 0; id < ROWS; id++)

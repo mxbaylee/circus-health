@@ -6,6 +6,7 @@ import { disposableSqlite } from './disposable-sqlite.ts';
 import { captureRecordHeadPhysical } from './record-head-physical.ts';
 
 const prepare = DatabaseSync.prototype.prepare,
+  nativeExec = DatabaseSync.prototype.exec,
   nativeGet = StatementSync.prototype.get,
   nativeRun = StatementSync.prototype.run,
   nativeAll = StatementSync.prototype.all,
@@ -61,12 +62,15 @@ export function createRecordPreparedIndex(
     used = false,
     count = 0,
     changes = 0n,
+    building = false,
     physical: ReturnType<typeof captureRecordHeadPhysical> | undefined;
   try {
     scratch.db.exec(
       'CREATE TABLE entries(position INTEGER PRIMARY KEY,sql TEXT NOT NULL,mode TEXT NOT NULL,expected INTEGER NOT NULL,arguments INTEGER NOT NULL,signature TEXT NOT NULL);' +
         'CREATE TABLE arguments(position INTEGER NOT NULL,ordinal INTEGER NOT NULL,kind TEXT NOT NULL,value,PRIMARY KEY(position,ordinal));',
     );
+    Reflect.apply(nativeExec, scratch.db, ['BEGIN']);
+    building = true;
     const statement = (sql: string) => Reflect.apply(prepare, scratch.db, [sql]) as StatementSync,
       stamp = statement('SELECT total_changes() AS n'),
       schema = statement('PRAGMA main.schema_version'),
@@ -88,6 +92,7 @@ export function createRecordPreparedIndex(
         closed ||
         !db.isOpen ||
         !scratch.db.isOpen ||
+        scratch.db.isTransaction !== building ||
         get(stamp)!.n !== changes ||
         get(schema)!.schema_version !== originalSchema ||
         get(peer)!.data_version !== originalPeer ||
@@ -236,6 +241,10 @@ export function createRecordPreparedIndex(
         if (busy || sealed || used) fail();
         busy = true;
         try {
+          guard();
+          Reflect.apply(nativeExec, scratch.db, ['COMMIT']);
+          building = false;
+          guard();
           const path = Reflect.apply(location, scratch.db, []) as string;
           if (!path) fail();
           physical = captureRecordHeadPhysical([path], [dirname(path)]);
