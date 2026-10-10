@@ -1,6 +1,6 @@
 /** Private disk replay for legacy contributions. Scratch cannot select or recover
  * accepted authority; every source frame and every version is authenticated. */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, openSync, closeSync, readSync, writeSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,6 +35,7 @@ import {
   type Reference,
   type Limits,
   type IntakeStateIdentity,
+  type IntakeStateResult,
 } from './intake-state-evidence.ts';
 import { intakeCopyJsonString } from './intake-copy-json.ts';
 import {
@@ -111,7 +112,8 @@ export function* prepareIntakeLegacyReplaySteps(
     state = new DiskIntakeValue(checkpoint, work),
     db = state.db;
   let closed = false,
-    complete = false;
+    complete = false,
+    rebindInFlight = false;
   const close = () => {
     if (closed) return;
     closed = true;
@@ -126,7 +128,7 @@ export function* prepareIntakeLegacyReplaySteps(
     Object.freeze(head.tip);
     Object.freeze(head);
     db.exec(
-      'CREATE TABLE frames(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE,raw TEXT NOT NULL,sha TEXT NOT NULL); CREATE TABLE consumed(key TEXT PRIMARY KEY); CREATE TABLE receipts(id TEXT PRIMARY KEY,raw TEXT NOT NULL);',
+      'CREATE TABLE frames(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE,raw TEXT NOT NULL,sha TEXT NOT NULL); CREATE TABLE consumed(key TEXT PRIMARY KEY); CREATE TABLE receipts(id TEXT PRIMARY KEY,raw TEXT NOT NULL); CREATE TABLE copied_operations(id TEXT PRIMARY KEY,target TEXT UNIQUE NOT NULL);',
     );
     const mark = (key: string) => db.prepare('INSERT OR IGNORE INTO consumed VALUES(?)').run(key);
     mark(prefix + 'head');
@@ -349,39 +351,67 @@ export function* prepareIntakeLegacyReplaySteps(
         return finishIntakeCopySteps(this.rebindSteps(target, write));
       },
       *rebindSteps(target: IntakeStateIdentity, write: (key: string, value: string) => void) {
-        current();
-        const checked = validateIntakeIdentity(target);
-        if (checked.intakeId !== identity.intakeId || checked.sourceHash !== identity.sourceHash)
-          invalid('copy legacy identity');
-        const targetPrefix = intakeNamespace(checked);
-        let previous: Reference | null = null,
-          bytes = 0;
-        for (const row of db.prepare('SELECT raw,sha FROM frames ORDER BY sequence').iterate()) {
+        if (rebindInFlight) invalid('legacy rebind already in flight');
+        rebindInFlight = true;
+        try {
           current();
-          yield;
-          if (digest(String(row.raw)) !== row.sha) invalid('legacy frame scratch changed');
-          const frame = decode(row.raw, FRAME_BYTES) as Frame,
-            copied: string = JSON.stringify({ ...frame, ...checked, previous });
-          if (Buffer.byteLength(copied) > FRAME_BYTES) invalid('frame bound');
-          bytes += Buffer.byteLength(copied);
-          const key = targetPrefix + 'frame:' + frame.id;
-          write(key, copied);
-          previous = { id: frame.id, sequence: frame.sequence, sha256: digest(copied) };
+          const checked = validateIntakeIdentity(target);
+          if (checked.intakeId !== identity.intakeId || checked.sourceHash !== identity.sourceHash)
+            invalid('copy legacy identity');
+          const targetPrefix = intakeNamespace(checked);
+          let previous: Reference | null = null,
+            bytes = 0;
+          db.exec('DELETE FROM copied_operations');
+          for (const row of db.prepare('SELECT id FROM receipts ORDER BY id').iterate()) {
+            current();
+            yield;
+            db.prepare('INSERT INTO copied_operations VALUES(?,?)').run(row.id, randomUUID());
+          }
+          for (const row of db.prepare('SELECT raw,sha FROM frames ORDER BY sequence').iterate()) {
+            current();
+            yield;
+            if (digest(String(row.raw)) !== row.sha) invalid('legacy frame scratch changed');
+            const frame = decode(row.raw, FRAME_BYTES) as Frame,
+              operationId = db
+                .prepare('SELECT target FROM copied_operations WHERE id=?')
+                .get(frame.operationId)?.target;
+            if (typeof operationId !== 'string') invalid('copy legacy operation identity');
+            const id = randomUUID(),
+              copied: string = JSON.stringify({ ...frame, ...checked, id, operationId, previous });
+            if (Buffer.byteLength(copied) > FRAME_BYTES) invalid('frame bound');
+            bytes += Buffer.byteLength(copied);
+            const key = targetPrefix + 'frame:' + id;
+            write(key, copied);
+            previous = { id, sequence: frame.sequence, sha256: digest(copied) };
+          }
+          for (const row of db
+            .prepare('SELECT raw,target FROM receipts JOIN copied_operations USING(id) ORDER BY id')
+            .iterate()) {
+            current();
+            yield;
+            const receipt = decode(row.raw, HEAD_BYTES) as {
+                fingerprint: string;
+                result: IntakeStateResult;
+              },
+              copied = JSON.stringify({
+                ...receipt,
+                result: { ...receipt.result, operationId: row.target },
+              });
+            if (Buffer.byteLength(copied) > HEAD_BYTES) invalid('copy legacy receipt bound');
+            bytes += Buffer.byteLength(copied);
+            write(targetPrefix + 'operation:' + row.target, copied);
+          }
+          const rebound: Head = {
+            ...head,
+            ...checked,
+            tip: previous!,
+            usage: { ...head.usage, bytes },
+          };
+          usage(rebound.usage, caps);
+          return rebound;
+        } finally {
+          rebindInFlight = false;
         }
-        for (const row of db.prepare('SELECT id,raw FROM receipts ORDER BY id').iterate()) {
-          current();
-          yield;
-          bytes += Buffer.byteLength(String(row.raw));
-          write(targetPrefix + 'operation:' + row.id, String(row.raw));
-        }
-        const rebound: Head = {
-          ...head,
-          ...checked,
-          tip: previous!,
-          usage: { ...head.usage, bytes },
-        };
-        usage(rebound.usage, caps);
-        return rebound;
       },
       close,
     });

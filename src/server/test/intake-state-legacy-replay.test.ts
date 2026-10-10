@@ -210,11 +210,23 @@ test('disk replay matches the original decoder at every version for all seven op
       },
     });
     try {
-      for (const id of f.operationIds)
-        assert.equal(
-          copied.get(intakeNamespace(target) + 'operation:' + id),
-          f.rows.get(intakeNamespace(identity) + 'operation:' + id),
-        );
+      const sourceIds = new Set(
+        [...f.rows.keys()].map((key) => key.slice(intakeNamespace(identity).length)),
+      );
+      const receipts = [...copied]
+        .filter(([key]) => key.includes(':operation:'))
+        .map(([, raw]) => JSON.parse(raw));
+      assert.equal(receipts.length, f.operationIds.length);
+      for (const [key] of copied)
+        if (!key.endsWith(':head'))
+          assert.equal(sourceIds.has(key.slice(intakeNamespace(target).length)), false);
+      for (const id of f.operationIds) {
+        const prior = JSON.parse(f.rows.get(intakeNamespace(identity) + 'operation:' + id)!);
+        const receipt = receipts.find((row) => row.result.version === prior.result.version);
+        assert.ok(receipt);
+        assert.notEqual(receipt.result.operationId, id);
+        assert.deepEqual({ ...receipt, result: { ...receipt.result, operationId: id } }, prior);
+      }
     } finally {
       targetReplay.close();
     }
@@ -222,6 +234,115 @@ test('disk replay matches the original decoder at every version for all seven op
     replay.close();
   }
   assert.throws(() => replay.pieces(), /closed/);
+});
+
+test('copied multipart legacy operations use fresh private identities without changing public receipt values', () => {
+  const publicOperation = randomUUID(),
+    value = {
+      publicReceipt: { operationId: publicOperation, status: 'accepted' },
+      retained: 'Independently fictional copied scalar. '.repeat(5000),
+    },
+    f = fixture([[{ op: 'set', path: [], value }]]),
+    replay = prepareIntakeLegacyReplay(identity, f.caps, f.head, (key) => f.rows.get(key));
+  assert.ok(f.head.usage.frames > 1);
+  try {
+    const copiedIds = new Set<string>();
+    for (const profileId of ['fictional-first-copy', 'fictional-second-copy']) {
+      const target = { ...identity, profileId },
+        copied = new Map<string, string>(),
+        head = replay.rebind(target, (key, raw) => copied.set(key, raw));
+      copied.set(intakeNamespace(target) + 'head', JSON.stringify(head));
+      const receipts = [...copied].filter(([key]) => key.includes(':operation:'));
+      assert.equal(receipts.length, 1);
+      const receipt = JSON.parse(receipts[0]![1]);
+      assert.notEqual(receipt.result.operationId, f.operationIds[0]);
+      assert.notEqual(receipt.result.operationId, publicOperation);
+      for (const [key, raw] of copied) {
+        if (key.endsWith(':head')) continue;
+        const suffix = key.slice(intakeNamespace(target).length);
+        assert.equal(copiedIds.has(suffix), false, 'independent copies do not reuse private IDs');
+        copiedIds.add(suffix);
+        if (key.includes(':frame:')) {
+          const frame = JSON.parse(raw);
+          assert.equal(frame.operationId, receipt.result.operationId);
+          assert.notEqual(frame.id, frame.previous?.id);
+        }
+      }
+      const restored = reconstructIntakeEvidence(target, f.caps, head, (key) => copied.get(key));
+      assert.equal(restored.serialized, f.serialized[0]);
+      assert.deepEqual(restored.value, value);
+      assert.equal(head.usage.frames, f.head.usage.frames);
+      assert.equal(head.version, f.head.version);
+    }
+  } finally {
+    replay.close();
+  }
+});
+
+test('legacy rebind refuses overlapping and callback-reentrant copies and releases its private mapping', () => {
+  const f = fixture([
+      [{ op: 'set', path: [], value: { retained: 'Fictional multipart state. '.repeat(5000) } }],
+    ]),
+    sourceRows = [...f.rows],
+    replay = prepareIntakeLegacyReplay(identity, f.caps, f.head, (key) => f.rows.get(key)),
+    target = { ...identity, profileId: 'fictional-rebind-lifetime' };
+  assert.ok(f.head.usage.frames > 1);
+  const check = (copied: Map<string, string>, head: Head) => {
+    copied.set(intakeNamespace(target) + 'head', JSON.stringify(head));
+    assert.equal(
+      reconstructIntakeEvidence(target, f.caps, head, (key) => copied.get(key)).serialized,
+      f.serialized[0],
+    );
+    assert.deepEqual([...f.rows], sourceRows, 'rebind never changes source evidence');
+  };
+  try {
+    const copied = new Map<string, string>(),
+      pending = replay.rebindSteps(target, (key, raw) => copied.set(key, raw));
+    assert.equal(pending.next().done, false);
+    const overlapping = replay.rebindSteps(target, () => {
+      assert.fail('refused overlapping copy must not write');
+    });
+    assert.throws(() => overlapping.next(), /legacy rebind already in flight/);
+    let step = pending.next();
+    while (!step.done) step = pending.next();
+    check(copied, step.value);
+
+    const reentrantCopy = new Map<string, string>();
+    let callbacks = 0;
+    const reentrantHead = replay.rebind(target, (key, raw) => {
+      callbacks++;
+      assert.throws(
+        () =>
+          replay.rebind(target, () => {
+            assert.fail('refused callback-reentrant copy must not write');
+          }),
+        /legacy rebind already in flight/,
+      );
+      reentrantCopy.set(key, raw);
+    });
+    assert.equal(callbacks, f.head.usage.frames + f.operationIds.length);
+    check(reentrantCopy, reentrantHead);
+
+    const cancelled = replay.rebindSteps(target, () => {
+      assert.fail('cancelled copy stops before its first write');
+    });
+    assert.equal(cancelled.next().done, false);
+    assert.equal(cancelled.return(f.head).done, true);
+    assert.throws(
+      () =>
+        replay.rebind(target, () => {
+          throw Error('Fictional rebind writer refusal');
+        }),
+      /Fictional rebind writer refusal/,
+    );
+    const retry = new Map<string, string>();
+    check(
+      retry,
+      replay.rebind(target, (key, raw) => retry.set(key, raw)),
+    );
+  } finally {
+    replay.close();
+  }
 });
 
 test(
