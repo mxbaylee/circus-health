@@ -52,7 +52,7 @@ export async function readCollectionQueueActivity(
     countsExact = true,
     sourceCount = 0;
   try {
-    for await (const source of collectionQueueSourcesAsync(db, profileId, assertCurrent)) {
+    for await (const source of collectionQueueSourcesAsync(db, root, profileId, assertCurrent)) {
       sourceCount++;
       const view = openIntakeCollectionEnvelope(db, source),
         intake = view.child(view.root(), 'intake')!,

@@ -235,6 +235,7 @@ export function* collectionQueueSources(
 /** Complete visible source traversal with no native cursor held across a host turn. */
 export async function* collectionQueueSourcesAsync(
   db: DatabaseSync,
+  root: string,
   profileId: string,
   assertRunning?: () => void,
 ): AsyncGenerator<IntakeEnvelopeSource> {
@@ -247,14 +248,14 @@ export async function* collectionQueueSourcesAsync(
   }
   const stamp = reviewReadStamp(db),
     methodEpoch = managedDatabaseMethodEpoch(db),
-    physicalEpoch = captureManagedPhysicalEpoch();
+    physicalEpoch = captureManagedPhysicalScope(profilePaths(root, profileId).root);
   if (!stamp || !methodEpoch || !physicalEpoch) throw changed();
   const assertWitness = () => {
     assertRunning?.();
     if (
       reviewReadStamp(db) !== stamp ||
       managedDatabaseMethodEpoch(db) !== methodEpoch ||
-      captureManagedPhysicalEpoch() !== physicalEpoch
+      !managedPhysicalScopeCurrent(physicalEpoch)
     )
       throw changed();
     assertIntakeOwner(db, profileId);
@@ -404,7 +405,7 @@ async function collectionQueueBinding(
   )
     throw changed();
   const { hash, update } = newCollectionQueueBindingHash(db, profileId);
-  for await (const source of collectionQueueSourcesAsync(db, profileId)) {
+  for await (const source of collectionQueueSourcesAsync(db, root, profileId)) {
     const version = intakeSourceVersion(db, source.id),
       pin = canonicalLiteral(version);
     update(canonicalLiteral([source.id, version]));
@@ -919,7 +920,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     const expectedPreparation = reviewPreparationStamp(db),
       expectedMethod = reviewPreparationMethodStamp(db),
       expectedMethodEpoch = managedDatabaseMethodEpoch(db),
-      expectedPhysicalEpoch = captureManagedPhysicalEpoch();
+      expectedPhysicalEpoch = initial?.physicalEpoch ?? captureManagedPhysicalEpoch();
     if (!expectedMethodEpoch || !expectedPhysicalEpoch) throw changed();
     const assertRefresh = () => {
       assertIntakeOwner(db, profileId);
@@ -929,7 +930,12 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
           : reviewPreparationMethodStamp(db) !== expectedMethod
       )
         throw changed();
-      if (captureManagedPhysicalEpoch() !== expectedPhysicalEpoch) throw changed();
+      if (
+        initial
+          ? !managedPhysicalScopeCurrent(expectedPhysicalEpoch)
+          : captureManagedPhysicalEpoch() !== expectedPhysicalEpoch
+      )
+        throw changed();
       if (
         !db.isTransaction &&
         (!expectedPreparation || reviewPreparationStamp(db) !== expectedPreparation)

@@ -11,6 +11,8 @@ import {
   beginIntakeFrontierAuxiliaryPreparation,
   execIntakeFrontierAuxiliarySQL,
   finishIntakeFrontierAuxiliaryPreparation,
+  prepareIntakeFrontierAuxiliaryInsert,
+  runIntakeFrontierAuxiliaryInsert,
 } from './intake-lookup-frontier-observer.ts';
 import {
   duplicateEvidenceValue,
@@ -223,104 +225,132 @@ export async function prepareDuplicateEvidenceIndex(
     state = initialize(db);
     cold = true;
   }
-  const generation = Number(db.prepare(`SELECT generation FROM ${META}`).get()!.generation);
-  const phase = cold ? 'reconstruction' : 'warm';
-  const yieldStep = async () => {
-    withIntakeWork(db, phase, () => recordIntakeWork('duplicateEvidenceYields'));
-    await setImmediate();
-    current();
-  };
-  const current = () => {
-    options.assertRunning?.();
-    checked(db);
-    if (Number(db.prepare(`SELECT generation FROM ${META}`).get()!.generation) !== generation)
-      throw pending();
-  };
-  for (const target of db
-    .prepare(`SELECT kind,id FROM ${TABLE} WHERE dirty=1 ORDER BY kind,id`)
-    .iterate()) {
-    current();
-    try {
-      const hash = createHash('sha256').update('['),
-        scope = createHash('sha256').update('[');
-      db.prepare(`DELETE FROM ${ORIGINALS} WHERE kind=? AND id=?`).run(target.kind!, target.id!);
-      let count = 0;
-      for (const row of db
-        .prepare(joined + ' WHERE e.entity_type=? AND e.entity_id=? ORDER BY e.id')
-        .iterate(target.kind!, target.id!)) {
-        const value = duplicateEvidenceValue(row),
-          text = canonicalLiteral(value),
-          scopeText = canonicalLiteral(scoped(db, value));
-        db.prepare(`INSERT OR IGNORE INTO ${ORIGINALS} VALUES(?,?,?)`).run(
-          target.kind!,
-          target.id!,
-          value.contentUrl,
-        );
-        if (count++) {
-          hash.update(',');
-          scope.update(',');
-        }
-        hash.update(text);
-        scope.update(scopeText);
-        state.rows++;
-        withIntakeWork(db, phase, () => {
-          recordIntakeWork('duplicateEvidenceHashedRows');
-          recordIntakeWork(
-            'duplicateEvidenceHashedBytes',
-            Buffer.byteLength(text) + Buffer.byteLength(scopeText),
-          );
-        });
-        if (cold) state.coldRows++;
-        state.maxValueBytes = Math.max(
-          state.maxValueBytes,
-          Buffer.byteLength(text),
-          Buffer.byteLength(scopeText),
-        );
-        if (count % 32 === 0) {
-          await yieldStep();
-        }
-      }
-      const raw = createHash('sha256').update('[');
-      let rawCount = 0;
-      for (const value of rawSavedEvidenceValues(
+  const targets = db.prepare(`SELECT kind,id FROM ${TABLE} WHERE dirty=1 ORDER BY kind,id`);
+  if (!targets.get()) return;
+  const frontier = beginIntakeFrontierAuxiliaryPreparation(db, 'duplicate-evidence');
+  let complete = false;
+  try {
+    const deleteOriginals = prepareIntakeFrontierAuxiliaryInsert(
         db,
-        String(target.kind) as SavedDuplicateEvidenceReference['kind'],
-        String(target.id),
-      )) {
-        if (rawCount++) raw.update(',');
-        const text = canonicalLiteral(value);
-        raw.update(text);
-        withIntakeWork(db, phase, () => {
-          recordIntakeWork('duplicateEvidenceRawHashedRows');
-          recordIntakeWork('duplicateEvidenceHashedBytes', Buffer.byteLength(text));
-        });
-        if (rawCount % 32 === 0) {
-          await yieldStep();
-        }
-      }
-      current();
-      db.prepare(
+        frontier,
+        `DELETE FROM ${ORIGINALS} WHERE kind=? AND id=?`,
+      ),
+      insertOriginal = prepareIntakeFrontierAuxiliaryInsert(
+        db,
+        frontier,
+        `INSERT OR IGNORE INTO ${ORIGINALS} VALUES(?,?,?)`,
+      ),
+      updateDigest = prepareIntakeFrontierAuxiliaryInsert(
+        db,
+        frontier,
         `UPDATE ${TABLE} SET dirty=0,error=NULL,count=?,digest=?,scope_digest=?,raw_digest=? WHERE kind=? AND id=?`,
-      ).run(
-        count,
-        hash.update(']').digest('hex'),
-        scope.update(']').digest('hex'),
-        raw.update(']').digest('hex'),
-        target.kind!,
-        target.id!,
+      ),
+      updateError = prepareIntakeFrontierAuxiliaryInsert(
+        db,
+        frontier,
+        `UPDATE ${TABLE} SET dirty=0,error=? WHERE kind=? AND id=?`,
       );
-    } catch (error) {
+    const generation = Number(db.prepare(`SELECT generation FROM ${META}`).get()!.generation);
+    const phase = cold ? 'reconstruction' : 'warm';
+    const yieldStep = async () => {
+      withIntakeWork(db, phase, () => recordIntakeWork('duplicateEvidenceYields'));
+      await setImmediate();
       current();
-      if (!(error instanceof HttpError && error.code === 'DUPLICATE_EVIDENCE')) throw error;
-      // A damaged unrelated target is not an absence answer and does not block
-      // another intake's selected evidence. Selecting it still refuses exactly.
-      db.prepare(`UPDATE ${TABLE} SET dirty=0,error=? WHERE kind=? AND id=?`).run(
-        error.message,
-        target.kind!,
-        target.id!,
-      );
+    };
+    const current = () => {
+      options.assertRunning?.();
+      checked(db);
+      if (Number(db.prepare(`SELECT generation FROM ${META}`).get()!.generation) !== generation)
+        throw pending();
+    };
+    for (const target of targets.iterate()) {
+      current();
+      try {
+        const hash = createHash('sha256').update('['),
+          scope = createHash('sha256').update('[');
+        runIntakeFrontierAuxiliaryInsert(db, frontier, deleteOriginals, [
+          target.kind as string,
+          target.id as string,
+        ]);
+        let count = 0;
+        for (const row of db
+          .prepare(joined + ' WHERE e.entity_type=? AND e.entity_id=? ORDER BY e.id')
+          .iterate(target.kind!, target.id!)) {
+          const value = duplicateEvidenceValue(row),
+            text = canonicalLiteral(value),
+            scopeText = canonicalLiteral(scoped(db, value));
+          runIntakeFrontierAuxiliaryInsert(db, frontier, insertOriginal, [
+            target.kind as string,
+            target.id as string,
+            value.contentUrl,
+          ]);
+          if (count++) {
+            hash.update(',');
+            scope.update(',');
+          }
+          hash.update(text);
+          scope.update(scopeText);
+          state.rows++;
+          withIntakeWork(db, phase, () => {
+            recordIntakeWork('duplicateEvidenceHashedRows');
+            recordIntakeWork(
+              'duplicateEvidenceHashedBytes',
+              Buffer.byteLength(text) + Buffer.byteLength(scopeText),
+            );
+          });
+          if (cold) state.coldRows++;
+          state.maxValueBytes = Math.max(
+            state.maxValueBytes,
+            Buffer.byteLength(text),
+            Buffer.byteLength(scopeText),
+          );
+          if (count % 32 === 0) {
+            await yieldStep();
+          }
+        }
+        const raw = createHash('sha256').update('[');
+        let rawCount = 0;
+        for (const value of rawSavedEvidenceValues(
+          db,
+          String(target.kind) as SavedDuplicateEvidenceReference['kind'],
+          String(target.id),
+        )) {
+          if (rawCount++) raw.update(',');
+          const text = canonicalLiteral(value);
+          raw.update(text);
+          withIntakeWork(db, phase, () => {
+            recordIntakeWork('duplicateEvidenceRawHashedRows');
+            recordIntakeWork('duplicateEvidenceHashedBytes', Buffer.byteLength(text));
+          });
+          if (rawCount % 32 === 0) {
+            await yieldStep();
+          }
+        }
+        current();
+        runIntakeFrontierAuxiliaryInsert(db, frontier, updateDigest, [
+          count,
+          hash.update(']').digest('hex'),
+          scope.update(']').digest('hex'),
+          raw.update(']').digest('hex'),
+          target.kind as string,
+          target.id as string,
+        ]);
+      } catch (error) {
+        current();
+        if (!(error instanceof HttpError && error.code === 'DUPLICATE_EVIDENCE')) throw error;
+        // A damaged unrelated target is not an absence answer and does not block
+        // another intake's selected evidence. Selecting it still refuses exactly.
+        runIntakeFrontierAuxiliaryInsert(db, frontier, updateError, [
+          error.message,
+          target.kind as string,
+          target.id as string,
+        ]);
+      }
+      await yieldStep();
     }
-    await yieldStep();
+    complete = true;
+  } finally {
+    finishIntakeFrontierAuxiliaryPreparation(db, frontier, complete);
   }
 }
 const empty = createHash('sha256').update('[]').digest('hex');

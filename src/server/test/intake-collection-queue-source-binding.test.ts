@@ -12,7 +12,10 @@ import {
   openCollectionReportQueue,
 } from '../intake-report-group-collection.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
-import { withManagedPhysicalMutation } from '../clinical-review-physical-epoch.ts';
+import {
+  beginManagedPhysicalMutation,
+  withManagedPhysicalMutation,
+} from '../clinical-review-physical-epoch.ts';
 import {
   execClinicalReviewMaintenance,
   runClinicalReviewMaintenance,
@@ -43,6 +46,30 @@ test('cold queue preparation and re-certification retain the original authority 
     'attention',
     'CREATE TEMP TABLE source_attention_counts_v1(source_id TEXT PRIMARY KEY,sections INTEGER NOT NULL)',
   );
+  const unrelated = ensureProfileDirectories(root, 'fictional-unrelated-queue-recertification'),
+    originalPrepare = DatabaseSync.prototype.prepare;
+  let intervened = false,
+    unrelatedQueue: Awaited<ReturnType<typeof openCollectionReportQueue>> | undefined;
+  DatabaseSync.prototype.prepare = function (sql) {
+    if (
+      !intervened &&
+      sql.startsWith('SELECT t.id,t.sha256,t.kind,t.details_json,t.pin FROM stagedSources t')
+    ) {
+      intervened = true;
+      withManagedPhysicalMutation(() => {}, [unrelated.root]);
+    }
+    return originalPrepare.call(this, sql);
+  };
+  try {
+    unrelatedQueue = await openCollectionReportQueue(db, root, profileId);
+    assert.equal(intervened, true, 'the event follows the original source binding capture');
+    unrelatedQueue.assertCurrent();
+    assert.deepEqual([...unrelatedQueue.groups('all')], []);
+  } finally {
+    DatabaseSync.prototype.prepare = originalPrepare;
+    unrelatedQueue?.close();
+    clearCollectionReportQueues(db);
+  }
   for (const change of ['certified', 'TEMP ABA', 'policy', 'physical ABA'] as const) {
     // No pre-warming of the clinical cache pin: opening this queue is the cold boundary.
     const queue = await openCollectionReportQueue(db, root, profileId);
@@ -73,9 +100,14 @@ test('cold queue preparation and re-certification retain the original authority 
 });
 
 test('collection source enumeration stops at its first bounded turn on cancellation and raw changes', async (t) => {
-  const profileId = 'fictional-collection-source-binding';
+  const root = mkdtempSync(join(tmpdir(), 'fictional-collection-source-binding-')),
+    profileId = 'fictional-collection-source-binding';
+  ensureProfileDirectories(root, profileId);
   const db = openDatabase(':memory:', profileId);
-  t.after(() => db.close());
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
   memoryRecordAuthority(db);
   transaction(db, () => {
     for (let index = 0; index < 130; index++) {
@@ -125,7 +157,7 @@ test('collection source enumeration stops at its first bounded turn on cancellat
     let rows = 0;
     await assert.rejects(
       async () => {
-        for await (const _source of collectionQueueSourcesAsync(db, profileId, () => {
+        for await (const _source of collectionQueueSourcesAsync(db, root, profileId, () => {
           if (canceled) throw Error('fictional cancellation');
         }))
           rows++;
@@ -136,6 +168,64 @@ test('collection source enumeration stops at its first bounded turn on cancellat
     assert.equal(rows, 64);
     if (change === 'owner')
       db.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(profileId);
+  }
+});
+
+test('collection source enumeration retains its profile scope across unrelated physical events', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-collection-source-scope-')),
+    profileId = 'fictional-collection-source-scope',
+    selected = ensureProfileDirectories(root, profileId),
+    unrelated = ensureProfileDirectories(root, 'fictional-unrelated-source-scope'),
+    db = openDatabase(':memory:', profileId);
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  memoryRecordAuthority(db);
+  const ids = ['fictional-source-a', 'fictional-source-b'];
+  transaction(db, () => {
+    for (const id of ids) {
+      registerRawIntakeFixture(
+        db,
+        id,
+        JSON.stringify({ intake: { version: 0, originalName: `${id}.txt` } }),
+      );
+      writeIntakeFixtureEnvelope(db, id, { intake: { version: 0, originalName: `${id}.txt` } });
+    }
+  });
+  for (const id of ids) await buildIntakeCollectionEnvelope(db, { id });
+  for (const event of [
+    'unrelated',
+    'selected',
+    'ancestor',
+    'unknown',
+    'active',
+    'overflow',
+  ] as const) {
+    const sources = collectionQueueSourcesAsync(db, root, profileId);
+    let finish: (() => void) | undefined;
+    try {
+      const first = await sources.next();
+      assert.equal(first.done, false);
+      assert.equal(first.value!.id, ids[0]);
+      if (event === 'unrelated') withManagedPhysicalMutation(() => {}, [unrelated.root]);
+      else if (event === 'selected') withManagedPhysicalMutation(() => {}, [selected.sources]);
+      else if (event === 'ancestor') withManagedPhysicalMutation(() => {}, [root]);
+      else if (event === 'unknown') withManagedPhysicalMutation(() => {});
+      else if (event === 'active') finish = beginManagedPhysicalMutation([unrelated.root]);
+      else
+        for (let index = 0; index < 1025; index++)
+          withManagedPhysicalMutation(() => {}, [unrelated.root]);
+      if (event === 'unrelated') {
+        const second = await sources.next();
+        assert.equal(second.done, false);
+        assert.equal(second.value!.id, ids[1]);
+        assert.equal((await sources.next()).done, true);
+      } else await assert.rejects(sources.next(), { code: 'REPORT_QUEUE_CURSOR' });
+    } finally {
+      finish?.();
+      await sources.return(undefined);
+    }
   }
 });
 

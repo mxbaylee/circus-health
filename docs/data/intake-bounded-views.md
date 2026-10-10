@@ -907,6 +907,12 @@ objects; they do not authorize protected source writes. Replacing either
 function, including a failed registration attempt, invalidates its index and
 the prior frontier. Repair rebuilds the index under the fixed function and
 does not revive the old proof.
+Warm duplicate-evidence maintenance uses the same private auxiliary protocol for
+its fixed original-row replacement and digest/error updates. Those cache-only
+writes preserve a previously captured lookup frontier after acceptance. Caller
+callbacks run outside the fixed statement scope; earlier or intervening source,
+ordinary accepted-record or foreign TEMP writes, denied statements and incomplete
+maintenance cannot use that continuation to restore a stale proof.
 Existing receipt rows join the freshly validated source head instead of being
 rewritten when that head changes. Detached hints are bounded to 64 keys per
 source, at most 100 sources and 1 MiB of retained string data per operation.
@@ -1016,6 +1022,15 @@ parsed GET completion does not cancel the response. This applies to reads, not
 acceptance replay: disconnecting a review cannot undo an accepted record or
 authorize another write. Source, profile and physical-evidence checks remain
 unchanged, and cancellation does not increase the browser's read deadline.
+
+Queue source enumeration and refresh retain the selected profile's original
+managed physical scope. A completed, known write confined to another profile
+does not invalidate that scope. Selected or ancestor paths, unknown paths,
+active writers and expired event history still refuse, as do changed source,
+SQL, owner and cancellation witnesses. Refresh retains its pre-enumeration
+witness rather than capturing a new baseline after work. This does not relax
+the separate complete artifact worker's global mutation guard or allow writes
+within the selected profile while a queue proof is held.
 
 The queue passes its actual operation owner into cold journal-activity replay.
 Parsing, replay and directory enumeration check that owner before resuming;

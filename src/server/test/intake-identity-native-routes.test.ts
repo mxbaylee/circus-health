@@ -836,7 +836,10 @@ test(
     while (
       intakeWorkCounters(f.db).warm.identityPreviewFullPreparations -
         before.identityPreviewFullPreparations <
-        2 ||
+        1 ||
+      intakeWorkCounters(f.db).warm.identityPreviewGroundingPreparations -
+        before.identityPreviewGroundingPreparations <
+        1 ||
       intakeWorkCounters(f.db).warm.reportSnapshotCheckpointChanges ===
         before.reportSnapshotCheckpointChanges
     ) {
