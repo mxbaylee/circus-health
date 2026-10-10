@@ -16,6 +16,9 @@ export function recordPreparedIndexBoundTo(db: DatabaseSync, index: object): boo
 }
 type Scalar = { kind: string; value: string | Uint8Array | null };
 type Header = { position: number; sql: string; mode: string; expected: number; arguments: number };
+type HashQuantum = { bytes: number; pieces: number };
+const HASH_BYTES = 16384,
+  HASH_PIECES = 64;
 const fail = (): never => {
   throw Error('Prepared record index changed, escaped or expired');
 };
@@ -92,33 +95,64 @@ export function createRecordPreparedIndex(
       )
         fail();
     };
-    const sign = async (header: Header, args: readonly Scalar[]) => {
+    const guard = () => {
+      assertRunning?.();
+      current();
+    };
+    const cooperate = async <T>(steps: Generator<void, T>): Promise<T> => {
+      guard();
+      let step = steps.next();
+      while (!step.done) {
+        guard();
+        await setImmediate();
+        guard();
+        step = steps.next();
+      }
+      guard();
+      return step.value;
+    };
+    const sign = function* (
+      header: Header,
+      args: readonly Scalar[],
+      quantum: HashQuantum,
+    ): Generator<void, string> {
       const hmac = createHmac('sha256', key);
-      const piece = async (input: string | Uint8Array) => {
-        for (let offset = 0; offset < input.length; offset += 16384) {
-          assertRunning?.();
-          current();
-          if (typeof input === 'string')
-            hmac.update(input.slice(offset, offset + 16384), 'utf16le');
-          else hmac.update(input.subarray(offset, offset + 16384));
-          await setImmediate();
-          assertRunning?.();
-          current();
+      const piece = function* (input: string | Uint8Array): Generator<void, void> {
+        const width = typeof input === 'string' ? 2 : 1,
+          units = HASH_BYTES / width;
+        for (let offset = 0; offset < input.length; offset += units) {
+          const end = Math.min(offset + units, input.length),
+            bytes = (end - offset) * width;
+          if (quantum.bytes + bytes > HASH_BYTES) {
+            yield;
+            quantum.bytes = quantum.pieces = 0;
+          }
+          if (typeof input === 'string') hmac.update(input.slice(offset, end), 'utf16le');
+          else hmac.update(input.subarray(offset, end));
+          quantum.bytes += bytes;
+          quantum.pieces++;
+          if (quantum.bytes === HASH_BYTES || quantum.pieces === HASH_PIECES) {
+            yield;
+            quantum.bytes = quantum.pieces = 0;
+          }
         }
       };
-      hmac.update(
-        JSON.stringify([
-          header.position,
-          header.mode,
-          header.expected,
-          header.arguments,
-          header.sql.length,
-        ]),
+      // Only bounded typed framing is encoded; scalar contents remain streamed.
+      yield* piece(
+        Buffer.from(
+          JSON.stringify([
+            header.position,
+            header.mode,
+            header.expected,
+            header.arguments,
+            header.sql.length,
+          ]),
+        ),
       );
-      await piece(header.sql);
+      yield* piece(header.sql);
       for (const arg of args) {
-        hmac.update(JSON.stringify([arg.kind, arg.value?.length ?? null]));
-        if (arg.value !== null) await piece(arg.value);
+        yield* piece(Buffer.from(JSON.stringify([arg.kind, arg.value?.length ?? null])));
+        if (arg.value !== null) yield* piece(arg.value);
       }
       return hmac.digest('hex');
     };
@@ -160,7 +194,8 @@ export function createRecordPreparedIndex(
               : arg;
           }),
           header: Header = { position: count, sql, mode, expected, arguments: args.length },
-          signature = await sign(header, args);
+          signature = await cooperate(sign(header, args, { bytes: 0, pieces: 0 }));
+        guard();
         for (let ordinal = 0; ordinal < args.length; ordinal++) {
           const arg = args[ordinal]!;
           if (run(insertArg, count, ordinal, arg.kind, arg.value).changes !== 1) fail();
@@ -170,7 +205,7 @@ export function createRecordPreparedIndex(
         if (run(insert, count, sql, mode, expected, args.length, signature).changes !== 1) fail();
         changes++;
         count++;
-        current();
+        guard();
       } catch (error) {
         close();
         throw error;
@@ -204,12 +239,18 @@ export function createRecordPreparedIndex(
           const path = Reflect.apply(location, scratch.db, []) as string;
           if (!path) fail();
           physical = captureRecordHeadPhysical([path], [dirname(path)]);
-          for (let position = 0; position < count; position++) {
-            const { row, args } = read(position);
-            if (row.signature !== (await sign(row, args))) fail();
-          }
+          await cooperate(
+            (function* () {
+              const quantum = { bytes: 0, pieces: 0 };
+              for (let position = 0; position < count; position++) {
+                const { row, args } = read(position);
+                if (row.signature !== (yield* sign(row, args, quantum))) fail();
+              }
+            })(),
+          );
+          guard();
           if (get(membership)!.n !== count || get(argumentMembership)!.n !== argumentCount) fail();
-          current();
+          guard();
           sealed = true;
         } catch (error) {
           close();
