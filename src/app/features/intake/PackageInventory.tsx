@@ -10,6 +10,7 @@ import type {
   IntakePackageMember,
 } from '../../../shared/intake';
 import {
+  intakeFilenameDisplay,
   isIntakeSummary,
   type IntakeRead,
   type IntakePackageFailurePage,
@@ -20,6 +21,7 @@ import { formatBytes } from '../../data/format';
 import { ResourceState } from '../../components/ResourceState';
 import { LoadingIndicator } from '../../components/LoadingIndicator';
 import { PackageProcessingFailures } from './PackageProcessingFailures';
+import { IntakeFilenameDetails } from './IntakeFilenameDetails';
 
 type PackageMember = IntakePackageMember | IntakePackageMemberReference;
 const isMemberReference = (member: PackageMember): member is IntakePackageMemberReference =>
@@ -212,8 +214,11 @@ function ScopedPackageInventory({
     <section className="intake-package" aria-label="Package contents">
       <h3>Package contents</h3>
       <a className="text-link" href={intake.contentUrl} target="_blank" rel="noreferrer">
-        Open original: {intake.filename}
+        Open original: {intakeFilenameDisplay(intake)}
       </a>
+      {isIntakeSummary(intake) && intake.filenameReference && (
+        <IntakeFilenameDetails reference={intake.filenameReference} />
+      )}
       {failurePage.error && (
         <p role="alert">
           {failurePage.error.message}{' '}

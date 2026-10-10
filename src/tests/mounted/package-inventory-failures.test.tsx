@@ -74,6 +74,63 @@ beforeEach(() => {
   selectProfile(profile);
 });
 
+it('labels a shortened original name and loads its exact pinned fragment on demand', async () => {
+  const reference: NonNullable<IntakeSummaryV2['filenameReference']> = {
+    format: 'health-intake-filename-reference-v1',
+    intakeId: intake.id,
+    field: 'originalName',
+    pins: { sourceHash: 'b'.repeat(64), logicalRoot: 'c'.repeat(64), domainVersion: 1, version: 1 },
+    scalarHash: 'd'.repeat(64),
+    bytes: 40000,
+  };
+  const requests: unknown[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, options: RequestInit = {}) => {
+      const path = String(input);
+      if (path.includes('/package?')) return inventory();
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      if (path.endsWith('/filename-fragment')) {
+        requests.push(JSON.parse(String(options.body)));
+        return json({
+          format: 'health-intake-filename-fragment-v1',
+          reference,
+          encoding: 'json-string',
+          text: '"Fictional retained name fragment',
+          complete: false,
+          nextCursor: 'fictional-name-continuation',
+        });
+      }
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  const { filename: _omittedName, ...header } = intake;
+  render(
+    <PackageInventory
+      intake={
+        {
+          ...header,
+          format: 'health-intake-summary-v2',
+          filenamePreview: 'Fictional delivery',
+          filenameTruncated: true,
+          filenameReference: reference,
+          packageSource: true,
+          retainOnly: false,
+        } as unknown as IntakeSummaryV2
+      }
+    />,
+  );
+  expect(
+    screen.getByRole('link', { name: 'Open original: Fictional delivery… (shortened)' }),
+  ).toHaveAttribute('href', intake.contentUrl);
+  expect(requests).toEqual([]);
+  await userEvent.setup().click(screen.getByText('Full retained filename'));
+  expect(await screen.findByText('"Fictional retained name fragment')).toBeVisible();
+  expect(screen.getByText('Part of the retained filename')).toBeVisible();
+  expect(requests).toEqual([{ reference, limit: 32768 }]);
+});
+
 it('returns to actual variable member pages and rejects stale results after profile, source or version changes', async () => {
   const requests: string[] = [];
   let delayed: ((response: Response) => void) | undefined;
