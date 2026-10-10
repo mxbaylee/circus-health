@@ -4,7 +4,12 @@ import { inlineReviewRecordIssuesWork, reviewRecordIssues } from './intake-revie
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
 import { canonicalLiteral } from './intake-format.ts';
-import { selectedReportGroupLinks, selectedReportGroups } from './intake-selected-report-groups.ts';
+import {
+  selectedReportGroupLinks,
+  selectedReportGroups,
+  selectedReportGroupAt,
+  isSelectedReportGroups,
+} from './intake-selected-report-groups.ts';
 import {
   buildClinicalReviewWork,
   finalizeClinicalPairScopesWork,
@@ -309,16 +314,19 @@ export function* createCollectionClinicalReviewSessionWork(input: {
         if (ordinal < 0)
           throw new HttpError(404, 'REVIEW_RECORD_NOT_FOUND', 'Clinical review record not found');
         const record = review.records[ordinal]!,
-          groupLinks = selectedReportGroupLinks(
-            () => selectedReportGroups(record.reportGroups),
-            {
-              candidateId: record.candidateId!,
-              candidateVersionId: record.candidateVersionId!,
-              recordId: record.id,
-              proposalId: review.proposalId,
-            },
-            0,
-          ),
+          groupLinks = isSelectedReportGroups(record.reportGroups)
+            ? record.reportGroups
+            : selectedReportGroupLinks(
+                () => selectedReportGroups(record.reportGroups),
+                {
+                  candidateId: record.candidateId!,
+                  candidateVersionId: record.candidateVersionId!,
+                  recordId: record.id,
+                  proposalId: review.proposalId,
+                },
+                0,
+                (ordinal) => selectedReportGroupAt(record.reportGroups, ordinal),
+              ),
           size = Buffer.byteLength(JSON.stringify(record)),
           value = { kind: 'record' as const, record },
           blockingIssueCount =

@@ -9,6 +9,10 @@ import {
   type EnvelopeCellReader,
 } from './intake-collection-envelope.ts';
 import { schemaKey, schemaOrdinal, type SchemaControl } from './intake-envelope-schema.ts';
+import {
+  parseIntakeFilenameFacts,
+  prepareIntakeFilenameFactsSteps,
+} from './intake-filename-facts.ts';
 import { hashIntakeJsonScalarSteps } from './intake-json-scalar.ts';
 
 const fail = (message: string): never => {
@@ -168,6 +172,26 @@ export function* validateIntakeSchemaReachabilitySteps(
           if (name.kind !== 'string' || lexical.kind !== 'string' || name.hash !== lexical.hash)
             fail('schema lexical/property agreement');
           field = name.hash;
+          if (
+            meta.kind === 'intake' &&
+            [schemaKey('originalName'), schemaKey('locator')].includes(field) &&
+            entry.target.type === 'cell'
+          ) {
+            const facts = store.get('q:' + entry.target.id);
+            if (facts !== undefined) {
+              if (typeof facts !== 'string') fail('fragmented filename facts');
+              const actual = store.get('c:' + entry.target.id);
+              if (!actual || typeof actual === 'string' || !store.byteBinding)
+                fail('filename facts require checked byte evidence');
+              const prepared = parseIntakeFilenameFacts(facts as string);
+              const expected = yield* prepareIntakeFilenameFactsSteps(
+                iterateSchemaCellText(store, 'c:' + entry.target.id),
+                store.byteBinding!(actual as import('./intake-state-storage.ts').IntakeByteValue),
+              );
+              if (JSON.stringify(prepared) !== JSON.stringify(expected))
+                fail('filename facts disagree with selected evidence');
+            }
+          }
           const previous = selectExpected.get('l:' + id + ':' + field)?.value ?? 'null';
           if (store.get('d:' + id + ':' + schemaOrdinal(ordinal)) !== previous)
             fail('schema property predecessor');

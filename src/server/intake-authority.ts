@@ -1,4 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import {
+  COMPACT_SCALAR_BYTES,
+  COMPACT_SCALAR_FORMAT,
+  compactIntakeScalarSteps,
+  isIntakeCompactScalar,
+  type IntakeCompactScalarField,
+} from './intake-compact-scalar.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { currentTransactionToken, json, rejectCurrentTransaction } from './database.ts';
 import {
@@ -25,6 +32,9 @@ import {
 } from './intake-work-accounting.ts';
 
 export const INTAKE_ENVELOPE_FORMAT = 'health-intake-envelope-v1';
+export const INTAKE_COMPACT_ENVELOPE_FORMAT = 'health-intake-envelope-v2';
+export type IntakeEnvelopeProjectionFormat =
+  typeof INTAKE_ENVELOPE_FORMAT | typeof INTAKE_COMPACT_ENVELOPE_FORMAT;
 export interface IntakeEnvelopeSource {
   id: string;
   kind?: string;
@@ -71,11 +81,35 @@ function envelope(value: unknown): asserts value is Record<string, unknown> & {
 }
 
 /** Preserve existing SQL metadata paths without retaining operational state. */
-export function compactIntakeMetadata(value: unknown): Record<string, unknown> {
+export function compactIntakeMetadata(
+  value: unknown,
+  format: IntakeEnvelopeProjectionFormat = INTAKE_ENVELOPE_FORMAT,
+): Record<string, unknown> {
   envelope(value);
   return Object.fromEntries(
-    Object.entries(value.intake).filter(([name]) => metadataFields.has(name)),
+    Object.entries(value.intake)
+      .filter(([name]) => metadataFields.has(name))
+      .map(([name, item]) => [name, compactScalarValue(name, JSON.stringify(item), format, item)]),
   );
+}
+function compactScalarValue(
+  name: string,
+  text: string,
+  format: IntakeEnvelopeProjectionFormat,
+  value: unknown,
+): unknown {
+  if (
+    format !== INTAKE_COMPACT_ENVELOPE_FORMAT ||
+    !['originalName', 'locator'].includes(name) ||
+    typeof value !== 'string' ||
+    Buffer.byteLength(text) <= COMPACT_SCALAR_BYTES
+  )
+    return value;
+  const steps = compactIntakeScalarSteps(name as IntakeCompactScalarField, [text]);
+  for (;;) {
+    const next = steps.next();
+    if (next.done) return next.value;
+  }
 }
 function members(raw: string): Array<{ name: string; key: string; value: string }> {
   // Input has already passed JSON.parse. Scan lexical boundaries, preserving
@@ -119,7 +153,12 @@ function members(raw: string): Array<{ name: string; key: string; value: string 
   }
   return result;
 }
-function compact(value: unknown, mode: Mode, raw?: string): string {
+function compact(
+  value: unknown,
+  mode: Mode,
+  raw?: string,
+  format: IntakeEnvelopeProjectionFormat = INTAKE_ENVELOPE_FORMAT,
+): string {
   if (mode === 'raw') {
     if (raw === undefined) return fail('raw metadata requires exact text');
     const intakes = members(raw)
@@ -129,36 +168,74 @@ function compact(value: unknown, mode: Mode, raw?: string): string {
           ? '{' +
             members(member.value)
               .filter((entry) => metadataFields.has(entry.name))
-              .map((entry) => `${entry.key}:${entry.value}`)
+              .map((entry) => {
+                if (
+                  format !== INTAKE_COMPACT_ENVELOPE_FORMAT ||
+                  !['originalName', 'locator'].includes(entry.name) ||
+                  Buffer.byteLength(entry.value) <= COMPACT_SCALAR_BYTES
+                )
+                  return `${entry.key}:${entry.value}`;
+                const projected = compactScalarValue(
+                  entry.name,
+                  entry.value,
+                  format,
+                  parse(entry.value),
+                );
+                return `${entry.key}:${
+                  projected && typeof projected === 'object' && isIntakeCompactScalar(projected)
+                    ? JSON.stringify(projected)
+                    : entry.value
+                }`;
+              })
               .join(',') +
             '}'
           : 'null';
         return `${member.key}:${retained}`;
       });
-    return `{"intakeAuthority":${recordIntakeSerialization(JSON.stringify({ format: INTAKE_ENVELOPE_FORMAT, mode }))},${intakes.join(',')}}`;
+    return `{"intakeAuthority":${recordIntakeSerialization(JSON.stringify({ format, mode }))},${intakes.join(',')}}`;
   }
   return recordIntakeSerialization(
     JSON.stringify({
-      intakeAuthority: { format: INTAKE_ENVELOPE_FORMAT, mode },
-      intake: compactIntakeMetadata(value),
+      intakeAuthority: { format, mode },
+      intake: compactIntakeMetadata(value, format),
     }),
   );
 }
 /** Validate the explicit current representation, never recognize legacy inline state. */
-export function intakeEnvelopeMode(raw: unknown): Mode {
+export function intakeEnvelopeProjection(raw: unknown): {
+  mode: Mode;
+  format: IntakeEnvelopeProjectionFormat;
+} {
   const value = parse(raw);
   if (
     !object(value) ||
     Object.keys(value).sort().join(',') !== 'intake,intakeAuthority' ||
     !object(value.intakeAuthority) ||
     Object.keys(value.intakeAuthority).sort().join(',') !== 'format,mode' ||
-    value.intakeAuthority.format !== INTAKE_ENVELOPE_FORMAT ||
+    ![INTAKE_ENVELOPE_FORMAT, INTAKE_COMPACT_ENVELOPE_FORMAT].includes(
+      String(value.intakeAuthority.format),
+    ) ||
     !['normalized', 'raw'].includes(String(value.intakeAuthority.mode)) ||
     !object(value.intake) ||
-    Object.keys(value.intake).some((name) => !metadataFields.has(name))
+    Object.keys(value.intake).some((name) => !metadataFields.has(name)) ||
+    (value.intakeAuthority.format === INTAKE_COMPACT_ENVELOPE_FORMAT &&
+      ['originalName', 'locator'].some((name) => {
+        const item = (value.intake as Record<string, unknown>)[name];
+        return (
+          object(item) &&
+          item.format === COMPACT_SCALAR_FORMAT &&
+          (!isIntakeCompactScalar(item) || item.field !== name)
+        );
+      }))
   )
     return fail('unsupported or duplicated original authority');
-  return value.intakeAuthority.mode as Mode;
+  return {
+    mode: value.intakeAuthority.mode as Mode,
+    format: value.intakeAuthority.format as IntakeEnvelopeProjectionFormat,
+  };
+}
+export function intakeEnvelopeMode(raw: unknown): Mode {
+  return intakeEnvelopeProjection(raw).mode;
 }
 
 /** Pure representation check shared with pre-publication copy/recovery validation. */
@@ -173,7 +250,7 @@ function validateRepresentation(
   state: unknown,
   serialized?: string,
 ): { value: Record<string, unknown>; text: string } {
-  const mode = intakeEnvelopeMode(detailsJson);
+  const { mode, format } = intakeEnvelopeProjection(detailsJson);
   let value: unknown, text: string;
   if (mode === 'raw') {
     if (!object(state) || Object.keys(state).join(',') !== 'raw' || typeof state.raw !== 'string')
@@ -191,7 +268,7 @@ function validateRepresentation(
     }
   }
   envelope(value);
-  if (compact(value, mode, text) !== detailsJson)
+  if (compact(value, mode, text, format) !== detailsJson)
     fail('compact metadata conflicts with selected state');
   return { value, text };
 }

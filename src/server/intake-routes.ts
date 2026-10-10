@@ -89,6 +89,26 @@ export async function handleIntakeRoute({
 }: IntakeRouteContext): Promise<boolean> {
   if (resource !== 'intakes') return false;
   if (
+    (method === 'GET' || method === 'POST') &&
+    id &&
+    db.prepare("SELECT 1 FROM source_files WHERE id=? AND kind='intake_original'").get(id)
+  ) {
+    const lifetime = intakeIdentityRequestLifetime(req, res);
+    try {
+      await intake.prepareIntakeReadFilenames(
+        db,
+        profileId,
+        { id },
+        {
+          assertRunning: () => lifetime.signal.throwIfAborted(),
+        },
+      );
+      lifetime.signal.throwIfAborted();
+    } finally {
+      lifetime.dispose();
+    }
+  }
+  if (
     method === 'GET' &&
     id &&
     action &&
@@ -161,21 +181,29 @@ export async function handleIntakeRoute({
   } else if (method === 'GET' && id === 'source-attention' && !action)
     respond(await listSourceAttentionRead(db, profileId, Number(params.get('offset') || 0)));
   else if (method === 'GET' && id === 'limits') respond(intakeLimits());
-  else if (method === 'GET' && !id)
-    list(
-      intake.listIntakeReads(
+  else if (method === 'GET' && !id) {
+    const options = {
+      offset: params.get('offset') as unknown as number,
+      limit: params.get('limit') as unknown as number,
+      visibility: params.get('visibility') || undefined,
+      rootOnly: params.get('rootOnly') === 'true',
+    };
+    const lifetime = intakeIdentityRequestLifetime(req, res);
+    try {
+      await intake.prepareIntakeReadFilenames(
         db,
         profileId,
+        { list: options },
         {
-          offset: params.get('offset') as unknown as number,
-          limit: params.get('limit') as unknown as number,
-          visibility: params.get('visibility') || undefined,
-          rootOnly: params.get('rootOnly') === 'true',
+          assertRunning: () => lifetime.signal.throwIfAborted(),
         },
-        root,
-      ),
-    );
-  else if (method === 'GET' && id && action === 'package-failures') {
+      );
+      lifetime.signal.throwIfAborted();
+    } finally {
+      lifetime.dispose();
+    }
+    list(intake.listIntakeReads(db, profileId, options, root));
+  } else if (method === 'GET' && id && action === 'package-failures') {
     const { collectionIntakePackageFailures } = await import('./intake-summary.ts');
     respond(
       collectionIntakePackageFailures(db, selectedPageSource(db, profileId, id), {
@@ -711,6 +739,15 @@ export async function handleIntakeRoute({
           db,
           selectedPageSource(db, profileId, id),
           input as unknown as Parameters<typeof collectionIntakeFilenameFragment>[2],
+        ),
+      );
+    } else if (id && action === 'package-failure-fragment') {
+      const { collectionIntakePackageFailureFieldFragment } = await import('./intake-summary.ts');
+      respond(
+        collectionIntakePackageFailureFieldFragment(
+          db,
+          selectedPageSource(db, profileId, id),
+          input as unknown as Parameters<typeof collectionIntakePackageFailureFieldFragment>[2],
         ),
       );
     } else if (id && action === 'package-metadata') {

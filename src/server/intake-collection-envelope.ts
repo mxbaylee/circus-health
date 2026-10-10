@@ -18,6 +18,10 @@ import type { Database } from './database.ts';
 import {
   intakeEnvelopeAuthorityBinding,
   readIntakeEnvelopeMaterialized,
+  intakeEnvelopeProjection,
+  INTAKE_ENVELOPE_FORMAT,
+  INTAKE_COMPACT_ENVELOPE_FORMAT,
+  type IntakeEnvelopeProjectionFormat,
   type IntakeEnvelopeSource,
 } from './intake-authority.ts';
 import { INTAKE_LEGACY_BRIDGE_CONTROL } from './intake-state-migration.ts';
@@ -46,6 +50,19 @@ import {
 import { iterateIntakeJsonVerification } from './intake-json-verify.ts';
 import { hashIntakeJsonScalar, hashIntakeJsonScalarSteps } from './intake-json-scalar.ts';
 import { validateIntakeSchemaReachabilitySteps } from './intake-envelope-schema-validation.ts';
+import {
+  captureIntakeFrontierAttempts,
+  readIntakeFrontierSourceEquality,
+} from './intake-lookup-frontier-observer.ts';
+import {
+  parseIntakeFilenameFacts,
+  prepareIntakeFilenameFactsSteps,
+} from './intake-filename-facts.ts';
+import {
+  compactIntakeScalar,
+  COMPACT_SCALAR_BYTES,
+  type IntakeCompactScalarField,
+} from './intake-compact-scalar.ts';
 
 declare const recordBrand: unique symbol;
 export interface IntakeEnvelopeRecord {
@@ -135,6 +152,7 @@ export interface EnvelopeCellReader {
     after?: string,
     bytes?: number,
   ): { chunks: Buffer[]; complete: boolean; after: string | null };
+  byteBinding?(value: IntakeByteValue): string;
   check(): void;
 }
 export interface IntakeEnvelopeFieldAccess {
@@ -191,6 +209,20 @@ export function intakeEnvelopeRecordOrder(
 }
 
 const compactProjectors = new WeakMap<IntakeCollectionEnvelopeReader, (bytes: number) => string>();
+const filenameCells = new WeakMap<
+  IntakeCollectionEnvelopeReader,
+  (
+    record: IntakeEnvelopeRecord,
+    field: IntakeCompactScalarField,
+  ) => { id: string; binding: string; facts?: string; bytes: number }
+>();
+export function intakeEnvelopeFilenameCell(
+  reader: IntakeCollectionEnvelopeReader,
+  record: IntakeEnvelopeRecord,
+  field: IntakeCompactScalarField = 'originalName',
+) {
+  return filenameCells.get(reader)?.(record, field) ?? fail('foreign filename reader');
+}
 /** Exact compact source projection, including raw known-key duplicates and spelling.
  * The caller supplies a bounded metadata budget and publishes the source row in
  * the same normal transaction as the selected envelope change. */
@@ -288,6 +320,7 @@ export function createSchemaEnvelopeReader(
   logical: IntakeCollectionHead['logical'],
   lookup?: (name: string, key: readonly string[]) => string | undefined,
   fieldSelection: 'first' | 'last' = 'last',
+  projectionFormat: IntakeEnvelopeProjectionFormat = INTAKE_ENVELOPE_FORMAT,
 ): IntakeCollectionEnvelopeReader {
   const handles = new WeakMap<IntakeEnvelopeRecord, string>();
   const capturedControl = inertSchemaControl(control);
@@ -574,6 +607,7 @@ export function createSchemaEnvelopeReader(
         logical,
         undefined,
         options.fieldSelection ?? fieldSelection,
+        projectionFormat,
       );
     },
     address,
@@ -878,7 +912,19 @@ export function createSchemaEnvelopeReader(
   });
   compactProjectors.set(view, (bytes) => {
     store.check?.();
-    return projectSchemaCompactMetadata(store, control, bytes);
+    return projectSchemaCompactMetadata(store, control, bytes, projectionFormat);
+  });
+  filenameCells.set(view, (record, field) => {
+    const item = fieldTarget(record, field);
+    if (!item || item.type !== 'cell') return fail('filename requires a scalar cell');
+    const value = store.get('c:' + item.id);
+    if (!value || typeof value === 'string' || !store.byteBinding)
+      return fail('filename requires a checked byte value');
+    const binding = store.byteBinding(value);
+    const facts = store.get('q:' + item.id);
+    if (facts !== undefined && typeof facts !== 'string') return fail('fragmented filename facts');
+    store.check();
+    return { id: item.id, binding, bytes: value.bytes, facts };
   });
   return view;
 }
@@ -929,7 +975,18 @@ export function collectionCellReader(
   let view = collections.openView();
   const head = collections.binding(view);
   if (!head) return fail('missing collection head');
+  let attempts = db.isTransaction ? undefined : captureIntakeFrontierAttempts(db);
   const check = () => {
+    if (attempts && !db.isTransaction) {
+      const equality = readIntakeFrontierSourceEquality(db, attempts);
+      const current = collections.openView(),
+        logical = collections.binding(current)?.logical;
+      if (equality) {
+        if (JSON.stringify(logical) !== binding.logicalHead) fail('stale logical envelope');
+        view = current;
+        return;
+      }
+    }
     const current = selectedEnvelopeStore(db, source);
     if (
       current.source.details_json !== source.details_json ||
@@ -938,6 +995,7 @@ export function collectionCellReader(
     )
       fail('stale logical envelope');
     view = collections.openView();
+    if (!db.isTransaction) attempts = captureIntakeFrontierAttempts(db);
   };
   const store: EnvelopeCellReader = {
     check,
@@ -946,6 +1004,7 @@ export function collectionCellReader(
       collections.range(view, area, collection, { after, items, bytes, prefix }),
     chunks: (value, after, bytes = 4096) =>
       collections.readBytes(value, { after, items: 64, bytes }),
+    byteBinding: (value) => collections.byteValueBinding(value),
   };
   const owner = intakeSchemaRecordOwner(collections);
   if (owner && ((area === 'logical' && collection === 'envelope.data') || area === 'builds'))
@@ -1013,6 +1072,10 @@ export function openIntakeCollectionEnvelope(
           : fail('semantic index target');
     },
     options.fieldSelection ?? 'last',
+    intakeEnvelopeProjection(
+      db.prepare('SELECT details_json FROM main.source_files WHERE id=?').get(source.id)
+        ?.details_json,
+    ).format,
   );
 }
 export function* iterateIntakeEnvelopeText(
@@ -1076,6 +1139,18 @@ export function prepareIntakeEnvelopeFieldMutation(
         key: 'c:' + selected.id,
         value: input.jsonText,
       },
+      ...(input.record.kind === 'intake' &&
+      ['originalName', 'locator'].includes(input.field) &&
+      store.get('q:' + selected.id) !== undefined
+        ? [
+            {
+              area: 'logical' as const,
+              collection: 'envelope.data',
+              op: 'delete' as const,
+              key: 'q:' + selected.id,
+            },
+          ]
+        : []),
     ],
   });
 }
@@ -1124,6 +1199,12 @@ export function createIntakeEnvelopeGraphReader(
   };
   const store: EnvelopeCellReader = {
     check() {},
+    byteBinding(value) {
+      if (!byteRefs.has(value)) return fail('foreign graph byte value');
+      const root = byteRefs.get(value);
+      if (root) tree.load(root);
+      return JSON.stringify({ kind: 'bytes', root, bytes: value.bytes });
+    },
     get(key) {
       const raw = tree.get(data.root, key);
       return raw === undefined ? undefined : publicValue(raw);
@@ -1192,6 +1273,7 @@ export function* validateIntakeCollectionEnvelopeRepresentationSteps(
   detailsJson: string,
   head: IntakeCollectionHead,
   readNode: (hash: string) => unknown,
+  projectionFormat?: IntakeEnvelopeProjectionFormat,
 ): Generator<void, { mode: 'raw' | 'normalized'; domainVersion: number }> {
   const { store, control, reader } = createIntakeEnvelopeGraphReader(head.identity, head, readNode);
   yield* validateIntakeSchemaReachabilitySteps(store, control);
@@ -1200,6 +1282,7 @@ export function* validateIntakeCollectionEnvelopeRepresentationSteps(
     store,
     control,
     Buffer.byteLength(detailsJson) + 4096,
+    projectionFormat ?? intakeEnvelopeProjection(detailsJson).format,
   );
   if (expected !== detailsJson) fail('compact metadata conflicts with selected schema');
   const intake = reader.child(reader.root(), 'intake');
@@ -1214,19 +1297,23 @@ function projectSchemaCompactMetadata(
   store: EnvelopeCellReader,
   control: SchemaControl,
   budget: number,
+  format: IntakeEnvelopeProjectionFormat = INTAKE_ENVELOPE_FORMAT,
 ): string {
-  const steps = projectSchemaCompactMetadataSteps(store, control, budget);
+  const steps = projectSchemaCompactMetadataSteps(store, control, budget, format);
   for (;;) {
     const next = steps.next();
     if (next.done) return next.value;
   }
 }
-function* projectSchemaCompactMetadataSteps(
+export function* projectSchemaCompactMetadataSteps(
   store: EnvelopeCellReader,
   control: SchemaControl,
   budget: number,
+  format?: IntakeEnvelopeProjectionFormat,
+  prepareMissingFacts = false,
 ): Generator<void, string> {
-  let work = 0;
+  let work = 0,
+    shortened = false;
   const collect = function* (pieces: Iterable<string>, limit = budget): Generator<void, string> {
     let text = '',
       bytes = 0;
@@ -1304,8 +1391,36 @@ function* projectSchemaCompactMetadataSteps(
       const hash = yield* nameHash(entry),
         field = hash && metadata.get(hash);
       if (!field) continue;
-      const text = (yield* collect(selectedValue(entry.target))).trim(),
-        piece = (control.mode === 'raw' ? lexicalKey(entry) : JSON.stringify(field)) + ':' + text;
+      let text: string;
+      const cell = entry.target.type === 'cell' ? store.get('c:' + entry.target.id) : undefined;
+      if (
+        format !== INTAKE_ENVELOPE_FORMAT &&
+        ['originalName', 'locator'].includes(field) &&
+        cell &&
+        typeof cell !== 'string' &&
+        cell.bytes > COMPACT_SCALAR_BYTES
+      ) {
+        if (!store.byteBinding) fail('compact scalar requires checked evidence');
+        const raw = store.get('q:' + entry.target.id);
+        if (typeof raw !== 'string' && !prepareMissingFacts)
+          fail('prepare compact scalar facts before projection');
+        const facts =
+          typeof raw === 'string'
+            ? parseIntakeFilenameFacts(raw)
+            : yield* prepareIntakeFilenameFactsSteps(
+                cellChunks(store, 'c:' + entry.target.id),
+                store.byteBinding!(cell as IntakeByteValue),
+              );
+        if (
+          facts.binding !== store.byteBinding!(cell as IntakeByteValue) ||
+          facts.bytes !== cell.bytes
+        )
+          fail('compact scalar facts binding');
+        text = JSON.stringify(compactIntakeScalar(field as IntakeCompactScalarField, facts));
+        shortened = true;
+      } else text = (yield* collect(selectedValue(entry.target))).trim();
+      const piece =
+        (control.mode === 'raw' ? lexicalKey(entry) : JSON.stringify(field)) + ':' + text;
       bytes += Buffer.byteLength(piece);
       if (bytes > budget) fail('compact metadata size');
       parts.push(piece);
@@ -1329,15 +1444,17 @@ function* projectSchemaCompactMetadataSteps(
     intakes.push(piece);
   }
   if (!last) fail('missing intake record');
+  const selectedFormat =
+    format ?? (shortened ? INTAKE_COMPACT_ENVELOPE_FORMAT : INTAKE_ENVELOPE_FORMAT);
   const expected =
     control.mode === 'raw'
       ? '{"intakeAuthority":' +
-        JSON.stringify({ format: 'health-intake-envelope-v1', mode: 'raw' }) +
+        JSON.stringify({ format: selectedFormat, mode: 'raw' }) +
         ',' +
         intakes.join(',') +
         '}'
       : JSON.stringify({
-          intakeAuthority: { format: 'health-intake-envelope-v1', mode: 'normalized' },
+          intakeAuthority: { format: selectedFormat, mode: 'normalized' },
           intake: JSON.parse(yield* compactIntake(last!)),
         });
   if (Buffer.byteLength(expected) > budget) fail('compact metadata size');

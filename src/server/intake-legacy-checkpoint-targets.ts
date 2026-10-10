@@ -111,7 +111,10 @@ export async function prepareLegacyCheckpointTargets(
     let work = 0;
     const checkpointWork = async () => {
       assertCurrent();
-      if (++work % 128 === 0) await setImmediate();
+      if (++work % 128 === 0) {
+        await setImmediate();
+        assertCurrent();
+      }
     };
     for (const key of checkpoint.seen) {
       putSeen.run(key);
@@ -131,6 +134,7 @@ export async function prepareLegacyCheckpointTargets(
       },
       pages: Iterable<number>,
     ) => {
+      await checkpointWork();
       const unitKey = workflowHash([planAddress, unit.id]),
         sourceId = unit.sourceId || intakeId,
         memberId = unit.memberId || null,
@@ -184,7 +188,7 @@ export async function prepareLegacyCheckpointTargets(
       flow = intake && reader.child(intake, 'workflow');
     if (flow)
       for (const plan of children(reader, flow, 'plans')) {
-        assertCurrent();
+        await checkpointWork();
         if (scalar(reader, plan, 'status') !== 'active') continue;
         const planId = scalar<string>(reader, plan, 'id');
         if (!planId) throw Error('Invalid active plan identity');
@@ -241,6 +245,7 @@ export async function prepareLegacyCheckpointTargets(
           });
           if (!scope) throw Error('Selected expanded target plan is unavailable');
           for (const record of children(scope.reader, scope.record, 'units')) {
+            await checkpointWork();
             const id = scalar<string>(scope.reader, record, 'id');
             if (!id) throw Error('Invalid retained target unit');
             const unit = scope.unitById(id);

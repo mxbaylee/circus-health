@@ -173,7 +173,10 @@ source, session, plan and unit ledger reference. Seen windows, pending windows,
 read scopes, complete JSON ancestors and deferred acknowledgments live in
 authenticated auxiliary maps. No unloaded legacy checkpoint arrays are invented.
 One acknowledged read forks the affected ledger and selects its new state and
-session totals atomically. Concurrent ledger publications for the same database,
+session totals atomically. The model bridge factory preserves asynchronous host
+event results, so evidence acknowledgment finishes or refuses before the bridge
+advances to another guarded tool or a completed turn. Concurrent ledger
+publications for the same database,
 source and session are serialized, including imported target preparation and
 deferred acknowledgments. Source reads remain concurrent. Queue admission
 rechecks cancellation, authorization and the selected source/plan capability;
@@ -183,10 +186,19 @@ intact; cache recovery follows the accepted auxiliary graph. Ledger writes do no
 advance the clinical version. Source or plan changes require reopening the unit
 capability under current pins.
 
+Cold retained-plan and imported-reading target preparation count examined input,
+including inactive plans, duplicates, nonmatching coverage and already indexed
+targets. Retained and reading-extension loops yield at most every 64 such units;
+legacy checkpoint targets retain their 128-unit bound. Cancellation and current
+source/session checks run before and after those turns; partial target work does
+not select a complete reading scope.
+
 A manual conversation can read a retained descendant original directly without
 creating a child plan. Before source I/O, the host obtains an opaque capability
 for the issuing database, root, session, parent plan/unit, child original hash
-and complete retained ancestry. Publication rechecks that ancestry and the
+and complete retained ancestry. An ancestry preparation also seals TEMP schema
+identity, so a source-table shadow installed after a checked prefix refuses.
+Publication rechecks that ancestry and the
 parent's exact logical/domain authority; source capture may advance the separate
 material-text pin without changing this original-byte authority. Each queued
 receipt still checks its current effective version and authorization. The pinned
@@ -292,6 +304,27 @@ source/version pins, bounded filename, provider, active plan, candidate count an
 durability. They do not reconstruct public collection-summary counts on each
 model event, and the smaller header does not represent omitted collections as
 empty. The public source summary remains a separate projection.
+Large original-name summaries use versioned derivative facts in the selected
+envelope map: canonical scalar hash, exact lexical byte count, bounded preview,
+suffix and checked immutable byte-root binding. Native construction prepares
+these facts cooperatively, and schema certification independently recomputes
+them. Ordinary summary reads, changed revisions and cache loss do not scan the
+large scalar again. HTTP reads and assistant admission prepare missing facts
+for complete older native envelopes before presentation; cancellation leaves
+the selected exact representation unchanged. A shortened filename has explicit
+reference pins and exact bounded JSON-string fragments, never a silent truncate.
+Interrupted build transcripts are bound to the current derivative recipe.
+
+These filename facts do not bound the separate compact source row. Its
+`originalName` and child `locator` can still retain complete large strings;
+metadata parsing and assistant source-binding serialization remain proportional
+to those retained values. ZIP names have their format's declared name-byte bound,
+but PDF attachment keys and internal child locators have no separate application
+length cap. New upload filenames and provider names have existing input limits;
+arbitrary older retained acquisition and metadata are not universally bounded.
+The versioned compact-scalar publication helpers are not yet wired into public
+readiness. No end-to-end bounded compact-metadata claim follows from zero
+filename-scalar reads.
 Decoded assistant headers retain at most 32 entries and 256 KiB of encoded
 headers, source bindings and keys per database. Reuse requires unchanged exact
 SQLite, collection-registry and policy epochs, current profile/source and
@@ -325,7 +358,9 @@ a regression. A no-reuse control must still fail these counted checks.
 The coordinator's current-interpretation check retains at most eight scalar
 results per database, without materializing proposal IDs. Reuse requires the
 same owner, source/version pins, collection-cache generation and SQLite
-change/data/schema versions. Transactions discard prior results and never
+change/data/main-schema and TEMP-schema versions. TEMP dependency shadowing and
+its removal invalidate both positive and negative results without requiring a
+main-table write. Transactions discard prior results and never
 populate the cache; rolled-back dependency repairs therefore cannot leave a
 positive interpretation witness. Returned results are detached from the cache.
 
@@ -604,6 +639,9 @@ Final inline issue selection and complete issue-token hashing use indexed point
 reads with work checkpoints, including when the inline byte budget is exhausted.
 Already-inline and empty policies also checkpoint so a long record sequence cannot
 skip host turns.
+Cold legacy draft-policy indexing counts skipped modern drafts toward its
+64-draft work checkpoint; skipping their legacy contribution does not skip
+cooperative scheduling. Legacy witness selection and ordering are unchanged.
 During this finalization, no scratch SQL iterator remains open across a host turn;
 cancellation or source invalidation refuses the attempt before publishing a partial
 issue token or list.
@@ -616,6 +654,11 @@ evidence and current authority. A caller receives no session or mutable policy
 alias. Failed rendering or a cancelled result handoff discards the matching
 cached attempt; mutation preparation continues to own its separate session.
 The first cold request still constructs the complete selected review.
+Referenced question and report-link sections use session-owned dense ordinal
+indexes for later pages and fragments; they do not replay preceding entries.
+Question controls on issue pages use the same selected question-ID index.
+These indexes are populated during cooperative complete-policy preparation and
+remain disposable: closed or changed selections refuse subsequent point reads.
 
 Cold native clinical preparation for retained-intake histories shares generator
 implementations with the transaction-bound synchronous policy. Native reads and prepublication preparation
@@ -628,17 +671,18 @@ resuming. A changed proof refuses the attempt; closing or aborting the generator
 releases its private policy scratch.
 
 Grouped native acceptance and single native import prepare their final complete
-original-source discovery digest outside the publication transaction. The scan
+original-source discovery digest outside the publication transaction. Cold or
+uncertified preparation uses a complete scan; certified native preparation can
+reuse the exact logical frontier described below. The complete scan
 uses exact rowid pagination and yields after at most 64 sources, retaining no
 live iterator across a turn. Its one-use admission binds the original raw
 database and TEMP proof, current physical accepted HEAD, profile, clinical
 operation, and disposable generations; the transaction rechecks that proof
 after its existing selected-source publication guards and before the first
 accepted change. Any intervening application transaction, local or peer write,
-authority change, cancellation, or failed proof discards admission. This moves the final
-full-frontier traversal out of the transaction; it does not reduce its total
-source visits, replace selected original-file checks, or make other cold
-preparation changed-source-only.
+authority change, cancellation, or failed proof discards admission. Complete
+frontier traversal stays outside the transaction. Neither path replaces selected
+original-file checks or makes cold reconstruction changed-source-only.
 
 Lookup-index preparation also pages its initial source traversal by exact rowid,
 yielding after 64 originals, including already prepared and legacy sources.
@@ -658,9 +702,15 @@ completely validating each source's append contributions; a changed original
 with no new receipt needs an explicit completed empty proof. The acceptance
 owner binds every final prepared logical root and one successful durable group
 outcome with the complete journal receipt before installing an atomic,
-operation-scoped hint. Fresh preparation still validates the complete current
-source frontier, checks every new selected lookup address, and creates a new
-global read proof. No prior global proof receives credit for the owner's writes.
+operation-scoped hint. Fresh preparation checks every new selected lookup address
+and creates a new global read proof. For a complete all-native catalog, a private
+connection frontier records protected source/head attempts monotonically and
+advances only across the exact successful owner outcome and compiler proof.
+Fixed maintenance can preserve that logical frontier only when every protected
+write attempt and the final unchanged logical binding are accounted for. Unknown
+SQL, rollback, failed outcomes, protected TEMP/schema changes, peer/profile/registry
+drift and mixed or legacy originals require complete derivation. Neither an old
+raw stamp nor an old token is simply refreshed.
 Existing receipt rows join the freshly validated source head instead of being
 rewritten when that head changes. Detached hints are bounded to 64 keys per
 source, at most 100 sources and 1 MiB of retained string data per operation.
@@ -668,6 +718,24 @@ An unsupported, incomplete, over-budget or mismatched batch uses complete
 derivation. These are optimization bounds, not acceptance limits. Readers and
 authority capabilities are not retained in detached hint metadata. Grouped
 approvals do not mint the separate single-source batch-revalidation capability.
+
+Certified native maximum and receipt getters consult this current private
+catalog before refreshing disposable projection rows. They validate actual source
+identity, selected logical head and indexed address; they do not treat projection
+rows as evidence. A one-source append need not reread unrelated originals. Cold
+construction, cache loss, an unsafe maximum or a missing certificate still requires
+the complete ordered frontier. Bounded attempt history refuses expired captures;
+it does not impose a lifetime operation quota. This is a logical/index proof, not
+an all-file physical certificate: selected originals and retained proposals keep
+their separate current identity/hash checks.
+
+Connection proofs assume trusted in-process application code uses the managed
+connection and native fixed-query methods. They are not a sandbox against code
+that deliberately borrows native prototype methods to bypass those managed APIs,
+or replaces a final query getter to mutate authority after its read. Supported
+connection-method replacement, ordinary SQL, TEMP changes and peer writes remain
+inside the invalidation contract. Tests of an unsupported prototype bypass do not
+establish protection against hostile JavaScript in the server process.
 
 Grounded source-scope checks retain a lazy, ordered verified prefix on the opened
 collection scope. Each new row still reads the original group and current version
@@ -745,6 +813,26 @@ acceptance replay: disconnecting a review cannot undo an accepted record or
 authorize another write. Source, profile and physical-evidence checks remain
 unchanged, and cancellation does not increase the browser's read deadline.
 
+The queue passes its actual operation owner into cold journal-activity replay.
+Parsing, replay and directory enumeration check that owner before resuming;
+enumeration yields after at most 64 entries even when names are ignored or
+journals are empty. Cancelled cold work removes its private scratch before a
+successor enters. A cancelled warm reader does not discard another valid shared
+activity index. Completion still requires the existing synchronous physical
+marker check across all journals; this remains work proportional to journal
+count, not a new constant-work physical frontier or an immediate cancellation
+guarantee during that final check.
+
+Queue source binding scans yield after at most 64 originals under one unchanged
+database, TEMP, peer, registry and managed-method witness. The final pass validates
+the complete visible source set, count and selected logical versions before
+retaining a private queue proof. Unchanged warm preparation reuses that proof
+without enumerating original bindings; it still prepares journal activity and
+closes owner, policy, physical accepted authority and cancellation checks.
+Supported function or authorizer registration, including failed registration,
+revokes this reuse even without a SQL change count. No new proof can be minted
+through a TEMP table or view shadowing a main-schema dependency.
+
 Source-attention list preparation joins this operation slot, including its dirty
 count reconciliation. A concurrent attention GET waits for native conversion
 instead of changing its raw SQL witness between checkpoints. Trusted nested
@@ -752,6 +840,14 @@ attention reads retain their active owner, and inherited cancellation or databas
 closure prevents later reconciliation work. This leaves attention results and
 maintenance credits unchanged; the conversion proof still refuses uncoordinated
 SQL, including changes followed by rollback.
+
+Source-attention counts and completion markers also carry private TEMP integrity
+guards. Unowned updates or deletions cannot turn disposable rows into a completed
+answer; source dirty inserts remain conservative additional work. Guard setup
+uses narrowly authorized definitions and fixed maintenance statements. Replacing
+the private function, changing relevant TEMP/schema objects or changing the
+underlying source invalidates reuse. This proof is independent of the global
+intake lookup catalog and does not certify its scaling behavior.
 
 Package inventory GETs acquire this slot before selecting the native or legacy
 path. Compatibility preparation, accepted inventory checkpoints, failure

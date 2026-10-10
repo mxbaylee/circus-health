@@ -5,6 +5,13 @@ import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
 import { canonicalLiteral, parseLiteralJSON } from './intake-format.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
+import {
+  beginIntakeFrontierAuxiliaryPreparation,
+  execIntakeFrontierAuxiliarySQL,
+  finishIntakeFrontierAuxiliaryPreparation,
+  prepareIntakeFrontierAuxiliaryInsert,
+  runIntakeFrontierAuxiliaryInsert,
+} from './intake-lookup-frontier-observer.ts';
 
 const TABLE = '__clinical_source_fingerprints',
   META = '__clinical_source_fingerprint_state',
@@ -94,38 +101,53 @@ export async function prepareClinicalSourceFingerprintIndex(
     states.set(db, state);
   }
   state.ready = false;
-  if (!state.registered) {
-    db.function(FUNCTION, { deterministic: true }, (raw) => canonicalDigest(db, raw, 'warm'));
-    state.registered = true;
-  }
-  for (const event of ['insert', 'delete', 'update'])
-    db.exec('DROP TRIGGER IF EXISTS temp.__clinical_source_fingerprints_' + event);
-  db.exec('DROP TABLE IF EXISTS temp.' + TABLE);
-  db.exec('DROP TABLE IF EXISTS temp.' + META);
-  for (const sql of definition) db.exec(sql);
-  db.exec(`INSERT INTO ${META} VALUES(1,0)`);
-  const selectedDataVersion = dataVersion(db),
-    selectedSchema = schema(db),
-    selectedMainSchema = mainSchema(db),
-    insert = db.prepare(`INSERT INTO ${TABLE}(record_id,provider_id,digest) VALUES(?,?,?)`);
-  let rows = 0;
-  const assertCurrent = () => {
-    options.assertRunning?.();
-    if (
-      dataVersion(db) !== selectedDataVersion ||
-      schema(db) !== selectedSchema ||
-      mainSchema(db) !== selectedMainSchema ||
-      Number(db.prepare(`SELECT generation FROM ${META} WHERE singleton=1`).get()?.generation) !== 0
-    )
-      throw unavailable();
-  };
+  const frontier = beginIntakeFrontierAuxiliaryPreparation(db, 'clinical-source');
+  let complete = false;
   try {
+    if (!state.registered) {
+      db.function(FUNCTION, { deterministic: true }, (raw) => canonicalDigest(db, raw, 'warm'));
+      state.registered = true;
+    }
+    for (const event of ['insert', 'delete', 'update'])
+      execIntakeFrontierAuxiliarySQL(
+        db,
+        frontier,
+        'DROP TRIGGER IF EXISTS temp.__clinical_source_fingerprints_' + event,
+      );
+    execIntakeFrontierAuxiliarySQL(db, frontier, 'DROP TABLE IF EXISTS temp.' + TABLE);
+    execIntakeFrontierAuxiliarySQL(db, frontier, 'DROP TABLE IF EXISTS temp.' + META);
+    for (const sql of definition) execIntakeFrontierAuxiliarySQL(db, frontier, sql);
+    execIntakeFrontierAuxiliarySQL(db, frontier, `INSERT INTO ${META} VALUES(1,0)`);
+    const selectedDataVersion = dataVersion(db),
+      selectedSchema = schema(db),
+      selectedMainSchema = mainSchema(db),
+      insert = prepareIntakeFrontierAuxiliaryInsert(
+        db,
+        frontier,
+        `INSERT INTO ${TABLE}(record_id,provider_id,digest) VALUES(?,?,?)`,
+      );
+    let rows = 0;
+    const assertCurrent = () => {
+      options.assertRunning?.();
+      if (
+        dataVersion(db) !== selectedDataVersion ||
+        schema(db) !== selectedSchema ||
+        mainSchema(db) !== selectedMainSchema ||
+        Number(db.prepare(`SELECT generation FROM ${META} WHERE singleton=1`).get()?.generation) !==
+          0
+      )
+        throw unavailable();
+    };
     for (const row of db
       .prepare(
         "SELECT id,provider_id,raw_json FROM source_records WHERE kind LIKE 'intake_%' ORDER BY id",
       )
       .iterate()) {
-      insert.run(row.id, row.provider_id, canonicalDigest(db, row.raw_json, 'reconstruction'));
+      runIntakeFrontierAuxiliaryInsert(db, frontier, insert, [
+        row.id as string,
+        row.provider_id as string | null,
+        canonicalDigest(db, row.raw_json, 'reconstruction'),
+      ]);
       if (++rows % 64 === 0) {
         await setImmediate();
         assertCurrent();
@@ -136,9 +158,12 @@ export async function prepareClinicalSourceFingerprintIndex(
     state.schema = selectedSchema;
     state.mainSchema = selectedMainSchema;
     state.ready = true;
+    complete = true;
   } catch (error) {
     state.ready = false;
     throw error;
+  } finally {
+    finishIntakeFrontierAuxiliaryPreparation(db, frontier, complete);
   }
 }
 /** Selected canonical strings are bounded changed JSONL inputs, never prior provider history. */

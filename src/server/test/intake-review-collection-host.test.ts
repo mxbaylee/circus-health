@@ -7,6 +7,8 @@ import { intakeNamespace } from '../intake-state-evidence.ts';
 import { profileOriginal } from '../profile-storage.ts';
 import { canonicalLiteral } from '../intake-format.ts';
 import { reviewDraftResolutions } from '../intake-review-draft-selection.ts';
+import { selectedReportGroupAt } from '../intake-selected-report-groups.ts';
+import { reviewQuestionAt, reviewQuestionById } from '../intake-review-question-selection.ts';
 import { prepareNativeDraftHistory, readNativeReviewDraft } from '../intake-review-draft-state.ts';
 import { createReportSnapshotCatalog } from '../intake-report-snapshot-catalog.ts';
 import { prepareIntakeWorkflowCommand } from '../intake-workflow-command.ts';
@@ -1328,6 +1330,10 @@ test('selected native host keeps an oversized linked-group sequence reachable wi
   assert.equal(detail.record.kind, 'reference');
   if (detail.record.kind !== 'reference') throw Error('Expected bounded selected reference');
   assert.equal(detail.record.reportGroups!.count, 13);
+  assert.deepEqual(
+    selectedReportGroupAt(record.reportGroups, 12),
+    selectedReportGroupAt(oracle.records[0]!.reportGroups, 12),
+  );
   const page = await readClinicalRecordSection(db, root, profileId, intake.id, {
     proposalId: null,
     recordId: record.id,
@@ -1350,6 +1356,8 @@ test('selected native host keeps an oversized linked-group sequence reachable wi
     cursor: page.nextCursor,
   });
   assert.equal(next.items[0]!.ordinal, 5);
+  selected.session.close();
+  assert.throws(() => selectedReportGroupAt(record.reportGroups, 12), /closed|changed/i);
 });
 
 test('native review policy scratch is session owned and leaves the authority connection unchanged', async (t) => {
@@ -2480,6 +2488,18 @@ test('selected questions, issues, fragments and public pages share complete deta
   );
   assert.equal(oracle.records[0]!.identityReview?.blocking ?? false, false);
   await buildIntakeCollectionEnvelope(db, { id: source.id });
+  await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
+  const pointSelected = prepareCollectionClinicalReview(db, root, profileId, source.id, null, {
+    metadataBytes: 16384,
+  });
+  if (pointSelected.status !== 'ready') throw Error('Question point selection must be prepared');
+  const pointRecord = pointSelected.session.review.records[0]!;
+  assert.ok(pointRecord.questionsReference);
+  assert.equal(reviewQuestionAt(pointRecord, 6)?.id, lateQuestion);
+  assert.equal(reviewQuestionById(pointRecord, lateQuestion)?.id, lateQuestion);
+  assert.equal(reviewQuestionById(pointRecord, 'fictional-missing-question'), undefined);
+  pointSelected.session.close();
+  assert.throws(() => reviewQuestionAt(pointRecord, 6), /closed|changed/i);
   const selection = {
     proposalId: null,
     recordId: record.id,

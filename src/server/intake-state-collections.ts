@@ -5,7 +5,14 @@ import {
   transaction,
   type Database,
 } from './database.ts';
-import { prepareIntakeMaintenancePublication } from './intake-state-maintenance.ts';
+import {
+  prepareIntakeMaintenancePublication,
+  stageIntakeCompactMetadataPublication,
+} from './intake-state-maintenance.ts';
+import {
+  expectIntakeFrontierMetaWrite,
+  finishIntakeFrontierMetaWrite,
+} from './intake-lookup-frontier-observer.ts';
 import {
   prepareIntakeLegacyBridgeProof,
   prepareIntakeSchemaAdoptionProof,
@@ -13,6 +20,8 @@ import {
   validateIntakeLegacyBridgeControl,
   INTAKE_LEGACY_BRIDGE_CONTROL,
   type IntakeLegacyBridgeProof,
+  type IntakeCompactMetadataProof,
+  prepareIntakeCompactMetadataProofAsync,
 } from './intake-state-migration.ts';
 import type { IntakeStateMaterialization } from './intake-state-storage.ts';
 import {
@@ -140,6 +149,7 @@ interface PreparedData {
   requestDigest: string;
   size: number;
   legacyBridge?: IntakeLegacyBridgeProof;
+  compactMetadata?: IntakeCompactMetadataProof;
 }
 interface SchemaRecordOwner {
   createCursor: (
@@ -1315,6 +1325,11 @@ export function createIntakeCollections(owner: {
         return readByteRange(readTree(), value, options);
       });
     },
+    /** A detached identity for one owner-issued, currently selected byte value.
+     * This does not grant a caller authority to resolve a self-described root. */
+    byteValueBinding(value: IntakeByteValue): string {
+      return runRead((readTree) => JSON.stringify(referencedBytes(value, readTree())));
+    },
     replay(operationId: string, requestDigest: string): IntakeCollectionResult | undefined {
       return runRead((readTree) => {
         uuid(operationId);
@@ -1733,8 +1748,11 @@ export function createIntakeCollections(owner: {
         if (!token || !db.isTransaction)
           invalid('collection stage requires application transaction');
         const data = inspect(prepared),
-          current = data.legacyBridge ? { raw: get(headKey), head: undefined } : selected();
-        if (data.legacyBridge && bridgeTransaction !== token)
+          current =
+            data.legacyBridge || data.compactMetadata
+              ? { raw: get(headKey), head: undefined }
+              : selected();
+        if ((data.legacyBridge || data.compactMetadata) && bridgeTransaction !== token)
           invalid('legacy bridge requires certified maintenance publication');
         const retained = receipt(current.head, data.result.operationId, data.requestDigest);
         if (retained) {
@@ -1746,16 +1764,36 @@ export function createIntakeCollections(owner: {
         // bytes are private; writes/readback remain inside the existing transaction.
         for (const row of data.writes) {
           if (row.key === headKey) continue;
-          const inserted = immutable(row.key, row.value, INTAKE_TREE_PAGE_BYTES);
+          const expected = expectIntakeFrontierMetaWrite(db, row.key, ['insert']);
+          let inserted = false;
+          try {
+            inserted = immutable(row.key, row.value, INTAKE_TREE_PAGE_BYTES);
+          } finally {
+            finishIntakeFrontierMetaWrite(db, expected, inserted);
+          }
           if (get(row.key) !== row.value) invalid('collection staged readback');
           if (inserted) {
             recordIntakeWork('collectionNodesWritten');
             recordIntakeWork('collectionWrittenBytes', Buffer.byteLength(row.value));
           }
         }
-        db.prepare(
-          'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-        ).run(headKey, data.after);
+        const expectedHead = expectIntakeFrontierMetaWrite(
+          db,
+          headKey,
+          ['insert', 'update'],
+          identity.intakeId,
+        );
+        let headWritten = false;
+        try {
+          headWritten =
+            db
+              .prepare(
+                'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+              )
+              .run(headKey, data.after).changes === 1;
+        } finally {
+          finishIntakeFrontierMetaWrite(db, expectedHead, headWritten);
+        }
         discard(prepared);
         return structuredClone(data.result);
       });
@@ -1797,6 +1835,31 @@ export function createIntakeCollections(owner: {
         data.legacyBridge = proof;
       });
     },
+    async certifyCompactMetadataAsync(
+      prepared: PreparedIntakeCollectionMutation,
+      options: { assertRunning?: () => void } = {},
+    ): Promise<boolean> {
+      const data = run(() => inspect(prepared));
+      if (data.before === undefined || data.legacyBridge || data.compactMetadata)
+        invalid('compact metadata preparation');
+      const proof = await prepareIntakeCompactMetadataProofAsync(
+        db,
+        {
+          identity,
+          beforeHead: data.before,
+          afterHead: data.after,
+          writes: data.writes,
+        },
+        options,
+      );
+      if (!proof) return false;
+      run(() => {
+        if (inspect(prepared) !== data || data.legacyBridge || data.compactMetadata)
+          invalid('expired compact metadata preparation');
+        data.compactMetadata = proof;
+      });
+      return true;
+    },
     commitMaintenance(
       prepared: PreparedIntakeCollectionMutation,
       options: { assertCurrent?: () => void } = {},
@@ -1810,7 +1873,10 @@ export function createIntakeCollections(owner: {
         )
           invalid('collection publication guard must finish synchronously');
         const data = inspect(prepared),
-          current = data.legacyBridge ? { raw: get(headKey), head: undefined } : selected();
+          current =
+            data.legacyBridge || data.compactMetadata
+              ? { raw: get(headKey), head: undefined }
+              : selected();
         const retained = receipt(current.head, data.result.operationId, data.requestDigest);
         if (retained) {
           discard(prepared);
@@ -1827,13 +1893,17 @@ export function createIntakeCollections(owner: {
           operationId: data.result.operationId,
           fingerprint,
           legacyBridge: data.legacyBridge,
+          compactMetadata: data.compactMetadata,
         });
         return transaction(
           db,
           () => {
-            if (data.legacyBridge) bridgeTransaction = currentTransactionToken(db);
+            if (data.legacyBridge || data.compactMetadata)
+              bridgeTransaction = currentTransactionToken(db);
             try {
-              return api.stage(prepared, options);
+              const result = api.stage(prepared, options);
+              stageIntakeCompactMetadataPublication(db, capability);
+              return result;
             } finally {
               bridgeTransaction = undefined;
             }

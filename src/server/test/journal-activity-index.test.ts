@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
+import { setImmediate } from 'node:timers';
 import { profilePaths } from '../profile-storage.ts';
 import { writeChat, clearChatJournalCache } from '../assistant-journal.ts';
 import {
@@ -76,6 +78,98 @@ function fixture(t: test.TestContext) {
     batchDirectory: join(profilePaths(root, profileId).root, 'intake-batches', batch.id, 'events'),
   };
 }
+
+for (const kind of ['journals', 'events'] as const)
+  test(`activity enumeration cooperates for ignored and empty ${kind} before cancellation`, async (t) => {
+    const f = fixture(t);
+    const base = join(profilePaths(f.root, f.profileId).root, 'intake-batches');
+    fs.mkdirSync(base, { recursive: true });
+    if (kind === 'journals') {
+      for (let i = 0; i < 65; i++) {
+        fs.mkdirSync(join(base, 'ignored-' + i));
+        fs.mkdirSync(join(base, randomUUID(), 'events'), { recursive: true });
+      }
+    } else {
+      const events = join(base, randomUUID(), 'events');
+      fs.mkdirSync(events, { recursive: true });
+      for (let i = 0; i < 65; i++) fs.writeFileSync(join(events, `fictional-${i}.pending`), '');
+    }
+    const original = fs.opendirSync;
+    let visited = 0;
+    let beforeHostTurn = -1;
+    t.mock.method(fs, 'opendirSync', (path: fs.PathLike, options?: fs.OpenDirOptions) => {
+      const directory = original(path, options);
+      const read = directory.readSync.bind(directory);
+      t.mock.method(directory, 'readSync', () => {
+        const entry = read();
+        if (entry) visited++;
+        return entry;
+      });
+      return directory;
+    });
+    syncBuiltinESMExports();
+    t.after(() => {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+      clearJournalActivityIndex(f.root, f.profileId);
+    });
+    const controller = new AbortController();
+    setImmediate(() => {
+      beforeHostTurn = visited;
+      controller.abort();
+    });
+    await assert.rejects(
+      prepareJournalActivity(f.root, f.profileId, { signal: controller.signal }),
+      {
+        name: 'AbortError',
+      },
+    );
+    assert.ok(
+      beforeHostTurn > 0 && beforeHostTurn <= 64,
+      'actual enumeration yields within 64 entries even without events',
+    );
+    assert.equal(
+      visited,
+      beforeHostTurn,
+      'cancelled enumeration performs no later directory reads',
+    );
+    assert.throws(() => journalActivityBinding(f.root, f.profileId), {
+      code: 'JOURNAL_ACTIVITY_NOT_PREPARED',
+    });
+  });
+
+test('ready activity refuses a cancelled reader without discarding valid shared state', async (t) => {
+  const f = fixture(t);
+  writeChat(f.root, f.profileId, f.chat, 'initial');
+  await prepareJournalActivity(f.root, f.profileId);
+  const binding = journalActivityBinding(f.root, f.profileId);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(prepareJournalActivity(f.root, f.profileId, { signal: controller.signal }), {
+    name: 'AbortError',
+  });
+  assert.equal(journalActivityBinding(f.root, f.profileId), binding);
+  let checks = 0;
+  await assert.rejects(
+    prepareJournalActivity(f.root, f.profileId, {
+      assertRunning() {
+        if (++checks === 2) throw Error('Fictional owner stopped');
+      },
+    }),
+    /Fictional owner stopped/,
+  );
+  assert.equal(checks, 2, 'warm reader is checked after complete binding validation');
+  assert.equal(journalActivityBinding(f.root, f.profileId), binding);
+  checks = 0;
+  await assert.rejects(
+    prepareJournalActivity(f.root, f.profileId, {
+      assertRunning() {
+        if (++checks === 2) clearJournalActivityIndex(f.root, f.profileId);
+      },
+    }),
+    { code: 'JOURNAL_ACTIVITY_NOT_PREPARED' },
+  );
+});
 test('cold complete disk replay, warm changed header and cache loss preserve exact activity without full DTOs', async (t) => {
   const f = fixture(t),
     work = journalJsonWork();

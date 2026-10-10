@@ -1336,6 +1336,12 @@ export function collectionWorkflowReviewScope(input: {
         references,
         { candidateId, candidateVersionId: versionId, recordId, proposalId },
         metadataBytes,
+        (ordinal) => {
+          const row = fallbackStore()
+            .prepare(`SELECT value FROM ${policyNamespace}refs WHERE selection=? AND ordinal=?`)
+            .get(selection, ordinal);
+          return row ? (JSON.parse(String(row.value)) as IntakeReviewGroupReference) : undefined;
+        },
       );
     },
     reportSource: input.reportSource,
@@ -1356,12 +1362,20 @@ export function collectionWorkflowReviewScope(input: {
       };
       const readQuestion = (question: IntakeEnvelopeRecord) =>
         input.questionState?.question(question, metadataBytes) ?? read<IntakeQuestion>(question);
+      const sql = fallbackStore(),
+        selection = ++fallbackSelection,
+        questionSelection = `${policyNamespace}questions`;
+      sql.exec(
+        `CREATE TABLE IF NOT EXISTS ${questionSelection}(selection INTEGER,ordinal INTEGER,address TEXT,id TEXT,PRIMARY KEY(selection,ordinal)); CREATE INDEX IF NOT EXISTS ${questionSelection}_id ON ${questionSelection}(selection,id,ordinal)`,
+      );
+      const retain = sql.prepare(`INSERT INTO ${questionSelection} VALUES(?,?,?,?)`);
       const result: IntakeQuestion[] = [];
       let bytes = 0,
         count = 0,
         referenced = false;
       for (const question of selected()) {
         yield;
+        retain.run(selection, count, view.address(question), value<string>(question, 'id')!);
         count++;
         if (referenced) continue;
         const item = readQuestion(question);
@@ -1372,6 +1386,7 @@ export function collectionWorkflowReviewScope(input: {
         } else result.push(item);
       }
       if (!referenced) {
+        sql.prepare(`DELETE FROM ${questionSelection} WHERE selection=?`).run(selection);
         questionInlineBytes -= bytes;
         return result;
       }
@@ -1390,6 +1405,20 @@ export function collectionWorkflowReviewScope(input: {
         },
         function* () {
           for (const question of selected()) yield readQuestion(question);
+        },
+        (ordinal) => {
+          const row = fallbackStore()
+            .prepare(`SELECT address FROM ${questionSelection} WHERE selection=? AND ordinal=?`)
+            .get(selection, ordinal);
+          return row ? readQuestion(view.resolve(String(row.address))) : undefined;
+        },
+        (id) => {
+          const row = fallbackStore()
+            .prepare(
+              `SELECT address FROM ${questionSelection} WHERE selection=? AND id=? ORDER BY ordinal LIMIT 1`,
+            )
+            .get(selection, id);
+          return row ? readQuestion(view.resolve(String(row.address))) : undefined;
         },
       );
     },

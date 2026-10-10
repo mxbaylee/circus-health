@@ -1,6 +1,7 @@
 /** Retained expanded plans keep their actual units. They are never relabelled as
  * an inventory recipe; the selected schema remains the evidence authority. */
 import { createHash } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 import { HttpError, type Database } from './database.ts';
 import { assertIntakeOwner } from './intake.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
@@ -124,6 +125,7 @@ export async function prepareRetainedPlanAccess(
   id: string,
   options: { assertRunning?: () => void } = {},
 ) {
+  options.assertRunning?.();
   const ctx = context(db, profileId, id),
     { source, view, version, name, flow } = ctx;
   if (ctx.get('complete') === POLICY) return;
@@ -131,14 +133,22 @@ export async function prepareRetainedPlanAccess(
     options.assertRunning?.();
     ctx.assertCurrent();
   };
+  let examined = 0;
+  const checkpoint = async () => {
+    assertCurrent();
+    if (++examined % 64 === 0) {
+      await setImmediate();
+      assertCurrent();
+    }
+  };
   const writer = createEnvelopeBuildWriter(db, source, name, version.rawVersion, {
     assertRunning: assertCurrent,
   });
   if (flow) {
     let planOrdinal = 0;
     for (const plan of children(view, flow, 'plans')) {
+      await checkpoint();
       withIntakeWork(db, 'reconstruction', () => recordIntakeWork('retainedPlanHeaders'));
-      assertCurrent();
       const planId = scalar<string>(view, plan, 'id'),
         address = view.address(plan),
         active = scalar(view, plan, 'status') === 'active';
@@ -189,7 +199,7 @@ export async function prepareRetainedPlanAccess(
         const scope = readDirectPlanScope(db, profileId, id, { recordAddress: address });
         if (!scope) throw Error('Direct plan registry disagrees');
         for (let ordinal = 0; ordinal < scope.unitCount; ordinal++) {
-          assertCurrent();
+          await checkpoint();
           withIntakeWork(db, 'reconstruction', () => recordIntakeWork('retainedPlanUnits'));
           const unit = scope.unitIdentityAt(ordinal);
           if (!unit) throw Error('Direct recipe unit is unavailable');
@@ -228,6 +238,7 @@ export async function prepareRetainedPlanAccess(
         await writer.put('packageEvidence', 'true');
       if (index)
         for (const member of children(view, index, 'members')) {
+          await checkpoint();
           if (writer.peek('hasMembers') !== 'true') await writer.put('hasMembers', 'true');
           const filename = view.field(member, 'filename', { bytes: 262144 });
           const identity = view.field(member, 'memberId', { bytes: 8192 });
@@ -274,8 +285,8 @@ export async function prepareRetainedPlanAccess(
         }
       let ordinal = 0;
       for (const unit of children(view, plan, 'units')) {
+        await checkpoint();
         withIntakeWork(db, 'reconstruction', () => recordIntakeWork('retainedPlanUnits'));
-        assertCurrent();
         await prepareRetainedUnitPages(view, unit, writer, 'pages:' + view.address(unit) + ':', {
           assertRunning: assertCurrent,
           onWork: intakeJsonCanonicalWorkObserver(db, 'reconstruction'),
@@ -302,6 +313,7 @@ export async function prepareRetainedPlanAccess(
             await writer.put(key, JSON.stringify({ memberId, unitId }));
         }
         for (const attempt of children(view, unit, 'attempts')) {
+          await checkpoint();
           let text = '';
           for (const piece of view.recordChunks(attempt)) {
             if (Buffer.byteLength(text) + Buffer.byteLength(piece) > 8192)
@@ -321,8 +333,10 @@ export async function prepareRetainedPlanAccess(
         ordinal++;
       }
       for (const batch of children(view, plan, 'batches')) {
+        await checkpoint();
         const batchId = scalar<string>(view, batch, 'id');
         for (const receipt of children(view, batch, 'coverage')) {
+          await checkpoint();
           withIntakeWork(db, 'reconstruction', () =>
             recordIntakeWork('retainedPlanCoverageReceipts'),
           );
@@ -350,6 +364,7 @@ export async function prepareRetainedPlanAccess(
         }
       }
       for (const role of children(view, plan, 'packageRoles')) {
+        await checkpoint();
         const memberId = scalar<string>(view, role, 'memberId'),
           key = planKey + 'role:' + memberId;
         const canonical = await prepareIntakeJsonCanonical(view.recordChunks(role), {

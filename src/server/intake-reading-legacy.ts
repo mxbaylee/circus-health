@@ -1,6 +1,7 @@
 /** Durable legacy checkpoint evidence remains session scoped: hashes do not
  * manufacture literal windows, and completion IDs do not replace coverage. */
 import { randomUUID, createHash } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 import { HttpError, type Database } from './database.ts';
 import { selectedEnvelopeStore } from './intake-collection-envelope.ts';
 import { createEnvelopeBuildWriter } from './intake-envelope-build.ts';
@@ -190,6 +191,14 @@ export async function prepareLegacyReadingTargets(
       current();
       targets.assertCurrent();
     };
+    let examined = 0;
+    const checkpoint = async () => {
+      assertCurrent();
+      if (++examined % 64 === 0) {
+        await setImmediate();
+        assertCurrent();
+      }
+    };
     const build = 'reading.reindex.' + randomUUID(),
       operationId = randomUUID();
     collections.commitMaintenance(
@@ -222,12 +231,15 @@ export async function prepareLegacyReadingTargets(
         throw Error('Imported reading count conflicts');
       await writer.put(key, String(value));
     };
-    for (const unit of targets.units())
+    for (const unit of targets.units()) {
+      await checkpoint();
       if (writer.peek('legacy.unit:' + unit.unitKey) === undefined) {
         await writer.put('legacy.indexing:' + unit.unitKey, '1');
         await writer.put('legacy.unit:' + unit.unitKey, '1');
       }
+    }
     for (const page of targets.pages()) {
+      await checkpoint();
       if (writer.peek('legacy.indexing:' + page.unitKey) === undefined) continue;
       await writer.put(
         'legacy.pageTargets:' + page.scopeKey + ':' + page.unitKey,
@@ -242,13 +254,14 @@ export async function prepareLegacyReadingTargets(
       }
     }
     for (const pending of old.entries('legacy.pending:')) {
-      assertCurrent();
+      await checkpoint();
       const key = pending.key.slice('legacy.pending:'.length, 'legacy.pending:'.length + 64),
         ordinal = pending.value,
         window = old.window(key);
       if (!window) throw Error('Imported pending window is missing');
       let matched = false;
       for (const unit of targets.targets(window)) {
+        await checkpoint();
         matched = true;
         if (writer.peek('legacy.indexing:' + unit.unitKey) === undefined) continue;
         const keyName = 'legacy.targets:' + key + ':' + unit.unitKey + ':' + ordinal;
@@ -270,9 +283,11 @@ export async function prepareLegacyReadingTargets(
         await increment('legacy.unmatchedCount');
       }
     }
-    for (const unit of targets.units())
+    for (const unit of targets.units()) {
+      await checkpoint();
       if (writer.peek('legacy.indexing:' + unit.unitKey) !== undefined)
         await writer.remove('legacy.indexing:' + unit.unitKey);
+    }
     if (writer.peek('legacy.unit:' + context.unitKey) === undefined)
       throw Error('Selected unit is not part of an active imported reading plan');
     await writer.flush();

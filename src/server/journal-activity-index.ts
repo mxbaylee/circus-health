@@ -520,17 +520,29 @@ export function forgetJournalActivityScope(profileRoot: string): void {
 export async function prepareJournalActivity(
   root: string,
   profileId: string,
-  options: { signal?: AbortSignal; work?: JournalJsonWork } = {},
+  options: { signal?: AbortSignal; assertRunning?: () => void; work?: JournalJsonWork } = {},
 ): Promise<void> {
+  const assertRunning = () => {
+    options.signal?.throwIfAborted();
+    options.assertRunning?.();
+    options.signal?.throwIfAborted();
+  };
+  assertRunning();
   const key = scope(root, profileId),
     existing = indexes.get(key);
   if (realpathSync(key) !== join(realpathSync(root), 'data', 'profiles', profileId)) invalid();
   if (existing?.ready) {
+    let valid = false;
     try {
       journalActivityBinding(root, profileId);
-      return;
+      valid = true;
     } catch {
       clearJournalActivityIndex(root, profileId);
+    }
+    if (valid) {
+      assertRunning();
+      if (indexes.get(key) !== existing) pending();
+      return;
     }
   } else if (existing) pending();
   const scratch = disposableSqlite('health-journal-activity-'),
@@ -548,13 +560,19 @@ export async function prepareJournalActivity(
   scratch.db.exec(
     'CREATE TABLE activity_journals(id TEXT,kind TEXT,root INTEGER,pin TEXT,ordinal INTEGER,tail TEXT,digest TEXT,bytes INTEGER,legacyCount INTEGER,legacyDigest TEXT,remaining TEXT,updatedAt TEXT,PRIMARY KEY(kind,id)); CREATE TABLE activity_events(name TEXT PRIMARY KEY);',
   );
+  const assertActive = () => {
+    assertRunning();
+    if (indexes.get(key) !== index) pending();
+  };
   const cooperate = async <T>(steps: Generator<void, T>): Promise<T> => {
     try {
       for (;;) {
-        options.signal?.throwIfAborted();
-        if (indexes.get(key) !== index) pending();
+        assertActive();
         const next = steps.next();
-        if (next.done) return next.value;
+        if (next.done) {
+          assertActive();
+          return next.value;
+        }
         index.work.yields++;
         await setImmediate();
       }
@@ -563,8 +581,17 @@ export async function prepareJournalActivity(
     }
   };
   indexes.set(key, index);
-  index.containers = { chat: container(index, 'chat'), batch: container(index, 'batch') };
   try {
+    index.containers = { chat: container(index, 'chat'), batch: container(index, 'batch') };
+    let enumerated = 0;
+    const enumerationCheckpoint = async () => {
+      assertActive();
+      if (++enumerated % 64 === 0) {
+        index.work.yields++;
+        await setImmediate();
+        assertActive();
+      }
+    };
     let ordinal = 0;
     for (const kind of ['chat', 'batch'] as const) {
       const base = join(key, kind === 'chat' ? 'chats' : 'intake-batches');
@@ -573,8 +600,8 @@ export async function prepareJournalActivity(
       const ids = opendirSync(base);
       try {
         for (let entry = ids.readSync(); entry; entry = ids.readSync()) {
+          await enumerationCheckpoint();
           if (!UUID.test(entry.name)) continue;
-          options.signal?.throwIfAborted();
           const id = entry.name,
             directory = path(index, kind, id);
           if (!existsSync(directory)) continue;
@@ -585,6 +612,7 @@ export async function prepareJournalActivity(
           let entries = 0;
           try {
             for (let file = files.readSync(); file; file = files.readSync()) {
+              await enumerationCheckpoint();
               if (kind === 'chat' && ++entries > 100_000)
                 throw new HttpError(
                   413,
@@ -615,7 +643,7 @@ export async function prepareJournalActivity(
           for (const row of scratch.db
             .prepare('SELECT name FROM activity_events ORDER BY name')
             .iterate()) {
-            options.signal?.throwIfAborted();
+            assertActive();
             const name = String(row.name);
             if (selected.value && (!tip || Number(name.slice(0, 12)) > Number(tip.slice(0, 12)))) {
               if (
@@ -669,8 +697,10 @@ export async function prepareJournalActivity(
         ids.closeSync();
       }
     }
+    assertActive();
+    activityBinding(index);
+    assertActive();
     index.ready = true;
-    journalActivityBinding(root, profileId);
   } catch (error) {
     if (indexes.get(key) === index) indexes.delete(key);
     scratch.close();
@@ -688,8 +718,10 @@ function checked(index: ActivityIndex, row: Selected): void {
 /** Compact dependency binding, recomputed from selected small markers; never a
  * growing array of pins and never an implicit cold replay during a GET. */
 export function journalActivityBinding(root: string, profileId: string): string {
-  const index = current(root, profileId),
-    hash = createHash('sha256');
+  return activityBinding(current(root, profileId));
+}
+function activityBinding(index: ActivityIndex): string {
+  const hash = createHash('sha256');
   for (const kind of ['chat', 'batch'] as const)
     if (container(index, kind) !== index.containers[kind]) pending();
   for (const row of index.scratch.db

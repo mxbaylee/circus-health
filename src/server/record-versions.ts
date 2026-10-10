@@ -25,6 +25,11 @@ import {
   type TransactionOperation,
 } from './database.ts';
 import type { SQLInputValue, SQLOutputValue } from 'node:sqlite';
+import {
+  expectIntakeFrontierMetaWrite,
+  expectIntakeFrontierStateWrite,
+  finishIntakeFrontierMetaWrite,
+} from './intake-lookup-frontier-observer.ts';
 
 export interface RecordStorage {
   read(name: string): Buffer | null | undefined;
@@ -763,13 +768,22 @@ function indexTransaction(
     stringifyRecordJson(commit.result),
     stringifyRecordJson(commit),
   );
-  db.prepare('INSERT OR REPLACE INTO __record_state VALUES(1,?,?,?,?,?)').run(
-    config.profileId,
-    PROJECTION,
-    config.schemaVersion,
-    commit.sequence,
-    stringifyRecordJson(ref),
-  );
+  const expectedState = expectIntakeFrontierStateWrite(db);
+  let wroteState = false;
+  try {
+    wroteState =
+      db
+        .prepare('INSERT OR REPLACE INTO __record_state VALUES(1,?,?,?,?,?)')
+        .run(
+          config.profileId,
+          PROJECTION,
+          config.schemaVersion,
+          commit.sequence,
+          stringifyRecordJson(ref),
+        ).changes === 1;
+  } finally {
+    finishIntakeFrontierMetaWrite(db, expectedState, wroteState);
+  }
 }
 function* collect(
   db: Database,
@@ -1150,12 +1164,21 @@ export function attachRecordDurability(
   }
   state.set(db, config);
   captureTriggers(db, config.schema);
-  const markPersisted = () =>
-    db
-      .prepare(
-        "INSERT INTO app_meta(key,value) VALUES('curation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-      )
-      .run(String(revision(db)));
+  const markPersisted = () => {
+    const expected = expectIntakeFrontierMetaWrite(db, 'curation_revision', ['insert', 'update']);
+    let written = false;
+    try {
+      const result = db
+        .prepare(
+          "INSERT INTO app_meta(key,value) VALUES('curation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        )
+        .run(String(revision(db)));
+      written = result.changes === 1;
+      return result;
+    } finally {
+      finishIntakeFrontierMetaWrite(db, expected, written);
+    }
+  };
   markPersisted();
   db.exec('DELETE FROM __record_changed');
   registerTransactionDurability(db, {

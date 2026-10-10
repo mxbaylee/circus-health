@@ -171,6 +171,8 @@ export async function prepareIntakeEnvelopeMutation(
       if (ref.type !== 'cell') throw Error('Use explicit put to replace a structured field');
       if (!structuredKind(record.kind, field, text[0]!)) {
         await writer.cell('c:' + ref.id, text);
+        if (record.kind === 'intake' && field === 'originalName')
+          await writer.filenameFacts(ref.id);
         return;
       }
       // A known field can start as null. Installing its first structured value
@@ -187,7 +189,11 @@ export async function prepareIntakeEnvelopeMutation(
         JSON.stringify({ parent: id, ordinal, field: schemaKey(field) }),
       );
       await writer.record(text, 0, text.length, kind, next, id);
-    } else await writer.cell('c:' + next, text);
+    } else {
+      await writer.cell('c:' + next, text);
+      if (record.kind === 'intake' && ['originalName', 'locator'].includes(field))
+        await writer.filenameFacts(next);
+    }
     if (existing !== undefined) {
       const key = 'o:' + id + ':' + schemaOrdinal(ordinal),
         order = JSON.parse(read(key)) as SchemaOrder;

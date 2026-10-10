@@ -2,9 +2,13 @@ import { currentClinicalOperation, runExclusiveClinicalOperation } from './clini
 import { selectedOwnershipBlockers } from './ownership-identity-values.ts';
 import { reviewIssueCollection } from './intake-review-issue-state.ts';
 import { reviewRecordIdentityWarnings } from './intake-review-identity-warnings.ts';
-import { reviewRecordQuestions, reviewQuestionCount } from './intake-review-question-selection.ts';
+import {
+  reviewQuestionById,
+  reviewQuestionCount,
+  reviewQuestionAt,
+} from './intake-review-question-selection.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
-import { selectedReportGroups } from './intake-selected-report-groups.ts';
+import { selectedReportGroupAt } from './intake-selected-report-groups.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
@@ -213,42 +217,26 @@ function sectionData(
     };
   }
   if (section === 'reportGroups') {
-    const values = record.reportGroups,
-      links = selectedReportGroups(values),
-      iterator = links[Symbol.iterator]();
-    let index = -1,
-      current: ReturnType<typeof iterator.next> | undefined;
+    const values = record.reportGroups;
     return {
       length: Array.isArray(values) ? values.length : values?.count || 0,
       at(ordinal: number) {
-        if (ordinal < index) throw Error('Report links require forward selected access');
-        while (index < ordinal) {
-          current = iterator.next();
-          index++;
-        }
-        if (!current || current.done) return undefined;
+        const value = selectedReportGroupAt(values, ordinal);
+        if (!value) return undefined;
         return {
-          value: current.value,
-          control: { kind: 'reportGroup' as const, ...current.value },
+          value,
+          control: { kind: 'reportGroup' as const, ...value },
         };
       },
     };
   }
   if (section === 'questions') {
-    const iterator = reviewRecordQuestions(record)[Symbol.iterator]();
-    let index = -1,
-      current: ReturnType<typeof iterator.next> | undefined;
     return {
       length: reviewQuestionCount(record),
       at(ordinal: number) {
-        if (ordinal < index) throw Error('Question sections require forward access');
-        while (index < ordinal) {
-          current = iterator.next();
-          index++;
-        }
-        if (!current || current.done) return undefined;
-        const question = current.value,
-          answer = question.answers.at(-1)?.answer;
+        const question = reviewQuestionAt(record, ordinal);
+        if (!question) return undefined;
+        const answer = question.answers.at(-1)?.answer;
         return {
           value: question,
           control: {
@@ -272,7 +260,7 @@ function sectionData(
         const issue = issues.at(ordinal);
         if (!issue) return undefined;
         const question = issue.questionId
-          ? reviewRecordQuestions(record).find((question) => question.id === issue.questionId)
+          ? reviewQuestionById(record, issue.questionId)
           : undefined;
         return {
           value: issue,

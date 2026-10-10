@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, StatementSync } from 'node:sqlite';
 import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
@@ -118,4 +118,35 @@ test('cache clear drains its active scratch and permits a fresh queue read', asy
   assert.equal(canceled, true);
   assert.equal(existsSync(scratchPath), false, 'the active scratch closes after cancellation');
   await prepareCollectionQueueRead(db, root, profileId);
+});
+
+test('unchanged warm queue preparation does not enumerate original source bindings', async (t) => {
+  const { db, root, profileId } = await preparedQueue(t);
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  const originalIterate = StatementSync.prototype.iterate;
+  const counted = new WeakSet<StatementSync>();
+  let rows = 0;
+  DatabaseSync.prototype.prepare = function (sql) {
+    const statement = originalPrepare.call(this, sql);
+    if (this === db && sql.startsWith('SELECT f.id,f.sha256 FROM source_files f'))
+      counted.add(statement);
+    return statement;
+  };
+  StatementSync.prototype.iterate = function* (...args) {
+    for (const row of Reflect.apply(originalIterate, this, args)) {
+      if (counted.has(this)) rows++;
+      yield row;
+    }
+    return undefined;
+  };
+  t.after(() => {
+    DatabaseSync.prototype.prepare = originalPrepare;
+    StatementSync.prototype.iterate = originalIterate;
+  });
+  await prepareCollectionQueueRead(db, root, profileId);
+  assert.equal(rows, 0);
+  // A supported policy replacement has no SQL change count, but revokes the private proof.
+  db.setAuthorizer(null);
+  await prepareCollectionQueueRead(db, root, profileId);
+  assert.equal(rows, 2, 'revoked warm proof requires both complete source binding checks');
 });

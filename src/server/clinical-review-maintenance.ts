@@ -8,6 +8,50 @@ import { observeDatabaseClose } from './database.ts';
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
 
 type Owner = 'reader' | 'attention';
+const maintenanceObservers = new WeakMap<
+  DatabaseSync,
+  { functionName: string; origins: ReadonlyMap<string, { table: string; sql: string }> }
+>();
+
+/** Fixed private attention triggers may report execution without performing SQL writes. */
+export function registerAttentionMaintenanceObserver(
+  db: DatabaseSync,
+  functionName: string,
+  origins: readonly string[],
+) {
+  if (
+    !/^__source_attention_event_[a-f0-9]{32}$/.test(functionName) ||
+    origins.length !== 8 ||
+    new Set(origins).size !== origins.length ||
+    origins.some(
+      (origin) =>
+        !origin.startsWith(functionName + '_') ||
+        !/^source_attention_(counts|dirty|state)_v1_(insert|update|delete)$/.test(
+          origin.slice(functionName.length + 1),
+        ) ||
+        origin.endsWith('_dirty_v1_insert'),
+    )
+  )
+    throw Error('Invalid private attention maintenance observer');
+  maintenanceObservers.set(db, {
+    functionName,
+    origins: new Map(
+      origins.map((origin) => {
+        const suffix = origin.slice(functionName.length + 1),
+          separator = suffix.lastIndexOf('_'),
+          table = suffix.slice(0, separator),
+          operation = suffix.slice(separator + 1).toUpperCase();
+        return [
+          origin,
+          {
+            table,
+            sql: `CREATE TRIGGER ${origin} AFTER ${operation} ON temp.${table} BEGIN SELECT ${functionName}(); END`,
+          },
+        ];
+      }),
+    ),
+  });
+}
 const readerTables = [
   'control',
   'sources',
@@ -139,7 +183,9 @@ function assertCanonicalSchema(db: DatabaseSync, owner: Owner, stamp: string): v
         ? canonicalTables[owner].get(name)
         : row.type === 'index'
           ? canonicalIndexes.get(name)
-          : undefined;
+          : row.type === 'trigger' && owner === 'attention'
+            ? maintenanceObservers.get(db)?.origins.get(name)?.sql
+            : undefined;
     if (
       row.type === 'index' &&
       row.sql === null &&
@@ -207,6 +253,15 @@ function execute(
     db.setAuthorizer((action, name, detail, database, origin) => {
       if (action === constants.SQLITE_READ || action === constants.SQLITE_SELECT)
         return constants.SQLITE_OK;
+      const observer = owner === 'attention' ? maintenanceObservers.get(db) : undefined;
+      if (
+        action === constants.SQLITE_FUNCTION &&
+        observer &&
+        detail === observer.functionName &&
+        origin &&
+        observer.origins.has(origin)
+      )
+        return constants.SQLITE_OK;
       if (
         action === constants.SQLITE_INSERT ||
         action === constants.SQLITE_UPDATE ||
@@ -255,7 +310,7 @@ function execute(
         (action === constants.SQLITE_CREATE_TEMP_TRIGGER ||
           action === constants.SQLITE_DROP_TEMP_TRIGGER) &&
         name &&
-        allowed.triggers.get(name) === detail
+        (allowed.triggers.get(name) === detail || observer?.origins.get(name)?.table === detail)
       ) {
         declaredTempTrigger = true;
         declaredDdl = true;

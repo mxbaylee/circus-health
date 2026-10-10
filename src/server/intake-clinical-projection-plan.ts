@@ -1,5 +1,5 @@
 /** Exact changed-row projection preparation. SQLite is only a disposable staging surface. */
-import { constants, type DatabaseSync, type Session } from 'node:sqlite';
+import { type DatabaseSync, type Session } from 'node:sqlite';
 import { cloneLiteral } from './intake-format.ts';
 import {
   HttpError,
@@ -31,6 +31,7 @@ import {
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
+import { applyObservedClinicalProjectionChangeset } from './intake-lookup-frontier-observer.ts';
 
 declare const projectionBrand: unique symbol;
 export interface PreparedClinicalProjection {
@@ -585,8 +586,7 @@ export function applyPreparedClinicalProjectionGroup(
     if (value.applied) throw changed();
     value.assertCurrent();
     value.evidence?.applyStandalone();
-    if (!db.applyChangeset(value.changes, { onConflict: () => constants.SQLITE_CHANGESET_ABORT }))
-      throw changed();
+    if (!applyObservedClinicalProjectionChangeset(db, value.changes)) throw changed();
     value.applied = true;
     value.appliedToken = token;
     const stop = observeTransactionOutcome(db, (outcome) => {

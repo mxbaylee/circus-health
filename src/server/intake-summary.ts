@@ -1,9 +1,4 @@
-import type {
-  Intake,
-  IntakeMetadata,
-  IntakePackageFailure,
-  IntakeAcceptedRecord,
-} from '../shared/intake.ts';
+import type { Intake, IntakeMetadata, IntakeAcceptedRecord } from '../shared/intake.ts';
 import type {
   IntakePackageFailurePage,
   IntakeReviewSummary,
@@ -14,6 +9,9 @@ import type {
   IntakePlanHeader,
   IntakeFilenameReference,
   IntakeFilenameFragment,
+  IntakePackageFailureField,
+  IntakePackageFailureFieldReference,
+  IntakePackageFailureFieldFragment,
 } from '../shared/intake-summary.ts';
 import { HttpError, type Database } from './database.ts';
 import { type IntakeEnvelopeSource } from './intake-authority.ts';
@@ -55,6 +53,35 @@ function text(
   const result = value(view, record, field);
   if (optional && (result === undefined || result === null)) return undefined;
   return typeof result === 'string' ? result : invalid(field);
+}
+const failureLocationFields = ['originalFilename', 'filename', 'locator'] as const;
+function failureLocation(
+  view: IntakeCollectionEnvelopeReader,
+  record: IntakeEnvelopeRecord,
+  field: IntakePackageFailureField,
+  key: string,
+  source: IntakeEnvelopeSource,
+  pins: IntakeSummaryPins,
+) {
+  const selected = view.field(record, field, { bytes: FIELD_BYTES });
+  if (selected.kind === 'missing') return undefined;
+  if (selected.kind === 'value') {
+    if (selected.value === null && field !== 'originalFilename') return undefined;
+    if (typeof selected.value !== 'string') return invalid(field);
+    return { value: selected.value };
+  }
+  if (!selected.bytes || view.fieldFragment(record, field, { bytes: 4096 }).text[0] !== '"')
+    return invalid(field);
+  return {
+    reference: {
+      format: 'health-intake-package-failure-field-reference-v1' as const,
+      intakeId: source.id,
+      key,
+      field,
+      pins: { ...pins },
+      bytes: selected.bytes,
+    },
+  };
 }
 function selection(db: Database, source: IntakeEnvelopeSource) {
   const view = openIntakeCollectionEnvelope(db, source),
@@ -370,12 +397,11 @@ export function collectionIntakePackageFailures(
   for (const field of page.fields) {
     const record = view.child(failures!, field.name);
     if (!record) return invalid('processing issue');
-    const failure = {} as IntakePackageFailure;
+    const failure = {} as IntakePackageFailurePage['entries'][number]['failure'];
     for (const name of [
       'sourceFileId',
       'sourceHash',
       'operationKey',
-      'originalFilename',
       'contentUrl',
       'reasonCode',
       'detail',
@@ -384,10 +410,17 @@ export function collectionIntakePackageFailures(
       'retryAction',
     ] as const)
       Object.assign(failure, { [name]: text(view, record, name) });
-    for (const name of ['memberId', 'filename', 'locator'] as const) {
-      const item = text(view, record, name, true);
-      if (item !== undefined) failure[name] = item;
+    const fieldReferences: Partial<
+      Record<IntakePackageFailureField, IntakePackageFailureFieldReference>
+    > = {};
+    for (const name of failureLocationFields) {
+      const location = failureLocation(view, record, name, field.name, source, pins);
+      if (name === 'originalFilename' && !location) return invalid(name);
+      if (location && 'value' in location) failure[name] = location.value;
+      if (location && 'reference' in location) fieldReferences[name] = location.reference;
     }
+    const memberId = text(view, record, 'memberId', true);
+    if (memberId !== undefined) failure.memberId = memberId;
     const ordinal = value(view, record, 'ordinal');
     if (ordinal !== undefined) {
       if (!Number.isSafeInteger(ordinal) || (ordinal as number) < 0)
@@ -402,7 +435,11 @@ export function collectionIntakePackageFailures(
       !['inventory', 'read_member', 'read_structure'].includes(failure.retryAction)
     )
       return invalid('issue binding');
-    entries.push({ key: field.name, failure });
+    entries.push({
+      key: field.name,
+      failure,
+      ...(Object.keys(fieldReferences).length ? { fieldReferences } : {}),
+    });
   }
   return {
     format: 'health-intake-package-failure-page-v1',
@@ -421,6 +458,70 @@ export function collectionIntakePackageFailures(
           } satisfies FailureCursor),
         ).toString('base64url')
       : null,
+  };
+}
+
+/** A retained long location is read only from the same selected root and issue key. */
+export function collectionIntakePackageFailureFieldFragment(
+  db: Database,
+  source: IntakeEnvelopeSource,
+  input: { reference: IntakePackageFailureFieldReference; cursor?: string; limit?: number },
+): IntakePackageFailureFieldFragment {
+  const { view, intake, pins } = selection(db, source);
+  const actual = input.reference;
+  if (
+    !actual ||
+    typeof actual !== 'object' ||
+    Array.isArray(actual) ||
+    !failureLocationFields.includes(actual.field) ||
+    actual.format !== 'health-intake-package-failure-field-reference-v1' ||
+    actual.intakeId !== source.id ||
+    typeof actual.key !== 'string' ||
+    !actual.key ||
+    !actual.pins ||
+    typeof actual.pins !== 'object' ||
+    Object.keys(actual).length !== 6 ||
+    Object.keys(actual.pins).length !== 4 ||
+    (['sourceHash', 'logicalRoot', 'domainVersion', 'version'] as const).some(
+      (key) => actual.pins[key] !== pins[key],
+    )
+  )
+    throw new HttpError(409, 'PACKAGE_FAILURE_CHANGED', 'Refresh this unfinished operation.');
+  const failures = view.child(intake, 'packageFailures'),
+    record = failures && view.child(failures, actual.key);
+  if (
+    !record ||
+    text(view, record, 'sourceFileId') !== source.id ||
+    text(view, record, 'sourceHash') !== pins.sourceHash ||
+    text(view, record, 'status') !== 'pending' ||
+    text(view, record, 'scope') !== 'incomplete'
+  )
+    throw new HttpError(409, 'PACKAGE_FAILURE_CHANGED', 'Refresh this unfinished operation.');
+  const location = failureLocation(view, record, actual.field, actual.key, source, pins),
+    expected = location && 'reference' in location ? location.reference : undefined;
+  if (!expected || expected.bytes !== actual.bytes)
+    throw new HttpError(409, 'PACKAGE_FAILURE_CHANGED', 'Refresh this unfinished operation.');
+  const limit = input.limit ?? 32768;
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < 4096 ||
+    limit > 32768 ||
+    (input.cursor !== undefined &&
+      (typeof input.cursor !== 'string' || !input.cursor || input.cursor.length > 8192))
+  )
+    throw new HttpError(400, 'PACKAGE_FAILURE_WINDOW', 'Read a bounded exact location fragment.');
+  const fragment = view.fieldFragment(record, actual.field, {
+    after: input.cursor,
+    bytes: limit,
+  });
+  if (Buffer.byteLength(fragment.text) > limit) return invalid('processing issue fragment');
+  return {
+    format: 'health-intake-package-failure-field-fragment-v1',
+    reference: expected,
+    encoding: 'json-string',
+    text: fragment.text,
+    complete: fragment.complete,
+    nextCursor: fragment.after,
   };
 }
 

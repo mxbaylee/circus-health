@@ -350,6 +350,7 @@ export async function prepareSelectedSourceContextClassification(
   options: {
     assertRunning?: () => void;
     refresh?: boolean;
+    onCheckpoint?: (visited: number) => void | Promise<void>;
     onWork?: (work: ReturnType<typeof createIntakeFileWorkCounters>) => void;
   } = {},
 ): Promise<SelectedSourceContextClassification> {
@@ -365,7 +366,11 @@ async function prepareClassification(
   root: string,
   profileId: string,
   id: string,
-  options: { assertRunning?: () => void; refresh?: boolean },
+  options: {
+    assertRunning?: () => void;
+    refresh?: boolean;
+    onCheckpoint?: (visited: number) => void | Promise<void>;
+  },
   work: ReturnType<typeof createIntakeFileWorkCounters>,
 ): Promise<SelectedSourceContextClassification> {
   const file = source(db, profileId, id),
@@ -385,6 +390,15 @@ async function prepareClassification(
     const current = intakeSourceVersion(db, id);
     if (current.version !== version.version || current.logicalBinding !== version.logicalBinding)
       throw new SourceContextClassificationPending('selection_changed');
+  };
+  let visited = 0;
+  const checkpoint = async () => {
+    if (++visited % 64 !== 0) return;
+    assertCurrent();
+    await options.onCheckpoint?.(visited);
+    assertCurrent();
+    await setImmediate();
+    assertCurrent();
   };
   function* entries(map: string) {
     let after: string | undefined;
@@ -445,8 +459,10 @@ async function prepareClassification(
   if (!intake) throw Error('Missing intake envelope');
   const flow = view.child(intake, 'workflow');
   if (flow)
-    for (const candidate of records(view, flow, 'candidates'))
+    for (const candidate of records(view, flow, 'candidates')) {
+      await checkpoint();
       for (const entry of records(view, candidate, 'versions')) {
+        await checkpoint();
         assertCurrent();
         if (truthy(view, entry, 'sourceContext')) continue;
         const versionId = field<string>(view, entry, 'id');
@@ -456,16 +472,20 @@ async function prepareClassification(
           String(Number(writers.unresolved.peek(versionId) ?? 0) + 1),
         );
       }
+    }
   await writers.unresolved.flush();
   // Legacy membership is keyed by version ID, including explicitly marked
   // duplicate occurrences when any occurrence of that ID remains unresolved.
   if (flow)
-    for (const candidate of records(view, flow, 'candidates'))
+    for (const candidate of records(view, flow, 'candidates')) {
+      await checkpoint();
       for (const entry of records(view, candidate, 'versions')) {
+        await checkpoint();
         assertCurrent();
         const versionId = field<string>(view, entry, 'id');
         if (!versionId) throw Error('Missing candidate version ID');
         for (const occurrence of records(view, entry, 'occurrences')) {
+          await checkpoint();
           const sourceId = field<string | null>(view, occurrence, 'proposalId') || id;
           const key = refKey(versionId, sourceId),
             prior = writers.versionReferences.peek(key);
@@ -481,12 +501,14 @@ async function prepareClassification(
             );
         }
       }
+    }
   await writers.references.flush();
   const unresolved =
     store.collection(store.openView(), 'builds', attempt + '.unresolved')?.root?.count ?? 0;
   {
     await writers.allowed.put(id, 'null');
     for (const proposal of records(view, intake, 'proposals')) {
+      await checkpoint();
       assertCurrent();
       const proposalId = field<string>(view, proposal, 'id');
       if (!proposalId) throw Error('Missing proposal ID');
@@ -500,12 +522,15 @@ async function prepareClassification(
   }
   await writers.allowed.flush();
   let referencedCount = 0;
-  for (const entry of entries(attempt + '.references'))
+  for (const entry of entries(attempt + '.references')) {
+    await checkpoint();
     if (writers.allowed.peek(entry.key) !== undefined) {
       referencedCount++;
     }
+  }
   let unavailable = false;
   for (const entry of entries(attempt + '.allowed')) {
+    await checkpoint();
     assertCurrent();
     if (!unresolved || (referencedCount && writers.references.peek(entry.key) === undefined))
       continue;
@@ -607,7 +632,8 @@ async function prepareClassification(
         });
         await setImmediate();
       };
-      for (const record of parsed.entries)
+      for (const record of parsed.entries) {
+        await checkpoint();
         if (sourceContextEnvelope(record.value)) {
           const versionId = withIntakeFileWork(work, () =>
             intakeCandidateVersionIdForRevision(record, revision),
@@ -621,6 +647,7 @@ async function prepareClassification(
           });
           if (cacheChanges.length === 64) await flushCache(false);
         }
+      }
       assertCurrent();
       try {
         checkWitness(db, root, profileId, witness);
@@ -643,6 +670,7 @@ async function prepareClassification(
     }
     await writers.sources.put(selected.id, JSON.stringify(witness));
     for (const version of entries(cache + '.versions')) {
+      await checkpoint();
       assertCurrent();
       await writers.contexts.put(
         refKey(version.key, selected.id),

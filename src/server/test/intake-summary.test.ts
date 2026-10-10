@@ -15,11 +15,13 @@ import {
   collectionIntakeUnitDetail,
   collectionIntakeAcceptedDestinations,
   collectionIntakeFilenameFragment,
+  collectionIntakePackageFailureFieldFragment,
 } from '../intake-summary.ts';
 import { buildVerifiedWorkflowSummary } from '../intake-workflow-state.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { isRetainOnlyIntake } from '../../shared/intake-source-policy.ts';
 import { intakeFilenameDisplay } from '../../shared/intake-summary.ts';
+import { zipFixture } from '../../tests/fixtures/zip.ts';
 function fixture(t: test.TestContext, input: Record<string, unknown> | string) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-envelope-schema-')),
     identity = {
@@ -213,6 +215,60 @@ test('processing issue pages retain exact targets and refuse foreign or changed 
     /invalid/,
   );
   assert.throws(() => collectionIntakePackageFailures(db, source, { limit: 101 }), /between/);
+});
+test('a valid long ZIP member location remains available through a bounded failure page', async (t) => {
+  const data = input(1);
+  const name = 'fictional-' + 'x'.repeat(20000) + '.txt';
+  assert.equal(
+    zipFixture([{ name, data: 'fictional' }]).readUInt16LE(26),
+    Buffer.byteLength(name),
+    'the long location is a legal ZIP member declaration',
+  );
+  const originalName = 'fictional-original-' + 'z'.repeat(20000) + '.zip';
+  data.intake.originalName = originalName;
+  Object.assign(data.intake.packageFailures.failure0!, {
+    originalFilename: originalName,
+    filename: name,
+    locator: 'ZIP member ' + name,
+  });
+  const { db, source } = fixture(t, data);
+  await buildIntakeCollectionEnvelope(db, source);
+  const page = collectionIntakePackageFailures(db, source, { limit: 1 });
+  assert.equal(page.total, 1);
+  assert.equal(page.entries[0]!.failure.memberId, 'member0');
+  const entry = page.entries[0]!;
+  assert.equal(entry.failure.filename, undefined);
+  assert.equal(entry.failure.locator, undefined);
+  assert.equal(entry.failure.originalFilename, undefined);
+  assert.ok(Buffer.byteLength(JSON.stringify(page)) < 16 * 1024);
+  for (const [field, expected] of [
+    ['filename', name],
+    ['locator', 'ZIP member ' + name],
+    ['originalFilename', originalName],
+  ] as const) {
+    const reference = entry.fieldReferences?.[field];
+    assert.ok(reference);
+    let cursor: string | undefined;
+    const parts: string[] = [];
+    do {
+      const fragment = collectionIntakePackageFailureFieldFragment(db, source, {
+        reference,
+        cursor,
+        limit: 4096,
+      });
+      parts.push(fragment.text);
+      cursor = fragment.nextCursor ?? undefined;
+      if (fragment.complete) break;
+    } while (true);
+    assert.equal(JSON.parse(parts.join('')), expected);
+    assert.throws(
+      () =>
+        collectionIntakePackageFailureFieldFragment(db, source, {
+          reference: { ...reference, pins: { ...reference.pins, version: -1 } },
+        }),
+      { code: 'PACKAGE_FAILURE_CHANGED' },
+    );
+  }
 });
 test('large labels remain explicitly unloaded rather than represented as absent', async (t) => {
   const data = input(0);

@@ -1,4 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { currentTransactionToken } from './database.ts';
+import { recordDurabilityStatus } from './record-versions.ts';
 import {
   HEAD_BYTES,
   intakeNamespace,
@@ -11,6 +13,9 @@ import { intakeSourcePinKey } from './intake-source-pin.ts';
 import {
   verifyIntakeLegacyBridgeProof,
   type IntakeLegacyBridgeProof,
+  consumeIntakeCompactMetadataProof,
+  type IntakeCompactMetadataProof,
+  intakeCompactSourceRowsEqual,
 } from './intake-state-migration.ts';
 
 declare const maintenanceBrand: unique symbol;
@@ -33,6 +38,7 @@ interface Candidate {
   /** Only the checked one-time legacy bridge can preserve a review across a
    * format transition; ordinary callers cannot request this with a Boolean. */
   legacyBridge?: IntakeLegacyBridgeProof;
+  compactMetadata?: IntakeCompactMetadataProof;
 }
 interface Publication {
   db: DatabaseSync;
@@ -48,6 +54,12 @@ interface Publication {
   fingerprint: string;
   bytes: number;
   bridgeCertified: boolean;
+  compactMetadata?: {
+    sourceRow: Readonly<Record<string, unknown>>;
+    target: string;
+    sequence: number;
+  };
+  sourceStaged?: boolean;
   token?: object;
   mainSchema?: number;
   tempSchema?: number;
@@ -96,15 +108,21 @@ function sourceBinding(
   db: DatabaseSync,
   identity: IntakeStateIdentity,
   readMeta: ReturnType<typeof metadataReader>,
+  includeDetails = true,
 ): string {
   if (!db.isOpen) fail('closed database');
   if (readMeta('owner_profile_id') !== identity.profileId) fail('database owner');
   const size = db
     .prepare('SELECT length(CAST(details_json AS BLOB)) AS bytes FROM source_files WHERE id=?')
     .get(identity.intakeId)?.bytes;
-  if (typeof size !== 'number' || size > MAX_WRITE_BYTES) fail('source metadata budget');
+  if (typeof size !== 'number' || (includeDetails && size > MAX_WRITE_BYTES))
+    fail('source metadata budget');
   const row = db
-    .prepare('SELECT kind,sha256,details_json FROM source_files WHERE id=?')
+    .prepare(
+      includeDetails
+        ? 'SELECT kind,sha256,details_json FROM source_files WHERE id=?'
+        : 'SELECT kind,sha256 FROM main.source_files WHERE id=?',
+    )
     .get(identity.intakeId);
   if (!row || row.kind !== 'intake_original' || row.sha256 !== identity.sourceHash)
     fail('original source');
@@ -155,25 +173,36 @@ export function prepareIntakeMaintenancePublication(
   const headKey = prefix + 'head';
   const readMeta = metadataReader(db);
   if (readMeta(headKey) !== candidate.beforeHead) fail('stale prepared head');
-  const source = sourceBinding(db, identity, readMeta);
+  const source = sourceBinding(db, identity, readMeta, candidate.compactMetadata === undefined);
   const sourcePin = readMeta(intakeSourcePinKey(identity.intakeId));
+  if (candidate.legacyBridge !== undefined && candidate.compactMetadata !== undefined)
+    fail('conflicting representation proofs');
+  const proofBinding = {
+    identity,
+    beforeHead: candidate.beforeHead,
+    afterHead: candidate.afterHead,
+    sourcePin,
+    detailsJson: db
+      .prepare('SELECT details_json FROM source_files WHERE id=?')
+      .get(identity.intakeId)!.details_json as string,
+    writes: candidate.writes,
+  };
+  const compactMetadata =
+    candidate.compactMetadata === undefined
+      ? undefined
+      : consumeIntakeCompactMetadataProof(db, candidate.compactMetadata, proofBinding);
   if (candidate.legacyBridge !== undefined) {
-    verifyIntakeLegacyBridgeProof(candidate.legacyBridge, db, {
-      identity,
-      beforeHead: candidate.beforeHead,
-      afterHead: candidate.afterHead,
-      sourcePin,
-      detailsJson: db
-        .prepare('SELECT details_json FROM source_files WHERE id=?')
-        .get(identity.intakeId)!.details_json as string,
-      writes: candidate.writes,
-    });
-  } else heads(identity, candidate.beforeHead, candidate.afterHead);
+    verifyIntakeLegacyBridgeProof(candidate.legacyBridge, db, proofBinding);
+  } else if (!compactMetadata) heads(identity, candidate.beforeHead, candidate.afterHead);
   if (!candidate.writes.length || candidate.writes.length > MAX_WRITES) fail('write count');
   const writes = new Map<string, string>();
   const seen = new Set<string>();
   let encodedBytes = 0;
-  let retainedBytes = bytes(source) + bytes(candidate.beforeHead) + bytes(candidate.afterHead);
+  let retainedBytes =
+    bytes(source) +
+    bytes(candidate.beforeHead) +
+    bytes(candidate.afterHead) +
+    bytes(compactMetadata?.target ?? '');
   for (const { key, value } of candidate.writes) {
     if (
       typeof key !== 'string' ||
@@ -222,7 +251,8 @@ export function prepareIntakeMaintenancePublication(
     operationId: candidate.operationId,
     fingerprint: candidate.fingerprint,
     bytes: retainedBytes,
-    bridgeCertified: candidate.legacyBridge !== undefined,
+    bridgeCertified: candidate.legacyBridge !== undefined || compactMetadata !== undefined,
+    compactMetadata,
   };
   let state = retained.get(db);
   if (!state) {
@@ -242,6 +272,38 @@ function selected(db: DatabaseSync, capability: IntakeMaintenancePublication): P
   if (!publication || publication.db !== db) fail('foreign, expired or consumed capability');
   return publication;
 }
+/** Called only after this exact prepared head was staged inside its owner token. */
+export function stageIntakeCompactMetadataPublication(
+  db: DatabaseSync,
+  capability: IntakeMaintenancePublication,
+): void {
+  const item = selected(db, capability),
+    proof = item.compactMetadata;
+  if (!proof) return;
+  const status = recordDurabilityStatus(db);
+  if (
+    !item.token ||
+    item.token !== currentTransactionToken(db) ||
+    item.sourceStaged ||
+    !status?.configured ||
+    status.dirty ||
+    status.sequence !== proof.sequence ||
+    metadataReader(db)(item.headKey) !== item.afterHead ||
+    !intakeCompactSourceRowsEqual(
+      db
+        .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
+        .get(item.identity.intakeId),
+      proof.sourceRow,
+    )
+  )
+    fail('compact metadata staging scope');
+  const before = proof.sourceRow as { details_json: string };
+  const update = db
+    .prepare('UPDATE main.source_files SET details_json=? WHERE id=? AND details_json IS ?')
+    .run(proof.target, item.identity.intakeId, before.details_json);
+  if (Number(update.changes) !== 1) fail('compact metadata exact update');
+  item.sourceStaged = true;
+}
 /** Called by transaction(), before the durable replay shortcut. */
 export function beginIntakeMaintenancePublication(
   db: DatabaseSync,
@@ -260,7 +322,15 @@ export function beginIntakeMaintenancePublication(
     fail('operation binding');
   if (
     readMeta(publication.headKey) !== publication.beforeHead ||
-    sourceBinding(db, publication.identity, readMeta) !== publication.source ||
+    sourceBinding(db, publication.identity, readMeta, publication.compactMetadata === undefined) !==
+      publication.source ||
+    (publication.compactMetadata &&
+      !intakeCompactSourceRowsEqual(
+        db
+          .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
+          .get(publication.identity.intakeId),
+        publication.compactMetadata.sourceRow,
+      )) ||
     readMeta(intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin
   )
     fail('stale authority or source binding');
@@ -292,15 +362,16 @@ export function verifyIntakeMaintenancePublication(
   )
     fail('capture/schema changed during publication');
   if (
-    sourceBinding(db, publication.identity, readMeta) !== publication.source ||
+    sourceBinding(db, publication.identity, readMeta, publication.compactMetadata === undefined) !==
+      publication.source ||
     readMeta(intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin ||
     boundedJson(result, HEAD_BYTES) !== publication.result
   )
     fail('source or result changed');
   const seen = new Set<string>();
+  let sourceRows = 0;
   for (const row of db.prepare('SELECT entity,record_id FROM __record_changed').iterate()) {
-    if (row.entity !== 'app_meta' || typeof row.record_id !== 'string')
-      fail('unexpected accepted row');
+    if (typeof row.record_id !== 'string') fail('unexpected accepted row');
     let identity: unknown;
     try {
       identity = JSON.parse(row.record_id);
@@ -310,12 +381,33 @@ export function verifyIntakeMaintenancePublication(
     if (!Array.isArray(identity) || identity.length !== 1 || typeof identity[0] !== 'string')
       fail('captured row identity');
     const key = identity[0] as string;
+    if (row.entity === 'source_files' && publication.compactMetadata) {
+      if (key !== publication.identity.intakeId || ++sourceRows !== 1 || !publication.sourceStaged)
+        fail('unexpected compact metadata source row');
+      const expected = {
+        ...publication.compactMetadata.sourceRow,
+        details_json: publication.compactMetadata.target,
+      };
+      if (
+        !intakeCompactSourceRowsEqual(
+          db
+            .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
+            .get(key),
+          expected,
+        )
+      )
+        fail('compact metadata complete source readback');
+      continue;
+    }
+    if (row.entity !== 'app_meta') fail('unexpected accepted row');
     const expected = publication.writes.get(key);
     if (expected === undefined || seen.has(key)) fail('unexpected accepted key');
     if (readMeta(key, MAX_ROW_BYTES) !== expected) fail('accepted write readback');
     seen.add(key);
   }
   if (seen.size !== publication.writes.size) fail('missing prepared write');
+  if (sourceRows !== (publication.compactMetadata ? 1 : 0))
+    fail('missing compact metadata source row');
   const afterHead = readMeta(publication.headKey);
   if (afterHead !== publication.afterHead) fail('selected head readback');
   // A migration certificate already proved this exact representation-only

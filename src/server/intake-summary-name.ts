@@ -4,9 +4,137 @@ import type {
   IntakeCollectionEnvelopeReader,
   IntakeEnvelopeRecord,
 } from './intake-collection-envelope.ts';
+import {
+  intakeEnvelopeFilenameCell,
+  hasIntakeCollectionEnvelope,
+  openIntakeCollectionEnvelope,
+  selectedEnvelopeStore,
+} from './intake-collection-envelope.ts';
 import type { IntakeFilename, IntakeSummaryPins } from '../shared/intake-summary.ts';
-import { hashIntakeJsonScalar } from './intake-json-scalar.ts';
+import { parseIntakeFilenameFacts } from './intake-filename-facts.ts';
 import { isRetainOnlyIntake } from '../shared/intake-source-policy.ts';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
+import type { IntakeEnvelopeSource } from './intake-authority.ts';
+
+/** One cooperative compatibility preparation; all later reads remain point reads.
+ * The selected map is shared, and only its bounded derivative entry is added. */
+export async function prepareIntakeFilenameSummary(
+  db: Database,
+  source: IntakeEnvelopeSource,
+  options: { assertRunning?: () => void } = {},
+): Promise<{ changed: boolean }> {
+  options.assertRunning?.();
+  if (intakeFilenameSummaryPrepared(db, source)) return { changed: false };
+  return runExclusiveClinicalOperation(
+    db,
+    async (operation) => {
+      const assertRunning = () => {
+        assertClinicalOperation(db, operation);
+        options.assertRunning?.();
+      };
+      assertRunning();
+      if (!hasIntakeCollectionEnvelope(db, source)) return { changed: false };
+      const view = openIntakeCollectionEnvelope(db, source);
+      const intake = view.child(view.root(), 'intake');
+      if (!intake) throw Error('The selected filename header is missing');
+      const selected = view.field(intake, 'originalName', { bytes: 16384 });
+      if (selected.kind !== 'fragmented' || !selected.bytes) return { changed: false };
+      const cell = intakeEnvelopeFilenameCell(view, intake);
+      if (cell.facts !== undefined) {
+        checkedFilenameFacts(view, intake);
+        return { changed: false };
+      }
+      const { collections, source: expectedSource } = selectedEnvelopeStore(db, source);
+      const logical = JSON.stringify(view.logical);
+      const assertCurrent = () => {
+        assertRunning();
+        const current = selectedEnvelopeStore(db, source);
+        if (
+          JSON.stringify(collections.binding(collections.openView())?.logical) !== logical ||
+          current.source.sha256 !== expectedSource.sha256 ||
+          current.source.details_json !== expectedSource.details_json
+        )
+          throw Error('The selected filename authority changed during preparation');
+      };
+      const build = 'filename.facts.' + randomUUID();
+      const prepare = (changes: Parameters<typeof collections.prepare>[1]['changes']) => {
+        assertCurrent();
+        const operationId = randomUUID();
+        return collections.prepare(collections.openView(), {
+          operationId,
+          requestDigest: createHash('sha256').update(operationId).digest('hex'),
+          domainVersion: view.logical.domainVersion,
+          changes,
+        });
+      };
+      collections.commitMaintenance(
+        prepare([
+          {
+            area: 'builds',
+            collection: build,
+            op: 'adoptCollection',
+            fromArea: 'logical',
+            fromCollection: 'envelope.data',
+          },
+        ]),
+      );
+      const { createEnvelopeBuildWriter } = await import('./intake-envelope-build.ts');
+      assertCurrent();
+      const writer = createEnvelopeBuildWriter(db, source, build, view.logical.domainVersion, {
+        assertRunning: assertCurrent,
+      });
+      await writer.filenameFacts(cell.id);
+      await writer.flush();
+      const prepared = prepare([
+        {
+          area: 'logical',
+          collection: 'envelope.data',
+          op: 'adoptCollection',
+          fromArea: 'builds',
+          fromCollection: build,
+        },
+      ]);
+      try {
+        await collections.certifySchemaAdoptionAsync(prepared, { assertRunning: assertCurrent });
+        assertCurrent();
+        collections.commitMaintenance(prepared, { assertCurrent });
+      } finally {
+        collections.disposePreparation(prepared);
+      }
+      assertRunning();
+      return { changed: true };
+    },
+    { operation: currentClinicalOperation(db), assertRunning: options.assertRunning },
+  );
+}
+
+export function intakeFilenameSummaryPrepared(db: Database, source: IntakeEnvelopeSource): boolean {
+  if (!hasIntakeCollectionEnvelope(db, source)) return true;
+  const view = openIntakeCollectionEnvelope(db, source);
+  const intake = view.child(view.root(), 'intake');
+  if (!intake) throw Error('The selected filename header is missing');
+  const selected = view.field(intake, 'originalName', { bytes: 16384 });
+  if (selected.kind !== 'fragmented' || !selected.bytes) return true;
+  const cell = intakeEnvelopeFilenameCell(view, intake);
+  if (cell.facts === undefined) return false;
+  checkedFilenameFacts(view, intake);
+  return true;
+}
+
+function checkedFilenameFacts(view: IntakeCollectionEnvelopeReader, intake: IntakeEnvelopeRecord) {
+  const cell = intakeEnvelopeFilenameCell(view, intake);
+  if (cell.facts === undefined)
+    throw new HttpError(409, 'INTAKE_SUMMARY_UNAVAILABLE', 'Prepare the selected filename first.');
+  const facts = parseIntakeFilenameFacts(cell.facts);
+  if (facts.binding !== cell.binding || facts.bytes !== cell.bytes)
+    throw new HttpError(409, 'INTAKE_SUMMARY_UNAVAILABLE', 'The prepared filename is stale.');
+  return facts;
+}
 
 const caches = new WeakMap<Database, Map<string, IntakeFilename>>();
 /** The cache holds only a short preview, suffix classification and root pins. */
@@ -45,31 +173,12 @@ export function summaryFilename(
         'INTAKE_SUMMARY_UNAVAILABLE',
         'The selected original filename is unavailable.',
       );
-    let preview = '',
-      suffix = '',
-      units = 0,
-      bytes = 0;
-    const pieces = function* () {
-      for (const piece of view.fieldChunks(intake, 'originalName')) {
-        bytes += Buffer.byteLength(piece);
-        yield piece;
-      }
-    };
-    const scalar = hashIntakeJsonScalar(pieces(), [], (unit) => {
-      if (units++ < 120) preview += unit;
-      suffix = (suffix + unit).slice(-64);
-    });
-    if (scalar.kind !== 'string' || bytes !== selected.bytes)
-      throw new HttpError(
-        409,
-        'INTAKE_SUMMARY_UNAVAILABLE',
-        'The selected original filename is invalid.',
-      );
+    const facts = checkedFilenameFacts(view, intake);
+    const { preview, suffix, bytes } = facts;
     const retainOnly = isRetainOnlyIntake({ filename: suffix, mimeType });
     const packageSource = /zip/i.test(mimeType) || /\.zip$/i.test(suffix);
-    if (units <= 120) result = { filename: preview, retainOnly, packageSource };
+    if (!facts.truncated) result = { filename: preview, retainOnly, packageSource };
     else {
-      if (/[\uD800-\uDBFF]$/.test(preview)) preview = preview.slice(0, -1);
       result = {
         filenamePreview: preview,
         filenameTruncated: true,
@@ -80,12 +189,17 @@ export function summaryFilename(
           intakeId: id,
           field: 'originalName',
           pins: { ...pins },
-          scalarHash: scalar.hash,
+          scalarHash: facts.scalarHash,
           bytes,
         },
       };
     }
   }
+  if (result.filenameReference) {
+    Object.freeze(result.filenameReference.pins);
+    Object.freeze(result.filenameReference);
+  }
+  Object.freeze(result);
   cache.set(key, result);
   while (cache.size > 64) cache.delete(cache.keys().next().value!);
   return result;

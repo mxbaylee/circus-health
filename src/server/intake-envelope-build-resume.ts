@@ -13,6 +13,7 @@ import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
 import { intakeSourcePinKey } from './intake-source-pin.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
+import { FILENAME_FACTS_FORMAT } from './intake-filename-facts.ts';
 
 const FORMAT = 'health-intake-envelope-build-resume-v1';
 const COLLECTION = 'schema.resume';
@@ -47,6 +48,8 @@ export function prepareEnvelopeBuildResume(
   const binding = JSON.stringify({
     format: FORMAT,
     codec: ENVELOPE_SCHEMA,
+    filenameFacts: FILENAME_FACTS_FORMAT,
+    compactScalars: 'originalName+locator-v1',
     identity: selected.identity,
     logical: hash(selected.binding.logicalHead),
     details: hash(selected.source.details_json!),

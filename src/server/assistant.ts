@@ -1,4 +1,5 @@
 import { readNativeAssistantSourceHeader } from './assistant-intake-header.ts';
+import { intakeFilenameSummaryPrepared } from './intake-summary-name.ts';
 import { readStoredIntakeDetails } from './intake-state-access.ts';
 import { isIntakeSummary } from '../shared/intake-summary.ts';
 import {
@@ -91,6 +92,8 @@ import { clinicalRecordHistory } from './clinical-history.ts';
 import {
   getIntake,
   getIntakeRead,
+  hasNativeIntakeSchema,
+  prepareIntakeReadFilenames,
   intakeConversionChatId,
   getRetainedIntakeOriginalReference,
   verifyIntakeOriginal,
@@ -1844,7 +1847,7 @@ export function createAssistant({
   const nativeRepair = (profileId: string, value: unknown) =>
     object(value) &&
     typeof value.intakeId === 'string' &&
-    isIntakeSummary(getIntakeRead(dbFor(profileId), root, profileId, value.intakeId));
+    hasNativeIntakeSchema(dbFor(profileId), profileId, value.intakeId);
   const repairApplications = new Map<string, Promise<AssistantChat>>();
   const resolvedContext = (profileId: string, input: unknown): AssistantContext =>
     resolveIntakeDraftRepairContext(
@@ -1869,6 +1872,15 @@ export function createAssistant({
     if (isIntakeSummary(intake))
       return nativeAssistantConversion(db, root, profileId, chat.id, intake);
     return intake.workflow ? intakeWithWorkflow(intake) : null;
+  };
+  const conversionFilenamePending = (profileId: string, chat: AssistantChat): boolean => {
+    const id = chat.context?.intakeId;
+    if (!id) return false;
+    const db = dbFor(profileId);
+    if (!db.prepare("SELECT 1 FROM source_files WHERE id=? AND kind='intake_original'").get(id))
+      return false;
+    if (intakeConversionChatId(db, profileId, id) !== chat.id) return false;
+    return !intakeFilenameSummaryPrepared(db, { id });
   };
   const conversionCheckpoint = (
     chat: AssistantChat,
@@ -2248,6 +2260,14 @@ export function createAssistant({
     assertRunning();
     const db = dbFor(profileId),
       args = params.arguments;
+    if (
+      object(args) &&
+      typeof args.id === 'string' &&
+      db.prepare("SELECT 1 FROM source_files WHERE id=? AND kind='intake_original'").get(args.id)
+    ) {
+      await prepareIntakeReadFilenames(db, profileId, { id: args.id }, { assertRunning });
+      assertRunning();
+    }
     let descendantRead: CollectionDescendantRead | undefined;
     let descendantUnitId: string | undefined;
     if (state.beforeModelRequest && state.checkpoint?.activeUnitId) {
@@ -4054,7 +4074,8 @@ export function createAssistant({
     chat.error = null;
     const firstResponse =
       !chat.runs?.length && !chat.messages.some((message) => message.role === 'assistant');
-    const intake = conversionIntake(profileId, chat);
+    const filenamePending = conversionFilenamePending(profileId, chat);
+    const intake = filenamePending ? null : conversionIntake(profileId, chat);
     // Native scopes may require asynchronous maintenance before they can be read.
     let checkpoint: ConversionCheckpoint | null = isNativeAssistantConversion(intake)
       ? null
@@ -4065,6 +4086,7 @@ export function createAssistant({
       checkpoint.activeUnitId = conversionReadingState(checkpoint, intake!).workUnit?.id;
     }
     const firstAcquaintance =
+      !filenamePending &&
       !intake &&
       firstResponse &&
       !journalChats(profileId).some(
@@ -4272,7 +4294,6 @@ export function createAssistant({
           assertRunning();
           persist(profileId, chat, 'draft-repair-prepared');
         }
-        let initial = conversionIntake(profileId, chat);
         const preparationDb = dbFor(profileId);
         const assertPreparationRunning = () => {
           state.assertAuthorized?.('publish');
@@ -4283,6 +4304,18 @@ export function createAssistant({
           )
             throw new Error('Conversion stopped');
         };
+        if (conversionFilenamePending(profileId, chat)) {
+          await prepareIntakeReadFilenames(
+            preparationDb,
+            profileId,
+            {
+              id: chat.context!.intakeId,
+            },
+            { assertRunning: assertPreparationRunning },
+          );
+          assertPreparationRunning();
+        }
+        let initial = conversionIntake(profileId, chat);
         if (initial && !isNativeAssistantConversion(initial)) {
           // Prepare a retained conversion before its first model context. A later
           // invalid proposal must not migrate its source beneath a legacy ledger.

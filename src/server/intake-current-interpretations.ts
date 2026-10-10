@@ -27,18 +27,29 @@ interface Cached {
   result: Result;
 }
 const caches = new WeakMap<Database, Map<string, Cached>>();
-const stampQueries = new WeakMap<Database, ReturnType<Database['prepare']>>();
+const stampQueries = new WeakMap<
+  Database,
+  {
+    main: ReturnType<Database['prepare']>;
+    temp: ReturnType<Database['prepare']>;
+  }
+>();
 function stamp(db: Database) {
   let query = stampQueries.get(db);
   if (!query) {
-    query = db.prepare(
-      'SELECT total_changes() AS changes,(SELECT data_version FROM pragma_data_version) AS external,(SELECT schema_version FROM pragma_schema_version) AS schema',
-    );
-    query.setReadBigInts(true);
+    query = {
+      main: db.prepare(
+        'SELECT total_changes() AS changes,(SELECT data_version FROM pragma_data_version) AS external,(SELECT schema_version FROM pragma_schema_version) AS schema',
+      ),
+      temp: db.prepare('PRAGMA temp.schema_version'),
+    };
+    query.main.setReadBigInts(true);
+    query.temp.setReadBigInts(true);
     stampQueries.set(db, query);
   }
-  const value = query.get()!;
-  return `${value.changes}:${value.external}:${value.schema}`;
+  const value = query.main.get()!,
+    temp = query.temp.get()!;
+  return `${value.changes}:${value.external}:${value.schema}:${temp.schema_version}`;
 }
 function field<T>(
   view: IntakeCollectionEnvelopeReader,

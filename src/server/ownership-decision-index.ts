@@ -1,6 +1,13 @@
 /** Disposable scalar routing for accepted ownership evidence; journal rows remain authoritative. */
 import { setImmediate } from 'node:timers/promises';
 import { HttpError, type Database } from './database.ts';
+import {
+  beginIntakeFrontierAuxiliaryPreparation,
+  execIntakeFrontierAuxiliarySQL,
+  finishIntakeFrontierAuxiliaryPreparation,
+  prepareIntakeFrontierAuxiliaryInsert,
+  runIntakeFrontierAuxiliaryInsert,
+} from './intake-lookup-frontier-observer.ts';
 const TABLE = '__ownership_decision_index',
   META = '__ownership_decision_index_state';
 const projection = (row: string) =>
@@ -108,32 +115,45 @@ async function prepareIndex(db: Database, options: { assertRunning?: () => void 
     exceptionReads: { queries: 0, rows: 0 },
   };
   states.set(db, state);
-  for (const event of ['insert', 'delete', 'update'])
-    db.exec('DROP TRIGGER IF EXISTS temp.__ownership_decision_index_' + event);
-  db.exec('DROP TABLE IF EXISTS temp.' + TABLE);
-  db.exec('DROP TABLE IF EXISTS temp.' + META);
-  for (const sql of ddl) db.exec(sql);
-  db.exec('INSERT INTO ' + META + ' VALUES(1,0)');
-  state.schema = schema(db);
-  state.mainSchema = mainSchema(db);
-  const assertCurrent = () => {
-    options.assertRunning?.();
-    if (
-      version(db) !== state.dataVersion ||
-      schema(db) !== state.schema ||
-      mainSchema(db) !== state.mainSchema ||
-      Number(db.prepare('SELECT generation FROM ' + META).get()?.generation) !== 0
-    )
-      throw unavailable();
-  };
+  const frontier = beginIntakeFrontierAuxiliaryPreparation(db, 'ownership');
+  let complete = false;
   try {
-    const insert = db.prepare(
+    for (const event of ['insert', 'delete', 'update'])
+      execIntakeFrontierAuxiliarySQL(
+        db,
+        frontier,
+        'DROP TRIGGER IF EXISTS temp.__ownership_decision_index_' + event,
+      );
+    execIntakeFrontierAuxiliarySQL(db, frontier, 'DROP TABLE IF EXISTS temp.' + TABLE);
+    execIntakeFrontierAuxiliarySQL(db, frontier, 'DROP TABLE IF EXISTS temp.' + META);
+    for (const sql of ddl) execIntakeFrontierAuxiliarySQL(db, frontier, sql);
+    execIntakeFrontierAuxiliarySQL(db, frontier, 'INSERT INTO ' + META + ' VALUES(1,0)');
+    state.schema = schema(db);
+    state.mainSchema = mainSchema(db);
+    const assertCurrent = () => {
+      options.assertRunning?.();
+      if (
+        version(db) !== state.dataVersion ||
+        schema(db) !== state.schema ||
+        mainSchema(db) !== state.mainSchema ||
+        Number(db.prepare('SELECT generation FROM ' + META).get()?.generation) !== 0
+      )
+        throw unavailable();
+    };
+    const insert = prepareIntakeFrontierAuxiliaryInsert(
+      db,
+      frontier,
       'INSERT INTO ' + TABLE + ' VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
     );
     for (const row of db
       .prepare('SELECT ' + projection('m') + ' FROM manual_batches m ORDER BY id')
       .iterate()) {
-      insert.run(...Object.values(row));
+      runIntakeFrontierAuxiliaryInsert(
+        db,
+        frontier,
+        insert,
+        Object.values(row) as (string | number | bigint | null)[],
+      );
       state.coldRows++;
       if (state.coldRows % 64 === 0) {
         await setImmediate();
@@ -142,9 +162,12 @@ async function prepareIndex(db: Database, options: { assertRunning?: () => void 
     }
     assertCurrent();
     state.ready = true;
+    complete = true;
   } catch (error) {
     state.ready = false;
     throw error;
+  } finally {
+    finishIntakeFrontierAuxiliaryPreparation(db, frontier, complete);
   }
 }
 /** Legacy synchronous hosts retain their existing path until explicit native preparation. */

@@ -5,6 +5,8 @@ import { HttpError } from './database.ts';
 import type { Database } from './database.ts';
 import {
   getIntakeRead,
+  hasNativeIntakeSchema,
+  prepareIntakeReadFilenames,
   reviewIntake,
   saveIntakeDraftRepair,
   verifyIntakeOriginal,
@@ -390,7 +392,7 @@ export function resolveIntakeDraftRepairContext(
   const chosen = selection(context.intakeRepair);
   // Native dependency preparation runs before provider dispatch. This retains
   // only validated selected IDs while keeping chat creation synchronous.
-  if (isIntakeSummary(getIntakeRead(db, root, profileId, chosen.intakeId)))
+  if (hasNativeIntakeSchema(db, profileId, chosen.intakeId))
     return { ...context, intakeRepair: chosen };
   return {
     ...context,
@@ -428,7 +430,9 @@ export async function prepareIntakeDraftRepairScope(
           }
         : selection(value);
       options.assertRunning?.();
-      if (isIntakeSummary(getIntakeRead(db, root, profileId, chosen.intakeId)))
+      await prepareIntakeReadFilenames(db, profileId, { id: chosen.intakeId }, options);
+      options.assertRunning?.();
+      if (hasNativeIntakeSchema(db, profileId, chosen.intakeId))
         for (const proposalId of new Set(chosen.rows.map((row) => row.proposalId))) {
           await prepareCollectionClinicalReviewDependencies(
             db,
@@ -764,8 +768,7 @@ function repairOperationRecorded(
     corrections: IntakeDraftRepairUpdate['corrections'];
   },
 ): boolean {
-  const intake = getIntakeRead(db, root, profileId, id);
-  if (isIntakeSummary(intake)) {
+  if (hasNativeIntakeSchema(db, profileId, id)) {
     try {
       return retainedIntakeWorkflowCommand(
         db,
@@ -777,6 +780,9 @@ function repairOperationRecorded(
       throw new HttpError(409, 'DRAFT_REPAIR_RECEIPT', 'Saved repair receipt has another request');
     }
   }
+  const intake = getIntakeRead(db, root, profileId, id);
+  if (isIntakeSummary(intake))
+    throw new HttpError(409, 'DRAFT_REPAIR_STALE', 'The selected intake representation changed');
   const prior = (
     intake.workflow as
       | (typeof intake.workflow & {
@@ -928,7 +934,7 @@ function applyRepair(
     result: { changed: corrections.length, sourceUnchanged: true, acceptanceUnchanged: true },
   });
   if (repairOperationRecorded(db, root, profileId, retained.intakeId, request)) return completed();
-  if (isIntakeSummary(getIntakeRead(db, root, profileId, retained.intakeId))) {
+  if (hasNativeIntakeSchema(db, profileId, retained.intakeId)) {
     if (!nativeAsync)
       throw new HttpError(
         409,
@@ -1012,7 +1018,7 @@ export function intakeDraftRepairAssistantExtensions() {
           ...(window.kind === 'pdf_page' ? { page: window.page, offset: 0 } : {}),
           ...(window.kind === 'text' ? { offset: window.offset } : {}),
           modelContext: true,
-          pagedContext: isIntakeSummary(getIntakeRead(db, root, profileId, scope.intakeId)),
+          pagedContext: hasNativeIntakeSchema(db, profileId, scope.intakeId),
           captureSourceText: false,
           pdf: context.pdf === true && window.kind === 'pdf_page',
           assertRunning: assertRunning as () => void,

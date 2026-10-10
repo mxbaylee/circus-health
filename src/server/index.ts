@@ -32,7 +32,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { iterateIntakeEnvelopeText } from './intake-collection-envelope.ts';
-import { listIntakeReads, intakeConversionChatId } from './intake.ts';
+import { listIntakeReads, intakeConversionChatId, prepareIntakeReadFilenames } from './intake.ts';
+import { normalizeAssistantContext } from './assistant-context.ts';
+import { intakeIdentityRequestLifetime } from './intake-identity-request.ts';
 import { exportImportAttribution } from './intake-attribution.ts';
 import { prepareIntakeAttributionSources } from './intake-attribution-source.ts';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -347,6 +349,40 @@ export function createApp({
         const { data, ...meta } = result;
         respond(data, meta);
       };
+      const prepareFilenameRead = async (
+        input: Parameters<typeof prepareIntakeReadFilenames>[2],
+      ) => {
+        const lifetime = intakeIdentityRequestLifetime(req, res);
+        try {
+          await prepareIntakeReadFilenames(db, profileId, input, {
+            assertRunning() {
+              lifetime.signal.throwIfAborted();
+              if (dbs.get(profileId) !== db || lifecycle.isLocked(profileId))
+                throw new HttpError(409, 'PROFILE_BUSY', 'The selected profile changed');
+            },
+          });
+          lifetime.signal.throwIfAborted();
+        } finally {
+          lifetime.dispose();
+        }
+      };
+      const prepareAssistantFilenameRead = async (input: unknown) => {
+        const context = normalizeAssistantContext(input);
+        const repair = context.intakeRepair;
+        const repairId =
+          repair && typeof repair === 'object' && 'intakeId' in repair
+            ? repair.intakeId
+            : undefined;
+        for (const sourceId of new Set([context.intakeId, repairId])) {
+          if (
+            typeof sourceId === 'string' &&
+            db
+              .prepare("SELECT 1 FROM source_files WHERE id=? AND kind='intake_original'")
+              .get(sourceId)
+          )
+            await prepareFilenameRead({ id: sourceId });
+        }
+      };
       if (resource === 'import-diagnostics' && id === 'status' && method === 'GET') {
         send(res, 200, { data: { enabled: diagnostics.enabled } });
         return;
@@ -368,6 +404,7 @@ export function createApp({
         const eventArchive = await diagnostics.exportArchive(profileId, salt);
         let attribution: unknown;
         try {
+          await prepareFilenameRead({ list: { visibility: 'all', limit: 100 } });
           const intakes = listIntakeReads(db, profileId, { visibility: 'all', limit: 100 }, root);
           const metadata = assistant.attributionMetadata(
             profileId,
@@ -416,15 +453,26 @@ export function createApp({
           );
         } else if (id === 'chats' && parts.length === 2 && method === 'GET')
           respond(assistant.list(profileId));
-        else if (id === 'chats' && parts.length === 2 && method === 'POST')
-          respond(assistant.create(profileId, await jsonBody(req)));
-        else if (id === 'chats' && parts.length === 3 && method === 'GET')
+        else if (id === 'chats' && parts.length === 2 && method === 'POST') {
+          const input = await jsonBody(req);
+          await prepareAssistantFilenameRead(input);
+          respond(assistant.create(profileId, input));
+        } else if (id === 'chats' && parts.length === 3 && method === 'GET')
           respond(assistant.get(profileId, action));
         else if (id === 'chats' && parts.length === 4 && method === 'POST') {
-          if (parts[3] === 'messages')
-            respond(assistant.send(profileId, action, await jsonBody(req)));
-          else if (parts[3] === 'retry') respond(assistant.retry(profileId, action));
-          else if (parts[3] === 'cancel') respond(assistant.cancel(profileId, action));
+          if (parts[3] === 'messages') {
+            const input = await jsonBody(req);
+            await prepareAssistantFilenameRead({
+              context: assistant.get(profileId, action).context,
+            });
+            await prepareAssistantFilenameRead(input);
+            respond(assistant.send(profileId, action, input));
+          } else if (parts[3] === 'retry') {
+            await prepareAssistantFilenameRead({
+              context: assistant.get(profileId, action).context,
+            });
+            respond(assistant.retry(profileId, action));
+          } else if (parts[3] === 'cancel') respond(assistant.cancel(profileId, action));
           else if (parts[3] === 'apply')
             respond(
               await assistant.applyRead(

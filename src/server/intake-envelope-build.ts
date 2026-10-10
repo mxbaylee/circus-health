@@ -13,6 +13,7 @@ import {
   collectionCellReader,
   hasIntakeCollectionEnvelope,
   iterateSchemaEnvelopeText,
+  iterateSchemaCellText,
   selectedEnvelopeStore,
 } from './intake-collection-envelope.ts';
 import {
@@ -31,6 +32,8 @@ import {
   type EnvelopeBuildResume,
 } from './intake-envelope-build-resume.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
+import { prepareIntakeFilenameFactsSteps } from './intake-filename-facts.ts';
+import { ensureIntakeFrontierObserver } from './intake-lookup-frontier-observer.ts';
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 export async function buildIntakeCollectionEnvelope(
   ...input: Parameters<typeof buildIntakeCollectionEnvelopeOwned>
@@ -39,9 +42,19 @@ export async function buildIntakeCollectionEnvelope(
   return runExclusiveClinicalOperation(
     db,
     async (operation) => {
+      ensureIntakeFrontierObserver(db);
       // A previous queued caller may have completed this exact current source.
       // The authenticated predicate still validates selected authority and schema.
-      if (hasIntakeCollectionEnvelope(db, source)) return undefined;
+      if (hasIntakeCollectionEnvelope(db, source)) {
+        const { prepareIntakeFilenameSummary } = await import('./intake-summary-name.ts');
+        await prepareIntakeFilenameSummary(db, source, {
+          assertRunning() {
+            assertClinicalOperation(db, operation);
+            options.assertRunning?.();
+          },
+        });
+        return undefined;
+      }
       return buildIntakeCollectionEnvelopeOwned(db, source, {
         ...options,
         assertRunning() {
@@ -347,6 +360,37 @@ export function createEnvelopeBuildWriter(
     else changes.push(change);
     await flush();
   };
+  const filenameFacts = async (id: string) => {
+    await flush();
+    options.assertRunning?.();
+    const { store } = collectionCellReader(db, source, 'builds', build);
+    const value = store.get('c:' + id);
+    if (!value) throw Error('The selected filename is missing');
+    if (typeof value === 'string' || value.bytes <= 16384) {
+      if (peek('q:' + id) !== undefined) await remove('q:' + id);
+      return;
+    }
+    const binding = store.byteBinding!(value);
+    const steps = prepareIntakeFilenameFactsSteps(iterateSchemaCellText(store, 'c:' + id), binding);
+    try {
+      for (;;) {
+        options.assertRunning?.();
+        const next = steps.next();
+        options.assertRunning?.();
+        if (next.done) {
+          const current = store.get('c:' + id);
+          if (!current || typeof current === 'string' || store.byteBinding!(current) !== binding)
+            throw Error('The selected filename changed during preparation');
+          await put('q:' + id, JSON.stringify(next.value));
+          return;
+        }
+        await setImmediate();
+        options.assertRunning?.();
+      }
+    } finally {
+      steps.return(undefined as never);
+    }
+  };
   async function record(
     text: string,
     start: number,
@@ -396,6 +440,12 @@ export function createEnvelopeBuildWriter(
           target = { type: 'record', id: occurrence };
         } else {
           await cell('c:' + occurrence, text.slice(entry.start, entry.end));
+          if (
+            kind === 'intake' &&
+            entry.name !== undefined &&
+            ['originalName', 'locator'].includes(entry.name)
+          )
+            await filenameFacts(occurrence);
           target = { type: 'cell', id: occurrence };
         }
         const field = schemaKey(entry.name!);
@@ -433,5 +483,5 @@ export function createEnvelopeBuildWriter(
       await put('j:' + parent + ':' + schemaKey(kind, publicId), id);
     }
   }
-  return { put, cell, cellPieces, flush, record, peek, remove };
+  return { put, cell, cellPieces, filenameFacts, flush, record, peek, remove };
 }

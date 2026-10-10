@@ -16,6 +16,10 @@ import {
 } from './intake-state-access.ts';
 import { readIntakeEnvelopeText } from './intake-authority.ts';
 import {
+  expectIntakeFrontierMetaWrite,
+  finishIntakeFrontierMetaWrite,
+} from './intake-lookup-frontier-observer.ts';
+import {
   openIntakeCollectionEnvelope,
   hasIntakeCollectionEnvelope,
   selectedEnvelopeStore,
@@ -450,9 +454,21 @@ function mutate<T>(db: DatabaseSync, fn: () => T, operation: TransactionOperatio
     db,
     () => {
       const result = fn();
-      db.prepare(
-        "INSERT INTO app_meta(key,value) VALUES('intake_mutation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-      ).run(String(revision(db) + 1));
+      const expectedRevision = expectIntakeFrontierMetaWrite(db, 'intake_mutation_revision', [
+        'insert',
+        'update',
+      ]);
+      let revisionWritten = false;
+      try {
+        revisionWritten =
+          db
+            .prepare(
+              "INSERT INTO app_meta(key,value) VALUES('intake_mutation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            )
+            .run(String(revision(db) + 1)).changes === 1;
+      } finally {
+        finishIntakeFrontierMetaWrite(db, expectedRevision, revisionWritten);
+      }
       return result;
     },
     operation,
@@ -551,6 +567,29 @@ export function listIntakeReads(
   root: string | null = null,
 ) {
   return listIntakeRows(db, profileId, options, (file) => intakeRead(db, root, profileId, file));
+}
+/** Prepare only the selected public page, without decoding its giant scalars
+ * on the synchronous presentation path. Legacy reads retain their contract. */
+export async function prepareIntakeReadFilenames(
+  db: DatabaseSync,
+  profileId: string,
+  input: { id?: string; list?: IntakeListOptions } = {},
+  options: { assertRunning?: () => void } = {},
+) {
+  const assertRunning = () => {
+    owner(db, profileId);
+    options.assertRunning?.();
+  };
+  assertRunning();
+  const files = input.id
+    ? [row(db, input.id)]
+    : listIntakeRows(db, profileId, input.list ?? {}, (file) => file).data;
+  const { prepareIntakeFilenameSummary } = await import('./intake-summary-name.ts');
+  for (const file of files) {
+    assertRunning();
+    await prepareIntakeFilenameSummary(db, file, { assertRunning });
+    assertRunning();
+  }
 }
 function listIntakeRows<T>(
   db: DatabaseSync,
@@ -659,6 +698,11 @@ function intakeRead(
 function hasCollectionIntakeSchema(db: DatabaseSync, file: SourceFileRow): boolean {
   return hasIntakeCollectionEnvelope(db, file);
 }
+/** Storage classification does not depend on presentation derivatives being ready. */
+export function hasNativeIntakeSchema(db: DatabaseSync, profileId: string, id: string): boolean {
+  owner(db, profileId);
+  return hasCollectionIntakeSchema(db, row(db, id));
+}
 /** Explicit, counted compatibility preparation before new public work. The
  * selected source and public version stay unchanged; a failed build leaves the
  * prior representation readable and a later call may retry it. */
@@ -675,7 +719,11 @@ export async function ensureNativeIntakeSchema(
       options.assertRunning?.();
       // Check readiness only after admission. A preceding owner may have built
       // this source; there is no external pending promise to wait on in the lane.
-      if (hasCollectionIntakeSchema(db, row(db, id))) return;
+      if (hasCollectionIntakeSchema(db, row(db, id))) {
+        const { prepareIntakeFilenameSummary } = await import('./intake-summary-name.ts');
+        await prepareIntakeFilenameSummary(db, row(db, id), options);
+        return;
+      }
       const { buildIntakeCollectionEnvelope } = await import('./intake-envelope-build.ts');
       await buildIntakeCollectionEnvelope(db, row(db, id), options);
       owner(db, profileId);

@@ -8,12 +8,25 @@ import type {
 import { selectedSequence } from './intake-selected-sequence.ts';
 import { canonicalLiteral, registerLiteralSharedValue } from './intake-format.ts';
 import { registerReviewCanonicalValue } from './intake-review-question-state.ts';
-const selections = new WeakMap<object, () => Iterable<IntakeReviewGroupReference>>();
+const selections = new WeakMap<
+  object,
+  {
+    read: () => Iterable<IntakeReviewGroupReference>;
+    at?: (ordinal: number) => IntakeReviewGroupReference | undefined;
+  }
+>();
 export function selectedReportGroups(value: IntakeReviewGroupLinks | undefined) {
   if (!value || Array.isArray(value)) return selectedSequence(value);
   const read = selections.get(value);
   if (!read) throw Error('Unbound selected report-group reference');
-  return selectedSequence(read);
+  return selectedSequence(read.read);
+}
+export function selectedReportGroupAt(value: IntakeReviewGroupLinks | undefined, ordinal: number) {
+  if (!Number.isSafeInteger(ordinal) || ordinal < 0) return undefined;
+  if (!value || Array.isArray(value)) return value?.[ordinal];
+  const selection = selections.get(value);
+  if (!selection?.at) throw Error('Unprepared selected report-group point read');
+  return ordinal < value.count ? selection.at(ordinal) : undefined;
 }
 export function isSelectedReportGroups(value: unknown): value is IntakeReviewGroupLinksReference {
   return !!value && typeof value === 'object' && selections.has(value);
@@ -27,6 +40,7 @@ export function* selectedReportGroupLinksWork(
   read: () => Iterable<IntakeReviewGroupReference>,
   selection: IntakeReviewGroupLinksReference['selection'],
   bytes: number,
+  at?: (ordinal: number) => IntakeReviewGroupReference | undefined,
 ): Generator<void, IntakeReviewGroupLinks, void> {
   let inline: IntakeReviewGroupReference[] | undefined = [],
     count = 0,
@@ -49,7 +63,7 @@ export function* selectedReportGroupLinksWork(
     ...(first ? { first: Object.freeze(first) } : {}),
     selection: Object.freeze(selection),
   });
-  selections.set(reference, read);
+  selections.set(reference, { read, at });
   registerLiteralSharedValue(reference);
   registerReviewCanonicalValue(reference, function* () {
     yield '[';

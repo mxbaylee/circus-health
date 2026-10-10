@@ -38,6 +38,7 @@ export function* legacyDraftPolicyContributions(
     }
     for (const draft of selectedDrafts ?? drafts()) {
       const format = view.field(draft, 'format', { bytes: 256 });
+      if (++visited % 64 === 0) yield { checkpoint: true };
       if (format.kind === 'value' && format.value === 'health-intake-review-draft-v2') continue;
       scratch.db.exec('DELETE FROM witnesses');
       for (
@@ -69,7 +70,6 @@ export function* legacyDraftPolicyContributions(
           key: prefix(view.address(draft)) + row.kind + ':' + row.issue,
           value: JSON.stringify({ ordinal: row.ordinal, address: row.address }),
         };
-      if (++visited % 64 === 0) yield { checkpoint: true };
     }
   } finally {
     scratch.close();

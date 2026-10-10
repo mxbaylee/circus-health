@@ -139,8 +139,33 @@ export interface IntakePackageFailurePage {
   format: 'health-intake-package-failure-page-v1';
   intakeId: string;
   pins: IntakeSummaryPins;
-  entries: { key: string; failure: IntakePackageFailure }[];
+  entries: {
+    key: string;
+    failure: Omit<IntakePackageFailure, 'originalFilename' | 'filename' | 'locator'> &
+      Partial<Pick<IntakePackageFailure, 'originalFilename' | 'filename' | 'locator'>>;
+    fieldReferences?: Partial<
+      Record<IntakePackageFailureField, IntakePackageFailureFieldReference>
+    >;
+  }[];
   total: number;
+  complete: boolean;
+  nextCursor: string | null;
+}
+
+export type IntakePackageFailureField = 'originalFilename' | 'filename' | 'locator';
+export interface IntakePackageFailureFieldReference {
+  format: 'health-intake-package-failure-field-reference-v1';
+  intakeId: string;
+  key: string;
+  field: IntakePackageFailureField;
+  pins: IntakeSummaryPins;
+  bytes: number;
+}
+export interface IntakePackageFailureFieldFragment {
+  format: 'health-intake-package-failure-field-fragment-v1';
+  reference: IntakePackageFailureFieldReference;
+  encoding: 'json-string';
+  text: string;
   complete: boolean;
   nextCursor: string | null;
 }

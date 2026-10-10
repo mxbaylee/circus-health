@@ -4,6 +4,18 @@ Evidence decoding and private historical-graph validation now avoid redundant UT
 
 This procedure serves the Operator's [operate and recover](../design/personas.md#operate-and-recover) job on the supported localhost npm → Docker Compose → LiteLLM installation. It covers a checked update from supported authority and recovery from a failed candidate using a separately retained backup. Review the limits before updating: recovery returns the backup's state, so writes made after that backup are not recovered by this procedure. General downgrade compatibility and rollback prevention are not provided.
 
+Large native filenames now have checked, versioned derivative facts and pinned
+exact-fragment reads. Restart into the reviewed build and reload open Import
+views so shortened names use the current references. Complete older native
+envelopes prepare missing facts cooperatively before HTTP or assistant
+presentation; original bytes, selected envelope syntax and public/domain version
+remain unchanged. Interrupted builder transcripts use a new recipe discriminator
+and do not reuse an older partial transcript as a matching prefix. Keep the
+checked pre-update backup for prior-build recovery; this is not a general
+downgrade qualification. Compact source-row contraction is not yet activated:
+large original names and child locators still incur separate metadata work.
+See the [bounded-view contract](../data/intake-bounded-views.md).
+
 Native Import report-group pages now use a disposable indexed group order and retained page totals. After updating, reload an open Import queue if its older group cursor is refused; its cursor is navigation state and is not portable across this change. No original, accepted-record or operator-configuration migration is required. The prior build continues to use its own queue ordering and cache behavior. See the [report review queue contract](../../src/server/INTAKE.md#report-review-queue).
 
 Native identity reviews add an optional complete evidence commitment for one

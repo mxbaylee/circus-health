@@ -917,8 +917,8 @@ for (const target of ['maximum', 'receipt'] as const)
       const row = Reflect.apply(original, this, parameters);
       if (
         !changed &&
-        this.sourceSQL.includes('FROM source_files f LEFT JOIN') &&
-        this.sourceSQL.includes('WHERE f.id=?')
+        this.sourceSQL.includes('FROM main.source_files') &&
+        this.sourceSQL.includes('WHERE id=?')
       ) {
         changed = true;
         f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-point-change', target);

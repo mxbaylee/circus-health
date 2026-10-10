@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import { setImmediate } from 'node:timers';
 import { setImmediate as immediate } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
+import { writeChat, clearChatJournalCache } from '../assistant-journal.ts';
+import { clearJournalActivityIndex, journalActivityBinding } from '../journal-activity-index.ts';
 import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
@@ -335,5 +338,90 @@ test(
     assert.equal(detailStarted, true);
     const detail = await getIntakeReportQueueGroupRead(f.db, f.root, f.profileId, groupId);
     assert.ok('format' in detail && detail.format === 'health-intake-report-detail-v2');
+  },
+);
+
+test(
+  'native queue cancellation stops cold activity replay before its successor',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t);
+    const { source, groupId } = await nativeReport(f);
+    await prepareCollectionQueueRead(f.db, f.root, f.profileId);
+    t.after(() => {
+      clearJournalActivityIndex(f.root, f.profileId);
+      clearChatJournalCache(f.root);
+    });
+    writeChat(
+      f.root,
+      f.profileId,
+      {
+        id: randomUUID(),
+        status: 'running',
+        context: { intakeId: source.id },
+        messages: [{ content: 'Fictional activity '.repeat(16000) }],
+        operations: [],
+      },
+      'initial',
+    );
+    clearJournalActivityIndex(f.root, f.profileId);
+    const controller = new AbortController();
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const originalExec = DatabaseSync.prototype.exec;
+    let strings = 0;
+    let scratchPath: string | undefined;
+    DatabaseSync.prototype.exec = function (sql) {
+      const result = originalExec.call(this, sql);
+      if (sql.startsWith('CREATE TABLE IF NOT EXISTS journal_nodes'))
+        scratchPath = this.location() ?? undefined;
+      return result;
+    };
+    DatabaseSync.prototype.prepare = function (sql) {
+      const statement = originalPrepare.call(this, sql);
+      if (sql === 'INSERT INTO journal_strings VALUES(?,?,?)') {
+        const run = statement.run.bind(statement);
+        statement.run = ((...args: unknown[]) => {
+          if (typeof args[2] === 'string' && Buffer.byteLength(args[2]) >= 8192)
+            if (++strings === 1) setImmediate(() => controller.abort());
+          return Reflect.apply(run, statement, args);
+        }) as typeof statement.run;
+      }
+      return statement;
+    };
+    try {
+      await assert.rejects(
+        getIntakeReportQueueGroupRead(
+          f.db,
+          f.root,
+          f.profileId,
+          groupId,
+          {},
+          { signal: controller.signal },
+        ),
+        { name: 'AbortError' },
+      );
+      assert.ok(strings > 0, 'actual native queue reached cold activity parsing');
+      assert.ok(
+        strings <= 2,
+        `cancellation stops at the next bounded parse turn: ${strings} large chunks`,
+      );
+      assert.ok(scratchPath);
+      assert.equal(existsSync(scratchPath), false, 'abandoned activity scratch is deleted');
+      assert.throws(() => journalActivityBinding(f.root, f.profileId), {
+        code: 'JOURNAL_ACTIVITY_NOT_PREPARED',
+      });
+      const stopped = strings;
+      await immediate();
+      assert.equal(strings, stopped, 'no detached activity work remains');
+    } finally {
+      DatabaseSync.prototype.prepare = originalPrepare;
+      DatabaseSync.prototype.exec = originalExec;
+    }
+    const detail = await getIntakeReportQueueGroupRead(f.db, f.root, f.profileId, groupId);
+    assert.ok('format' in detail && detail.format === 'health-intake-report-detail-v2');
+    assert.equal(
+      f.db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(source.id)?.sha256,
+      source.sha256,
+    );
   },
 );

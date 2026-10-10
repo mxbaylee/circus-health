@@ -34,6 +34,7 @@ import {
 } from './intake-lookup-state.ts';
 import { consumeWorkflowReceiptAppendProof } from './intake-workflow-update.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
+import { protectedIntakeLookupTempShadow } from './intake-lookup-frontier-observer.ts';
 export {
   prepareIntakeLookupIndices,
   intakeDiscoveryRevision,
@@ -77,7 +78,10 @@ interface Connection {
   hashes?: ReturnType<typeof disposableSqlite>;
   entries: WeakMap<object, Map<string, ProjectionRow>>;
   nativeCatalog?: NativeLookupCatalog & { token: object };
-  nativeReceiptAppend?: { members: ReadonlyMap<string, NativeReceiptAppend> };
+  nativeReceiptAppend?: {
+    members: ReadonlyMap<string, NativeReceiptAppend>;
+    outcomeToken?: object;
+  };
   catalogAttempt?: object;
 }
 const connections = new WeakMap<DatabaseSync, Connection>();
@@ -179,15 +183,35 @@ function tracking(db: DatabaseSync): void {
   const markDirty = (id: string) =>
     `INSERT INTO __intake_lookup_dirty(source_id) SELECT ${id}
       WHERE NOT EXISTS(SELECT 1 FROM __intake_lookup_dirty WHERE source_id=${id});`;
-  db.exec(`CREATE TEMP TABLE IF NOT EXISTS __intake_lookup_dirty(source_id TEXT PRIMARY KEY);
-    CREATE TEMP TABLE IF NOT EXISTS __intake_lookup_authorities(authority_key TEXT PRIMARY KEY,source_id TEXT NOT NULL UNIQUE);
-    CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_insert AFTER INSERT ON main.source_files BEGIN
-      ${markDirty('NEW.id')} END;
-    CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_update AFTER UPDATE ON main.source_files BEGIN
-      ${markDirty('OLD.id')}
-      ${markDirty('NEW.id')} END;
-    CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_delete AFTER DELETE ON main.source_files BEGIN
-      ${markDirty('OLD.id')} END;`);
+  const statements = [
+    `CREATE TEMP TABLE IF NOT EXISTS __intake_lookup_dirty(source_id TEXT PRIMARY KEY)`,
+    `CREATE TEMP TABLE IF NOT EXISTS __intake_lookup_authorities(authority_key TEXT PRIMARY KEY,source_id TEXT NOT NULL UNIQUE)`,
+    `CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_insert AFTER INSERT ON main.source_files BEGIN ${markDirty('NEW.id')} END`,
+    `CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_update AFTER UPDATE ON main.source_files BEGIN ${markDirty('OLD.id')} ${markDirty('NEW.id')} END`,
+    `CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_delete AFTER DELETE ON main.source_files BEGIN ${markDirty('OLD.id')} END`,
+  ];
+  const names = [
+    '__intake_lookup_dirty',
+    '__intake_lookup_authorities',
+    '__intake_lookup_insert',
+    '__intake_lookup_update',
+    '__intake_lookup_delete',
+  ];
+  const existing = new Map(
+    db
+      .prepare(
+        `SELECT name,sql FROM sqlite_temp_master WHERE name IN (${names.map(() => '?').join(',')})`,
+      )
+      .all(...names)
+      .map((row) => [String(row.name), String(row.sql)]),
+  );
+  const canonical = (statement: string) =>
+    statement.replace(/^CREATE TEMP (TABLE|TRIGGER) IF NOT EXISTS /, 'CREATE $1 ');
+  for (let index = 0; index < names.length; index++) {
+    const actual = existing.get(names[index]!);
+    if (actual !== undefined && actual !== canonical(statements[index]!)) fail('tracking schema');
+    if (actual === undefined) db.exec(statements[index]!);
+  }
 }
 function initialize(db: DatabaseSync, connection: Connection, profile: string): void {
   // Reconstruction cannot inherit text retained by an aborted attempt or an
@@ -682,6 +706,7 @@ function current(db: DatabaseSync): Connection {
     clearIntakeLookupCache(db);
     fail('closed');
   }
+  if (protectedIntakeLookupTempShadow(db)) fail('protected lookup TEMP shadow');
   const authority = recordDurabilityStatus(db);
   if (authority?.dirty) {
     clearIntakeLookupCache(db);
@@ -742,6 +767,14 @@ interface NativeLookupCatalog {
   generation: object;
   attempt: object;
   unsafeMaximum: boolean;
+  allOriginalsNative: boolean;
+}
+export interface AdvancedNativeLookupSource {
+  sourceId: string;
+  sourceOrder: number;
+  sourceHash: string;
+  authorityKey: string;
+  logicalHead: string;
 }
 interface NativeReceiptAppend {
   catalog: NativeLookupCatalog & { token: object };
@@ -771,6 +804,51 @@ export function discardNativeIntakeLookupCatalog(db: DatabaseSync): void {
     connection.nativeCatalog = undefined;
     connection.nativeReceiptAppend = undefined;
   }
+}
+/** An old token may only enter the changed-source transition from a complete native catalog. */
+export function nativeIntakeLookupCatalogAllOriginalsNative(
+  db: DatabaseSync,
+  token: object,
+): boolean {
+  const connection = connections.get(db);
+  return (
+    connection?.nativeCatalog?.token === token &&
+    connection.nativeCatalog.generation === connection.generation &&
+    connection.nativeCatalog.allOriginalsNative &&
+    !connection.nativeCatalog.unsafeMaximum
+  );
+}
+/** Only a prior complete native catalog can prove a bounded head rewrite kept the same source digest. */
+export function nativeIntakeLookupCatalogHeadBindingsEqual(
+  db: DatabaseSync,
+  token: object,
+  sourceIds: readonly string[],
+): boolean {
+  if (!nativeIntakeLookupCatalogAllOriginalsNative(db, token) || sourceIds.length > 100)
+    return false;
+  const catalog = connections.get(db)?.nativeCatalog;
+  if (!catalog) return false;
+  const sourceRow = db.prepare(
+    "SELECT rowid source_order,id,kind,sha256,details_json FROM main.source_files WHERE id=? AND kind='intake_original'",
+  );
+  const oldRow = catalog.scratch.db.prepare('SELECT * FROM sources WHERE source_id=?');
+  for (const id of sourceIds) {
+    const source = sourceRow.get(id) as
+      (IntakeEnvelopeSource & { source_order: number }) | undefined;
+    const prior = oldRow.get(id);
+    if (
+      !source ||
+      !prior ||
+      !Number.isSafeInteger(source.source_order) ||
+      prior.source_order !== source.source_order ||
+      prior.source_hash !== source.sha256
+    )
+      return false;
+    const binding = intakeEnvelopeAuthorityBinding(db, source);
+    if (typeof binding.key !== 'string' || binding.logicalHead !== prior.authority_head)
+      return false;
+  }
+  return true;
 }
 /** The old complete source/index is checked before the owner starts its write. */
 export function nativeIntakeReceiptAppendBasis(
@@ -826,8 +904,13 @@ export function retainNativeIntakeReceiptAppend(
   source: IntakeEnvelopeSource,
   before: string,
   after: string,
+  outcomeToken?: object,
 ): void {
-  retainNativeIntakeReceiptAppendBatch(db, [{ basis, proof, reader, source, before, after }]);
+  retainNativeIntakeReceiptAppendBatch(
+    db,
+    [{ basis, proof, reader, source, before, after }],
+    outcomeToken,
+  );
 }
 export function retainNativeIntakeReceiptAppendBatch(
   db: Database,
@@ -839,6 +922,7 @@ export function retainNativeIntakeReceiptAppendBatch(
     before: string;
     after: string;
   }[],
+  outcomeToken?: object,
 ): void {
   const connection = connections.get(db);
   if (!items.length || items.length > 100) {
@@ -909,7 +993,173 @@ export function retainNativeIntakeReceiptAppendBatch(
     )
   )
     return;
-  connection.nativeReceiptAppend = { members };
+  connection.nativeReceiptAppend = { members, outcomeToken };
+}
+
+/** Advance one complete disposable catalog only from the final owned append outcome. */
+export async function advanceNativeIntakeLookupCatalog(
+  db: DatabaseSync,
+  oldToken: object,
+  nextToken: object,
+  changedHeads: readonly string[],
+  ordinaryToken: object | undefined,
+  current: () => boolean,
+  options: { assertRunning?: () => void },
+): Promise<readonly AdvancedNativeLookupSource[] | undefined> {
+  const connection = connections.get(db);
+  const catalog = connection?.nativeCatalog;
+  const batch = connection?.nativeReceiptAppend;
+  if (connection) connection.nativeReceiptAppend = undefined;
+  if (!connection || !catalog || catalog.token !== oldToken || catalog.unsafeMaximum) return;
+  const members = batch?.members;
+  if (
+    (changedHeads.length > 0 && (!ordinaryToken || batch?.outcomeToken !== ordinaryToken)) ||
+    (changedHeads.length === 0 && ordinaryToken !== undefined) ||
+    changedHeads.length > 100 ||
+    changedHeads.length !== (members?.size ?? 0) ||
+    changedHeads.some((id) => !members?.has(id))
+  )
+    return;
+  const scratch = catalog.scratch.db;
+  const changed: AdvancedNativeLookupSource[] = [];
+  const cast = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n");
+  cast.setReadBigInts(true);
+  let units = 0;
+  const checkpoint = () => {
+    options.assertRunning?.();
+    if (!current()) throw Error('Intake lookup frontier changed');
+    return ++units % 64 === 0;
+  };
+  const cooperate = async () => {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    options.assertRunning?.();
+    if (!current()) throw Error('Intake lookup frontier changed');
+  };
+  try {
+    if (!current()) return;
+    for (const member of [...(members?.values() ?? [])].sort(
+      (a, b) => a.sourceOrder - b.sourceOrder,
+    )) {
+      if (checkpoint()) await cooperate();
+      if (member.catalog !== catalog || member.generation !== connection.generation) return;
+      const source = db
+        .prepare(
+          "SELECT rowid source_order,id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+        )
+        .get(member.sourceId) as (IntakeEnvelopeSource & { source_order: number }) | undefined;
+      if (
+        !source ||
+        !Number.isSafeInteger(source.source_order) ||
+        source.source_order !== member.sourceOrder ||
+        source.sha256 !== member.sourceHash
+      )
+        return;
+      const binding = intakeEnvelopeAuthorityBinding(db, source);
+      if (
+        binding.logicalHead !== member.after ||
+        typeof binding.key !== 'string' ||
+        !hasIntakeCollectionEnvelope(db, source)
+      )
+        return;
+      const prior = scratch.prepare('SELECT * FROM sources WHERE source_id=?').get(member.sourceId);
+      if (
+        !prior ||
+        prior.source_order !== member.sourceOrder ||
+        prior.source_hash !== member.sourceHash ||
+        prior.authority_head !== member.before
+      )
+        return;
+      const view = nativeReader(db, {
+        ...source,
+        source_order: member.sourceOrder,
+        sha256: member.sourceHash,
+        authority_head: member.after,
+      });
+      const maximum = readNativeIntakeLookupTarget(
+        db,
+        source,
+        view,
+        'lookup-discovery-maximum',
+        [],
+      );
+      const oldMaximum = scratch
+        .prepare('SELECT source_id,value FROM maximum WHERE singleton=1')
+        .get();
+      let nextMaximum: bigint | null = null;
+      let maximumAddress: string | undefined;
+      if (maximum) {
+        const text = boundedIntakeLookupText(view.fieldChunks(maximum, 'discoveryOrder'));
+        nextMaximum = cast.get(text)!.n as bigint | null;
+        if (
+          nextMaximum !== null &&
+          (nextMaximum < BigInt(Number.MIN_SAFE_INTEGER) ||
+            nextMaximum > BigInt(Number.MAX_SAFE_INTEGER))
+        )
+          return;
+        maximumAddress = view.address(maximum);
+      }
+      if (
+        oldMaximum?.source_id === member.sourceId &&
+        (nextMaximum === null || nextMaximum < BigInt(oldMaximum.value as number | bigint))
+      )
+        return;
+      for (const item of member.rows) {
+        if (checkpoint()) await cooperate();
+        const selected = readNativeIntakeLookupTarget(
+          db,
+          source,
+          view,
+          'lookup-acceptance-operation-first',
+          [item.operation],
+        );
+        const existing = scratch
+          .prepare('SELECT address FROM acceptances WHERE operation=? AND source_id=?')
+          .get(item.operation, member.sourceId);
+        if (!selected || view.address(selected) !== (existing?.address ?? item.address)) return;
+        connection.counters.nativeReceiptRowsWritten += Number(
+          scratch
+            .prepare('INSERT OR IGNORE INTO acceptances VALUES(?,?,?,?)')
+            .run(item.operation, member.sourceId, member.sourceOrder, item.address).changes,
+        );
+      }
+      scratch
+        .prepare('UPDATE sources SET authority_head=? WHERE source_id=?')
+        .run(member.after, member.sourceId);
+      if (nextMaximum !== null && maximumAddress !== undefined)
+        scratch
+          .prepare(
+            `INSERT INTO maximum VALUES(1,?,?,?,?,?,?)
+            ON CONFLICT(singleton) DO UPDATE SET source_id=excluded.source_id,
+            source_order=excluded.source_order,source_hash=excluded.source_hash,
+            authority_head=excluded.authority_head,address=excluded.address,value=excluded.value
+            WHERE excluded.value>maximum.value OR
+              (excluded.value=maximum.value AND
+                (excluded.source_order<maximum.source_order OR
+                  excluded.source_id=maximum.source_id))`,
+          )
+          .run(
+            member.sourceId,
+            member.sourceOrder,
+            member.sourceHash,
+            member.after,
+            maximumAddress,
+            nextMaximum,
+          );
+      else if (oldMaximum?.source_id === member.sourceId) return;
+      changed.push({
+        sourceId: member.sourceId,
+        sourceOrder: member.sourceOrder,
+        sourceHash: member.sourceHash,
+        authorityKey: binding.key,
+        logicalHead: member.after,
+      });
+    }
+    if (!current()) return;
+    catalog.token = nextToken;
+    return changed;
+  } finally {
+    if (catalog.token !== nextToken) discardNativeIntakeLookupCatalog(db);
+  }
 }
 /** Read-only, checkpointed derivation. No incomplete catalog can answer a miss. */
 export async function buildNativeIntakeLookupCatalog(
@@ -984,11 +1234,13 @@ export async function buildNativeIntakeLookupCatalog(
       }
     };
     let unsafeMaximum = false;
+    let allOriginalsNative = true;
     for (const row of originalSourceRows(db)) {
       options.assertRunning?.();
       if (!isCurrent()) return undefined;
       const source = checkedNativeSource(db, row);
       if (!source) {
+        allOriginalsNative = false;
         if (!(await checkpoint(String(row.id), 0))) return undefined;
         continue;
       }
@@ -1114,7 +1366,7 @@ export async function buildNativeIntakeLookupCatalog(
       if (!(await checkpoint(cursor, 0))) return undefined;
     }
     retained = true;
-    return { scratch, generation, attempt, unsafeMaximum };
+    return { scratch, generation, attempt, unsafeMaximum, allOriginalsNative };
   } finally {
     stopClose();
     if (!retained) scratch.close();
@@ -1157,21 +1409,24 @@ function catalogTarget(
 ) {
   const source = db
     .prepare(
-      `SELECT f.id,f.kind,f.sha256,f.details_json,f.rowid source_order,
-    s.authority_head,s.identity_first FROM source_files f LEFT JOIN ${table('sources')} s
-    ON s.source_id=f.id WHERE f.id=?`,
+      'SELECT id,kind,sha256,details_json,rowid source_order FROM main.source_files WHERE id=?',
     )
     .get(pointer.source_id);
+  const binding = source
+    ? intakeEnvelopeAuthorityBinding(db, source as unknown as IntakeEnvelopeSource)
+    : undefined;
+  const selected =
+    source && binding?.logicalHead !== undefined
+      ? ({ ...source, authority_head: binding.logicalHead } as unknown as NativeSource)
+      : undefined;
   if (
-    !source ||
-    source.kind !== 'intake_original' ||
-    source.source_order !== pointer.source_order ||
-    source.sha256 !== pointer.source_hash ||
-    source.identity_first !== -1 ||
-    source.authority_head !== pointer.authority_head
+    !selected ||
+    selected.kind !== 'intake_original' ||
+    selected.source_order !== pointer.source_order ||
+    selected.sha256 !== pointer.source_hash ||
+    selected.authority_head !== pointer.authority_head
   )
     return fail('native catalog source binding changed');
-  const selected = source as unknown as NativeSource;
   const view = nativeReader(db, selected);
   const record = readNativeIntakeLookupTarget(db, selected, view, index, key);
   if (!record || view.address(record) !== pointer.address)
@@ -1179,38 +1434,57 @@ function catalogTarget(
   return { view, record };
 }
 export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
-  const connection = current(db);
-  let maximum = db
-    .prepare(
-      `SELECT MAX(g.discovery_order) n FROM ${table('groups')} g JOIN ${table('sources')} s ON s.source_id=g.source_id WHERE s.identity_first IS NULL OR s.identity_first<>-1`,
-    )
-    .get()!.n;
-  const catalog = checkedNativeCatalog(db, connection);
-  if (catalog && !catalog.unsafeMaximum) {
+  const retained = connections.get(db);
+  const direct = retained ? checkedNativeCatalog(db, retained) : undefined;
+  const connection =
+    retained && direct?.allOriginalsNative && !direct.unsafeMaximum ? retained : current(db);
+  const catalog =
+    direct?.allOriginalsNative && !direct.unsafeMaximum
+      ? direct
+      : checkedNativeCatalog(db, connection);
+  if (catalog?.allOriginalsNative && !catalog.unsafeMaximum) {
     const pointer = catalog.scratch.db.prepare('SELECT * FROM maximum WHERE singleton=1').get();
-    if (pointer) {
-      const { view, record } = catalogTarget(
-        db,
-        pointer as unknown as NativeLookupPointer,
-        'lookup-discovery-maximum',
-        [],
-      );
-      const text = boundedIntakeLookupText(view.fieldChunks(record, 'discoveryOrder'));
-      const value = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n").get(text)!.n;
-      if (value !== pointer.value) return fail('native catalog discovery value changed');
-      if (value !== null && (maximum === null || Number(value) > Number(maximum))) maximum = value;
+    if (!pointer) {
+      assertNativeCatalogCurrent(db, catalog);
+      return 0;
     }
+    const { view, record } = catalogTarget(
+      db,
+      pointer as unknown as NativeLookupPointer,
+      'lookup-discovery-maximum',
+      [],
+    );
+    const text = boundedIntakeLookupText(view.fieldChunks(record, 'discoveryOrder'));
+    const value = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n").get(text)!.n;
+    if (value !== pointer.value) return fail('native catalog discovery value changed');
     assertNativeCatalogCurrent(db, catalog);
-    return Number(maximum || 0);
+    return Number(value || 0);
   }
-  for (const source of nativeSources(db)) {
+  let nativeMaximum: number | null = null;
+  let allOriginalsNative = true;
+  for (const row of actualOriginalSourceRows(db)) {
+    const source = actualNativeSource(db, row);
+    if (!source) {
+      allOriginalsNative = false;
+      continue;
+    }
     const view = nativeReader(db, source);
     const group = readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
     if (!group) continue;
     const text = boundedIntakeLookupText(view.fieldChunks(group, 'discoveryOrder'));
     const value = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n").get(text)!.n;
-    if (value !== null && (maximum === null || Number(value) > Number(maximum))) maximum = value;
+    if (value !== null && (nativeMaximum === null || Number(value) > nativeMaximum))
+      nativeMaximum = Number(value);
   }
+  if (allOriginalsNative) return nativeMaximum ?? 0;
+  refreshLegacyProjection(db, connection);
+  let maximum = db
+    .prepare(
+      `SELECT MAX(g.discovery_order) n FROM ${table('groups')} g JOIN ${table('sources')} s ON s.source_id=g.source_id JOIN main.source_files f ON f.id=s.source_id WHERE f.kind='intake_original' AND (s.identity_first IS NULL OR s.identity_first<>-1)`,
+    )
+    .get()!.n;
+  if (nativeMaximum !== null && (maximum === null || nativeMaximum > Number(maximum)))
+    maximum = nativeMaximum;
   return Number(maximum || 0);
 }
 export function retainedIntakeAcceptance(db: DatabaseSync, operationId: string): unknown {
@@ -1225,19 +1499,12 @@ export function retainedIntakeAcceptanceReference(
   db: DatabaseSync,
   operationId: string,
 ): IntakeLookupReceiptReference | null {
-  const connection = current(db);
-  const row = db
-    .prepare(
-      `SELECT p.payload,s.source_id,s.source_order FROM ${table('acceptances')} a JOIN ${table('payloads')} p ON p.hash=a.hash JOIN ${table('sources')} s ON s.source_id=a.source_id WHERE a.operation_id=? AND (s.identity_first IS NULL OR s.identity_first<>-1) ORDER BY s.source_order LIMIT 1`,
-    )
-    .get(operationId);
-  let selected: IntakeLookupReceiptReference | null = row
-    ? { mode: 'legacy', sourceId: String(row.source_id), value: JSON.parse(String(row.payload)) }
-    : null;
-  let order = row ? Number(row.source_order) : Infinity;
+  const retained = connections.get(db);
+  const direct = retained ? checkedNativeCatalog(db, retained) : undefined;
+  const connection = retained && direct?.allOriginalsNative ? retained : current(db);
+  const catalog = direct?.allOriginalsNative ? direct : checkedNativeCatalog(db, connection);
   const nativeOperation = Buffer.from(operationId, 'utf8').toString('hex').toUpperCase();
-  const catalog = checkedNativeCatalog(db, connection);
-  if (catalog) {
+  if (catalog?.allOriginalsNative) {
     const pointer = catalog.scratch.db
       .prepare(
         `SELECT a.operation,a.address,s.source_id,s.source_order,s.source_hash,
@@ -1245,20 +1512,28 @@ export function retainedIntakeAcceptanceReference(
         WHERE a.operation=? AND a.source_order=s.source_order ORDER BY a.source_order LIMIT 1`,
       )
       .get(nativeOperation);
-    if (pointer && Number(pointer.source_order) < order) {
-      const { view, record } = catalogTarget(
-        db,
-        pointer as unknown as NativeLookupPointer,
-        'lookup-acceptance-operation-first',
-        [nativeOperation],
-      );
+    if (!pointer) {
       assertNativeCatalogCurrent(db, catalog);
-      return { mode: 'native', sourceId: String(pointer.source_id), view, record };
+      return null;
     }
+    const { view, record } = catalogTarget(
+      db,
+      pointer as unknown as NativeLookupPointer,
+      'lookup-acceptance-operation-first',
+      [nativeOperation],
+    );
     assertNativeCatalogCurrent(db, catalog);
-    return selected;
+    return { mode: 'native', sourceId: String(pointer.source_id), view, record };
   }
-  for (const source of nativeSources(db)) {
+  let native: IntakeLookupReceiptReference | null = null;
+  let nativeOrder = Infinity;
+  let allOriginalsNative = true;
+  for (const row of actualOriginalSourceRows(db)) {
+    const source = actualNativeSource(db, row);
+    if (!source) {
+      allOriginalsNative = false;
+      continue;
+    }
     const view = nativeReader(db, source);
     const record = readNativeIntakeLookupTarget(
       db,
@@ -1267,11 +1542,22 @@ export function retainedIntakeAcceptanceReference(
       'lookup-acceptance-operation-first',
       [nativeOperation],
     );
-    if (record && Number(source.source_order) < order) {
-      selected = { mode: 'native', sourceId: String(source.id), view, record };
-      order = Number(source.source_order);
+    if (record && Number(source.source_order) < nativeOrder) {
+      native = { mode: 'native', sourceId: String(source.id), view, record };
+      nativeOrder = Number(source.source_order);
     }
   }
+  if (allOriginalsNative) return native;
+  refreshLegacyProjection(db, connection);
+  const row = db
+    .prepare(
+      `SELECT p.payload,s.source_id,s.source_order FROM ${table('acceptances')} a JOIN ${table('payloads')} p ON p.hash=a.hash JOIN ${table('sources')} s ON s.source_id=a.source_id JOIN main.source_files f ON f.id=s.source_id WHERE a.operation_id=? AND f.kind='intake_original' AND (s.identity_first IS NULL OR s.identity_first<>-1) ORDER BY s.source_order LIMIT 1`,
+    )
+    .get(operationId);
+  let selected: IntakeLookupReceiptReference | null = row
+    ? { mode: 'legacy', sourceId: String(row.source_id), value: JSON.parse(String(row.payload)) }
+    : null;
+  if (native && nativeOrder < (row ? Number(row.source_order) : Infinity)) selected = native;
   return selected;
 }
 type NativeSource = IntakeEnvelopeSource & {
@@ -1286,6 +1572,60 @@ function originalSourceRows(db: DatabaseSync) {
     )
     .iterate();
 }
+function actualOriginalSourceRows(db: DatabaseSync) {
+  return db
+    .prepare(
+      "SELECT id,kind,sha256,details_json,rowid source_order FROM main.source_files WHERE kind='intake_original' ORDER BY rowid",
+    )
+    .iterate();
+}
+function actualNativeSource(
+  db: DatabaseSync,
+  row: Record<string, unknown>,
+): NativeSource | undefined {
+  const source = row as unknown as NativeSource;
+  const binding = intakeEnvelopeAuthorityBinding(db, source);
+  if (binding.logicalHead === undefined || !hasIntakeCollectionEnvelope(db, source))
+    return undefined;
+  assertProjectedNativeBinding(db, source, binding.logicalHead);
+  return { ...source, authority_head: binding.logicalHead };
+}
+function assertProjectedNativeBinding(
+  db: DatabaseSync,
+  source: NativeSource,
+  logicalHead: string,
+): void {
+  const projected = db
+    .prepare(
+      `SELECT source_order,identity_first,authority_head FROM ${table('sources')} WHERE source_id=?`,
+    )
+    .get(source.id);
+  if (
+    !projected ||
+    projected.source_order !== source.source_order ||
+    projected.identity_first !== -1 ||
+    projected.authority_head !== logicalHead
+  )
+    return fail('native source projection binding is unavailable');
+}
+function refreshLegacyProjection(db: DatabaseSync, connection: Connection): void {
+  db.exec('SAVEPOINT __intake_lookup_legacy_read');
+  try {
+    for (const row of actualOriginalSourceRows(db))
+      prune(db, connection, reconcile(db, connection, String(row.id)));
+    db.exec('RELEASE __intake_lookup_legacy_read');
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK TO __intake_lookup_legacy_read; RELEASE __intake_lookup_legacy_read');
+    } catch {
+      /* The transaction owner handles a failed rollback. */
+    }
+    connection.rebuild = true;
+    connection.schema = -1;
+    if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
+    throw error;
+  }
+}
 function checkedNativeSource(
   db: DatabaseSync,
   source: Record<string, unknown>,
@@ -1296,12 +1636,6 @@ function checkedNativeSource(
   if (source.identity_first !== -1 || source.authority_head !== binding.logicalHead)
     return fail('native source projection binding is unavailable');
   return selected;
-}
-function* nativeSources(db: DatabaseSync): Generator<NativeSource> {
-  for (const row of originalSourceRows(db)) {
-    const source = checkedNativeSource(db, row);
-    if (source) yield source;
-  }
 }
 function nativeReader(db: DatabaseSync, source: NativeSource): IntakeCollectionEnvelopeReader {
   if (intakeEnvelopeAuthorityBinding(db, source).logicalHead !== source.authority_head)

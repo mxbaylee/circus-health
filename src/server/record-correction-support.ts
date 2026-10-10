@@ -1,4 +1,8 @@
-import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
 /** Exact, bounded supporting-original preparation for direct clinical corrections. */
 import { setImmediate } from 'node:timers/promises';
 import { HttpError, revision, type Database } from './database.ts';
@@ -138,14 +142,26 @@ async function prepareSupportingSourceRoot(
   db: Database,
   profileId: string,
   id: string,
+  assertRunning: () => void,
 ): Promise<string> {
+  const ancestry = supportingAncestry(db, profileId, id);
   let root = id,
     count = 0;
-  for (const source of supportingAncestry(db, profileId, id)) {
-    root = source.id;
-    if (++count % 64 === 0) await setImmediate();
+  try {
+    for (;;) {
+      assertRunning();
+      const next = ancestry.next();
+      assertRunning();
+      if (next.done) return root;
+      root = next.value.id;
+      if (++count % 64 === 0) {
+        await setImmediate();
+        assertRunning();
+      }
+    }
+  } finally {
+    ancestry.return(undefined);
   }
-  return root;
 }
 /** The opaque host object never comes from an HTTP request or a display page. */
 export interface PreparedCorrectionSupportingEvidence {
@@ -197,7 +213,9 @@ export async function prepareCorrectionSupportingEvidence(
 ): Promise<PreparedCorrectionSupportingEvidence> {
   return runExclusiveClinicalOperation(
     db,
-    async () => {
+    async (operation) => {
+      const assertPreparing = () => assertClinicalOperation(db, operation);
+      assertPreparing();
       assertIntakeOwner(db, profileId);
       const refs = correctionSupportingReferences(input),
         dependencies = new Set<string>();
@@ -210,7 +228,9 @@ export async function prepareCorrectionSupportingEvidence(
           profileId,
           ref.intakeId,
           ref.proposalId,
+          { assertRunning: assertPreparing },
         );
+        assertPreparing();
         dependencies.add(key);
       }
       const initialRevision = revision(db),
@@ -226,6 +246,11 @@ export async function prepareCorrectionSupportingEvidence(
           );
         for (const assertion of assertions) assertion();
       };
+      // The retained proof checks evidence authority after this operation ends.
+      const assertPreparation = () => {
+        assertPreparing();
+        assertCurrent();
+      };
       const sessions: Extract<
         Awaited<ReturnType<typeof prepareCollectionClinicalReviewAsync>>,
         { status: 'ready' }
@@ -236,7 +261,7 @@ export async function prepareCorrectionSupportingEvidence(
       };
       try {
         for (const ref of refs) {
-          assertCurrent();
+          assertPreparation();
           const view = openIntakeCollectionEnvelope(db, { id: ref.intakeId }),
             intake = view.child(view.root(), 'intake')!,
             workflow = view.child(intake, 'workflow'),
@@ -256,7 +281,7 @@ export async function prepareCorrectionSupportingEvidence(
             profileId,
             ref.intakeId,
             ref.proposalId,
-            { assertRunning: assertCurrent },
+            { assertRunning: assertPreparation },
           );
           if (selected.status !== 'ready')
             throw new HttpError(
@@ -265,6 +290,7 @@ export async function prepareCorrectionSupportingEvidence(
               'Prepare the complete selected clinical review before choosing supporting evidence',
             );
           sessions.push(selected.session);
+          assertPreparation();
           const record = selected.session.record(
             ref.recordId,
             ref.candidateId,
@@ -284,14 +310,22 @@ export async function prepareCorrectionSupportingEvidence(
             catalog = createReportSnapshotCatalog(db, { id: ref.intakeId });
           let memberId: string | undefined,
             steps = 0;
+          const checkpoint = () => {
+            assertPreparing();
+            return ++steps % 32 === 0;
+          };
           // Preserve v1's first group with this candidate/version in any retained version,
           // independently of which particular occurrence established the group.
           group: for (const group of intakeReviewChildren(view, workflow, 'reportGroups')) {
+            if (checkpoint()) {
+              await setImmediate();
+              assertPreparation();
+            }
             const id = field<string>(view, group, 'memberId');
             for (const reportVersion of intakeReviewChildren(view, group, 'versions')) {
-              if (++steps % 32 === 0) {
+              if (checkpoint()) {
                 await setImmediate();
-                assertCurrent();
+                assertPreparation();
               }
               if (!id) continue;
               const native =
@@ -328,8 +362,12 @@ export async function prepareCorrectionSupportingEvidence(
             file.row.sha256 === member.sourceHash;
           if (
             (!selectedEvidence && !exactMember) ||
-            (await prepareSupportingSourceRoot(db, profileId, ref.originalSourceFileId)) !==
-              (await prepareSupportingSourceRoot(db, profileId, ref.intakeId))
+            (await prepareSupportingSourceRoot(
+              db,
+              profileId,
+              ref.originalSourceFileId,
+              assertPreparing,
+            )) !== (await prepareSupportingSourceRoot(db, profileId, ref.intakeId, assertPreparing))
           )
             throw new HttpError(
               409,
@@ -368,7 +406,7 @@ export async function prepareCorrectionSupportingEvidence(
             title: record.title,
           });
         }
-        assertCurrent();
+        assertPreparation();
         const proof: PreparedCorrectionSupportingEvidence = Object.freeze({
           kind: 'prepared-correction-support',
           dispose() {

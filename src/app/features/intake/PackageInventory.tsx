@@ -165,7 +165,7 @@ function ScopedPackageInventory({
       }
     }
   }
-  async function retryFailure(failure: IntakePackageFailure) {
+  async function retryFailure(failure: Pick<IntakePackageFailure, 'memberId' | 'retryAction'>) {
     if (failure.retryAction === 'inventory') {
       inventory.reload();
       return;

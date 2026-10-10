@@ -8,7 +8,7 @@ import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import { setImmediate } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { HttpError, clinicalReviewRevision } from './database.ts';
+import { HttpError, clinicalReviewRevision, managedDatabaseMethodEpoch } from './database.ts';
 import { assertIntakeOwner, withVerifiedIntakeOriginalDescriptor } from './intake.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { visibilityCondition, visibilitySQL } from './visibility.ts';
@@ -43,6 +43,8 @@ import {
 import { readCollectionImportFeed } from './intake-import-feed-collection.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import { intakeClinicalCachePin } from './intake-clinical-cache-pin.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import { recordDurabilityStatus } from './record-versions.ts';
 import {
   prepareCollectionQueueTransitions,
   collectionQueueTransitionEffects,
@@ -55,6 +57,8 @@ import {
 } from './intake-report-group-collection.ts';
 type PreparedQueue = {
   binding: string;
+  stamp: string | undefined;
+  methods: object | undefined;
   revision: string;
   scratch: ReturnType<typeof disposableSqlite>;
 };
@@ -109,7 +113,11 @@ export async function prepareCollectionQueueRead(
 ) {
   return runExclusiveClinicalOperation(
     db,
-    async () => {
+    async (owner) => {
+      const assertRunning = () => {
+        assertClinicalOperation(db, owner);
+        options.assertRunning?.();
+      };
       let active = preparingQueues.get(db);
       if (!active) {
         active = new Map();
@@ -120,7 +128,8 @@ export async function prepareCollectionQueueRead(
       const operation = (async () => {
         // Each caller rechecks its own authority and cancellation after any earlier preparation.
         if (prior) await prior.catch(() => undefined);
-        await prepareCollectionQueueReadNow(db, root, profileId, options);
+        assertRunning();
+        await prepareCollectionQueueReadNow(db, root, profileId, { assertRunning });
       })();
       active.set(key, operation);
       try {
@@ -142,6 +151,14 @@ async function prepareCollectionQueueReadNow(
   options: { assertRunning?: () => void },
 ) {
   assertIntakeOwner(db, profileId);
+  if (
+    db
+      .prepare(
+        "SELECT 1 FROM temp.sqlite_schema t JOIN main.sqlite_schema m ON lower(t.name)=lower(m.name) WHERE t.type IN ('table','view') AND m.type IN ('table','view') LIMIT 1",
+      )
+      .get()
+  )
+    throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
   prepareCollectionQueueTransitions(db);
   const revision = clinicalReviewRevision(db),
     policyPin = intakeClinicalCachePin(db),
@@ -150,32 +167,95 @@ async function prepareCollectionQueueReadNow(
       visibilitySQL("'source_file'", 'f.id'),
     ),
     cacheKey = JSON.stringify([root, profileId]);
-  const bindingNow = () => {
+  const generation = queueGenerations.get(db) ?? 0;
+  const assertCurrent = () => {
+    options.assertRunning?.();
+    assertIntakeOwner(db, profileId);
+    if (
+      (queueGenerations.get(db) ?? 0) !== generation ||
+      clinicalReviewRevision(db) !== revision ||
+      intakeClinicalCachePin(db) !== policyPin
+    )
+      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+  };
+  const assertStamp = (stamp: string | undefined, methods: object | undefined) => {
+    assertCurrent();
+    const status = recordDurabilityStatus(db);
+    if (
+      stamp === undefined ||
+      methods === undefined ||
+      managedDatabaseMethodEpoch(db) !== methods ||
+      reviewReadStamp(db) !== stamp ||
+      !status?.configured ||
+      status.dirty ||
+      status.conflicted
+    )
+      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+  };
+  const bindingNow = async (expected?: PreparedQueue['scratch']) => {
+    const stamp = reviewReadStamp(db);
+    const methods = managedDatabaseMethodEpoch(db);
+    assertStamp(stamp, methods);
     const hash = createHash('sha256').update(
       JSON.stringify([profileId, clinicalReviewRevision(db), intakeClinicalCachePin(db)]),
     );
+    let visited = 0;
     for (const row of db
       .prepare(
         "SELECT f.id,f.sha256 FROM source_files f WHERE f.kind='intake_original' AND " +
           visible +
           ' ORDER BY f.id',
       )
-      .iterate())
-      hash.update(JSON.stringify([row.id, row.sha256, intakeSourceVersion(db, String(row.id))]));
-    return hash.digest('hex');
+      .iterate()) {
+      const version = intakeSourceVersion(db, String(row.id));
+      if (
+        expected &&
+        expected.db.prepare('SELECT logical FROM sources WHERE id=?').get(String(row.id))
+          ?.logical !== canonicalLiteral(version)
+      )
+        throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+      hash.update(JSON.stringify([row.id, row.sha256, version]));
+      if (++visited % 64 === 0) {
+        await setImmediate();
+        assertStamp(stamp, methods);
+      }
+    }
+    if (
+      expected &&
+      Number(expected.db.prepare('SELECT count(*) AS n FROM sources').get()!.n) !== visited
+    )
+      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+    assertStamp(stamp, methods);
+    return { binding: hash.digest('hex'), stamp, methods };
   };
-  const binding = bindingNow();
   const previous = preparedQueues.get(db)?.get(cacheKey);
+  if (
+    previous?.stamp !== undefined &&
+    previous.stamp === reviewReadStamp(db) &&
+    previous.methods === managedDatabaseMethodEpoch(db)
+  ) {
+    assertStamp(previous.stamp, previous.methods);
+    await prepareJournalActivity(root, profileId, { assertRunning: options.assertRunning });
+    assertStamp(previous.stamp, previous.methods);
+    return;
+  }
+  const initial = await bindingNow();
+  assertStamp(initial.stamp, initial.methods);
+  const { binding } = initial;
   if (previous?.binding === binding) {
     options.assertRunning?.();
-    await prepareJournalActivity(root, profileId);
+    await prepareJournalActivity(root, profileId, { assertRunning: options.assertRunning });
+    options.assertRunning?.();
     assertIntakeOwner(db, profileId);
-    if (bindingNow() !== binding)
+    const checked = await bindingNow();
+    assertStamp(checked.stamp, checked.methods);
+    if (checked.binding !== binding)
       throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+    previous.stamp = checked.stamp;
+    previous.methods = checked.methods;
     return;
   }
   const scratch = previous?.scratch || disposableSqlite('circus-queue-preparation-');
-  const generation = queueGenerations.get(db) ?? 0;
   let active = activeScratch.get(db);
   if (!active) {
     active = new Set();
@@ -183,32 +263,35 @@ async function prepareCollectionQueueReadNow(
   }
   active.add(scratch);
   let retained = !!previous;
-  const assertCurrent = () => {
-    if ((queueGenerations.get(db) ?? 0) !== generation)
-      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
-    options.assertRunning?.();
-    assertIntakeOwner(db, profileId);
-    if (clinicalReviewRevision(db) !== revision)
-      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
-  };
   if (!previous)
     scratch.db.exec(
       'CREATE TABLE sources(id TEXT PRIMARY KEY,logical TEXT,seen INTEGER);CREATE TABLE proposals(intake TEXT,id TEXT,PRIMARY KEY(intake,id));',
     );
   scratch.db.exec('BEGIN;UPDATE sources SET seen=0;DELETE FROM proposals;');
   try {
+    const enumerationStamp = reviewReadStamp(db);
+    const enumerationMethods = managedDatabaseMethodEpoch(db);
+    let enumerated = 0;
     for (const row of db
       .prepare(
         "SELECT f.id FROM source_files f WHERE f.kind='intake_original' AND " +
           visible +
           ' ORDER BY f.id',
       )
-      .iterate())
+      .iterate()) {
       scratch.db
         .prepare('INSERT INTO sources(id,seen) VALUES(?,1) ON CONFLICT(id) DO UPDATE SET seen=1')
         .run(String(row.id));
+      if (++enumerated % 64 === 0) {
+        await setImmediate();
+        assertStamp(enumerationStamp, enumerationMethods);
+      }
+    }
+    assertStamp(enumerationStamp, enumerationMethods);
     scratch.db.exec('DELETE FROM sources WHERE seen=0');
+    let inspected = 0;
     for (const row of scratch.db.prepare('SELECT id,logical FROM sources ORDER BY id').iterate()) {
+      if (++inspected % 64 === 0) await setImmediate();
       assertCurrent();
       const id = String(row.id);
       if (
@@ -350,11 +433,9 @@ async function prepareCollectionQueueReadNow(
         JSON.parse(String(row.id)),
         { assertRunning: assertCurrent },
       );
-    await prepareJournalActivity(root, profileId);
-    for (const row of scratch.db.prepare('SELECT id,logical FROM sources').iterate())
-      if (canonicalLiteral(intakeSourceVersion(db, String(row.id))) !== row.logical)
-        throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
-    assertCurrent();
+    await prepareJournalActivity(root, profileId, { assertRunning: assertCurrent });
+    const checked = await bindingNow(scratch);
+    assertStamp(checked.stamp, checked.methods);
     let cache = preparedQueues.get(db);
     if (!cache) {
       cache = new Map();
@@ -366,7 +447,7 @@ async function prepareCollectionQueueReadNow(
       cache.delete(oldest);
     }
     scratch.db.exec('COMMIT');
-    cache.set(cacheKey, { binding: bindingNow(), revision: policyPin, scratch });
+    cache.set(cacheKey, { ...checked, revision: policyPin, scratch });
     retained = true;
   } catch (error) {
     scratch.db.exec('ROLLBACK');

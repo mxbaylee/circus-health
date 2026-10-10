@@ -1,4 +1,4 @@
-import { DatabaseSync, type SQLOutputValue } from 'node:sqlite';
+import { DatabaseSync, constants, type SQLOutputValue } from 'node:sqlite';
 import { mkdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,10 +11,149 @@ import {
   verifyIntakeMaintenancePublication,
   type IntakeMaintenancePublication,
 } from './intake-state-maintenance.ts';
+import {
+  expectIntakeFrontierMetaWrite,
+  finishIntakeFrontierMetaWrite,
+} from './intake-lookup-frontier-observer.ts';
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const LATEST_SCHEMA_VERSION = 7;
 export type Database = DatabaseSync;
 export type SqliteRow = Record<string, SQLOutputValue>;
+
+type Authorizer = NonNullable<Parameters<DatabaseSync['setAuthorizer']>[0]>;
+type AuthorizationObserver = (...args: Parameters<Authorizer>) => void;
+interface ManagedAuthorization {
+  setter: DatabaseSync['setAuthorizer'];
+  refresh: () => void;
+  readonly observers: Set<AuthorizationObserver>;
+  readonly policyChanges: Set<() => void>;
+  policy: Authorizer | null;
+}
+const managedAuthorizers = new WeakMap<DatabaseSync, ManagedAuthorization>();
+const managedMethodEpochs = new WeakMap<DatabaseSync, object>();
+const managedFunctions = new WeakMap<
+  DatabaseSync,
+  { setter: DatabaseSync['function']; observers: Set<(name: string) => void> }
+>();
+
+export function installManagedDatabaseFunctionRegistration(db: DatabaseSync): void {
+  if (managedFunctions.has(db)) return;
+  const nativeFunction = db.function;
+  const observers = new Set<(name: string) => void>();
+  const builtins = new Set(
+    db
+      .prepare('PRAGMA function_list')
+      .all()
+      .filter((row) => row.builtin === 1 && typeof row.name === 'string')
+      .map((row) => (row.name as string).toLowerCase()),
+  );
+  const setter = function (this: DatabaseSync, ...args: Parameters<DatabaseSync['function']>) {
+    if (this === db) {
+      managedMethodEpochs.set(db, {});
+      for (const observer of observers) {
+        try {
+          observer(args[0]);
+        } catch {
+          /* Disposable observation cannot replace native registration. */
+        }
+      }
+    }
+    if (this === db && builtins.has(args[0].toLowerCase()))
+      throw Error('Replacing a SQLite built-in function is unsupported');
+    return Reflect.apply(nativeFunction, this, args);
+  } as DatabaseSync['function'];
+  db.function = setter;
+  managedFunctions.set(db, { setter, observers });
+  managedMethodEpochs.set(db, {});
+}
+
+/** Private identity for read proofs; failed registrations also invalidate prior reads. */
+export function managedDatabaseMethodEpoch(db: DatabaseSync): object | undefined {
+  if (
+    !db.isOpen ||
+    db.function !== managedFunctions.get(db)?.setter ||
+    db.setAuthorizer !== managedAuthorizers.get(db)?.setter
+  )
+    return undefined;
+  return managedMethodEpochs.get(db);
+}
+
+export function observeManagedDatabaseFunctionRegistration(
+  db: DatabaseSync,
+  observer: (name: string) => void,
+): (() => void) | undefined {
+  const state = managedFunctions.get(db);
+  if (!state || db.function !== state.setter) return undefined;
+  state.observers.add(observer);
+  return () => state.observers.delete(observer);
+}
+
+export function managedDatabaseFunctionSetter(
+  db: DatabaseSync,
+): DatabaseSync['function'] | undefined {
+  return managedFunctions.get(db)?.setter;
+}
+
+/** Install before a connection exposes mutable authorizer policy to consumers. */
+export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
+  if (managedAuthorizers.has(db)) return;
+  const nativeSetter = db.setAuthorizer;
+  const state: ManagedAuthorization = {
+    setter: undefined as unknown as DatabaseSync['setAuthorizer'],
+    refresh: () => {},
+    observers: new Set(),
+    policyChanges: new Set(),
+    policy: null,
+  };
+  const setter = function (this: DatabaseSync, policy: Authorizer | null) {
+    if (this !== db) return Reflect.apply(nativeSetter, this, [policy]);
+    managedMethodEpochs.set(db, {});
+    for (const changed of state.policyChanges) changed();
+    state.policy = policy;
+    state.refresh();
+  } as DatabaseSync['setAuthorizer'];
+  state.setter = setter;
+  const dispatch: Authorizer = (...args) => {
+    for (const observer of state.observers) observer(...args);
+    return state.policy?.(...args) ?? constants.SQLITE_OK;
+  };
+  state.refresh = () =>
+    nativeSetter.call(db, state.policy || state.observers.size ? dispatch : null);
+  db.setAuthorizer = setter;
+  managedAuthorizers.set(db, state);
+  managedMethodEpochs.set(db, {});
+}
+
+export function observeManagedDatabaseAuthorization(
+  db: DatabaseSync,
+  observer: AuthorizationObserver,
+  onPolicyChange: () => void,
+): (() => void) | undefined {
+  const state = managedAuthorizers.get(db);
+  if (!state || db.setAuthorizer !== state.setter) return undefined;
+  state.observers.add(observer);
+  state.policyChanges.add(onPolicyChange);
+  state.refresh();
+  return () => {
+    state.observers.delete(observer);
+    state.policyChanges.delete(onPolicyChange);
+    state.refresh();
+  };
+}
+
+export function managedDatabaseAuthorizerSetter(
+  db: DatabaseSync,
+): DatabaseSync['setAuthorizer'] | undefined {
+  return managedAuthorizers.get(db)?.setter;
+}
+
+/** Expire prepared SQLite authorization decisions without changing user policy. */
+export function rearmManagedDatabaseAuthorization(db: DatabaseSync): boolean {
+  const state = managedAuthorizers.get(db);
+  if (!state || db.setAuthorizer !== state.setter) return false;
+  state.refresh();
+  return true;
+}
 
 export const databaseSchemaVersion = (db: DatabaseSync): number => {
   const row = db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get();
@@ -106,6 +245,8 @@ export function openDatabase(path?: string | null, profileId?: string): Database
         AND json_type(coverage_json,'$.reviewDraftHistory')='object'`);
     db.exec('COMMIT');
     inTransaction = false;
+    installManagedDatabaseAuthorization(db);
+    installManagedDatabaseFunctionRegistration(db);
     return db;
   } catch (error) {
     if (inTransaction) db.exec('ROLLBACK');
@@ -257,6 +398,16 @@ export function observeDatabaseClose(db: DatabaseSync, observer: () => void): ()
   return () => observers.delete(observer);
 }
 const beforePublicationObservers = new WeakMap<DatabaseSync, Set<(token: object) => void>>();
+const startObservers = new WeakMap<DatabaseSync, Set<(token: object) => void>>();
+export function observeTransactionStart(
+  db: DatabaseSync,
+  observer: (token: object) => void,
+): () => void {
+  let observers = startObservers.get(db);
+  if (!observers) startObservers.set(db, (observers = new Set()));
+  observers.add(observer);
+  return () => observers.delete(observer);
+}
 /** Read-only witnesses inspect the complete caller write set before owner
  * revision/durability bookkeeping. Observer failure can only suppress its own
  * optimization; it cannot alter the transaction acknowledgement. */
@@ -292,6 +443,13 @@ export function transaction<T>(
   let verifiedIntakeMaintenance = false;
   const token = {};
   transactionTokens.set(db, token);
+  for (const observer of startObservers.get(db) ?? []) {
+    try {
+      observer(token);
+    } catch {
+      /* memory-only witnesses cannot change a durable transaction */
+    }
+  }
   const hooks = durabilityHooks.get(db);
   let captured;
   try {
@@ -322,14 +480,38 @@ export function transaction<T>(
         /* memory-only witnesses must remain ineligible after a failed check */
       }
     }
-    db.prepare(
-      "INSERT OR IGNORE INTO app_meta(key,value) VALUES('clinical_review_revision',(SELECT value FROM app_meta WHERE key='revision'))",
-    ).run();
-    if (operation.actor !== 'source-text' && !operation.intakeMaintenance)
-      db.exec(
-        "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='clinical_review_revision'",
-      );
-    db.exec("UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'");
+    const clinicalInsert = expectIntakeFrontierMetaWrite(db, 'clinical_review_revision', [
+      'insert',
+    ]);
+    let clinicalInserted = false;
+    try {
+      clinicalInserted =
+        db
+          .prepare(
+            "INSERT OR IGNORE INTO app_meta(key,value) VALUES('clinical_review_revision',(SELECT value FROM app_meta WHERE key='revision'))",
+          )
+          .run().changes === 1;
+    } finally {
+      finishIntakeFrontierMetaWrite(db, clinicalInsert, clinicalInserted);
+    }
+    if (operation.actor !== 'source-text' && !operation.intakeMaintenance) {
+      const clinicalUpdate = expectIntakeFrontierMetaWrite(db, 'clinical_review_revision', [
+        'update',
+      ]);
+      try {
+        db.exec(
+          "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='clinical_review_revision'",
+        );
+      } finally {
+        finishIntakeFrontierMetaWrite(db, clinicalUpdate, true);
+      }
+    }
+    const revisionUpdate = expectIntakeFrontierMetaWrite(db, 'revision', ['update']);
+    try {
+      db.exec("UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'");
+    } finally {
+      finishIntakeFrontierMetaWrite(db, revisionUpdate, true);
+    }
     hooks?.markDirty?.();
     // The recoverable intent must reach durable profile storage before an
     // ephemeral SQLite COMMIT can be acknowledged.

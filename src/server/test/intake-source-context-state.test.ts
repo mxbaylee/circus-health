@@ -14,7 +14,10 @@ import {
   intakeSourceVersion,
   type IntakeDetails,
 } from '../intake-state-access.ts';
-import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
+import {
+  memoryRecordAuthority,
+  writeIntakeFixtureEnvelope,
+} from './helpers/intake-authority-fixture.ts';
 import {
   intakeCandidateVersionId,
   intakeWorkflow,
@@ -66,12 +69,14 @@ async function fixture(
   duplicate = false,
   modify?: (d: IntakeDetails) => void,
   versionsInFirstSource?: number,
+  memoryAuthority = false,
 ) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-context-state-')),
     profileId = 'cookie-dough',
     paths = ensureProfileDirectories(root, profileId),
     db = openDatabase(paths.database, profileId);
-  attachPersonalDurability(db, { root, profileId });
+  if (memoryAuthority) memoryRecordAuthority(db);
+  else attachPersonalDurability(db, { root, profileId });
   t.after(() => {
     clearSourceContextClassificationCache(db);
     if (db.isOpen) db.close();
@@ -162,6 +167,65 @@ async function fixture(
   });
   await buildIntakeCollectionEnvelope(db, file);
   return { db, root, profileId, id: file.id, file, d, all, bytes, sourceIds, versionIds, paths };
+}
+for (const shape of ['skipped-versions', 'empty-candidates', 'duplicate-proposals'] as const) {
+  test(`cold classification yields for ${shape}`, async (t) => {
+    const f = await fixture(
+      t,
+      1,
+      false,
+      false,
+      (details) => {
+        const candidate = details.workflow!.candidates[0]!;
+        if (shape === 'skipped-versions')
+          candidate.versions = Array.from({ length: 65 }, (_, index) => ({
+            ...candidate.versions[0]!,
+            id: 'fictional-skipped-' + index,
+            sourceContext: true,
+            occurrences: [],
+          }));
+        else if (shape === 'empty-candidates')
+          details.workflow!.candidates = Array.from({ length: 65 }, (_, index) => ({
+            ...candidate,
+            id: 'fictional-empty-' + index,
+            versions: [],
+          }));
+        else {
+          details.workflow!.candidates = [];
+          const proposal = details.proposals[0]!;
+          // Only the proposal identity participates in this duplicate-skip path.
+          details.proposals = Array.from(
+            { length: 65 },
+            () => ({ id: proposal.id }) as typeof proposal,
+          );
+        }
+      },
+      undefined,
+      true,
+    );
+    const controller = new AbortController(),
+      checkpoints: number[] = [];
+    let cancel: ReturnType<typeof setImmediate> | undefined;
+    try {
+      await assert.rejects(
+        prepareSelectedSourceContextClassification(f.db, f.root, f.profileId, f.id, {
+          assertRunning: () => controller.signal.throwIfAborted(),
+          onCheckpoint: (visited) => {
+            checkpoints.push(visited);
+            cancel = setImmediate(() => controller.abort(Error('fictional host cancellation')));
+          },
+        }),
+        /fictional host cancellation/,
+      );
+      assert.deepEqual(checkpoints, [64]);
+      assert.equal(
+        readSelectedSourceContextClassification(f.db, f.root, f.profileId, f.id).state,
+        'pending',
+      );
+    } finally {
+      if (cancel) clearImmediate(cancel);
+    }
+  });
 }
 test('cold native classification matches actual legacy fallback and warm points never hydrate or rehash', async (t) => {
   const f = await fixture(t),

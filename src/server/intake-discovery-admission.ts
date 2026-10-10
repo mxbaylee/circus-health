@@ -11,7 +11,10 @@ import { assertClinicalOperation, currentClinicalOperation } from './clinical-op
 import { intakeEnvelopeAuthorityBinding, type IntakeEnvelopeSource } from './intake-authority.ts';
 import { identityGroundingGeneration } from './intake-identity-grounding.ts';
 import { intakeLookupProjectionGeneration } from './intake-lookup-projection.ts';
-import { INTAKE_LOOKUP_INDEX_POLICY } from './intake-lookup-state.ts';
+import {
+  INTAKE_LOOKUP_INDEX_POLICY,
+  preparedIntakeDiscoveryRevision,
+} from './intake-lookup-state.ts';
 import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 
@@ -162,6 +165,11 @@ export async function prepareIntakeDiscoveryAdmission(
   state.removeClose = observeDatabaseClose(db, dispose);
   state.removeOutcome = observeTransactionOutcome(db, dispose);
   try {
+    if (preparedIntakeDiscoveryRevision(db) === expected) {
+      assertProof(db, proof, readRaw, state, options.assertRunning);
+      admissions.set(token, state);
+      return token;
+    }
     const revision = createHash('sha256');
     revision.update(JSON.stringify([INTAKE_LOOKUP_INDEX_POLICY, proof.profile]));
     const first = db.prepare(

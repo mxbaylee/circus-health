@@ -25,20 +25,37 @@ import {
 import {
   validateIntakeEnvelopeRepresentation,
   readIntakeEnvelopeMaterialized,
+  INTAKE_ENVELOPE_FORMAT,
 } from './intake-authority.ts';
 import {
   createIntakeEnvelopeGraphReader,
   iterateSchemaEnvelopeText,
   validateIntakeCollectionEnvelopeRepresentationSteps,
+  projectSchemaCompactMetadataSteps,
 } from './intake-collection-envelope.ts';
 import { intakeSourcePinKey } from './intake-source-pin.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
+import { protectedIntakeLookupTempShadow } from './intake-lookup-frontier-observer.ts';
 
 declare const proofBrand: unique symbol;
 export interface IntakeLegacyBridgeProof {
   readonly [proofBrand]: true;
 }
+declare const compactProofBrand: unique symbol;
+export interface IntakeCompactMetadataProof {
+  readonly [compactProofBrand]: true;
+}
+interface CompactProofData {
+  db: Database;
+  binding: string;
+  bridge: IntakeLegacyBridgeProof;
+  sourceRow: Readonly<Record<string, unknown>>;
+  target: string;
+  sequence: number;
+}
+const compactProofs = new WeakMap<IntakeCompactMetadataProof, CompactProofData>();
+const compactRetained = new WeakMap<Database, Set<IntakeCompactMetadataProof>>();
 export interface IntakeLegacyBridgeBinding {
   identity: IntakeStateIdentity;
   beforeHead: string;
@@ -50,6 +67,7 @@ export interface IntakeLegacyBridgeBinding {
 interface ProofData {
   db: Database;
   binding: string;
+  detailsJson: string;
 }
 const proofs = new WeakMap<IntakeLegacyBridgeProof, ProofData>();
 const retained = new WeakMap<Database, Set<IntakeLegacyBridgeProof>>();
@@ -117,7 +135,6 @@ function certificate(binding: IntakeLegacyBridgeBinding): string {
       binding.beforeHead,
       binding.afterHead,
       binding.sourcePin ?? null,
-      binding.detailsJson,
     ]),
   );
   const writes = [...binding.writes].sort((a, b) => a.key.localeCompare(b.key));
@@ -127,6 +144,199 @@ function certificate(binding: IntakeLegacyBridgeBinding): string {
 export function clearIntakeLegacyBridgeProofs(db: Database): void {
   for (const proof of retained.get(db) ?? []) proofs.delete(proof);
   retained.delete(db);
+  for (const proof of compactRetained.get(db) ?? []) compactProofs.delete(proof);
+  compactRetained.delete(db);
+}
+/** Distinct, exact-target permission. No caller-supplied metadata is accepted. */
+export async function prepareIntakeCompactMetadataProofAsync(
+  db: Database,
+  candidate: Omit<IntakeLegacyBridgeBinding, 'sourcePin' | 'detailsJson'>,
+  options: { assertRunning?: () => void } = {},
+): Promise<IntakeCompactMetadataProof | undefined> {
+  const source = db
+    .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
+    .get(candidate.identity.intakeId);
+  if (!source || typeof source.details_json !== 'string') invalid('compact metadata source');
+  const sourceRow = Object.freeze({ ...source }),
+    status = recordDurabilityStatus(db);
+  withIntakeWork(db, 'reconstruction', () =>
+    recordIntakeWork(
+      'compactMetadataSourceReadBytes',
+      Buffer.byteLength(source.details_json as string),
+    ),
+  );
+  if (!status?.configured || status.dirty) invalid('compact metadata physical authority');
+  const key = intakeNamespace(candidate.identity) + 'head',
+    pin = db
+      .prepare('SELECT value FROM app_meta WHERE key=?')
+      .get(intakeSourcePinKey(candidate.identity.intakeId))?.value;
+  const guard = db.prepare('SELECT total_changes() AS writes'),
+    writes = guard.get()!.writes,
+    mainSchema = db.prepare('PRAGMA main.schema_version').get()!.schema_version,
+    tempSchema = db.prepare('PRAGMA temp.schema_version').get()!.schema_version,
+    peer = db.prepare('PRAGMA main.data_version').get()!.data_version;
+  const assertCurrent = () => {
+    options.assertRunning?.();
+    withIntakeWork(db, 'reconstruction', () =>
+      recordIntakeWork('compactMetadataSourceGuardChecks'),
+    );
+    const current = recordDurabilityStatus(db);
+    if (
+      !current?.configured ||
+      current.dirty ||
+      current.sequence !== status!.sequence ||
+      protectedIntakeLookupTempShadow(db) ||
+      guard.get()!.writes !== writes ||
+      db.prepare('PRAGMA main.schema_version').get()!.schema_version !== mainSchema ||
+      db.prepare('PRAGMA temp.schema_version').get()!.schema_version !== tempSchema ||
+      db.prepare('PRAGMA main.data_version').get()!.data_version !== peer ||
+      db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value !==
+        candidate.beforeHead ||
+      db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value !==
+        candidate.identity.profileId ||
+      db
+        .prepare('SELECT value FROM app_meta WHERE key=?')
+        .get(intakeSourcePinKey(candidate.identity.intakeId))?.value !== pin
+    )
+      invalid('compact metadata source/head/physical authority changed');
+  };
+  assertCurrent();
+  const adoption = prepareIntakeSchemaAdoptionProofSteps(db, candidate, true);
+  let bridge: IntakeLegacyBridgeProof;
+  try {
+    for (;;) {
+      assertCurrent();
+      const next = withIntakeWork(db, 'reconstruction', () => adoption.next());
+      if (next.done) {
+        bridge = next.value;
+        break;
+      }
+      await setImmediate();
+    }
+  } finally {
+    adoption.return(undefined as never);
+  }
+  let complete = false;
+  try {
+    const rows = new Map(candidate.writes.map((item) => [item.key, item.value])),
+      prefix = intakeNamespace(candidate.identity),
+      after = parseIntakeCollectionHead(candidate.afterHead, candidate.identity)!;
+    const read = (hash: string) =>
+      rows.get(prefix + 'node:' + hash) ??
+      db.prepare('SELECT value FROM app_meta WHERE key=?').get(prefix + 'node:' + hash)?.value;
+    const graph = createIntakeEnvelopeGraphReader(candidate.identity, after, read);
+    const steps = projectSchemaCompactMetadataSteps(
+      graph.store,
+      graph.control,
+      Buffer.byteLength(source.details_json as string) + 4096,
+      undefined,
+      true,
+    );
+    let target: string;
+    try {
+      for (;;) {
+        assertCurrent();
+        const next = withIntakeWork(db, 'reconstruction', () => steps.next());
+        if (next.done) {
+          target = next.value;
+          break;
+        }
+        await setImmediate();
+      }
+    } finally {
+      steps.return(undefined as never);
+    }
+    assertCurrent();
+    const finalSource = db
+      .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
+      .get(candidate.identity.intakeId);
+    withIntakeWork(db, 'reconstruction', () =>
+      recordIntakeWork(
+        'compactMetadataSourceReadBytes',
+        Buffer.byteLength(String(finalSource?.details_json ?? '')),
+      ),
+    );
+    if (!intakeCompactSourceRowsEqual(finalSource, sourceRow))
+      invalid('compact metadata source readback changed');
+    withIntakeWork(db, 'reconstruction', () =>
+      recordIntakeWork('compactMetadataProjectionBytes', Buffer.byteLength(target!)),
+    );
+    if (target! === source.details_json) return undefined;
+    const proof = Object.freeze({}) as IntakeCompactMetadataProof;
+    let entries = compactRetained.get(db);
+    if (!entries) {
+      entries = new Set();
+      compactRetained.set(db, entries);
+    }
+    while (entries.size >= 8) {
+      const old = entries.values().next().value!;
+      const prior = compactProofs.get(old);
+      if (prior) {
+        proofs.delete(prior.bridge);
+        retained.get(db)?.delete(prior.bridge);
+      }
+      compactProofs.delete(old);
+      entries.delete(old);
+    }
+    entries.add(proof);
+    compactProofs.set(proof, {
+      db,
+      bridge,
+      sourceRow,
+      target: target!,
+      sequence: status!.sequence,
+      binding: certificate({
+        ...candidate,
+        sourcePin: pin as string | undefined,
+        detailsJson: source.details_json as string,
+      }),
+    });
+    complete = true;
+    return proof;
+  } finally {
+    if (!complete) {
+      proofs.delete(bridge);
+      retained.get(db)?.delete(bridge);
+    }
+  }
+}
+export function consumeIntakeCompactMetadataProof(
+  db: Database,
+  proof: IntakeCompactMetadataProof,
+  binding: IntakeLegacyBridgeBinding,
+): { sourceRow: Readonly<Record<string, unknown>>; target: string; sequence: number } {
+  const item = compactProofs.get(proof);
+  compactProofs.delete(proof);
+  compactRetained.get(db)?.delete(proof);
+  if (!item || item.db !== db || item.binding !== certificate(binding))
+    invalid('foreign or expired compact metadata proof');
+  verifyIntakeLegacyBridgeProof(item!.bridge, db, binding);
+  const current = recordDurabilityStatus(db);
+  if (
+    !current?.configured ||
+    current.dirty ||
+    current.sequence !== item!.sequence ||
+    !intakeCompactSourceRowsEqual(
+      db
+        .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
+        .get(binding.identity.intakeId),
+      item!.sourceRow,
+    )
+  )
+    invalid('compact metadata proof source or physical authority changed');
+  return { sourceRow: item!.sourceRow, target: item!.target, sequence: item!.sequence };
+}
+export function intakeCompactSourceRowsEqual(
+  actual: Record<string, unknown> | undefined,
+  expected: Readonly<Record<string, unknown>>,
+): boolean {
+  return (
+    !!actual &&
+    Object.keys(actual).length === Object.keys(expected).length &&
+    Object.keys(expected).every(
+      (key) => Object.hasOwn(actual, key) && actual[key] === expected[key],
+    )
+  );
 }
 export function prepareIntakeLegacyBridgeProof(
   db: Database,
@@ -241,7 +451,7 @@ export function prepareIntakeLegacyBridgeProof(
       proofs.delete(old);
     }
     entries.add(proof);
-    proofs.set(proof, { db, binding });
+    proofs.set(proof, { db, binding, detailsJson: source.details_json as string });
     return proof;
   });
 }
@@ -255,7 +465,12 @@ export function verifyIntakeLegacyBridgeProof(
   const retainedProof = proofs.get(proof);
   proofs.delete(proof);
   retained.get(db)?.delete(proof);
-  if (!retainedProof || retainedProof.db !== db || retainedProof.binding !== certificate(binding))
+  if (
+    !retainedProof ||
+    retainedProof.db !== db ||
+    retainedProof.binding !== certificate(binding) ||
+    retainedProof.detailsJson !== binding.detailsJson
+  )
     invalid('foreign, expired or conflicting legacy bridge proof');
 }
 
@@ -298,6 +513,7 @@ export async function prepareIntakeSchemaAdoptionProofAsync(
 function* prepareIntakeSchemaAdoptionProofSteps(
   db: Database,
   candidate: Omit<IntakeLegacyBridgeBinding, 'sourcePin' | 'detailsJson'>,
+  compactSameData = false,
 ): Generator<void, IntakeLegacyBridgeProof> {
   let work = 0;
   const { identity, beforeHead, afterHead, writes } = candidate,
@@ -337,6 +553,11 @@ function* prepareIntakeSchemaAdoptionProofSteps(
   const beforeRead = (hash: string) => get(prefix + 'node:' + hash),
     beforeTree = createIntakeTree(identity, beforeRead, new Map()),
     schemaBefore = beforeTree.get(before.logical.root, 'envelope.data') !== undefined;
+  if (
+    compactSameData &&
+    (!schemaBefore || JSON.stringify(after.logical) !== JSON.stringify(before.logical))
+  )
+    invalid('compact metadata requires unchanged native logical data');
   const priorHash = createHash('sha256');
   let priorBytes = 0,
     priorMode: 'raw' | 'normalized';
@@ -401,7 +622,7 @@ function* prepareIntakeSchemaAdoptionProofSteps(
       break;
     }
   }
-  if (!adopted) invalid('schema adoption unselected build');
+  if (!adopted && !compactSameData) invalid('schema adoption unselected build');
   const graph = createIntakeEnvelopeGraphReader(identity, after, read),
     hash = createHash('sha256');
   let total = 0;
@@ -418,7 +639,12 @@ function* prepareIntakeSchemaAdoptionProofSteps(
     hash.digest('hex') !== priorHash.digest('hex')
   )
     invalid('schema adoption export equivalence');
-  yield* validateIntakeCollectionEnvelopeRepresentationSteps(source.details_json, after, read);
+  yield* validateIntakeCollectionEnvelopeRepresentationSteps(
+    source.details_json,
+    after,
+    read,
+    compactSameData ? INTAKE_ENVELOPE_FORMAT : undefined,
+  );
   const historyRaw = tree.get(after.history, String(after.storageSequence).padStart(16, '0'));
   if (historyRaw === undefined) invalid('schema adoption history');
   const event = parseIntakeCollectionHistory(historyRaw, identity);
@@ -501,6 +727,6 @@ function* prepareIntakeSchemaAdoptionProofSteps(
     proofs.delete(old);
   }
   entries.add(proof);
-  proofs.set(proof, { db, binding });
+  proofs.set(proof, { db, binding, detailsJson: source.details_json as string });
   return proof;
 }

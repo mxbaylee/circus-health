@@ -15,7 +15,8 @@ import {
   intakeLookupProjectionGeneration,
   prepareIntakeLookupProjection,
 } from '../intake-lookup-projection.ts';
-import { intakeDiscoveryRevision } from '../intake-lookup-state.ts';
+import { intakeDiscoveryRevision, prepareIntakeLookupIndices } from '../intake-lookup-state.ts';
+import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { clearIntakeCollectionCache } from '../intake-state-collections.ts';
 import { clearIdentityGrounding } from '../intake-identity-grounding.ts';
 import {
@@ -44,6 +45,70 @@ function fixture(t: import('node:test').TestContext, count: number) {
   }
   return { db, authority, path: join(root, 'cache.sqlite') };
 }
+
+test('current complete lookup proof admits without a second original frontier scan', async (t) => {
+  const { db } = fixture(t, 8);
+  for (let index = 0; index < 8; index++)
+    await buildIntakeCollectionEnvelope(db, { id: `fictional-original-${index}` });
+  const prepared = await prepareIntakeLookupIndices(db);
+  const prepare = db.prepare.bind(db);
+  let frontierStatements = 0;
+  db.prepare = ((sql: string) => {
+    if (sql.includes('frontier_rowid')) frontierStatements++;
+    return prepare(sql);
+  }) as typeof db.prepare;
+  t.after(() => {
+    db.prepare = prepare;
+  });
+  await runExclusiveClinicalOperation(db, async () => {
+    const admission = await prepareIntakeDiscoveryAdmission(db, prepared.discoveryRevision);
+    try {
+      assert.equal(frontierStatements, 0);
+      clearIntakeLookupCache(db);
+      assert.throws(
+        () => transaction(db, () => consumeIntakeDiscoveryAdmission(db, admission)),
+        /frontier admission changed/,
+      );
+    } finally {
+      disposeIntakeDiscoveryAdmission(admission);
+    }
+  });
+});
+
+test('unknown SQL invalidates the lookup shortcut and rechecks the complete frontier', async (t) => {
+  const { db } = fixture(t, 1);
+  await buildIntakeCollectionEnvelope(db, { id: 'fictional-original-0' });
+  const prepared = await prepareIntakeLookupIndices(db);
+  transaction(db, () => {
+    db.exec("UPDATE source_files SET details_json=details_json WHERE kind='intake_original'");
+  });
+  const prepare = db.prepare.bind(db);
+  let frontierRows = 0;
+  db.prepare = ((sql: string) => {
+    const statement = prepare(sql);
+    if (sql.includes('frontier_rowid')) {
+      const get = statement.get.bind(statement);
+      statement.get = ((...args: Parameters<typeof get>) => {
+        const value = get(...args);
+        if (value) frontierRows++;
+        return value;
+      }) as typeof statement.get;
+    }
+    return statement;
+  }) as typeof db.prepare;
+  t.after(() => {
+    db.prepare = prepare;
+  });
+  await runExclusiveClinicalOperation(db, async () => {
+    const admission = await prepareIntakeDiscoveryAdmission(db, prepared.discoveryRevision);
+    try {
+      assert.equal(frontierRows, 1);
+      transaction(db, () => consumeIntakeDiscoveryAdmission(db, admission));
+    } finally {
+      disposeIntakeDiscoveryAdmission(admission);
+    }
+  });
+});
 
 test('complete legacy frontier keeps the original digest and yields after at most 64 rows', async (t) => {
   const { db } = fixture(t, 65);

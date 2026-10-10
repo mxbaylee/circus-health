@@ -44,6 +44,10 @@ import {
   nativeIntakeReceiptAppendBasis,
   retainNativeIntakeReceiptAppendBatch,
 } from './intake-lookup-projection.ts';
+import {
+  expectIntakeFrontierMetaWrite,
+  finishIntakeFrontierMetaWrite,
+} from './intake-lookup-frontier-observer.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
 import type { IntakeReviewDecision, IntakeAtomicAcceptanceReceipt } from '../shared/intake.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
@@ -504,9 +508,21 @@ export async function prepareNativeIntakeAcceptanceGroup(
             );
           }
           if (transition) {
-            db.prepare(
-              "INSERT INTO app_meta(key,value) VALUES('intake_mutation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            ).run(String(revision(db) + 1));
+            const expectedRevision = expectIntakeFrontierMetaWrite(db, 'intake_mutation_revision', [
+              'insert',
+              'update',
+            ]);
+            let revisionWritten = false;
+            try {
+              revisionWritten =
+                db
+                  .prepare(
+                    "INSERT INTO app_meta(key,value) VALUES('intake_mutation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  )
+                  .run(String(revision(db) + 1)).changes === 1;
+            } finally {
+              finishIntakeFrontierMetaWrite(db, expectedRevision, revisionWritten);
+            }
             transition.seal({
               operationId: input.operationId,
               fingerprint: input.fingerprint,

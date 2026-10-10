@@ -126,6 +126,42 @@ test('selected interpretation existence preserves old fallback and rechecks chan
   } finally {
     peer.close();
   }
+  const quote = (value: string) => String(db.prepare('SELECT quote(?) value').get(value)!.value);
+  const beforeTemp = db
+    .prepare('SELECT total_changes() n,(SELECT schema_version FROM pragma_schema_version) schema')
+    .get();
+  db.exec(
+    `CREATE TEMP VIEW app_meta AS SELECT key, CASE WHEN key=${quote(dependencyKey)} THEN ${quote(validDependency)} ELSE value END value FROM main.app_meta`,
+  );
+  assert.deepEqual(
+    db
+      .prepare('SELECT total_changes() n,(SELECT schema_version FROM pragma_schema_version) schema')
+      .get(),
+    beforeTemp,
+  );
+  assert.equal(
+    (await prepareCurrentIntakeInterpretations(db, profile, source.id)).hasCurrentProposal,
+    true,
+    'TEMP dependency shadow invalidates a cached negative without main writes',
+  );
+  db.exec('DROP VIEW temp.app_meta');
+  assert.equal(
+    (await prepareCurrentIntakeInterpretations(db, profile, source.id)).hasCurrentProposal,
+    false,
+    'Dropping the TEMP shadow invalidates its cached positive',
+  );
+  clearIntakeCollectionCache(db);
+  await assert.rejects(
+    prepareCurrentIntakeInterpretations(db, profile, source.id, {
+      onProposal() {
+        db.exec(
+          `CREATE TEMP VIEW app_meta AS SELECT key, CASE WHEN key=${quote(dependencyKey)} THEN ${quote(validDependency)} ELSE value END value FROM main.app_meta`,
+        );
+      },
+    }),
+    /Interpretation selection changed/,
+  );
+  db.exec('DROP VIEW temp.app_meta');
   async function assertRescanned() {
     let visited = 0;
     assert.equal(

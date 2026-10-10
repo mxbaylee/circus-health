@@ -814,10 +814,12 @@ async function inspectDescendant(
     'SELECT total_changes() AS changes,(SELECT data_version FROM pragma_data_version) AS external,(SELECT schema_version FROM pragma_schema_version) AS schema',
   );
   readStamp.setReadBigInts(true);
+  const readTempSchema = db.prepare('PRAGMA temp.schema_version');
+  readTempSchema.setReadBigInts(true);
   const stamp = () => {
     if (db.isTransaction) throw Error('Prepare descendant reading outside a transaction');
     const row = readStamp.get()!;
-    return `${row.changes}:${row.external}:${row.schema}`;
+    return `${row.changes}:${row.external}:${row.schema}:${readTempSchema.get()!.schema_version}`;
   };
   const before = stamp();
   const assertCurrent = () => {

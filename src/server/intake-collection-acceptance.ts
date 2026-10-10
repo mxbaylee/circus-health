@@ -47,6 +47,10 @@ import {
   retainNativeIntakeReceiptAppendBatch,
 } from './intake-lookup-projection.ts';
 import {
+  expectIntakeFrontierMetaWrite,
+  finishIntakeFrontierMetaWrite,
+} from './intake-lookup-frontier-observer.ts';
+import {
   collectionClinicalProjectionContext,
   type CollectionClinicalReviewSession,
 } from './intake-review-collection-session.ts';
@@ -748,9 +752,21 @@ export async function prepareNativeIntakeAcceptance(
           // intakeTransaction records this same fixed revision after its host
           // callback. Include that owned marker now so the final footprint can
           // prove the wrapper only repeats the identical value.
-          db.prepare(
-            "INSERT INTO app_meta(key,value) VALUES('intake_mutation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-          ).run(String(revision(db) + 1));
+          const expectedRevision = expectIntakeFrontierMetaWrite(db, 'intake_mutation_revision', [
+            'insert',
+            'update',
+          ]);
+          let revisionWritten = false;
+          try {
+            revisionWritten =
+              db
+                .prepare(
+                  "INSERT INTO app_meta(key,value) VALUES('intake_mutation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                )
+                .run(String(revision(db) + 1)).changes === 1;
+          } finally {
+            finishIntakeFrontierMetaWrite(db, expectedRevision, revisionWritten);
+          }
           if (reportReceipt && footprint) {
             footprint.seal();
             observeOwnedAcceptanceTransition(
@@ -1120,6 +1136,7 @@ function observeOwnedAcceptanceTransition(
         saved.source,
         saved.before,
         saved.after,
+        outcome.token,
       );
     let registry = transitions.get(db);
     if (!registry) transitions.set(db, (registry = new Map()));
@@ -1190,7 +1207,7 @@ export function beginOwnedGroupedAcceptanceTransition(db: Database) {
           canonicalLiteral(JSON.parse(String(row.result_json))) !== canonicalLiteral(receipt)
         )
           return;
-        retainNativeIntakeReceiptAppendBatch(db, sources);
+        retainNativeIntakeReceiptAppendBatch(db, sources, outcome.token);
       });
     },
   };
