@@ -93,6 +93,13 @@ sets and prior issue authority retain their separate preparation paths. Reuse
 avoids publishing another identical empty snapshot; it does not skip evidence
 verification or apply across preparation lifetimes.
 
+Ownership name-evidence hashing preserves the complete canonical order and
+membership while yielding at bounded piece and byte intervals. Individual hash
+updates retain surrogate pairs and consume at most 4,097 UTF-16 units; each digest
+interval consumes at most 64 KiB. Original plan and source guards run before and
+after each yield, and cancellation disposes the unpublished scratch plan. This
+does not remove final physical checks or bound every name-rendering operation.
+
 ## Current data and searchable history
 
 SQLite is a disposable, indexed projection containing both current records and retained version history. The current view selects the latest accepted version in committed order. Record history is a normal query, not an offline backup-restoration workflow. Index by profile, entity/record, version/sequence and time, with a field-change index or equivalent for queries such as **When did I change my birthday?**

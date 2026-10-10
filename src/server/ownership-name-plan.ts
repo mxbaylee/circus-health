@@ -512,7 +512,38 @@ export async function prepareOwnershipNamePlan(
       yield ']';
     }
     const digest = createHash('sha256');
-    for (const piece of canonicalEffects()) digest.update(piece);
+    let digestPieces = 0,
+      digestBytes = 0;
+    const digestCheckpoint = async () => {
+      assertCurrent();
+      await setImmediate();
+      assertCurrent();
+      digestPieces = 0;
+      digestBytes = 0;
+    };
+    assertCurrent();
+    for (const piece of canonicalEffects()) {
+      digestPieces++;
+      for (let offset = 0; offset < piece.length;) {
+        let end = Math.min(offset + 4096, piece.length);
+        if (
+          end < piece.length &&
+          piece.charCodeAt(end - 1) >= 0xd800 &&
+          piece.charCodeAt(end - 1) <= 0xdbff &&
+          piece.charCodeAt(end) >= 0xdc00 &&
+          piece.charCodeAt(end) <= 0xdfff
+        )
+          end++;
+        const chunk = piece.slice(offset, end),
+          bytes = Buffer.byteLength(chunk);
+        if (digestBytes && digestBytes + bytes > 64 * 1024) await digestCheckpoint();
+        digest.update(chunk);
+        digestBytes += bytes;
+        offset = end;
+        if (digestPieces >= 64 || digestBytes >= 64 * 1024) await digestCheckpoint();
+      }
+    }
+    assertCurrent();
     const token = randomUUID();
     const reference: OwnershipNameEvidenceReference = {
       token,
