@@ -1,12 +1,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, constants } from 'node:sqlite';
 import {
   execClinicalReviewMaintenance as exec,
   prepareClinicalReviewMaintenance as prepare,
+  reviewPreparationMethodStamp,
   reviewPreparationStamp,
   runClinicalReviewMaintenance as run,
 } from '../clinical-review-maintenance.ts';
+import {
+  managedDatabaseMethodSerial,
+  observeManagedDatabaseAuthorization,
+  openDatabase,
+} from '../database.ts';
 import { reviewReadStamp } from '../intake-clinical-review-read-cache.ts';
 
 function fixture(t: { after(fn: () => void): void }) {
@@ -25,6 +31,54 @@ const create = (db: DatabaseSync) =>
     'attention',
     'CREATE TEMP TABLE source_attention_counts_v1(source_id TEXT PRIMARY KEY,sections INTEGER NOT NULL)',
   );
+
+test('only exact successful maintenance authorizer transitions preserve method authority', (t) => {
+  const db = openDatabase(':memory:', 'fictional-maintenance-method');
+  t.after(() => db.close());
+  const before = reviewPreparationMethodStamp(db);
+  assert.ok(before !== undefined);
+  const serial = managedDatabaseMethodSerial(db)!;
+  create(db);
+  assert.equal(managedDatabaseMethodSerial(db), serial + 2n);
+  assert.equal(reviewPreparationMethodStamp(db), before);
+  run(db, 'attention', "INSERT INTO source_attention_counts_v1 VALUES('a',1)");
+  assert.equal(reviewPreparationMethodStamp(db), before);
+  assert.throws(() => run(db, 'attention', "INSERT INTO source_attention_counts_v1 VALUES('a',2)"));
+  const failed = reviewPreparationMethodStamp(db);
+  assert.notEqual(failed, before);
+  db.setAuthorizer(null);
+  assert.notEqual(reviewPreparationMethodStamp(db), failed);
+  const publicPolicy = reviewPreparationMethodStamp(db);
+  db.function('fictional_method_change', () => 1);
+  assert.notEqual(reviewPreparationMethodStamp(db), publicPolicy);
+});
+
+test('extra method transition inside a maintenance statement receives no credit', (t) => {
+  const db = openDatabase(':memory:', 'fictional-maintenance-extra');
+  t.after(() => db.close());
+  create(db);
+  const before = reviewPreparationMethodStamp(db);
+  let nested = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    () => {},
+    () => {
+      if (nested) return;
+      nested = true;
+      db.setAuthorizer(null);
+    },
+  );
+  assert.ok(stop);
+  try {
+    assert.throws(
+      () => run(db, 'attention', "INSERT INTO source_attention_counts_v1 VALUES('a',1)"),
+      /changed method authority/,
+    );
+    assert.notEqual(reviewPreparationMethodStamp(db), before);
+  } finally {
+    stop();
+  }
+});
 
 test('certified cold and warm TEMP SQL preserves preparation authority and raw cache invalidation', (t) => {
   const db = fixture(t),
@@ -51,6 +105,77 @@ test('certified cold and warm TEMP SQL preserves preparation authority and raw c
   exec(db, 'attention', 'DROP TABLE temp.source_attention_counts_v1');
   assert.equal(reviewPreparationStamp(db), authority);
 });
+
+test('nested owned DDL from an authorization observer receives no maintenance credit', (t) => {
+  const db = openDatabase(':memory:', 'fictional-maintenance-nested-ddl');
+  t.after(() => db.close());
+  const before = reviewPreparationStamp(db),
+    methods = reviewPreparationMethodStamp(db);
+  let entered = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action) => {
+      if (entered || action !== constants.SQLITE_CREATE_TEMP_TABLE) return;
+      entered = true;
+      db.exec(
+        'CREATE TEMP TABLE source_attention_dirty_v1(source_id TEXT PRIMARY KEY); DROP TABLE source_attention_dirty_v1',
+      );
+    },
+    () => {},
+  );
+  assert.ok(stop);
+  try {
+    assert.throws(() => create(db));
+    assert.equal(entered, true);
+    assert.equal(reviewPreparationStamp(db), before, 'nested DDL is denied before a schema write');
+    assert.notEqual(reviewPreparationMethodStamp(db), methods);
+  } finally {
+    stop();
+  }
+});
+
+for (const target of ['main', 'temp', 'schema'] as const)
+  for (const phase of [1, 2])
+    test(`policy callback ${target} changes at transition ${phase} receive no maintenance credit`, (t) => {
+      const db = openDatabase(':memory:', 'fictional-maintenance-callback');
+      t.after(() => db.close());
+      create(db);
+      db.exec('CREATE TEMP TABLE fictional_unrelated(value INTEGER)');
+      const before = reviewPreparationStamp(db),
+        methods = reviewPreparationMethodStamp(db);
+      let transitions = 0;
+      const stop = observeManagedDatabaseAuthorization(
+        db,
+        () => {},
+        () => {
+          if (++transitions !== phase) return;
+          if (target === 'main') {
+            db.prepare(
+              "UPDATE app_meta SET value='fictional-other' WHERE key='owner_profile_id'",
+            ).run();
+            db.prepare(
+              "UPDATE app_meta SET value='fictional-maintenance-callback' WHERE key='owner_profile_id'",
+            ).run();
+          } else if (target === 'temp') {
+            db.exec('INSERT INTO fictional_unrelated VALUES(1); DELETE FROM fictional_unrelated');
+          } else {
+            db.exec(
+              'CREATE TEMP TABLE fictional_callback(value INTEGER); DROP TABLE fictional_callback',
+            );
+          }
+        },
+      );
+      assert.ok(stop);
+      try {
+        assert.throws(() =>
+          run(db, 'attention', "INSERT INTO source_attention_counts_v1 VALUES('a',1)"),
+        );
+        assert.notEqual(reviewPreparationStamp(db), before);
+        assert.notEqual(reviewPreparationMethodStamp(db), methods);
+      } finally {
+        stop();
+      }
+    });
 
 test('real writes and rollbacks before, between and after neutral SQL remain visible', (t) => {
   const db = fixture(t);

@@ -135,6 +135,71 @@ test('async activity enumeration yields for empty batches before any visible ite
   }, /fictional stop/);
 });
 
+test('new batch ordering is prepared cooperatively without replaying retained history', async (t) => {
+  const f = fixture(t),
+    base = join(profilePaths(f.root, f.profileId).root, 'intake-batches'),
+    work = journalJsonWork();
+  for (let index = 0; index < 3; index++)
+    writeIntakeBatch(
+      f.root,
+      f.profileId,
+      trackIntakeBatch({ ...f.batch, id: randomUUID(), items: f.batch.items.slice(0, 1) }),
+      'initial',
+    );
+  for (let index = 0; index < 65; index++) fs.mkdirSync(join(base, `ignored-${index}`));
+  await prepareJournalActivity(f.root, f.profileId, { work });
+  const original = fs.opendirSync;
+  let visited = 0;
+  t.mock.method(fs, 'opendirSync', (path: fs.PathLike, options?: fs.OpenDirOptions) => {
+    const directory = original(path, options);
+    if (String(path) === base) {
+      const read = directory.readSync.bind(directory);
+      t.mock.method(directory, 'readSync', () => {
+        const entry = read();
+        if (entry) visited++;
+        return entry;
+      });
+    }
+    return directory;
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    clearJournalActivityIndex(f.root, f.profileId);
+  });
+  writeIntakeBatch(
+    f.root,
+    f.profileId,
+    trackIntakeBatch({ ...f.batch, id: randomUUID(), items: f.batch.items.slice(0, 1) }),
+    'initial',
+  );
+  assert.equal(visited, 0, 'publishing one new batch does not enumerate other batch IDs');
+  const events = work.events;
+  assert.throws(() => [...iterateIntakeBatchActivity(f.root, f.profileId)], {
+    code: 'JOURNAL_ACTIVITY_NOT_PREPARED',
+  });
+  const controller = new AbortController();
+  let beforeHostTurn = -1;
+  setImmediate(() => {
+    beforeHostTurn = visited;
+    controller.abort();
+  });
+  await assert.rejects(prepareJournalActivity(f.root, f.profileId, { signal: controller.signal }), {
+    name: 'AbortError',
+  });
+  assert.ok(beforeHostTurn > 0 && beforeHostTurn <= 64);
+  assert.throws(() => [...iterateIntakeBatchActivity(f.root, f.profileId)], {
+    code: 'JOURNAL_ACTIVITY_NOT_PREPARED',
+  });
+  await prepareJournalActivity(f.root, f.profileId);
+  assert.equal(work.events, events, 'ordering preparation does not replay retained events');
+  assert.deepEqual(
+    [...iterateIntakeBatchActivity(f.root, f.profileId)].map((item) => item.batchId),
+    listIntakeBatches(f.root, f.profileId).map((batch) => batch.id),
+  );
+});
+
 for (const kind of ['journals', 'events'] as const)
   test(`activity enumeration cooperates for ignored and empty ${kind} before cancellation`, async (t) => {
     const f = fixture(t);

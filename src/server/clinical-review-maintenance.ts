@@ -4,7 +4,12 @@ import {
   type SQLInputValue,
   type StatementResultingChanges,
 } from 'node:sqlite';
-import { observeDatabaseClose } from './database.ts';
+import {
+  managedDatabaseMethodSerial,
+  managedDatabaseAuthorizationCallbackActive,
+  observeDatabaseClose,
+  observeManagedDatabaseAuthorization,
+} from './database.ts';
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
 
 type Owner = 'reader' | 'attention';
@@ -201,6 +206,7 @@ function assertCanonicalSchema(db: DatabaseSync, owner: Owner, stamp: string): v
 interface Credit {
   changes: bigint;
   schema: bigint;
+  methods: bigint;
 }
 const credits = new WeakMap<DatabaseSync, Credit>();
 const active = new WeakSet<DatabaseSync>();
@@ -219,6 +225,13 @@ export function reviewPreparationStamp(db: DatabaseSync): string | undefined {
   return `${state.epoch}:${state.changes - (credit?.changes || 0n)}:${state.external}:${state.main}:${state.schema - (credit?.schema || 0n)}`;
 }
 
+/** Only the two authorizer transitions of a certified statement receive credit. */
+export function reviewPreparationMethodStamp(db: DatabaseSync): bigint | undefined {
+  if (db.isTransaction) return undefined;
+  const serial = managedDatabaseMethodSerial(db);
+  return serial === undefined ? undefined : serial - (credits.get(db)?.methods ?? 0n);
+}
+
 function execute(
   db: DatabaseSync,
   owner: Owner,
@@ -232,12 +245,32 @@ function execute(
   if (db.isTransaction) return db.prepare(sql).run(...parameters);
   const beforeRaw = reviewReadStamp(db);
   if (beforeRaw === undefined) throw Error('Clinical cache maintenance authority unavailable');
-  assertCanonicalSchema(db, owner, beforeRaw);
   const before = parts(beforeRaw),
+    beforeMethodSerial = managedDatabaseMethodSerial(db),
     allowed = objects[owner];
   let catalogWrites = false,
     declaredDdl = false,
-    declaredTempTrigger = false;
+    declaredTempTrigger = false,
+    restored = false;
+  let executing = false,
+    foreignAuthorization = false;
+  // Public policy-change callbacks run outside the statement's restrictive
+  // authorizer. Their SQL must never receive this statement's maintenance credit.
+  const stopBoundary = observeManagedDatabaseAuthorization(
+    db,
+    (action, _name, detail) => {
+      if (
+        !executing &&
+        action !== constants.SQLITE_READ &&
+        action !== constants.SQLITE_SELECT &&
+        action !== constants.SQLITE_FUNCTION &&
+        action !== constants.SQLITE_RECURSIVE &&
+        !(action === constants.SQLITE_PRAGMA && detail === null)
+      )
+        foreignAuthorization = true;
+    },
+    () => {},
+  );
   const catalog = (name: string | null) =>
     name === 'sqlite_temp_master' || name === 'sqlite_temp_schema';
   const index = (name: string | null, table: string | null) =>
@@ -248,11 +281,13 @@ function execute(
       (/^sqlite_autoindex_.*_\d+$/.test(name) && name.startsWith(`sqlite_autoindex_${table}_`)));
   active.add(db);
   try {
+    assertCanonicalSchema(db, owner, beforeRaw);
     // These connections have no other application authorizer. Install only for
     // this fresh statement's compilation/execution, then restore normal SQL.
     db.setAuthorizer((action, name, detail, database, origin) => {
       if (action === constants.SQLITE_READ || action === constants.SQLITE_SELECT)
         return constants.SQLITE_OK;
+      if (managedDatabaseAuthorizationCallbackActive(db)) return constants.SQLITE_DENY;
       const observer = owner === 'attention' ? maintenanceObservers.get(db) : undefined;
       if (
         action === constants.SQLITE_FUNCTION &&
@@ -318,28 +353,39 @@ function execute(
       }
       return constants.SQLITE_DENY;
     });
+    if (foreignAuthorization) throw Error('Clinical cache maintenance changed authority');
+    executing = true;
     const statement = db.prepare(sql);
     if (statement.sourceSQL.trim() !== sql.trim())
       throw Error('Clinical cache maintenance requires one SQL statement');
     if (catalogWrites && !declaredDdl) throw Error('Uncertified clinical cache catalog write');
     const result = statement.run(...parameters);
+    executing = false;
     db.setAuthorizer(null);
+    restored = true;
     const afterRaw = reviewReadStamp(db);
     if (afterRaw === undefined) throw Error('Clinical cache maintenance changed transaction state');
     const after = parts(afterRaw);
     if (
+      foreignAuthorization ||
       before.epoch !== after.epoch ||
       before.external !== after.external ||
       before.main !== after.main ||
-      after.changes < before.changes ||
+      after.changes - before.changes !== (ddl ? 0n : BigInt(result.changes)) ||
       after.schema < before.schema
     )
       throw Error('Clinical cache maintenance changed authority');
+    const afterMethodSerial = managedDatabaseMethodSerial(db);
+    if (
+      beforeMethodSerial !== undefined &&
+      (afterMethodSerial === undefined || afterMethodSerial - beforeMethodSerial !== 2n)
+    )
+      throw Error('Clinical cache maintenance changed method authority');
     if (after.schema === before.schema) schemaProofs.get(db)!.set(owner, afterRaw);
     else assertCanonicalSchema(db, owner, afterRaw);
     let credit = credits.get(db);
     if (!credit) {
-      credits.set(db, (credit = { changes: 0n, schema: 0n }));
+      credits.set(db, (credit = { changes: 0n, schema: 0n, methods: 0n }));
       observeDatabaseClose(db, () => {
         credits.delete(db);
         schemaProofs.delete(db);
@@ -347,10 +393,16 @@ function execute(
     }
     credit.changes += after.changes - before.changes;
     credit.schema += after.schema - before.schema;
+    if (beforeMethodSerial !== undefined) credit.methods += 2n;
     return result;
   } finally {
-    if (db.isOpen) db.setAuthorizer(null);
-    active.delete(db);
+    executing = false;
+    try {
+      if (db.isOpen && !restored) db.setAuthorizer(null);
+    } finally {
+      if (db.isOpen) stopBoundary?.();
+      active.delete(db);
+    }
   }
 }
 

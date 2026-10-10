@@ -54,6 +54,8 @@ interface ActivityIndex {
   json: JournalJsonIndex;
   order: JournalActivityOrder;
   ready: boolean;
+  orderDirty: boolean;
+  orderPreparing: boolean;
   profileId: string;
   root: string;
   work: JournalJsonWork;
@@ -547,14 +549,26 @@ export async function prepareJournalActivity(
   if (realpathSync(key) !== join(realpathSync(root), 'data', 'profiles', profileId)) invalid();
   if (existing?.ready) {
     let valid = false;
+    const reorder = existing.orderDirty;
+    if (existing.orderPreparing) pending();
+    if (reorder) existing.orderPreparing = true;
     try {
-      const proof = await activityBindingAsync(existing, { ...options, assertRunning });
+      const assertPrepared = reorder
+        ? await prepareActivityOrder(existing, assertRunning)
+        : assertRunning;
+      const proof = await activityBindingAsync(existing, {
+        ...options,
+        assertRunning: assertPrepared,
+      });
       proof.assertCurrent();
+      existing.orderDirty = false;
       valid = true;
     } catch (error) {
       if (interrupted || indexes.get(key) !== existing) throw error;
       options.signal?.throwIfAborted();
       clearJournalActivityIndex(root, profileId);
+    } finally {
+      if (reorder) existing.orderPreparing = false;
     }
     if (valid) {
       if (indexes.get(key) !== existing) pending();
@@ -568,6 +582,8 @@ export async function prepareJournalActivity(
       json: new JournalJsonIndex(scratch.db, work),
       order: new JournalActivityOrder(scratch.db),
       ready: false,
+      orderDirty: false,
+      orderPreparing: false,
       profileId,
       root,
       work,
@@ -725,7 +741,7 @@ export async function prepareJournalActivity(
 }
 function current(root: string, profileId: string): ActivityIndex {
   const index = indexes.get(scope(root, profileId));
-  if (!index?.ready) pending();
+  if (!index?.ready || index.orderDirty) pending();
   return index;
 }
 function checked(index: ActivityIndex, row: Selected): void {
@@ -758,20 +774,7 @@ async function activityBindingAsync(
   };
   assertActive();
   const sql = index.scratch.db;
-  const changes = [
-    'SELECT total_changes() AS value',
-    'PRAGMA main.schema_version',
-    'PRAGMA main.data_version',
-    'PRAGMA temp.schema_version',
-    'PRAGMA temp.data_version',
-  ].map((query) => {
-    const statement = sql.prepare(query);
-    statement.setReadBigInts(true);
-    return statement;
-  });
-  const stamp = () => {
-    return changes.map((statement) => Object.values(statement.get()!)[0]).join(':');
-  };
+  const stamp = activityScratchStamp(index);
   const original = stamp(),
     epoch = captureManagedPhysicalEpoch();
   const assertCurrent = () => {
@@ -846,6 +849,70 @@ async function activityBindingAsync(
     };
   } finally {
     if (!closed) await worker.abort();
+  }
+}
+function activityScratchStamp(index: ActivityIndex): () => string {
+  const changes = [
+    'SELECT total_changes() AS value',
+    'PRAGMA main.schema_version',
+    'PRAGMA main.data_version',
+    'PRAGMA temp.schema_version',
+    'PRAGMA temp.data_version',
+  ].map((query) => {
+    const statement = index.scratch.db.prepare(query);
+    statement.setReadBigInts(true);
+    return statement;
+  });
+  return () => {
+    return changes.map((statement) => Object.values(statement.get()!)[0]).join(':');
+  };
+}
+/** Ordering is disposable but filesystem enumeration decides equal-date ties. */
+async function prepareActivityOrder(index: ActivityIndex, assertRunning: () => void) {
+  const key = scope(index.root, index.profileId),
+    stamp = activityScratchStamp(index),
+    epoch = captureManagedPhysicalEpoch();
+  let expected = stamp();
+  const assertCurrent = () => {
+    assertRunning();
+    if (
+      indexes.get(key) !== index ||
+      !index.scratch.db.isOpen ||
+      !epoch ||
+      !managedPhysicalEpochCurrent(epoch) ||
+      stamp() !== expected ||
+      container(index, 'batch') !== index.containers.batch
+    )
+      pending();
+  };
+  assertCurrent();
+  const directory = opendirSync(join(key, 'intake-batches'));
+  try {
+    let ordinal = 0,
+      visited = 0;
+    for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+      if (UUID.test(entry.name)) {
+        const row = select(index, 'batch', entry.name);
+        if (row) {
+          if (row.ordinal !== ordinal) {
+            row.ordinal = ordinal;
+            put(index, row);
+            expected = stamp();
+          }
+          ordinal++;
+        }
+      }
+      if (++visited % 64 === 0) {
+        assertCurrent();
+        index.work.yields++;
+        await setImmediate();
+        assertCurrent();
+      }
+    }
+    assertCurrent();
+    return assertCurrent;
+  } finally {
+    directory.closeSync();
   }
 }
 function activityBinding(index: ActivityIndex): string {
@@ -1052,26 +1119,7 @@ export function publishedJournalActivity(
     )
       invalid();
     put(index, next);
-    if (kind === 'batch' && !before) {
-      // A new directory can change the filesystem's enumeration order (including
-      // equal-date ties). Revisit only batch IDs, never their retained histories.
-      const directory = opendirSync(join(scope(root, profileId), 'intake-batches'));
-      try {
-        let ordinal = 0;
-        for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
-          if (!UUID.test(entry.name)) continue;
-          const row = select(index, 'batch', entry.name);
-          if (!row) continue;
-          if (row.ordinal !== ordinal) {
-            row.ordinal = ordinal;
-            put(index, row);
-          }
-          ordinal++;
-        }
-      } finally {
-        directory.closeSync();
-      }
-    }
+    if (kind === 'batch' && !before) index.orderDirty = true;
     index.containers[kind] = container(index, kind);
   } catch {
     clearJournalActivityIndex(root, profileId);

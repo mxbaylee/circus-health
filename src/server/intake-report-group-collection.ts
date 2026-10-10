@@ -10,7 +10,10 @@ import {
   type VerifiedClinicalArtifact,
 } from './intake-review-collection-session.ts';
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
-import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
+import {
+  reviewPreparationMethodStamp,
+  reviewPreparationStamp,
+} from './clinical-review-maintenance.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Complete native report summaries. Pages never become a clinical decision scope. */
 import { createHash, randomUUID } from 'node:crypto';
@@ -365,6 +368,8 @@ interface CollectionQueueBindingWitness {
   stamp: string;
   methodEpoch: object;
   physicalEpoch: object;
+  preparationStamp: string;
+  preparationMethods: bigint;
 }
 async function collectionQueueBinding(
   db: DatabaseSync,
@@ -372,10 +377,21 @@ async function collectionQueueBinding(
   retain?: (source: IntakeEnvelopeSource, pin: string) => void,
 ): Promise<CollectionQueueBindingWitness | undefined> {
   if (db.isTransaction) return undefined;
+  // Install the disposable policy tracker before taking the readonly witness.
+  intakeClinicalCachePin(db);
   const stamp = reviewReadStamp(db),
     methodEpoch = managedDatabaseMethodEpoch(db),
-    physicalEpoch = captureManagedPhysicalEpoch();
-  if (!stamp || !methodEpoch || !physicalEpoch) throw changed();
+    physicalEpoch = captureManagedPhysicalEpoch(),
+    preparationStamp = reviewPreparationStamp(db),
+    preparationMethods = reviewPreparationMethodStamp(db);
+  if (
+    !stamp ||
+    !methodEpoch ||
+    !physicalEpoch ||
+    !preparationStamp ||
+    preparationMethods === undefined
+  )
+    throw changed();
   const { hash, update } = newCollectionQueueBindingHash(db, profileId);
   for await (const source of collectionQueueSourcesAsync(db, profileId)) {
     const version = intakeSourceVersion(db, source.id),
@@ -389,7 +405,14 @@ async function collectionQueueBinding(
     captureManagedPhysicalEpoch() !== physicalEpoch
   )
     throw changed();
-  return { binding: hash.digest('hex'), stamp, methodEpoch, physicalEpoch };
+  return {
+    binding: hash.digest('hex'),
+    stamp,
+    methodEpoch,
+    physicalEpoch,
+    preparationStamp,
+    preparationMethods,
+  };
 }
 /** Internal complete-policy access; records/providers stay local to the pinned consumer. */
 export interface RetainedCollectionClinicalPolicy {
@@ -772,13 +795,16 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       currentRevision = intakeClinicalCachePin(db),
       removedSources: string[] = [];
     const expectedPreparation = reviewPreparationStamp(db),
+      expectedMethod = reviewPreparationMethodStamp(db),
       expectedMethodEpoch = managedDatabaseMethodEpoch(db),
       expectedPhysicalEpoch = captureManagedPhysicalEpoch();
     if (!expectedMethodEpoch || !expectedPhysicalEpoch) throw changed();
     const assertRefresh = () => {
       assertIntakeOwner(db, profileId);
       if (
-        managedDatabaseMethodEpoch(db) !== expectedMethodEpoch ||
+        (expectedMethod === undefined
+          ? managedDatabaseMethodEpoch(db) !== expectedMethodEpoch
+          : reviewPreparationMethodStamp(db) !== expectedMethod) ||
         captureManagedPhysicalEpoch() !== expectedPhysicalEpoch ||
         (!db.isTransaction &&
           (!expectedPreparation || reviewPreparationStamp(db) !== expectedPreparation))
@@ -1373,8 +1399,19 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
   };
   const prepareCurrent = async () => {
     if (closed) throw changed();
+    const assertPreparation = () => {
+      if (
+        !bindingWitness ||
+        reviewPreparationStamp(db) !== bindingWitness.preparationStamp ||
+        reviewPreparationMethodStamp(db) !== bindingWitness.preparationMethods ||
+        captureManagedPhysicalEpoch() !== bindingWitness.physicalEpoch
+      )
+        throw changed();
+    };
+    if (!db.isTransaction) assertPreparation();
     const current = await collectionQueueBinding(db, profileId);
     if (current) {
+      assertPreparation();
       if (current.binding !== binding) throw changed();
       bindingWitness = current;
     } else if (bindingNow() !== binding) {

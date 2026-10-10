@@ -28,9 +28,15 @@ interface ManagedAuthorization {
   readonly observers: Set<AuthorizationObserver>;
   readonly policyChanges: Set<() => void>;
   policy: Authorizer | null;
+  callbackDepth: number;
 }
 const managedAuthorizers = new WeakMap<DatabaseSync, ManagedAuthorization>();
 const managedMethodEpochs = new WeakMap<DatabaseSync, object>();
+const managedMethodSerials = new WeakMap<DatabaseSync, bigint>();
+function rotateManagedMethodEpoch(db: DatabaseSync): void {
+  managedMethodEpochs.set(db, {});
+  managedMethodSerials.set(db, (managedMethodSerials.get(db) ?? 0n) + 1n);
+}
 const managedFunctions = new WeakMap<
   DatabaseSync,
   { setter: DatabaseSync['function']; observers: Set<(name: string) => void> }
@@ -49,7 +55,7 @@ export function installManagedDatabaseFunctionRegistration(db: DatabaseSync): vo
   );
   const setter = function (this: DatabaseSync, ...args: Parameters<DatabaseSync['function']>) {
     if (this === db) {
-      managedMethodEpochs.set(db, {});
+      rotateManagedMethodEpoch(db);
       for (const observer of observers) {
         try {
           observer(args[0]);
@@ -64,7 +70,7 @@ export function installManagedDatabaseFunctionRegistration(db: DatabaseSync): vo
   } as DatabaseSync['function'];
   db.function = setter;
   managedFunctions.set(db, { setter, observers });
-  managedMethodEpochs.set(db, {});
+  rotateManagedMethodEpoch(db);
 }
 
 /** Private identity for read proofs; failed registrations also invalidate prior reads. */
@@ -76,6 +82,11 @@ export function managedDatabaseMethodEpoch(db: DatabaseSync): object | undefined
   )
     return undefined;
   return managedMethodEpochs.get(db);
+}
+
+/** Monotonic method mutation count; undefined when managed wrappers are replaced. */
+export function managedDatabaseMethodSerial(db: DatabaseSync): bigint | undefined {
+  return managedDatabaseMethodEpoch(db) ? managedMethodSerials.get(db) : undefined;
 }
 
 export function observeManagedDatabaseFunctionRegistration(
@@ -104,24 +115,38 @@ export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
     observers: new Set(),
     policyChanges: new Set(),
     policy: null,
+    callbackDepth: 0,
+  };
+  const notify = (callback: () => void) => {
+    state.callbackDepth++;
+    try {
+      callback();
+    } finally {
+      state.callbackDepth--;
+    }
   };
   const setter = function (this: DatabaseSync, policy: Authorizer | null) {
     if (this !== db) return Reflect.apply(nativeSetter, this, [policy]);
-    managedMethodEpochs.set(db, {});
-    for (const changed of state.policyChanges) changed();
+    rotateManagedMethodEpoch(db);
+    for (const changed of state.policyChanges) notify(changed);
     state.policy = policy;
     state.refresh();
   } as DatabaseSync['setAuthorizer'];
   state.setter = setter;
   const dispatch: Authorizer = (...args) => {
-    for (const observer of state.observers) observer(...args);
+    for (const observer of state.observers) notify(() => observer(...args));
     return state.policy?.(...args) ?? constants.SQLITE_OK;
   };
   state.refresh = () =>
     nativeSetter.call(db, state.policy || state.observers.size ? dispatch : null);
   db.setAuthorizer = setter;
   managedAuthorizers.set(db, state);
-  managedMethodEpochs.set(db, {});
+  rotateManagedMethodEpoch(db);
+}
+
+/** Distinguishes observer SQL from the statement whose policy it is observing. */
+export function managedDatabaseAuthorizationCallbackActive(db: DatabaseSync): boolean {
+  return (managedAuthorizers.get(db)?.callbackDepth ?? 0) > 0;
 }
 
 export function observeManagedDatabaseAuthorization(

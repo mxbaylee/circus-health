@@ -39,7 +39,13 @@ test(
           const value = envelope(`fictional-${index}`);
           return JSON.stringify({
             ...value,
-            report: { ...value.report, key: `fictional-${index}` },
+            report: {
+              ...value.report,
+              anchor: {
+                locator: `page ${index + 1} heading`,
+                text: `Fictional report ${index + 1}`,
+              },
+            },
           });
         }).join('\n'),
       ),
