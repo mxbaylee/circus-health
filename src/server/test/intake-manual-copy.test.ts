@@ -24,6 +24,7 @@ import { readIntakeEnvelopeText } from '../intake-authority.ts';
 import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
 import { profilePaths } from '../profile-storage.ts';
 import { rebuildContributorDatabase } from '../contributor-durability.ts';
+import { contributorAuthorityPath } from '../contributor-record-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import type { ManualSourceRecordRequest } from '../../shared/intake-manual-source-record.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
@@ -395,15 +396,21 @@ test('copy proof survives later source-text changes while existing stale-source 
 test('source advancement between preparation and staging refuses the unpublished copy', async (t) => {
   const f = await fixture(t);
   let destination: string | undefined;
+  let advancedHead: Buffer | undefined;
+  const sourceHead = resolve(contributorAuthorityPath(f.root, f.source.id), 'head');
   f.setBeforeStage((context) => {
     destination = context.targetProfileId;
     transaction(f.db, () =>
       f.db.prepare("INSERT INTO app_meta VALUES('fictional:advanced','retained')").run(),
     );
+    advancedHead = readFileSync(sourceHead);
   });
-  await assert.rejects(f.copy(), /source selected head changed/);
+  await assert.rejects(f.copy(), { message: 'Copy original read interval changed' });
   assert.ok(destination);
+  assert.ok(advancedHead);
   assert.equal(existsSync(profilePaths(f.root, destination).root), false);
+  assert.equal(existsSync(resolve(contributorAuthorityPath(f.root, destination), 'head')), false);
+  assert.deepEqual(readFileSync(sourceHead), advancedHead);
   assert.equal(
     f.db.prepare("SELECT value FROM app_meta WHERE key='fictional:advanced'").get()?.value,
     'retained',
