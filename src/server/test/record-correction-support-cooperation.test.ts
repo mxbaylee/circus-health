@@ -162,8 +162,22 @@ test('supporting ancestry cancellation stops at the next bounded host turn', asy
   assert.equal(reads, atAbort, 'cancelled ancestry reads no more selected parent metadata');
   assert.equal(reviewIssueScratchCounts(f.db).databases, 0);
   t.mock.restoreAll();
+  let successorReads = 0;
+  t.mock.method(StatementSync.prototype, 'get', function (this: StatementSync, ...args: unknown[]) {
+    const result = Reflect.apply(original, this, args);
+    if (
+      this.sourceSQL ===
+        "SELECT id,kind,sha256 FROM main.source_files WHERE id=? AND kind='intake_original'" &&
+      typeof args[0] === 'string' &&
+      args[0].startsWith('fictional-ancestor-') &&
+      /\bat prepareSupportingSourceRoot \(/.test(new Error().stack ?? '')
+    )
+      successorReads++;
+    return result;
+  });
   const successor = await prepareCorrectionSupportingEvidence(f.db, f.root, f.profileId, [f.ref]);
   successor.dispose();
+  assert.equal(successorReads, 260, 'each of the 130 ancestor edges is checked and rechecked once');
   assert.equal(reviewIssueScratchCounts(f.db).databases, 0);
 });
 

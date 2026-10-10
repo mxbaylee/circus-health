@@ -362,14 +362,20 @@ export async function prepareCorrectionSupportingEvidence(
             file.details?.parentSourceFileId === ref.intakeId &&
             intakeMetadataScalarMatches(file.details.locator, member.locator) &&
             file.row.sha256 === member.sourceHash;
+          const supportingRoot =
+            selectedEvidence || exactMember
+              ? await prepareSupportingSourceRoot(
+                  db,
+                  profileId,
+                  ref.originalSourceFileId,
+                  assertPreparing,
+                )
+              : undefined;
           if (
-            (!selectedEvidence && !exactMember) ||
-            (await prepareSupportingSourceRoot(
-              db,
-              profileId,
-              ref.originalSourceFileId,
-              assertPreparing,
-            )) !== (await prepareSupportingSourceRoot(db, profileId, ref.intakeId, assertPreparing))
+            supportingRoot === undefined ||
+            (ref.originalSourceFileId !== ref.intakeId &&
+              supportingRoot !==
+                (await prepareSupportingSourceRoot(db, profileId, ref.intakeId, assertPreparing)))
           )
             throw new HttpError(
               409,
