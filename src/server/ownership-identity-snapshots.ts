@@ -39,13 +39,12 @@ export async function prepareOwnershipIdentityIssueSnapshot(
   previous?: OwnershipIdentityIssues,
   options: { deferMaintenance?: boolean } = {},
 ) {
-  const snapshot = await factory.prepareSplit({
+  const snapshot = await factory.prepareMembership({
     previous: previous && !Array.isArray(previous) ? previous.snapshot : undefined,
     sourceRecordIds: values,
-    movingSourceRecordIds: () => [],
   });
   if (!options.deferMaintenance) await factory.finishMaintenance();
-  return { format: 'health-ownership-identity-issues-v1', snapshot: snapshot.remaining } as const;
+  return { format: 'health-ownership-identity-issues-v1', snapshot } as const;
 }
 
 export async function prepareOwnershipIdentitySnapshots(

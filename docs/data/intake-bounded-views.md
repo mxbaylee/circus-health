@@ -337,6 +337,20 @@ returned SQL pages, not SQLite's internal work. This does not yet bound every
 cold host turn: some reconstruction and hashing still use complete strings, and
 other selected-envelope and synchronous readers still fetch complete metadata.
 
+Each compact read-owner guard checks its original accepted sequence and
+configured accepted HEAD once, without a second status/HEAD read or unused
+revision queries.
+The original owner still checks database, storage and method continuity. This
+removes duplicate work within a guard; it does not reduce the number of guarded
+chunks or replace the complete physical publication proof.
+
+Identity issue membership uses the same checked snapshot codec without creating
+an unused empty moving-members snapshot. Existing split operations still retain
+both selected halves. Cold and changed-set fixtures compare every same member,
+preserve prior references through cache loss, and avoid three auxiliary catalog
+checkpoints per identity snapshot. Final ownership publication and complete
+physical verification remain separate requirements.
+
 HTTP and assistant readiness cooperatively prepare complete older native
 projections before presentation. Identity preparation covers only the exact
 retained child before sealing its scope. Packet export preparation covers the

@@ -140,6 +140,60 @@ export function createOwnershipSourceSnapshotPreparation(
     await catalog.publish(reference.snapshotId, writer);
     return reference;
   };
+  const prepareMembership = async (input: {
+    previous?: OwnershipSourceSnapshotReference;
+    sourceRecordIds: () => Iterable<string>;
+  }) => {
+    if (finished) throw Error('Ownership source snapshot preparation already finished');
+    assertCurrent();
+    if (input.previous && JSON.stringify(input.previous.source) !== JSON.stringify(binding))
+      throw Error('Ownership source snapshot custodian changed');
+    const previous = input.previous && open(catalog, input.previous),
+      current = previous ? await catalog.forkReference(previous) : await catalog.fork(),
+      before = previous ? members(previous) : [][Symbol.iterator](),
+      after = sorted(input.sourceRecordIds()),
+      phase: IntakeWorkPhase = previous ? 'warm' : 'reconstruction',
+      oldHash = accumulator(db, phase);
+    let old = before.next(),
+      next = after.next(),
+      pending: Array<{ key: string; value: string }> = [];
+    let compared = 0;
+    const flush = async () => {
+      if (pending.length) {
+        await current.putMany(pending);
+        pending = [];
+      }
+    };
+    while (!old.done || !next.done) {
+      assertCurrent();
+      withIntakeWork(db, phase, () => recordIntakeWork('ownershipSnapshotComparedIds'));
+      if (++compared % 64 === 0) await yieldStep(phase);
+      if (!old.done && (next.done || old.value < next.value)) {
+        oldHash.add(old.value);
+        await flush();
+        await current.delete(key(old.value));
+        withIntakeWork(db, phase, () => recordIntakeWork('ownershipSnapshotChangedIds'));
+        old = before.next();
+      } else if (!next.done && (old.done || next.value < old.value)) {
+        pending.push({ key: key(next.value), value: next.value });
+        withIntakeWork(db, phase, () => recordIntakeWork('ownershipSnapshotChangedIds'));
+        if (pending.length === 16) await flush();
+        next = after.next();
+      } else {
+        oldHash.add(old.value!);
+        old = before.next();
+        next = after.next();
+      }
+    }
+    await flush();
+    const prior = oldHash.finish();
+    if (
+      input.previous &&
+      (prior.count !== input.previous.count || prior.digest !== input.previous.digest)
+    )
+      throw Error('Ownership prior source membership failed complete verification');
+    return { current, phase };
+  };
   return {
     assertCurrent,
     assertPublishedCurrent(reference: OwnershipSourceSnapshotReference) {
@@ -153,59 +207,19 @@ export function createOwnershipSourceSnapshotPreparation(
       if (clinicalReviewRevision(db) !== basis)
         throw Error('Ownership source evidence changed after publication');
     },
+    async prepareMembership(input: {
+      previous?: OwnershipSourceSnapshotReference;
+      sourceRecordIds: () => Iterable<string>;
+    }) {
+      const { current, phase } = await prepareMembership(input);
+      return publish(current, phase);
+    },
     async prepareSplit(input: {
       previous?: OwnershipSourceSnapshotReference;
       sourceRecordIds: () => Iterable<string>;
       movingSourceRecordIds: () => Iterable<string>;
     }) {
-      if (finished) throw Error('Ownership source snapshot preparation already finished');
-      assertCurrent();
-      if (input.previous && JSON.stringify(input.previous.source) !== JSON.stringify(binding))
-        throw Error('Ownership source snapshot custodian changed');
-      const previous = input.previous && open(catalog, input.previous),
-        current = previous ? await catalog.forkReference(previous) : await catalog.fork(),
-        before = previous ? members(previous) : [][Symbol.iterator](),
-        after = sorted(input.sourceRecordIds()),
-        phase: IntakeWorkPhase = previous ? 'warm' : 'reconstruction',
-        oldHash = accumulator(db, phase);
-      let old = before.next(),
-        next = after.next(),
-        pending: Array<{ key: string; value: string }> = [];
-      let compared = 0;
-      const flush = async () => {
-        if (pending.length) {
-          await current.putMany(pending);
-          pending = [];
-        }
-      };
-      while (!old.done || !next.done) {
-        assertCurrent();
-        withIntakeWork(db, phase, () => recordIntakeWork('ownershipSnapshotComparedIds'));
-        if (++compared % 64 === 0) await yieldStep(phase);
-        if (!old.done && (next.done || old.value < next.value)) {
-          oldHash.add(old.value);
-          await flush();
-          await current.delete(key(old.value));
-          withIntakeWork(db, phase, () => recordIntakeWork('ownershipSnapshotChangedIds'));
-          old = before.next();
-        } else if (!next.done && (old.done || next.value < old.value)) {
-          pending.push({ key: key(next.value), value: next.value });
-          withIntakeWork(db, phase, () => recordIntakeWork('ownershipSnapshotChangedIds'));
-          if (pending.length === 16) await flush();
-          next = after.next();
-        } else {
-          oldHash.add(old.value!);
-          old = before.next();
-          next = after.next();
-        }
-      }
-      await flush();
-      const prior = oldHash.finish();
-      if (
-        input.previous &&
-        (prior.count !== input.previous.count || prior.digest !== input.previous.digest)
-      )
-        throw Error('Ownership prior source membership failed complete verification');
+      const { current, phase } = await prepareMembership(input);
       const moving = await catalog.fork();
       for (const id of sorted(input.movingSourceRecordIds())) {
         assertCurrent();
