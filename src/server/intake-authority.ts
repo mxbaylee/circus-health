@@ -638,6 +638,119 @@ const selectedBridgeProofs = new WeakMap<
     version: number;
   }
 >();
+declare const selectedBuildBrand: unique symbol;
+export interface PreparedSelectedIntakeBuildView {
+  readonly [selectedBuildBrand]: true;
+}
+const selectedBuildViews = new WeakMap<
+  PreparedSelectedIntakeBuildView,
+  {
+    db: Database;
+    originalRead: IntakeLegacyBridgeReadWitness;
+    source: PagedIntakeEnvelopeSource;
+    identity: IntakeStateIdentity;
+    projection: { mode: Mode; format: IntakeEnvelopeProjectionFormat };
+    detailsDigest: string;
+    textDigest: string;
+    textBytes: number;
+    selected?: IntakeEnvelopeBinding;
+    collections?: ReturnType<typeof createIntakeStateStorage>['collections'];
+  }
+>();
+/** Build-only handle from the complete original read. No caller metadata or hash
+ * can be enrolled as a selected source. */
+export function openSelectedIntakeBuildView(
+  db: Database,
+  view: PreparedSelectedIntakeBuildView,
+  originalRead: IntakeLegacyBridgeReadWitness,
+) {
+  const data = selectedBuildViews.get(view);
+  if (!data || data.db !== db || data.originalRead !== originalRead || data.selected)
+    return fail('foreign or reused selected build view');
+  assertIntakeLegacyBridgeReadWitness(db, originalRead);
+  const current = selectedSourceHeader(db, data.source);
+  if (
+    current.id !== data.source.id ||
+    current.kind !== data.source.kind ||
+    current.sha256 !== data.source.sha256 ||
+    current.metadataBytes !== data.source.metadataBytes
+  )
+    return fail('selected build source changed');
+  const selected = identity(db, current);
+  if (JSON.stringify(selected) !== JSON.stringify(data.identity))
+    return fail('selected build identity changed');
+  const binding = intakeEnvelopeAuthorityBindingChecked(db, current, data.projection);
+  assertIntakeLegacyBridgeReadWitness(db, originalRead);
+  data.collections ??= createIntakeStateStorage(db, data.identity).collections;
+  assertIntakeLegacyBridgeReadWitness(db, originalRead);
+  return {
+    view,
+    identity: data.identity,
+    binding,
+    collections: data.collections,
+    detailsDigest: data.detailsDigest,
+    textDigest: data.textDigest,
+    textBytes: data.textBytes,
+  };
+}
+/** Seal only an already-selected source. A legacy bridge advances the accepted
+ * HEAD and requires a separate certified continuation before this view can be used. */
+export function sealSelectedIntakeBuildView(
+  db: Database,
+  view: PreparedSelectedIntakeBuildView,
+  originalRead: IntakeLegacyBridgeReadWitness,
+) {
+  const data = selectedBuildViews.get(view);
+  if (!data || data.db !== db || data.originalRead !== originalRead || data.selected)
+    return fail('selected build view cannot be sealed');
+  const selected = openSelectedIntakeBuildView(db, view, originalRead);
+  data.selected = Object.freeze({ ...selected.binding });
+  return { ...selected, binding: data.selected };
+}
+export function assertSelectedIntakeBuildView(
+  db: Database,
+  view: PreparedSelectedIntakeBuildView,
+  originalRead: IntakeLegacyBridgeReadWitness,
+): void {
+  const data = selectedBuildViews.get(view);
+  if (!data || data.db !== db || data.originalRead !== originalRead || !data.selected)
+    return fail('selected build view unavailable');
+  // The caller must close its original frontier around this observational
+  // comparison. Its own certified checkpoints may have advanced that frontier.
+  const current = selectedSourceHeader(db, data.source);
+  if (
+    current.id !== data.source.id ||
+    current.kind !== data.source.kind ||
+    current.sha256 !== data.source.sha256 ||
+    current.metadataBytes !== data.source.metadataBytes ||
+    JSON.stringify(identity(db, current)) !== JSON.stringify(data.identity)
+  )
+    fail('selected build source changed');
+  const binding = intakeEnvelopeAuthorityBindingChecked(db, current, data.projection);
+  if (binding.key !== data.selected.key || binding.logicalHead !== data.selected.logicalHead)
+    fail('selected build binding changed');
+}
+export function closeSelectedIntakeBuildView(view: PreparedSelectedIntakeBuildView): void {
+  selectedBuildViews.delete(view);
+}
+/** Read-only selection for the owner that already holds the original frontier.
+ * This accessor does not itself certify current SQL or physical state. */
+export function selectedIntakeBuildSelection(
+  db: Database,
+  view: PreparedSelectedIntakeBuildView,
+  originalRead: IntakeLegacyBridgeReadWitness,
+) {
+  const data = selectedBuildViews.get(view);
+  if (
+    !data ||
+    data.db !== db ||
+    data.originalRead !== originalRead ||
+    !data.selected ||
+    !data.collections
+  )
+    return fail('selected build selection unavailable');
+  return { collections: data.collections, binding: data.selected };
+}
 /** A one-use result of the actual complete selected read, never a caller digest. */
 export function consumeSelectedIntakeEnvelopeForBridge(
   db: Database,
@@ -791,6 +904,26 @@ export function readIntakeEnvelopeMaterialized(
   });
 }
 
+async function digestSelectedBuildText(text: string, assertCurrent: () => void) {
+  const digest = createHash('sha256');
+  let bytes = 0;
+  for (let at = 0, pages = 0; at < text.length; pages++) {
+    assertCurrent();
+    let end = Math.min(at + 64 * 1024, text.length);
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
+    const piece = text.slice(at, end);
+    digest.update(piece, 'utf8');
+    bytes += Buffer.byteLength(piece);
+    at = end;
+    if (pages % 4 === 3) {
+      await setImmediate();
+      assertCurrent();
+    }
+  }
+  assertCurrent();
+  return { hash: digest.digest('hex'), bytes };
+}
+
 /** Build-only selected reader. The caller's original authority witness must
  * remain live across every cooperative cold-replay and metadata step. */
 export async function readIntakeEnvelopeMaterializedForBuild(
@@ -803,6 +936,7 @@ export async function readIntakeEnvelopeMaterializedForBuild(
   text: string;
   fingerprint: string | null;
   selectedProof: PreparedSelectedIntakeEnvelope;
+  selectedBuildView: PreparedSelectedIntakeBuildView;
 }> {
   const assertCurrent = () => assertIntakeLegacyBridgeReadWitness(db, originalRead);
   assertCurrent();
@@ -845,7 +979,7 @@ export async function readIntakeEnvelopeMaterializedForBuild(
     text = state.value.raw;
   } else text = state.serialized;
   const version =
-    details !== undefined && Buffer.byteLength(text) <= 64 * 1024
+    details !== undefined && text.length <= 64 * 1024 && Buffer.byteLength(text) <= 64 * 1024
       ? (() => {
           const validated = validateRepresentation(details, state.value, state.serialized);
           const intake = validated.value.intake;
@@ -876,7 +1010,7 @@ export async function readIntakeEnvelopeMaterializedForBuild(
   assertCurrent();
   if (!detailsDigest || !binding.head || !source.sha256)
     return fail('incomplete selected intake proof');
-  const textDigest = createHash('sha256').update(text).digest('hex');
+  const textIdentity = await digestSelectedBuildText(text, assertCurrent);
   assertCurrent();
   const selectedProof = Object.freeze({}) as PreparedSelectedIntakeEnvelope;
   selectedBridgeProofs.set(selectedProof, {
@@ -887,16 +1021,29 @@ export async function readIntakeEnvelopeMaterializedForBuild(
     beforeHead: binding.head,
     metadataBytes: source.metadataBytes,
     detailsDigest,
-    textDigest,
+    textDigest: textIdentity.hash,
     mode: projection.mode,
     version,
   });
+  const selectedBuildView = Object.freeze({}) as PreparedSelectedIntakeBuildView;
+  selectedBuildViews.set(selectedBuildView, {
+    db,
+    originalRead,
+    source: Object.freeze({ ...source }),
+    identity: Object.freeze({ ...identity(db, source) }),
+    projection: Object.freeze({ ...projection }),
+    detailsDigest,
+    textDigest: textIdentity.hash,
+    textBytes: textIdentity.bytes,
+  });
+  assertCurrent();
   return {
     mode: projection.mode,
     version,
     text,
     fingerprint: projection.mode === 'normalized' ? state.fingerprint : null,
     selectedProof,
+    selectedBuildView,
   };
 }
 export function readIntakeEnvelope(

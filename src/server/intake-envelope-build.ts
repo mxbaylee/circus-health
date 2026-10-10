@@ -12,10 +12,14 @@ import { hashIntakeJsonScalarSteps } from './intake-json-scalar.ts';
 import type { Database } from './database.ts';
 import {
   readIntakeEnvelopeMaterializedForBuild,
+  openSelectedIntakeBuildView,
+  sealSelectedIntakeBuildView,
+  closeSelectedIntakeBuildView,
   type IntakeEnvelopeSource,
 } from './intake-authority.ts';
 import {
   collectionCellReader,
+  collectionCellReaderForBuild,
   hasIntakeCollectionEnvelope,
   iterateSchemaEnvelopeText,
   iterateSchemaCellText,
@@ -112,135 +116,166 @@ async function buildIntakeCollectionEnvelopeOwned(
   originalRead: IntakeLegacyBridgeReadWitness,
 ) {
   const legacy = await readIntakeEnvelopeMaterializedForBuild(db, source, originalRead);
-  const { collections, binding } = selectedEnvelopeStore(db, source);
-  assertIntakeLegacyBridgeReadWitness(db, originalRead);
-  const version = legacy.version;
-  const sourceTextHash = digest(legacy.text);
-  withIntakeWork(db, 'warm', () =>
-    recordIntakeWork('schemaBuildSourceHashBytes', Buffer.byteLength(legacy.text)),
-  );
-  if (binding.logicalHead === undefined) {
-    const id = randomUUID();
-    const prepared = await collections.prepareLegacyBridgeAsync(
+  try {
+    const initial = openSelectedIntakeBuildView(db, legacy.selectedBuildView, originalRead);
+    const { collections, binding } = initial;
+    assertIntakeLegacyBridgeReadWitness(db, originalRead);
+    const version = legacy.version;
+    const sourceTextHash = initial.textDigest;
+    withIntakeWork(db, 'warm', () =>
+      recordIntakeWork('schemaBuildSourceHashBytes', initial.textBytes),
+    );
+    const bridgeRequired = binding.logicalHead === undefined;
+    if (bridgeRequired) {
+      const id = randomUUID();
+      const prepared = await collections.prepareLegacyBridgeAsync(
+        {
+          operationId: id,
+          requestDigest: digest(id),
+          domainVersion: version,
+        },
+        originalRead,
+        () => assertIntakeLegacyBridgeReadWitness(db, originalRead),
+        legacy.selectedProof,
+      );
+      assertIntakeLegacyBridgeReadWitness(db, originalRead);
+      collections.commitMaintenance(prepared);
+    }
+    // An accepted V3 bridge intentionally advances the original record HEAD.
+    // Its private continuation is not yet available to this build-only view.
+    const selected = bridgeRequired
+      ? undefined
+      : sealSelectedIntakeBuildView(db, legacy.selectedBuildView, originalRead);
+    const resume = prepareEnvelopeBuildResume(
+      db,
+      source,
       {
+        mode: legacy.mode,
+        version,
+        hash: sourceTextHash,
+        bytes: selected?.textBytes ?? Buffer.byteLength(legacy.text),
+      },
+      options,
+      selected,
+      legacy.selectedBuildView,
+      originalRead,
+    );
+    try {
+      const build = resume.build;
+      const { put, cell, cellPieces, flush, record, recordLexical } = createEnvelopeBuildWriter(
+        db,
+        source,
+        build,
+        version,
+        { ...options, assertRunning: resume.assertCurrent },
+        resume,
+        selected,
+        originalRead,
+      );
+      void put;
+      const text = legacy.text;
+      const root = schemaKey('envelope', build);
+      if (text.length > 64 * 1024) {
+        const lexical = await prepareIntakeJsonLexical([text], {
+          assertRunning: resume.assertCurrent,
+        });
+        try {
+          await cellPieces('$before', lexical.pieces(0, lexical.root.start));
+          await recordLexical(lexical, lexical.root, 'root', root);
+          await cellPieces('$after', lexical.pieces(lexical.root.end, lexical.work.inputUnits));
+        } finally {
+          lexical.close();
+        }
+      } else {
+        let start = 0;
+        while (/\s/.test(text[start] ?? '') && start < text.length) start++;
+        const end = valueEnd(text, start);
+        await cell('$before', text.slice(0, start));
+        await record(text, start, end, 'root', root);
+        await cell('$after', text.slice(end));
+      }
+      await flush();
+      resume.finish();
+      const control: SchemaControl = {
+        format: ENVELOPE_SCHEMA,
+        mode: legacy.mode,
+        root,
+      };
+      const { store } = selected
+        ? collectionCellReaderForBuild(
+            db,
+            source,
+            'builds',
+            build,
+            legacy.selectedBuildView,
+            originalRead,
+            resume.assertCurrent,
+          )
+        : collectionCellReader(db, source, 'builds', build);
+      const expected = sourceTextHash,
+        hash = createHash('sha256');
+      let bytes = 0;
+      for (const chunk of iterateSchemaEnvelopeText(store, control)) {
+        resume.assertCurrent();
+        hash.update(chunk);
+        bytes += Buffer.byteLength(chunk);
+        resume.countWork('validationHashBytes', Buffer.byteLength(chunk));
+        resume.countWork('validationChunks');
+        if (resume.work.validationChunks % 64 === 0) {
+          resume.countWork('validationYields');
+          await setImmediate();
+          resume.assertCurrent();
+        }
+      }
+      if (
+        hash.digest('hex') !== expected ||
+        bytes !== (selected?.textBytes ?? Buffer.byteLength(text))
+      )
+        throw Error('Schema build does not reproduce exact retained envelope');
+      // The owner independently verifies the candidate graph/export before granting
+      // the representation-only maintenance capability.
+      const id = randomUUID();
+      const prepared = collections.prepare(collections.openView(), {
         operationId: id,
         requestDigest: digest(id),
         domainVersion: version,
-      },
-      originalRead,
-      () => assertIntakeLegacyBridgeReadWitness(db, originalRead),
-      legacy.selectedProof,
-    );
-    assertIntakeLegacyBridgeReadWitness(db, originalRead);
-    collections.commitMaintenance(prepared);
-  }
-  const resume = prepareEnvelopeBuildResume(
-    db,
-    source,
-    {
-      mode: legacy.mode,
-      version,
-      hash: sourceTextHash,
-      bytes: Buffer.byteLength(legacy.text),
-    },
-    options,
-  );
-  try {
-    const build = resume.build;
-    const { put, cell, cellPieces, flush, record, recordLexical } = createEnvelopeBuildWriter(
-      db,
-      source,
-      build,
-      version,
-      { ...options, assertRunning: resume.assertCurrent },
-      resume,
-    );
-    void put;
-    const text = legacy.text;
-    const root = schemaKey('envelope', build);
-    if (text.length > 64 * 1024) {
-      const lexical = await prepareIntakeJsonLexical([text], {
+        changes: [
+          {
+            area: 'logical',
+            collection: 'envelope.data',
+            op: 'adoptCollection',
+            fromArea: 'builds',
+            fromCollection: build,
+          },
+          {
+            area: 'logical',
+            collection: 'envelope.control',
+            op: 'put',
+            key: 'representation',
+            value: JSON.stringify(control),
+          },
+        ],
+      });
+      await collections.certifySchemaAdoptionAsync(prepared, {
         assertRunning: resume.assertCurrent,
       });
-      try {
-        await cellPieces('$before', lexical.pieces(0, lexical.root.start));
-        await recordLexical(lexical, lexical.root, 'root', root);
-        await cellPieces('$after', lexical.pieces(lexical.root.end, lexical.work.inputUnits));
-      } finally {
-        lexical.close();
-      }
-    } else {
-      let start = 0;
-      while (/\s/.test(text[start] ?? '') && start < text.length) start++;
-      const end = valueEnd(text, start);
-      await cell('$before', text.slice(0, start));
-      await record(text, start, end, 'root', root);
-      await cell('$after', text.slice(end));
-    }
-    await flush();
-    resume.finish();
-    const control: SchemaControl = {
-      format: ENVELOPE_SCHEMA,
-      mode: legacy.mode,
-      root,
-    };
-    const { store } = collectionCellReader(db, source, 'builds', build);
-    const expected = sourceTextHash,
-      hash = createHash('sha256');
-    let bytes = 0;
-    for (const chunk of iterateSchemaEnvelopeText(store, control)) {
       resume.assertCurrent();
-      hash.update(chunk);
-      bytes += Buffer.byteLength(chunk);
-      resume.countWork('validationHashBytes', Buffer.byteLength(chunk));
-      resume.countWork('validationChunks');
-      if (resume.work.validationChunks % 64 === 0) {
-        resume.countWork('validationYields');
-        await setImmediate();
-        resume.assertCurrent();
-      }
+      const result = collections.commitMaintenance(prepared, {
+        assertCurrent: resume.assertWitness,
+      });
+      return {
+        result,
+        control,
+        build,
+        sourceTextHash: expected,
+        sourceTextBytes: bytes,
+        work: { ...resume.work },
+      };
+    } finally {
+      resume.close();
     }
-    if (hash.digest('hex') !== expected || bytes !== Buffer.byteLength(text))
-      throw Error('Schema build does not reproduce exact retained envelope');
-    // The owner independently verifies the candidate graph/export before granting
-    // the representation-only maintenance capability.
-    const id = randomUUID();
-    const prepared = collections.prepare(collections.openView(), {
-      operationId: id,
-      requestDigest: digest(id),
-      domainVersion: version,
-      changes: [
-        {
-          area: 'logical',
-          collection: 'envelope.data',
-          op: 'adoptCollection',
-          fromArea: 'builds',
-          fromCollection: build,
-        },
-        {
-          area: 'logical',
-          collection: 'envelope.control',
-          op: 'put',
-          key: 'representation',
-          value: JSON.stringify(control),
-        },
-      ],
-    });
-    await collections.certifySchemaAdoptionAsync(prepared, {
-      assertRunning: resume.assertCurrent,
-    });
-    resume.assertCurrent();
-    const result = collections.commitMaintenance(prepared, { assertCurrent: resume.assertWitness });
-    return {
-      result,
-      control,
-      build,
-      sourceTextHash: expected,
-      sourceTextBytes: bytes,
-      work: { ...resume.work },
-    };
   } finally {
-    resume.close();
+    closeSelectedIntakeBuildView(legacy.selectedBuildView);
   }
 }
 
@@ -254,8 +289,10 @@ export function createEnvelopeBuildWriter(
     onCheckpoint?: () => void | Promise<void>;
   } = {},
   resume?: EnvelopeBuildResume,
+  selected?: ReturnType<typeof sealSelectedIntakeBuildView>,
+  originalRead?: IntakeLegacyBridgeReadWitness,
 ) {
-  const { collections } = selectedEnvelopeStore(db, source);
+  const collections = selected?.collections ?? selectedEnvelopeStore(db, source).collections;
   const changes: IntakeCollectionChange[] = [];
   const flush = async () => {
     if (!changes.length) return;
@@ -423,7 +460,18 @@ export function createEnvelopeBuildWriter(
   const filenameFacts = async (id: string) => {
     await flush();
     options.assertRunning?.();
-    const { store } = collectionCellReader(db, source, 'builds', build);
+    const { store } =
+      selected && resume && originalRead
+        ? collectionCellReaderForBuild(
+            db,
+            source,
+            'builds',
+            build,
+            selected.view,
+            originalRead,
+            resume.assertCurrent,
+          )
+        : collectionCellReader(db, source, 'builds', build);
     const value = store.get('c:' + id);
     if (!value) throw Error('The selected filename is missing');
     if (typeof value === 'string' || value.bytes <= 16384) {

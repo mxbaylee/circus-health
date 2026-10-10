@@ -6,8 +6,14 @@ import { setImmediate } from 'node:timers/promises';
 import { managedDatabaseMethodSerial, type Database } from './database.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { holdReadOnlySourceTextProjection } from './source-text-projection.ts';
-import type { IntakeEnvelopeSource } from './intake-authority.ts';
 import { selectedEnvelopeStore } from './intake-collection-envelope.ts';
+import {
+  assertSelectedIntakeBuildView,
+  type IntakeEnvelopeSource,
+  type PreparedSelectedIntakeBuildView,
+} from './intake-authority.ts';
+import type { IntakeLegacyBridgeReadWitness } from './intake-state-migration.ts';
+import type { sealSelectedIntakeBuildView } from './intake-authority.ts';
 import { ENVELOPE_SCHEMA, schemaKey } from './intake-envelope-schema.ts';
 import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
@@ -47,9 +53,13 @@ export function prepareEnvelopeBuildResume(
     bytes: number;
   },
   options: { assertRunning?: () => void },
+  selectedBuild?: ReturnType<typeof sealSelectedIntakeBuildView>,
+  selectedView?: PreparedSelectedIntakeBuildView,
+  originalRead?: IntakeLegacyBridgeReadWitness,
 ) {
   if (db.isTransaction) fail('prepare outside a transaction');
-  const selected = selectedEnvelopeStore(db, source);
+  const selectedFallback = selectedBuild ? undefined : selectedEnvelopeStore(db, source);
+  const selected = selectedBuild ?? selectedFallback!;
   const selectedHeadKey = `${intakeNamespace(selected.identity)}head`;
   if (selected.binding.logicalHead === undefined) fail('missing legacy bridge');
   const sourcePin = () =>
@@ -62,7 +72,9 @@ export function prepareEnvelopeBuildResume(
     compactScalars: 'originalName+locator-v1',
     identity: selected.identity,
     logical: hash(selected.binding.logicalHead),
-    details: hash(selected.source.details_json!),
+    details: selectedBuild
+      ? selectedBuild.detailsDigest
+      : hash(selectedFallback!.source.details_json ?? ''),
     pin: pinHash,
     ...legacy,
   });
@@ -159,11 +171,16 @@ export function prepareEnvelopeBuildResume(
         fail('authority changed during preparation');
     };
     const assertSelectedBinding = () => {
+      if (selectedBuild && selectedView && originalRead) {
+        assertSelectedIntakeBuildView(db, selectedView, originalRead);
+        if (hash(JSON.stringify([sourcePin() ?? null])) !== pinHash) fail('source pin changed');
+        return;
+      }
       const current = selectedEnvelopeStore(db, source);
       if (
         JSON.stringify(current.identity) !== JSON.stringify(selected.identity) ||
         current.binding.logicalHead !== selected.binding.logicalHead ||
-        current.source.details_json !== selected.source.details_json ||
+        current.source.details_json !== selectedFallback!.source.details_json ||
         hash(JSON.stringify([sourcePin() ?? null])) !== pinHash
       )
         fail('source binding changed');

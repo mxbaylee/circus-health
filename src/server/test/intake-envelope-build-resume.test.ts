@@ -16,8 +16,21 @@ import {
   type Database,
 } from '../database.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
-import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
+import {
+  prepareInitialIntakeEnvelope,
+  readIntakeEnvelopeMaterializedForBuild,
+  openSelectedIntakeBuildView,
+  sealSelectedIntakeBuildView,
+  assertSelectedIntakeBuildView,
+  closeSelectedIntakeBuildView,
+  type PreparedSelectedIntakeBuildView,
+} from '../intake-authority.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
+import { ensureIntakeFrontierObserver } from '../intake-lookup-frontier-observer.ts';
+import {
+  captureIntakeLegacyBridgeReadWitness,
+  disposeIntakeLegacyBridgeReadWitness,
+} from '../intake-state-migration.ts';
 import { ensureNativeIntakeSchema } from '../intake.ts';
 import {
   hasIntakeCollectionEnvelope,
@@ -145,12 +158,14 @@ function fixture(
     rmSync(directory, { recursive: true, force: true });
   });
   const writes = { calls: 0, bytes: 0 };
-  const write = authority.storage.writeImmutable.bind(authority.storage);
-  authority.storage.writeImmutable = (name, bytes) => {
-    writes.calls++;
-    writes.bytes += bytes.length;
-    write(name, bytes);
-  };
+  if (!contributor) {
+    const write = authority.storage.writeImmutable.bind(authority.storage);
+    authority.storage.writeImmutable = (name, bytes) => {
+      writes.calls++;
+      writes.bytes += bytes.length;
+      write(name, bytes);
+    };
+  }
   function rebuild() {
     clearIntakeStateCache(db);
     db.close();
@@ -199,6 +214,36 @@ async function pauseAfter(db: Database, source: { id: string }, checkpoints: num
   );
   return selectedProgress(db, source);
 }
+
+test('the checked selected build view is original-bound, one-use and disposable', async (t) => {
+  const { db, source } = fixture(t, 1, 4_096);
+  ensureIntakeFrontierObserver(db);
+  const original = captureIntakeLegacyBridgeReadWitness(db, source.id);
+  try {
+    const materialized = await readIntakeEnvelopeMaterializedForBuild(db, source, original);
+    const initial = openSelectedIntakeBuildView(db, materialized.selectedBuildView, original);
+    assert.equal(initial.textDigest, sha(materialized.text));
+    assert.equal(initial.textBytes, Buffer.byteLength(materialized.text));
+    const selected = sealSelectedIntakeBuildView(db, materialized.selectedBuildView, original);
+    assert.equal(selected.detailsDigest, initial.detailsDigest);
+    assertSelectedIntakeBuildView(db, materialized.selectedBuildView, original);
+    assert.throws(
+      () => openSelectedIntakeBuildView(db, materialized.selectedBuildView, original),
+      /reused selected build view/,
+    );
+    assert.throws(
+      () => openSelectedIntakeBuildView(db, {} as PreparedSelectedIntakeBuildView, original),
+      /foreign or reused selected build view/,
+    );
+    closeSelectedIntakeBuildView(materialized.selectedBuildView);
+    assert.throws(
+      () => assertSelectedIntakeBuildView(db, materialized.selectedBuildView, original),
+      /selected build view unavailable/,
+    );
+  } finally {
+    disposeIntakeLegacyBridgeReadWitness(original);
+  }
+});
 
 test('missing progress and zero-count progress refuse retained main or oversized-leading-whitespace blob data', async (t) => {
   for (const blobOnly of [false, true]) {
@@ -362,6 +407,14 @@ test('real contributor HEAD final physical checks refuse committed peer ABA and 
     const f = fixture(t, 3, 0, true, 0, true);
     const paused = await pauseAfter(f.db, f.source, 1);
     const headPath = join(contributorAuthorityPath(f.directory, f.identity.profileId), 'head');
+    const objectsPath = join(
+      contributorAuthorityPath(f.directory, f.identity.profileId),
+      'objects',
+    );
+    const physicalBefore = {
+      head: nodeFs.readFileSync(headPath),
+      objects: nodeFs.readdirSync(objectsPath).sort(),
+    };
     const peer = new DatabaseSync(String(f.db.prepare('PRAGMA database_list').get()!.file));
     const physicalStat = nodeFs.lstatSync;
     const stackTraceLimit = Error.stackTraceLimit;
@@ -451,6 +504,8 @@ test('real contributor HEAD final physical checks refuse committed peer ABA and 
     assert.equal(stimulus.capture, 0, 'local rollback restored captured rows, too');
     assert.equal(stimulus.transaction, boundary === 'transaction-begin');
     assert.deepEqual(f.writes, before.writes);
+    assert.deepEqual(nodeFs.readFileSync(headPath), physicalBefore.head);
+    assert.deepEqual(nodeFs.readdirSync(objectsPath).sort(), physicalBefore.objects);
     assert.equal(intakeWorkCounters(f.db).warm.collectionNodesWritten, before.nodes);
     assert.equal(selectedProgress(f.db, f.source).raw, paused.raw);
     assert.equal(hasIntakeCollectionEnvelope(f.db, f.source), false);

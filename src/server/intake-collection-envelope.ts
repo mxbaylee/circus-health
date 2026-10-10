@@ -20,12 +20,17 @@ import {
   readIntakeEnvelopeMaterialized,
   intakeEnvelopeProjection,
   intakeEnvelopeProjectionFormatHint,
+  selectedIntakeBuildSelection,
   INTAKE_ENVELOPE_FORMAT,
   INTAKE_COMPACT_ENVELOPE_FORMAT,
   type IntakeEnvelopeProjectionFormat,
   type IntakeEnvelopeSource,
+  type PreparedSelectedIntakeBuildView,
 } from './intake-authority.ts';
-import { INTAKE_LEGACY_BRIDGE_CONTROL } from './intake-state-migration.ts';
+import {
+  INTAKE_LEGACY_BRIDGE_CONTROL,
+  type IntakeLegacyBridgeReadWitness,
+} from './intake-state-migration.ts';
 import {
   createIntakeStateStorage,
   type IntakeByteValue,
@@ -1009,22 +1014,39 @@ export function selectedEnvelopeStore(db: Database, input: IntakeEnvelopeSource)
   if (retained.handles.size > 32) retained.handles.delete(retained.handles.keys().next().value!);
   return { source, identity, binding, collections };
 }
-export function collectionCellReader(
+function collectionCellReaderOwned(
   db: Database,
   input: IntakeEnvelopeSource,
   area: IntakeCollectionArea = 'logical',
   collection = 'envelope.data',
+  build?: {
+    view: PreparedSelectedIntakeBuildView;
+    originalRead: IntakeLegacyBridgeReadWitness;
+    assertCurrent: () => void;
+  },
 ): {
   store: EnvelopeCellReader;
   head: IntakeCollectionHead;
   collections: ReturnType<typeof createIntakeStateStorage>['collections'];
 } {
-  const { source, binding, collections } = selectedEnvelopeStore(db, input);
+  build?.assertCurrent();
+  const selected = build
+    ? selectedIntakeBuildSelection(db, build.view, build.originalRead)
+    : selectedEnvelopeStore(db, input);
+  build?.assertCurrent();
+  const { binding, collections } = selected;
+  const source = build ? input : (selected as ReturnType<typeof selectedEnvelopeStore>).source;
   let view = collections.openView();
   const head = collections.binding(view);
   if (!head) return fail('missing collection head');
-  let attempts = db.isTransaction ? undefined : captureIntakeFrontierAttempts(db);
+  let attempts = build || db.isTransaction ? undefined : captureIntakeFrontierAttempts(db);
   const check = () => {
+    if (build) {
+      build.assertCurrent();
+      view = collections.openView(binding.logicalHead);
+      build.assertCurrent();
+      return;
+    }
     if (attempts && !db.isTransaction) {
       const equality = readIntakeFrontierSourceEquality(db, attempts);
       if (equality) {
@@ -1068,6 +1090,31 @@ export function collectionCellReader(
       canAdvance: owner.canAdvance,
     });
   return { head, collections, store };
+}
+export function collectionCellReader(
+  db: Database,
+  input: IntakeEnvelopeSource,
+  area: IntakeCollectionArea = 'logical',
+  collection = 'envelope.data',
+) {
+  return collectionCellReaderOwned(db, input, area, collection);
+}
+/** Build-only reader. Its sealed selection is not an authority by itself; the
+ * owning resume guard closes the original SQL and physical interval. */
+export function collectionCellReaderForBuild(
+  db: Database,
+  input: IntakeEnvelopeSource,
+  area: IntakeCollectionArea,
+  collection: string,
+  view: PreparedSelectedIntakeBuildView,
+  originalRead: IntakeLegacyBridgeReadWitness,
+  assertCurrent: () => void,
+) {
+  return collectionCellReaderOwned(db, input, area, collection, {
+    view,
+    originalRead,
+    assertCurrent,
+  });
 }
 /** A V4 storage head can still select an exact V3 bridge after interrupted
  * conversion. Only a completed schema may enter native record consumers. */
