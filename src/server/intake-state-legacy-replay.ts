@@ -46,6 +46,7 @@ import {
 import { compactIntakeScalarSteps, COMPACT_SCALAR_BYTES } from './intake-compact-scalar.ts';
 import { schemaKey } from './intake-envelope-schema.ts';
 import { finishIntakeCopySteps } from './intake-copy-work.ts';
+import { recordIntakeWork } from './intake-work-accounting.ts';
 
 const MAX_DEPTH = 64,
   MAX_ITEMS = 1_000_000,
@@ -271,8 +272,11 @@ export function* prepareIntakeLegacyReplaySteps(
       const remaining = budget(caps, used);
       try {
         if (hash.digest('hex') !== first.payloadHash) invalid('payload hash/UTF-8');
+        recordIntakeWork('evidenceReplayVersions');
         if (changes.kind(changes.root) !== 'array') invalid('legacy change array');
         for (const change of changes.arrayItems(changes.root)) {
+          // Refusal retains visited work, without charging unvisited trailing entries.
+          recordIntakeWork('evidenceReplayOperations');
           if (++changed > MAX_ITEMS) invalid('legacy change count');
           yield* state.applySteps(changes, change, remaining);
         }

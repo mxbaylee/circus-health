@@ -19,6 +19,7 @@ import {
 import { prepareIntakeLegacyReplay } from '../intake-state-legacy-replay.ts';
 import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
 import { intakeCopyTrimmedPieces } from '../intake-copy-json.ts';
+import { intakeWorkCounters, withIntakeWork } from '../intake-work-accounting.ts';
 
 const identity = {
   profileId: 'fictional-legacy-replay',
@@ -173,6 +174,149 @@ test('legacy replay and whitespace scratch batch all prepared row writes', (t) =
   }
   assert.ok(writes > 0, 'real replay and whitespace scratch writes were exercised');
   assert.equal(autocommitWrites, 0, 'no scratch write starts a per-row transaction');
+});
+
+test('disk replay accounts actual versions and operations without charging warm or unrelated owners', () => {
+  const db = new DatabaseSync(':memory:'),
+    ordinaryDb = new DatabaseSync(':memory:'),
+    versions = operations('Fictional accounted state.'),
+    f = fixture(versions),
+    expected = {
+      versions: versions.length,
+      operations: versions.reduce((total, changes) => total + changes.length, 0),
+    };
+  try {
+    const replay = withIntakeWork(db, 'reconstruction', () =>
+      prepareIntakeLegacyReplay(identity, f.caps, f.head, (key) => f.rows.get(key)),
+    );
+    try {
+      withIntakeWork(ordinaryDb, 'reconstruction', () =>
+        reconstructIntakeEvidence(identity, f.caps, f.head, (key) => f.rows.get(key)),
+      );
+      for (const owner of [db, ordinaryDb]) {
+        const work = intakeWorkCounters(owner);
+        assert.equal(work.reconstruction.evidenceReplayVersions, expected.versions);
+        assert.equal(work.reconstruction.evidenceReplayOperations, expected.operations);
+        assert.equal(work.warm.evidenceReplayVersions, 0);
+        assert.equal(work.warm.evidenceReplayOperations, 0);
+      }
+      const baseline = intakeWorkCounters(db),
+        ordinaryBaseline = intakeWorkCounters(ordinaryDb);
+      withIntakeWork(db, 'warm', () => {
+        assert.equal([...replay.pieces()].join(''), f.serialized.at(-1));
+        const target = { ...identity, profileId: 'fictional-accounted-copy' },
+          copied = new Map<string, string>(),
+          head = replay.rebind(target, (key, raw) => copied.set(key, raw));
+        assert.equal(head.version, f.head.version);
+        assert.equal(copied.size, f.head.usage.frames + f.operationIds.length);
+      });
+      const warm = intakeWorkCounters(db);
+      assert.equal(warm.warm.evidenceReplayVersions, 0);
+      assert.equal(warm.warm.evidenceReplayOperations, 0);
+      assert.equal(
+        warm.reconstruction.evidenceReplayVersions,
+        baseline.reconstruction.evidenceReplayVersions,
+      );
+      assert.equal(
+        warm.reconstruction.evidenceReplayOperations,
+        baseline.reconstruction.evidenceReplayOperations,
+      );
+      const unscoped = prepareIntakeLegacyReplay(identity, f.caps, f.head, (key) =>
+        f.rows.get(key),
+      );
+      unscoped.close();
+      assert.deepEqual(intakeWorkCounters(db), warm, 'unscoped work cannot borrow an old owner');
+      assert.deepEqual(intakeWorkCounters(ordinaryDb), ordinaryBaseline);
+    } finally {
+      replay.close();
+    }
+  } finally {
+    db.close();
+    ordinaryDb.close();
+  }
+});
+
+test('disk replay keeps visited work visible after refusal and charges no replay before frame authentication', () => {
+  const db = new DatabaseSync(':memory:'),
+    versions = operations('Fictional refused accounted state.'),
+    f = fixture(versions),
+    missingReceipt = intakeNamespace(identity) + 'operation:' + f.operationIds[1];
+  try {
+    assert.throws(
+      () =>
+        withIntakeWork(db, 'reconstruction', () =>
+          prepareIntakeLegacyReplay(identity, f.caps, f.head, (key) =>
+            key === missingReceipt ? undefined : f.rows.get(key),
+          ),
+        ),
+      /encoded bytes/,
+    );
+    const refused = intakeWorkCounters(db);
+    assert.equal(refused.reconstruction.evidenceReplayVersions, 2);
+    assert.equal(
+      refused.reconstruction.evidenceReplayOperations,
+      versions.slice(0, 2).reduce((total, changes) => total + changes.length, 0),
+    );
+    assert.equal(refused.warm.evidenceReplayVersions, 0);
+    assert.equal(refused.warm.evidenceReplayOperations, 0);
+    const frameKey = intakeNamespace(identity) + 'frame:' + f.head.tip.id;
+    assert.throws(
+      () =>
+        withIntakeWork(db, 'reconstruction', () =>
+          prepareIntakeLegacyReplay(identity, f.caps, f.head, (key) =>
+            key === frameKey ? f.rows.get(key)! + ' ' : f.rows.get(key),
+          ),
+        ),
+      /bytes\/hash/,
+    );
+    const unauthenticated = intakeWorkCounters(db);
+    assert.equal(
+      unauthenticated.reconstruction.evidenceReplayVersions,
+      refused.reconstruction.evidenceReplayVersions,
+    );
+    assert.equal(
+      unauthenticated.reconstruction.evidenceReplayOperations,
+      refused.reconstruction.evidenceReplayOperations,
+    );
+    const invalidOperation = frameIntakeChanges(
+        identity,
+        [
+          { op: 'fictional-invalid-operation', path: [] },
+          { op: 'set', path: [], value: { retained: 'Fictional unvisited state.' } },
+        ],
+        hash('{}'),
+        randomUUID(),
+        f.caps,
+        undefined,
+        budget(f.caps, { bytes: 0, frames: 0, nodes: 0, operations: 0, stringWork: 0 }),
+      ),
+      invalidFrames = new Map(
+        invalidOperation.frames.map((frame) => [frame.key, frame.serialized]),
+      );
+    assert.throws(
+      () =>
+        withIntakeWork(db, 'reconstruction', () =>
+          prepareIntakeLegacyReplay(identity, f.caps, invalidOperation.head, (key) =>
+            invalidFrames.get(key),
+          ),
+        ),
+      /legacy delta operation/,
+    );
+    const partial = intakeWorkCounters(db);
+    assert.equal(
+      partial.reconstruction.evidenceReplayVersions -
+        unauthenticated.reconstruction.evidenceReplayVersions,
+      1,
+    );
+    assert.equal(
+      partial.reconstruction.evidenceReplayOperations -
+        unauthenticated.reconstruction.evidenceReplayOperations,
+      1,
+      'invalid first operation is visited; the trailing operation is not charged',
+    );
+  } finally {
+    db.close();
+  }
 });
 
 test('disk replay matches the original decoder at every version for all seven operations and exact budgets', () => {
