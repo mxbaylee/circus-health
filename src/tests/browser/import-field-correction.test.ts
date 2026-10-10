@@ -4,6 +4,8 @@ import {
   fixtureDestinations,
   fixtureAssertNoAccepted,
   fixtureNativeFeedReady,
+  fixtureNativeFeedWindowReady,
+  fixtureNativeRecordReady,
   fixtureBrowserResponse,
 } from './native-intake-fixture.ts';
 import type { CollectionImportFeed } from '../../shared/intake-clinical-pages.ts';
@@ -210,7 +212,17 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         ].join('\n'),
       });
       await page.goto(url + '/#/import');
-      await fixtureNativeFeedReady(page, prefix, () => page.reload());
+      const displayedFeed = await fixtureNativeFeedReady(page, prefix, () => page.reload());
+      assert.equal(displayedFeed.records.length, 1);
+      const selectedRecord = displayedFeed.records[0]!;
+      const selectedPins =
+        selectedRecord.detail.kind === 'record'
+          ? selectedRecord.detail.record
+          : selectedRecord.detail.selection;
+      const selectedRecordId =
+        selectedRecord.detail.kind === 'record'
+          ? selectedRecord.detail.record.id
+          : selectedRecord.detail.selection.recordId;
       await page.getByRole('button', { name: 'Review', exact: true }).waitFor();
       if (!wrongKind) {
         assert.match(await page.locator('.import-record-row').innerText(), /Value to review/);
@@ -218,23 +230,47 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
         );
       }
-      await page.getByRole('button', { name: 'Review', exact: true }).click();
+      await fixtureNativeRecordReady(
+        page,
+        prefix,
+        {
+          intakeId: intake.id,
+          recordId: selectedRecordId,
+          proposalId: selectedRecord.proposalId,
+          candidateVersionId: selectedPins.candidateVersionId,
+        },
+        () => page.getByRole('button', { name: 'Review', exact: true }).click(),
+      );
       assert.equal(new URL(page.url()).hash, '#/import');
       const inline = page.locator('.import-record-accordion');
-      const updateCorrection = async () => {
-        const saved = fixtureBrowserResponse(
-          page,
-          (response) =>
-            response.request().method() === 'POST' &&
-            new URL(response.url()).pathname ===
-              `${prefix}/intakes/${encodeURIComponent(intake.id)}/review-draft`,
+      const awaitFeedRefresh = async (action: () => Promise<unknown>) => {
+        const feed = await fixtureNativeFeedWindowReady(page, prefix, action);
+        const row = feed.records.find(
+          (row) => row.intakeId === intake.id && row.proposalId === selectedRecord.proposalId,
         );
-        await inline.getByRole('button', { name: 'Update', exact: true }).click();
-        const response = await saved;
-        assert.equal(response.status(), 200, await response.text());
-        assert.equal(await response.finished(), null);
-        await inline.waitFor({ state: 'detached' });
+        assert.ok(row);
+        const pins = row.detail.kind === 'record' ? row.detail.record : row.detail.selection;
+        const id =
+          row.detail.kind === 'record' ? row.detail.record.id : row.detail.selection.recordId;
+        assert.equal(id, selectedRecordId);
+        assert.equal(pins.candidateVersionId, selectedPins.candidateVersionId);
       };
+      const updateCorrection = () =>
+        awaitFeedRefresh(async () => {
+          const saved = fixtureBrowserResponse(
+            page,
+            (response) =>
+              response.request().method() === 'POST' &&
+              new URL(response.url()).pathname ===
+                `${prefix}/intakes/${encodeURIComponent(intake.id)}/review-draft`,
+          );
+          await inline.getByRole('button', { name: 'Update', exact: true }).click();
+          const response = await saved;
+          assert.equal(response.status(), 200, await response.text());
+          assert.equal(await response.finished(), null);
+          await inline.waitFor({ state: 'detached' });
+          return response;
+        });
       await inline.getByRole('img', { name: 'cookie-doe-lab.pdf, page 2 of 2' }).waitFor();
       if (wrongKind) {
         await inline.getByLabel('Document text', { exact: true }).waitFor();
@@ -307,7 +343,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         await updateCorrection();
       }
       await page.getByText(/^4\.1\s*mmol\/L$/).waitFor();
-      await page.reload();
+      await awaitFeedRefresh(() => page.reload());
       await page.getByText(/^4\.1\s*mmol\/L$/).waitFor();
       await fixtureAssertNoAccepted(request, prefix, intake.id);
       await page.waitForFunction(() =>

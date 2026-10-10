@@ -216,6 +216,12 @@ function nativeBrowserReads(page: Page, prefix: string) {
         const selected = result as Response;
         if (selected.request().isNavigationRequest())
           cutoff = Math.max(since, selected.request().timing().startTime);
+        else if (selected.request().method() === 'POST') {
+          assert.equal(await selected.finished(), null);
+          const timing = selected.request().timing();
+          assert.ok(timing.responseEnd >= 0, 'the mutation response completed');
+          cutoff = Math.max(since, timing.startTime + timing.responseEnd);
+        }
       }
     },
     async read(matches: (url: URL) => boolean) {
@@ -235,6 +241,25 @@ function nativeBrowserReads(page: Page, prefix: string) {
       page.off('response', response);
     },
   };
+}
+
+/** Wait for this action's current-document feed only, without preparing or
+ * requiring its independently loaded report and identity dependencies. */
+export async function fixtureNativeFeedWindowReady(
+  page: Page,
+  prefix: string,
+  action: () => Promise<unknown>,
+): Promise<CollectionImportFeed> {
+  const reads = nativeBrowserReads(page, prefix);
+  try {
+    await reads.action(action);
+    const response = await reads.read((url) => url.pathname === prefix + '/intakes/import-feed');
+    const feed = (await response.json()).data as CollectionImportFeed;
+    assert.equal(feed.format, 'health-intake-import-feed-v2');
+    return feed;
+  } finally {
+    reads.close();
+  }
 }
 
 /** Await only the actual browser reads for the displayed native window. Cold
