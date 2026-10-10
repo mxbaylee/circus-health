@@ -22,48 +22,48 @@ import {
   discardVaultRecordStaging,
 } from '../vault-store.ts';
 
-test('record-only vault backing authenticates nonmetadata priors and absence without a dummy source', async (t) => {
-  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'fictional-record-backing-'))),
-    profileId = 'fictional-record-backing',
-    key = freshKey(),
-    db = openDatabase(':memory:', profileId),
-    vault = openVault({ directory: root, profileId, key, initialize: true }),
-    storage = vault.recordStorage();
-  t.after(() => {
-    vault.close();
-    db.close();
-    key.fill(0);
-    rmSync(root, { recursive: true, force: true });
-  });
-  attachRecordDurability(db, { profileId, storage });
-  transaction(db, () => {
-    db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)').run(
-      'fictional-person',
-      'Fictional Person',
+for (const fault of [undefined, 'version', 'preimage', 'absence', 'deleted'] as const)
+  test(`record-only vault backing authenticates nonmetadata priors and absence without a dummy source${fault ? `: ${fault} disagreement` : ''}`, async (t) => {
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'fictional-record-backing-'))),
+      profileId = 'fictional-record-backing',
+      key = freshKey(),
+      db = openDatabase(':memory:', profileId),
+      vault = openVault({ directory: root, profileId, key, initialize: true }),
+      storage = vault.recordStorage();
+    t.after(() => {
+      vault.close();
+      db.close();
+      key.fill(0);
+      rmSync(root, { recursive: true, force: true });
+    });
+    attachRecordDurability(db, { profileId, storage });
+    transaction(db, () => {
+      db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)').run(
+        'fictional-person',
+        'Fictional Person',
+      );
+      db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)').run(
+        'fictional-deleted',
+        'Fictional Removed',
+      );
+    });
+    transaction(db, () => db.prepare('DELETE FROM people WHERE id=?').run('fictional-deleted'));
+    const read = db.prepare(
+      'SELECT v.* FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?',
     );
-    db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)').run(
-      'fictional-deleted',
-      'Fictional Removed',
-    );
-  });
-  transaction(db, () => db.prepare('DELETE FROM people WHERE id=?').run('fictional-deleted'));
-  const read = db.prepare(
-    'SELECT v.* FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?',
-  );
-  const original = read.get('people', JSON.stringify(['fictional-person']))!,
-    deleted = read.get('people', JSON.stringify(['fictional-deleted']))!,
-    digest = (raw: string) => {
-      const encoded = JSON.stringify(raw);
-      return {
-        hash: createHash('sha256').update(encoded).digest('hex'),
-        bytes: Buffer.byteLength(encoded),
+    const original = read.get('people', JSON.stringify(['fictional-person']))!,
+      deleted = read.get('people', JSON.stringify(['fictional-deleted']))!,
+      digest = (raw: string) => {
+        const encoded = JSON.stringify(raw);
+        return {
+          hash: createHash('sha256').update(encoded).digest('hex'),
+          bytes: Buffer.byteLength(encoded),
+        };
       };
-    };
-  const selectedHead = storage.read('head')!.toString('utf8');
-  await runExclusiveClinicalOperation(db, async () => {
-    const operation = currentClinicalOperation(db)!,
-      current = () => assertClinicalOperation(db, operation);
-    for (const fault of [undefined, 'version', 'preimage', 'absence', 'deleted'] as const) {
+    const selectedHead = storage.read('head')!.toString('utf8');
+    await runExclusiveClinicalOperation(db, async () => {
+      const operation = currentClinicalOperation(db)!,
+        current = () => assertClinicalOperation(db, operation);
       const witness = captureVaultRecordStaging(db, storage, captureManagedPhysicalEpoch()!);
       assert.ok(witness);
       try {
@@ -130,6 +130,22 @@ test('record-only vault backing authenticates nonmetadata priors and absence wit
       } finally {
         discardVaultRecordStaging(witness);
       }
-    }
+      const retry = captureVaultRecordStaging(db, storage, captureManagedPhysicalEpoch()!);
+      assert.ok(retry);
+      try {
+        if (fault)
+          await assert.rejects(
+            prepareVaultRecordTransactionBacking(retry, selectedHead, current),
+            /recovery required/,
+          );
+        else {
+          await prepareVaultRecordTransactionBacking(retry, selectedHead, current);
+          await finishVaultRecordStagingPreparation(retry);
+        }
+        assert.equal(storage.read('head')!.toString('utf8'), selectedHead);
+        assert.equal(db.isTransaction, false);
+      } finally {
+        discardVaultRecordStaging(retry);
+      }
+    });
   });
-});
