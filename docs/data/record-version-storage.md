@@ -43,6 +43,12 @@ version decoding on the second. Complete physical verification still runs.
 This private-path result does not establish public ownership, prerequisite or
 group integration, nor changed-only physical verification or general capacity.
 
+Contributor and vault backing workers load recovery modules only for cold
+preparation. Later physical-only checks do not load the application database,
+storage adapter or record replay modules. Both complete signed physical passes,
+membership checks and owner checkpoints remain unchanged; this reduces worker
+initialization work, not the number of originals verified.
+
 Preparatory recipes record both literal SQL and genuine native changeset effects,
 including their exact write counts. Before final physical verification, every
 retained literal replay statement is compiled again under the installed policy.

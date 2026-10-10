@@ -376,7 +376,7 @@ test('ownership publication rejects a source change at the pre-durability termin
       scopeToken: f.preview.scopeToken,
       version: f.preview.version,
     }),
-    /Retained clinical evidence changed/,
+    /Retained (?:clinical|physical) evidence changed/,
   );
   assert.equal(reachedTerminal, true);
   assert.equal(

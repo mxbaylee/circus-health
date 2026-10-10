@@ -3,15 +3,11 @@ import { createHmac } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { resolve, relative, dirname } from 'node:path';
 import { opendirSync, fstatSync, lstatSync, realpathSync } from 'node:fs';
-import { openVault } from './vault-store.ts';
-import { openDatabase } from './database.ts';
-import { attachRecordDurability } from './record-versions.ts';
 import {
   withRecordReplayCheckpoints,
   createRecordVersionWorkCounters,
   withRecordVersionWork,
 } from './record-version-work.ts';
-import { recordFieldDigest, recordStringFieldDigest } from './record-prior-fields.ts';
 import {
   unlockPhysicalEntries,
   unlockPhysicalDigest,
@@ -19,7 +15,6 @@ import {
 } from './encrypted-unlock-physical.ts';
 import type { VaultRecordBackingInput } from './vault-record-backing.ts';
 import type { PackageSourceOriginalPhysical } from './intake-package-source-lease.ts';
-import { VAULT_CERTIFICATE_SCHEMA, vaultRecordCertificates } from './vault-record-certificates.ts';
 import type { IntakeTreeRoot } from './intake-state-tree.ts';
 import { regularFileIdentity } from './regular-file-identity.ts';
 
@@ -218,6 +213,13 @@ function verifyPhysical(expected: number): void {
 }
 
 async function prepare(): Promise<number> {
+  // Repeated physical verification does not need the recovery/application graph.
+  const { openVault } = await import('./vault-store.ts'),
+    { openDatabase } = await import('./database.ts'),
+    { attachRecordDurability } = await import('./record-versions.ts'),
+    { recordFieldDigest, recordStringFieldDigest } = await import('./record-prior-fields.ts'),
+    { VAULT_CERTIFICATE_SCHEMA, vaultRecordCertificates } =
+      await import('./vault-record-certificates.ts');
   const physical = new DatabaseSync(input.physical);
   let entries = 0;
   try {

@@ -6,14 +6,11 @@ import { fstatSync, lstatSync, realpathSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { regularFileIdentity } from './regular-file-identity.ts';
 import type { PackageSourceOriginalPhysical } from './intake-package-source-lease.ts';
-import { recordFieldDigest, recordStringFieldDigest } from './record-prior-fields.ts';
-import { openContributorRecordStorage } from './contributor-record-storage.ts';
-import { openDatabase } from './database.ts';
-import { attachRecordDurability } from './record-versions.ts';
-import { profileOriginal } from './profile-storage.ts';
-import { hashFile } from './vault-store.ts';
-import { unlockPhysicalEntries, unlockPhysicalIdentity } from './encrypted-unlock-physical.ts';
-import { vaultRecordCertificates, VAULT_CERTIFICATE_SCHEMA } from './vault-record-certificates.ts';
+import {
+  unlockPhysicalDigest,
+  unlockPhysicalEntries,
+  unlockPhysicalIdentity,
+} from './encrypted-unlock-physical.ts';
 import {
   withRecordReplayCheckpoints,
   createRecordVersionWorkCounters,
@@ -38,7 +35,7 @@ const pause = () => {
 const checkpoint = () => {
   if (++work % 64 === 0) pause();
 };
-const digest = (path: string) => hashFile(path);
+const digest = unlockPhysicalDigest;
 async function rawDigest(value: string): Promise<{ hash: string; bytes: number }> {
   const hash = createHash('sha256');
   let bytes = 0;
@@ -205,6 +202,14 @@ function verifyPhysical(progress: boolean): number {
 }
 
 async function prepare() {
+  // Repeated physical verification does not need the recovery/application graph.
+  const { openContributorRecordStorage } = await import('./contributor-record-storage.ts'),
+    { openDatabase } = await import('./database.ts'),
+    { attachRecordDurability } = await import('./record-versions.ts'),
+    { profileOriginal } = await import('./profile-storage.ts'),
+    { recordFieldDigest, recordStringFieldDigest } = await import('./record-prior-fields.ts'),
+    { vaultRecordCertificates, VAULT_CERTIFICATE_SCHEMA } =
+      await import('./vault-record-certificates.ts');
   const sql = new DatabaseSync(input.physical);
   let entries = 0;
   try {
@@ -269,7 +274,7 @@ async function prepare() {
               if (
                 identity.kind !== 'file' ||
                 Number(row.bytes) !== Number(identity.value.split(':')[2]) ||
-                hashFile(physical) !== row.sha256
+                digest(physical) !== row.sha256
               )
                 throw Error('Contributor accepted original changed');
             }
