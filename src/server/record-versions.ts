@@ -77,6 +77,9 @@ import {
   discardVaultRecordStaging,
   prepareVaultRecordStagingBacking,
   prepareVaultRecordTransactionBacking,
+  prepareVaultRecordTransactionBackingAdvance,
+  installVaultRecordTransactionHead,
+  completeVaultRecordTransactionPublication,
   assertVaultRecordTransactionPrior,
   prepareVaultRecordBackingAdvance,
   finishVaultRecordStagingPreparation,
@@ -1949,6 +1952,13 @@ export async function stageRecordTransactionPreparation(
       backingPlan,
     );
     check();
+  } else {
+    await prepareVaultRecordTransactionBackingAdvance(
+      staging!,
+      encode(ref).toString('utf8'),
+      backingPlan,
+    );
+    check();
   }
 }
 /** Actual-vault finalization of one frozen preparatory intent. Ordinary public
@@ -2122,30 +2132,33 @@ export async function commitRecordTransactionPreparation<T>(
                 : !contributorRecordStagingCurrent(admitted.contributorStaging!))
             )
               fail('record replay final owner changed');
-            if (admitted.staging) {
-              prepareVaultRecordHead(admitted.staging);
+            if (admitted.staging) prepareVaultRecordHead(admitted.staging);
+            const indexed = Object.freeze({}) as RecordTransactionIndexedPublication;
+            transactionIndexedPublications.set(indexed, {
+              proof: admitted,
+              plan: admitted.backingPlan!,
+              witness: staging,
+              token,
+              head: encode(plan.ref).toString('utf8'),
+              consumed: false,
+            });
+            try {
               markSelectionAttempt(db);
-              installVaultRecordHead(admitted.staging, encode(plan.ref));
-            } else {
-              const indexed = Object.freeze({}) as RecordTransactionIndexedPublication;
-              transactionIndexedPublications.set(indexed, {
-                proof: admitted,
-                plan: admitted.backingPlan!,
-                witness: staging,
-                token,
-                head: encode(plan.ref).toString('utf8'),
-                consumed: false,
-              });
-              try {
-                markSelectionAttempt(db);
+              if (admitted.staging)
+                installVaultRecordTransactionHead(
+                  admitted.staging,
+                  encode(plan.ref),
+                  indexed,
+                  admitted.backingPlan!,
+                );
+              else
                 installContributorRecordStagingHead(
                   admitted.contributorStaging!,
                   indexed,
                   admitted.backingPlan!,
                 );
-              } finally {
-                transactionIndexedPublications.delete(indexed);
-              }
+            } finally {
+              transactionIndexedPublications.delete(indexed);
             }
             return preparedResult;
           }),
@@ -2167,17 +2180,17 @@ export async function commitRecordTransactionPreparation<T>(
     if (outcome?.committed && outcome.succeeded) {
       originals.expectedHead = stringifyRecordJson(plan.ref);
       originals.expectedSequence = plan.commit.sequence;
-      if (admitted.contributorStaging) {
-        acceptedTransactionBackings.set(admitted.backingPlan!, {
-          db,
-          witness: admitted.contributorStaging,
-        });
+      acceptedTransactionBackings.set(admitted.backingPlan!, {
+        db,
+        witness: staging,
+      });
+      if (admitted.contributorStaging)
         completeContributorRecordStagingPublication(
           db,
           admitted.contributorStaging,
           admitted.backingPlan!,
         );
-      }
+      else completeVaultRecordTransactionPublication(db, admitted.staging!, admitted.backingPlan!);
       const observers = admitted.observers;
       admitted.observers = undefined;
       preparedPublicationTokens.delete(admitted.token!);
@@ -2190,6 +2203,8 @@ export async function commitRecordTransactionPreparation<T>(
       }
     } else if (admitted.contributorStaging) {
       discardContributorRecordStaging(admitted.contributorStaging);
+    } else if (admitted.staging) {
+      discardVaultRecordStaging(admitted.staging);
     }
   }
   return result as T;

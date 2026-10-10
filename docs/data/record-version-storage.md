@@ -24,6 +24,25 @@ Older application builds refuse v2 accepted commits. Before the first candidate 
 
 Fictional journal tests cover hundreds of segments, exact forward row order, v1 compatibility, bounded reference counts, invalid page links/counts/profile/operation bindings, cancellation and interrupted publication. They do not qualify arbitrary installation capacity or remove the historical per-object decoding limit.
 
+## Prepared publication backing
+
+The private original-backed prepared-write path can retain authenticated vault
+version certificates across its own accepted writes. A cold preparation verifies
+the existing history. Subsequent preparations reuse that history only through the
+exact committed transaction's one-use grant, retaining the original namespace
+and physical identities plus that transaction's checked immutable additions.
+The successor is captured during HEAD installation, before outcome observers;
+a later filesystem state cannot become the reuse baseline. Uncertain or failed
+staging invalidates reuse. These certificates are disposable, never recovery
+authority, and ordinary full-record certificates do not authorize compact
+metadata-only publication.
+
+The two-write fictional regression checks exact accepted values and HEAD changes,
+business execution once per write, a cold first traversal and zero historical
+version decoding on the second. Complete physical verification still runs.
+This private-path result does not establish public ownership, prerequisite or
+group integration, nor changed-only physical verification or general capacity.
+
 ## Current data and searchable history
 
 SQLite is a disposable, indexed projection containing both current records and retained version history. The current view selects the latest accepted version in committed order. Record history is a normal query, not an offline backup-restoration workflow. Index by profile, entity/record, version/sequence and time, with a field-change index or equivalent for queries such as **When did I change my birthday?**

@@ -18,6 +18,7 @@ import { intakeTreeRef, type IntakeTreeRoot } from './intake-state-tree.ts';
 import { recordVersionWork } from './record-version-work.ts';
 
 const nativeStatementGet = StatementSync.prototype.get;
+const nativeStatementRun = StatementSync.prototype.run;
 
 interface SelectedSourceBackingBinding {
   kind?: 'source';
@@ -339,17 +340,32 @@ export async function prepareVaultRecordBackingTransport(
       }
     };
     assertBinding(retained);
-    let pending: { root: IntakeTreeRoot; head: string; versions: string[] } | undefined;
+    let pending:
+      | { root: IntakeTreeRoot; head: string; versions: string[]; kind: 'compact' }
+      | { root: IntakeTreeRoot; head: string; kind: 'records' }
+      | undefined;
     let capturedParent: { path: string; identity: string } | undefined;
     let capturedHeadParent: string | undefined;
+    let compactBindings = true;
+    let installed:
+      | {
+          head: string;
+          physical: ReturnType<typeof captureRecordHeadPhysical>;
+          parents: readonly { path: string; kind: string; identity: string }[];
+        }
+      | undefined;
     return {
       supportsRecordPriors: input.kind === 'records',
+      get supportsCompactBindings() {
+        return compactBindings;
+      },
       acquire(nextHead: string, nextBinding: VaultRecordBackingBinding, check: () => void) {
         if (
           closed ||
           activeCurrent ||
           pending ||
           nextHead !== input.selectedHead ||
+          (nextBinding.kind !== 'records' && !compactBindings) ||
           (nextBinding.kind === 'records' && input.kind !== 'records')
         )
           throw Error('Vault retained backing frontier unavailable');
@@ -359,9 +375,11 @@ export async function prepareVaultRecordBackingTransport(
         recordVersionWork('vaultBackingReuses');
       },
       release() {
-        if (pending || capturedParent) throw Error('Vault retained backing transition unfinished');
+        if (pending || capturedParent || installed)
+          throw Error('Vault retained backing transition unfinished');
         scratchCurrent();
         input.originalSources = undefined;
+        input.originalArtifacts = undefined;
         activeCurrent = undefined;
       },
       assertRecordPrior(
@@ -439,12 +457,61 @@ export async function prepareVaultRecordBackingTransport(
           ids.push(version.versionId);
           recordVersionWork('vaultBackingChangedVersions');
         }
-        pending = { root, head, versions: ids };
+        pending = { root, head, versions: ids, kind: 'compact' };
+      },
+      async prepareTransactionAdvance(
+        head: string,
+        versions: Iterable<{
+          entity: string;
+          recordId: string;
+          versionId: string;
+          deleted: boolean;
+          previousVersion: string | null;
+          contentsJson: string;
+          sourceFields: readonly { name: string; hash: string; bytes: number }[];
+        }>,
+      ) {
+        if (input.kind !== 'records' || pending || installed)
+          throw Error('Vault prepared record transition unavailable');
+        let root = certificateRoot;
+        const keys = new Set<string>(),
+          ids = new Set<string>();
+        for (const version of versions) {
+          assertCurrent();
+          scratchCurrent();
+          const key = JSON.stringify([version.entity, version.recordId]),
+            old = certificates.get(certificateRoot, version.entity, version.recordId);
+          if (
+            (old?.versionId ?? null) !== version.previousVersion ||
+            keys.has(key) ||
+            ids.has(version.versionId)
+          )
+            throw Error('Vault prepared record predecessor differs');
+          // The core plan supplies the exact serialized indexing bytes. The
+          // certificate codec hashes that string quoted, without parsing it.
+          const preimage = await recordStringFieldDigest(version.contentsJson, assertCurrent);
+          root = certificates.put(root, {
+            entity: version.entity,
+            recordId: version.recordId,
+            versionId: version.versionId,
+            deleted: Number(version.deleted),
+            preimage,
+            fields: version.deleted ? [] : [...version.sourceFields],
+          }).root;
+          keys.add(key);
+          ids.add(version.versionId);
+          recordVersionWork('vaultBackingChangedVersions');
+        }
+        assertCurrent();
+        scratchCurrent();
+        if (!ids.size) throw Error('Vault prepared record transition empty');
+        pending = { root, head, kind: 'records' };
       },
       promote(head: string, versionIds: readonly string[]) {
         scratchCurrent();
         if (
           !pending ||
+          pending.kind !== 'compact' ||
           pending.head !== head ||
           JSON.stringify(pending.versions) !== JSON.stringify(versionIds)
         )
@@ -453,12 +520,59 @@ export async function prepareVaultRecordBackingTransport(
         input.selectedHead = head;
         pending = undefined;
       },
+      retainTransactionSuccessor(head: string) {
+        scratchCurrent();
+        if (!pending || pending.kind !== 'records' || pending.head !== head || installed)
+          throw Error('Vault prepared record successor unavailable');
+        const parents = ['', 'versions', 'manifest.enc'].map((path) => {
+          const actual = unlockPhysicalIdentity(resolve(root, path)),
+            original = Reflect.apply(nativeStatementGet, lookup, [path]);
+          if (
+            !original ||
+            original.kind !== actual.kind ||
+            original.identity !== actual.value ||
+            original.signature !== sign(path, actual.kind, actual.value)
+          )
+            throw Error('Vault owned successor recipe differs');
+          return Object.freeze({ path, kind: actual.kind, identity: actual.value });
+        });
+        // Captured inside the lexical installer, before observers or awaits.
+        const seal = captureRecordHeadPhysical([physical], [scratch]);
+        installed = { head, physical: seal, parents: Object.freeze(parents) };
+        scratchCurrent();
+      },
+      promoteTransaction(head: string) {
+        scratchCurrent();
+        if (
+          !installed ||
+          !pending ||
+          pending.kind !== 'records' ||
+          pending.head !== head ||
+          installed.head !== head ||
+          !installed.physical.current()
+        )
+          throw Error('Vault original installed successor changed');
+        for (const original of installed.parents) {
+          const actual = unlockPhysicalIdentity(resolve(root, original.path));
+          if (actual.kind !== original.kind || actual.value !== original.identity)
+            throw Error('Vault original installed parent changed');
+        }
+        certificateRoot = pending.root;
+        input.selectedHead = head;
+        // Full ordinary roots retain complete preimages and source headers,
+        // not the compact selected-source complete-field certificate contract.
+        compactBindings = false;
+        pending = undefined;
+        installed.physical.close();
+        installed = undefined;
+        scratchCurrent();
+      },
       beforeHead() {
         // The factory's exact indexed publication has replaced the original
         // source row. Its closing gate owns this phase, not the prep callback.
         scratchCurrent();
-        const parent = lookup.get(''),
-          manifest = lookup.get('manifest.enc');
+        const parent = Reflect.apply(nativeStatementGet, lookup, ['']),
+          manifest = Reflect.apply(nativeStatementGet, lookup, ['manifest.enc']);
         const actualParent = unlockPhysicalIdentity(root),
           actualManifest = unlockPhysicalIdentity(resolve(root, 'manifest.enc'));
         if (
@@ -493,7 +607,13 @@ export async function prepareVaultRecordBackingTransport(
           ['', parent],
           ['manifest.enc', manifest],
         ] as const) {
-          if (update.run(item.value, sign(path, item.kind, item.value), path).changes !== 1)
+          if (
+            Reflect.apply(nativeStatementRun, update, [
+              item.value,
+              sign(path, item.kind, item.value),
+              path,
+            ]).changes !== 1
+          )
             throw Error('Vault owned HEAD recipe changed');
           expectedChanges++;
         }
@@ -660,6 +780,7 @@ export async function prepareVaultRecordBackingTransport(
       close() {
         if (closed) return;
         closed = true;
+        installed?.physical.close();
         sql!.close();
         input.key.fill(0);
         signatureKey.fill(0);
