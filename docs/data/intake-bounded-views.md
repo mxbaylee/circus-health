@@ -347,6 +347,12 @@ record's fields cooperatively using a disposable disk-backed derivative rather
 than decoding a giant prior source header during publication. Its private field
 digests are signed and retain exact scratch SQL, schema, peer and membership
 continuity; a disposable row or point result cannot supply a new comparison.
+Contributor and portable record adapters also authenticate the latest selected
+source from their original accepted HEAD, commit ancestry and immutable segments
+before issuing that comparison. Two mutually matching SQLite source/version rows
+are not evidence. The selected commit's complete record count closes before the
+exact prior preimage is admitted, with owner checks across decoder and hash
+advancements. This cold ancestry traversal is not a warm proof frontier.
 The actual encrypted-vault path pairs this comparator with an adapter-owned
 worker replay of the accepted HEAD. It verifies the exact source preimage,
 column digests, metadata predecessors, retained originals, complete vault
@@ -364,6 +370,20 @@ The current compatibility verifier reconstructs accepted profile history for
 each cold proof. Repeated-source proof reuse and bounded oversized-source replay
 remain unfinished qualification requirements, not a global recovery bound or a
 completed scaling claim.
+
+Cold journal framing retains at most 64 KiB for its small-record path. Larger
+records are privately spooled and decoded through 8 KiB reads and the existing
+disk-backed JSON parser; a digest of the authenticated segment bytes closes the
+spool before any record is yielded. These sizes are processing windows, not new
+record limits. Giant numeric tokens, duplicate keys, escaped names and surrogate
+strings retain `JSON.parse` semantics without a complete giant version string.
+Oversized source field-history indexing uses signed disk-backed comparisons
+instead of materializing every serialized ancestor. The final source scalar and
+`contents_json` required by SQLite still materialize in each replay pass; requested complete
+history values are not silently truncated. Encrypted backing and unlock workers
+report fixed replay work checkpoints. Synchronous contributor recovery remains a
+contributor facility, not an interactive request guarantee. Current integration
+and old-profile recovery qualification are still required for this codec.
 
 This contracts these two known string fields, not arbitrary metadata. ZIP names
 have their format's declared name-byte bound, while PDF attachment keys and
@@ -769,6 +789,12 @@ write attempt and the final unchanged logical binding are accounted for. Unknown
 SQL, rollback, failed outcomes, protected TEMP/schema changes, peer/profile/registry
 drift and mixed or legacy originals require complete derivation. Neither an old
 raw stamp nor an old token is simply refreshed.
+Maintenance bookkeeping is credited from literal accepted-record index writes
+and exact captured metadata identities, bound to the successful transaction.
+The original protected-write observer supplies those identities; neither an
+observed total-change delta nor an arbitrary caller-supplied count grants credit.
+Capture cleanup and lookup dirty-row insertion retain their own fixed SQL
+origins. Extra writes, capture substitution and failed publication discard reuse.
 The fixed duplicate-evidence and clinical-source SQL functions are registered
 before capturing the lookup frontier, without constructing their indexes.
 Their guarded cold index builders can add only their own disposable TEMP
@@ -793,6 +819,10 @@ the complete ordered frontier. Bounded attempt history refuses expired captures;
 it does not impose a lifetime operation quota. This is a logical/index proof, not
 an all-file physical certificate: selected originals and retained proposals keep
 their separate current identity/hash checks.
+Uncertified native and mixed lookups finish any legacy projection preparation
+before selecting an answer, then keep that original answer witness through the
+final return. Foreign projection mutation refuses the read; explicit cache
+rebuild must restore exact answers from retained authority before retrying.
 
 Connection proofs assume trusted in-process application code uses the managed
 connection and native fixed-query methods. They are not a sandbox against code

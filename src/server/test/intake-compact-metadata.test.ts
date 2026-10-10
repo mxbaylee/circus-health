@@ -15,6 +15,7 @@ import { constants } from 'node:sqlite';
 import { openVault } from '../vault-store.ts';
 import { freshKey } from '../vault-crypto.ts';
 import { withManagedPhysicalMutation } from '../clinical-review-physical-epoch.ts';
+import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
 import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import { createIntakeStateStorage } from '../intake-state-storage.ts';
@@ -856,6 +857,93 @@ test(
 );
 
 test(
+  'contributor compact publication refuses mutually forged disposable source preimages',
+  { timeout: 30000 },
+  async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-compact-preimage-'));
+    const profileId = 'fictional-preimage',
+      id = 'fictional-original';
+    const paths = ensureProfileDirectories(root, profileId);
+    const db = openDatabase(paths.database, profileId);
+    const authority = memoryRecordAuthority(db);
+    t.after(() => {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    const bytes = Buffer.from('Independently fictional accepted source preimage.');
+    const sourceHash = createHash('sha256').update(bytes).digest('hex');
+    const path = paths.relativeRoot + '/sources/fictional.txt';
+    writeFileSync(join(root, path), bytes);
+    const initial = prepareInitialIntakeEnvelope({
+      intake: {
+        version: 1,
+        originalName: 'fictional-' + 'x'.repeat(20000) + '.txt',
+        state: 'ready',
+        proposals: [],
+        importHistory: [],
+        metadata: { source: 'Fictional Clinic', careArea: null, documentType: null, topics: [] },
+        workflow: {
+          format: 'health-intake-workflow-v1',
+          candidates: [],
+          questions: [],
+          plans: [],
+          reportGroups: [],
+        },
+      },
+    });
+    transaction(db, () => {
+      db.prepare(
+        'INSERT INTO source_files(id,path,sha256,bytes,kind,mime_type,details_json) VALUES(?,?,?,?,?,?,?)',
+      ).run(
+        id,
+        path,
+        sourceHash,
+        bytes.length,
+        'intake_original',
+        'text/plain',
+        initial.detailsJson,
+      );
+      createIntakeStateStorage(db, { profileId, intakeId: id, sourceHash }).stage(
+        initial.state,
+        randomUUID(),
+      );
+    });
+    const source = { id, sha256: sourceHash };
+    await buildIntakeCollectionEnvelope(db, source);
+    transaction(db, () =>
+      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(initial.detailsJson, id),
+    );
+    assert.ok(
+      Buffer.byteLength(initial.detailsJson) > 16384,
+      'control reaches compact publication',
+    );
+    const head = Buffer.from(authority.objects.get('head')!);
+    const previous = db
+      .prepare(
+        "SELECT v.version_id,v.contents_json FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity='source_files' AND c.record_id=?",
+      )
+      .get(JSON.stringify([id]))!;
+    const forged = JSON.parse(previous.contents_json as string);
+    forged.mime_type = 'application/fictional-forged';
+    db.prepare('UPDATE source_files SET mime_type=? WHERE id=?').run(forged.mime_type, id);
+    db.prepare('UPDATE __record_versions SET contents_json=? WHERE version_id=?').run(
+      JSON.stringify(forged),
+      previous.version_id,
+    );
+    db.prepare('DELETE FROM __record_changed').run();
+    await assert.rejects(
+      prepareIntakeCompactMetadata(db, source),
+      /accepted|preimage|authority|prior source/,
+    );
+    assert.deepEqual(
+      authority.objects.get('head'),
+      head,
+      'forged cache bytes cannot advance durable authority',
+    );
+  },
+);
+
+test(
   'formerly valid native metadata over the ordinary write budget upgrades without duplicating old metadata',
   { timeout: 180000 },
   async (t) => {
@@ -945,13 +1033,17 @@ test(
     const before = intakeWorkCounters(db).reconstruction;
     let oldSourceParses = 0;
     let giantMetadataParses = 0;
+    const giantMetadataParseStacks: string[] = [];
     const oldSourceParseStacks: string[] = [];
     const parse = JSON.parse;
     JSON.parse = ((
       text: string,
       ...args: Parameters<typeof JSON.parse> extends [string, ...infer Rest] ? Rest : never
     ) => {
-      if (Buffer.byteLength(String(text)) > 8 * 1024 * 1024) giantMetadataParses++;
+      if (Buffer.byteLength(String(text)) > 8 * 1024 * 1024) {
+        giantMetadataParses++;
+        giantMetadataParseStacks.push(new Error('giant metadata parse').stack!);
+      }
       if (text === oldMetadata) {
         oldSourceParses++;
         oldSourceParseStacks.push(new Error('giant source parse').stack!);
@@ -972,7 +1064,8 @@ test(
     assert.equal(
       giantMetadataParses,
       0,
-      'cold publication also avoids parsing the complete giant accepted source preimage',
+      'cold publication also avoids parsing the complete giant accepted source preimage\n' +
+        giantMetadataParseStacks.join('\n'),
     );
     assert.equal(JSON.stringify(openIntakeCollectionEnvelope(db, source).logical), logical);
     const after = intakeWorkCounters(db).reconstruction;
@@ -1003,7 +1096,30 @@ test(
       },
     };
     const recoveredPath = join(paths.root, 'fictional-recovered.sqlite');
-    rebuildRecordDatabase(recoveredPath, { profileId, storage: recoveredStorage });
+    const replayWork = createRecordVersionWorkCounters();
+    let giantReplayParses = 0;
+    JSON.parse = ((
+      text: string,
+      ...args: Parameters<typeof JSON.parse> extends [string, ...infer Rest] ? Rest : never
+    ) => {
+      if (Buffer.byteLength(String(text)) > 65536) giantReplayParses++;
+      return parse(text, ...args);
+    }) as typeof JSON.parse;
+    try {
+      withRecordVersionWork(replayWork, () =>
+        rebuildRecordDatabase(recoveredPath, { profileId, storage: recoveredStorage }),
+      );
+    } finally {
+      JSON.parse = parse;
+    }
+    assert.equal(
+      giantReplayParses,
+      0,
+      'cold recovery neither parses giant versions nor source ancestors',
+    );
+    assert.ok(replayWork.reconstruction.journalRecordsSpooled > 0);
+    assert.ok(replayWork.reconstruction.maxJournalRecordBufferBytes <= 65536);
+    assert.equal(replayWork.reconstruction.maxJournalRecordDecodeWindowBytes, 8192);
     const recovered = openDatabase(recoveredPath, profileId);
     try {
       attachRecordDurability(recovered, { profileId, storage: recoveredStorage });

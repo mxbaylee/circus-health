@@ -20,6 +20,7 @@ import {
   preparedIntakeLookupReadToken,
 } from '../intake-lookup-state.ts';
 import {
+  clearIntakeLookupCache,
   maximumIntakeDiscoveryOrder,
   nativeIntakeLookupCatalogHeadBindingsEqual,
   retainedIntakeAcceptance,
@@ -82,15 +83,22 @@ test('a forged disposable projection cannot override a complete native lookup', 
     'forged-payload',
   );
 
+  assert.throws(() => maximumIntakeDiscoveryOrder(db), /disposable projection mutation/);
+  assert.throws(
+    () => retainedIntakeAcceptance(db, 'fictional-operation'),
+    /disposable projection mutation/,
+  );
+  clearIntakeLookupCache(db);
+  await prepareIntakeLookupIndices(db);
   const maximum = maximumIntakeDiscoveryOrder(db);
   const receipt = retainedIntakeAcceptance(db, 'fictional-operation');
   t.diagnostic(
     JSON.stringify({ maximum, receiptMarker: (receipt as { marker?: string })?.marker }),
   );
-  assert.notEqual(maximum, 999);
-  assert.notDeepEqual(receipt, {
+  assert.equal(maximum, 3);
+  assert.deepEqual(receipt, {
     receipt: { operationId: 'fictional-operation' },
-    marker: 'forged',
+    marker: 'real',
   });
   db.exec('CREATE TEMP TABLE source_files(id TEXT PRIMARY KEY)');
   assert.throws(() => maximumIntakeDiscoveryOrder(db), /protected lookup TEMP shadow/);
@@ -103,7 +111,7 @@ test('a forged disposable projection cannot override a complete native lookup', 
   assert.throws(() => maximumIntakeDiscoveryOrder(db), /protected lookup TEMP shadow/);
 });
 
-test('a forged disposable projection cannot create an answer with no originals', (t) => {
+test('a forged disposable projection cannot create an answer with no originals', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'fictional-empty-frontier-'));
   const db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
   memoryRecordAuthority(db);
@@ -117,6 +125,13 @@ test('a forged disposable projection cannot create an answer with no originals',
       VALUES('forged-source',0,'intake_original',NULL,NULL,NULL)`,
   ).run();
   db.prepare('INSERT INTO __record_intake_lookup_groups VALUES(?,0,999)').run('forged-source');
+  assert.throws(() => maximumIntakeDiscoveryOrder(db), /disposable projection mutation/);
+  assert.throws(
+    () => retainedIntakeAcceptance(db, 'fictional-missing'),
+    /disposable projection mutation/,
+  );
+  clearIntakeLookupCache(db);
+  await prepareIntakeLookupIndices(db);
   assert.equal(maximumIntakeDiscoveryOrder(db), 0);
   assert.equal(retainedIntakeAcceptance(db, 'fictional-missing'), null);
 });
@@ -227,7 +242,7 @@ test('a new logical head cannot reuse the old complete discovery digest', async 
   assert.equal(preparedIntakeDiscoveryRevision(db), undefined);
 });
 
-test('mixed lookup rederives legacy rows after disposable projection mutation', async (t) => {
+test('mixed lookup refuses disposable projection mutation and explicitly rebuilds exact rows', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'fictional-mixed-frontier-'));
   const db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
   memoryRecordAuthority(db);
@@ -299,6 +314,13 @@ test('mixed lookup rederives legacy rows after disposable projection mutation', 
     JSON.stringify({ receipt: { operationId: 'fictional-duplicate' }, marker: 'forged' }),
     'fictional-legacy',
   );
+  assert.throws(() => maximumIntakeDiscoveryOrder(db), /disposable projection mutation/);
+  assert.throws(
+    () => retainedIntakeAcceptance(db, 'fictional-duplicate'),
+    /disposable projection mutation/,
+  );
+  clearIntakeLookupCache(db);
+  await prepareIntakeLookupIndices(db);
   assert.equal(maximumIntakeDiscoveryOrder(db), 13);
   assert.deepEqual(retainedIntakeAcceptance(db, 'fictional-duplicate'), {
     receipt: { operationId: 'fictional-duplicate' },

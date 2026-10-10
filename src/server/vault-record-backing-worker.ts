@@ -6,6 +6,7 @@ import { opendirSync } from 'node:fs';
 import { openVault } from './vault-store.ts';
 import { openDatabase } from './database.ts';
 import { attachRecordDurability } from './record-versions.ts';
+import { withRecordReplayCheckpoints } from './record-version-work.ts';
 import { recordFieldDigest, recordStringFieldDigest } from './record-prior-fields.ts';
 import {
   unlockPhysicalEntries,
@@ -179,34 +180,36 @@ async function prepare(): Promise<number> {
       );
     }
     db = openDatabase(input.database, input.profileId);
-    attachRecordDurability(db, {
-      profileId: input.profileId,
-      storage,
-      verifyReferences(versions) {
-        for (const version of versions) {
-          checkpoint();
-          if (version.deleted) continue;
-          const row = version.contents,
-            path =
-              version.entity === 'source_files'
-                ? row.path
-                : version.entity === 'assets'
-                  ? row.stored_path
-                  : null;
-          if (typeof path !== 'string') continue;
-          const prefix = `data/profiles/${input.profileId}/`;
-          if (path.startsWith('data/profiles/') && !path.startsWith(prefix))
-            throw Error('Vault original escaped its profile');
-          const name = path.startsWith(prefix) ? path.slice(prefix.length) : path;
-          const bytes = Number(row.bytes),
-            hash = String(row.sha256);
-          if (original.get(path, bytes, hash)) continue;
-          if (!vault.verifyFile(name, bytes, hash) && !vault.verifyFile(path, bytes, hash))
-            throw Error('Vault accepted original changed');
-          retainOriginal.run(path, bytes, hash);
-        }
-      },
-    });
+    withRecordReplayCheckpoints(checkpoint, () =>
+      attachRecordDurability(db!, {
+        profileId: input.profileId,
+        storage,
+        verifyReferences(versions) {
+          for (const version of versions) {
+            checkpoint();
+            if (version.deleted) continue;
+            const row = version.contents,
+              path =
+                version.entity === 'source_files'
+                  ? row.path
+                  : version.entity === 'assets'
+                    ? row.stored_path
+                    : null;
+            if (typeof path !== 'string') continue;
+            const prefix = `data/profiles/${input.profileId}/`;
+            if (path.startsWith('data/profiles/') && !path.startsWith(prefix))
+              throw Error('Vault original escaped its profile');
+            const name = path.startsWith(prefix) ? path.slice(prefix.length) : path;
+            const bytes = Number(row.bytes),
+              hash = String(row.sha256);
+            if (original.get(path, bytes, hash)) continue;
+            if (!vault.verifyFile(name, bytes, hash) && !vault.verifyFile(path, bytes, hash))
+              throw Error('Vault accepted original changed');
+            retainOriginal.run(path, bytes, hash);
+          }
+        },
+      }),
+    );
     const current = db
       .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
       .get('source_files', JSON.stringify([input.sourceId]));

@@ -49,6 +49,7 @@ import {
   type SchemaTarget,
 } from './intake-envelope-schema.ts';
 import { iterateIntakeJsonVerification } from './intake-json-verify.ts';
+import { prepareIntakeJsonCanonicalSteps } from './intake-json-canonical.ts';
 import { hashIntakeJsonScalar, hashIntakeJsonScalarSteps } from './intake-json-scalar.ts';
 import { validateIntakeSchemaReachabilitySteps } from './intake-envelope-schema-validation.ts';
 import {
@@ -1492,6 +1493,7 @@ export function* projectSchemaCompactMetadataSteps(
       entry.target.type === 'record' && header(store, entry.target.id).shape === 'object';
     if (!retainedObject && control.mode !== 'raw') fail('selected intake record');
     last = retainedObject ? entry.target.id : undefined;
+    if (control.mode !== 'raw') continue;
     const piece =
       lexicalKey(entry) + ':' + (retainedObject ? yield* compactIntake(entry.target.id) : 'null');
     total += Buffer.byteLength(piece);
@@ -1501,17 +1503,45 @@ export function* projectSchemaCompactMetadataSteps(
   if (!last) fail('missing intake record');
   const selectedFormat =
     format ?? (shortened ? INTAKE_COMPACT_ENVELOPE_FORMAT : INTAKE_ENVELOPE_FORMAT);
-  const expected =
-    control.mode === 'raw'
-      ? '{"intakeAuthority":' +
-        JSON.stringify({ format: selectedFormat, mode: 'raw' }) +
-        ',' +
-        intakes.join(',') +
-        '}'
-      : JSON.stringify({
-          intakeAuthority: { format: selectedFormat, mode: 'normalized' },
-          intake: JSON.parse(yield* compactIntake(last!)),
-        });
+  let expected: string;
+  if (control.mode === 'raw')
+    expected =
+      '{"intakeAuthority":' +
+      JSON.stringify({ format: selectedFormat, mode: 'raw' }) +
+      ',' +
+      intakes.join(',') +
+      '}';
+  else {
+    const intake = yield* compactIntake(last!);
+    if (Buffer.byteLength(intake) <= 65536) {
+      expected = JSON.stringify({
+        intakeAuthority: {
+          format: format ?? (shortened ? INTAKE_COMPACT_ENVELOPE_FORMAT : INTAKE_ENVELOPE_FORMAT),
+          mode: 'normalized',
+        },
+        intake: JSON.parse(intake),
+      });
+    } else {
+      const pieces = function* () {
+        for (let offset = 0; offset < intake.length; offset += 8192)
+          yield intake.slice(offset, offset + 8192);
+      };
+      const normalized = yield* prepareIntakeJsonCanonicalSteps(pieces(), { mode: 'stringify' });
+      try {
+        expected =
+          '{"intakeAuthority":' +
+          JSON.stringify({
+            format: format ?? (shortened ? INTAKE_COMPACT_ENVELOPE_FORMAT : INTAKE_ENVELOPE_FORMAT),
+            mode: 'normalized',
+          }) +
+          ',"intake":' +
+          (yield* collect(normalized.chunks())) +
+          '}';
+      } finally {
+        normalized.close();
+      }
+    }
+  }
   if (Buffer.byteLength(expected) > budget) fail('compact metadata size');
   return expected;
 }

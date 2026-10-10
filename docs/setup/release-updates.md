@@ -27,6 +27,16 @@ accepted backing and stages only changed immutable objects before its fixed
 transaction. This does not qualify bounded cold source-history reconstruction
 or repeated-source proof reuse; those remain release gates, with no extra
 operator setting or permitted authority downgrade.
+Contributor and portable compatibility writes also check their source preimage
+against immutable accepted history, not mutually matching cache rows. A refused
+altered cache must be reconstructed from its unchanged accepted record storage;
+do not modify that storage to make a cache agree. This adds no record limit or
+configuration setting and does not qualify warm ancestry-proof reuse.
+The cold journal codec now spools oversized records rather than decoding a
+complete giant version string, preserving the existing accepted formats and
+exact field-history semantics. Its windows do not cap old records, and required
+final SQLite values remain materialized. No operator migration or setting is
+needed; current old-profile recovery and integration qualification remain open.
 See the [bounded-view contract](../data/intake-bounded-views.md).
 
 Native Import report-group pages now use a disposable indexed group order and retained page totals. After updating, reload an open Import queue if its older group cursor is refused; its cursor is navigation state and is not portable across this change. No original, accepted-record or operator-configuration migration is required. The prior build continues to use its own queue ordering and cache behavior. See the [report review queue contract](../../src/server/INTAKE.md#report-review-queue).

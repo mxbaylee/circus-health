@@ -1604,6 +1604,8 @@ export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
     assertNativeCatalogCurrent(db, catalog);
     return Number(value || 0);
   }
+  refreshLegacyProjection(db, connection);
+  const answerWitness = projectionAnswerWitness(db);
   let nativeMaximum: number | null = null;
   let allOriginalsNative = true;
   for (const row of actualOriginalSourceRows(db)) {
@@ -1620,9 +1622,10 @@ export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
     if (value !== null && (nativeMaximum === null || Number(value) > nativeMaximum))
       nativeMaximum = Number(value);
   }
-  if (allOriginalsNative) return nativeMaximum ?? 0;
-  refreshLegacyProjection(db, connection);
-  const answerWitness = projectionAnswerWitness(db);
+  if (allOriginalsNative) {
+    assertProjectionAnswerWitness(db, answerWitness);
+    return nativeMaximum ?? 0;
+  }
   let maximum = db
     .prepare(
       `SELECT MAX(g.discovery_order) n FROM ${table('groups')} g JOIN ${table('sources')} s ON s.source_id=g.source_id JOIN main.source_files f ON f.id=s.source_id WHERE f.kind='intake_original' AND (s.identity_first IS NULL OR s.identity_first<>-1)`,
@@ -1671,6 +1674,8 @@ export function retainedIntakeAcceptanceReference(
     assertNativeCatalogCurrent(db, catalog);
     return { mode: 'native', sourceId: String(pointer.source_id), view, record };
   }
+  refreshLegacyProjection(db, connection);
+  const answerWitness = projectionAnswerWitness(db);
   let native: IntakeLookupReceiptReference | null = null;
   let nativeOrder = Infinity;
   let allOriginalsNative = true;
@@ -1693,9 +1698,10 @@ export function retainedIntakeAcceptanceReference(
       nativeOrder = Number(source.source_order);
     }
   }
-  if (allOriginalsNative) return native;
-  refreshLegacyProjection(db, connection);
-  const answerWitness = projectionAnswerWitness(db);
+  if (allOriginalsNative) {
+    assertProjectionAnswerWitness(db, answerWitness);
+    return native;
+  }
   const row = db
     .prepare(
       `SELECT p.payload,s.source_id,s.source_order FROM ${table('acceptances')} a JOIN ${table('payloads')} p ON p.hash=a.hash JOIN ${table('sources')} s ON s.source_id=a.source_id JOIN main.source_files f ON f.id=s.source_id WHERE a.operation_id=? AND f.kind='intake_original' AND (s.identity_first IS NULL OR s.identity_first<>-1) ORDER BY s.source_order LIMIT 1`,

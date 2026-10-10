@@ -117,3 +117,77 @@ test('source verification is cold once per identity, bounded, and revoked by mut
     { code: 'PROFILE_LOCKED' },
   );
 });
+
+test('publication liveness keeps the original file and owner pinned across an own authority transition', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-package-publication-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const bytes = Buffer.from('fictional retained original');
+  const path = join(root, 'source.zip');
+  writeFileSync(path, bytes);
+  let transitioning = false;
+  const owner = createPackageSourceLeaseOwner({
+    profileId: 'fictional',
+    root,
+    assertAuthorized() {
+      if (transitioning) throw Error('Own accepted HEAD is not installed yet');
+    },
+    assertPublicationAuthorized() {},
+  });
+  const source = {
+    profileId: 'fictional',
+    intakeId: 'original',
+    path,
+    bytes: bytes.length,
+    sourceHash: createHash('sha256').update(bytes).digest('hex'),
+  };
+  await assert.rejects(
+    owner.withSource(source, async (lease) => {
+      transitioning = true;
+      assert.throws(() => lease.assertCurrent(), /accepted HEAD/);
+      lease.assertPublicationCurrent();
+      const replacement = join(root, 'replacement');
+      writeFileSync(replacement, bytes);
+      renameSync(replacement, path);
+      assert.throws(() => lease.assertPublicationCurrent(), { code: 'SOURCE_CHANGED' });
+      transitioning = false;
+      assert.throws(() => lease.assertCurrent(), { code: 'SOURCE_CHANGED' });
+    }),
+    { code: 'SOURCE_CHANGED' },
+  );
+  owner.close();
+});
+
+test('publication liveness retains a direct caller cancellation guard by default', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-package-cancellation-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const bytes = Buffer.from('fictional retained original');
+  const path = join(root, 'source.zip');
+  writeFileSync(path, bytes);
+  const owner = createPackageSourceLeaseOwner({
+    profileId: 'fictional',
+    root,
+    assertAuthorized() {},
+  });
+  let cancelled = false;
+  await assert.rejects(
+    owner.withSource(
+      {
+        profileId: 'fictional',
+        intakeId: 'original',
+        path,
+        bytes: bytes.length,
+        sourceHash: createHash('sha256').update(bytes).digest('hex'),
+      },
+      async (lease) => {
+        lease.assertPublicationCurrent();
+        cancelled = true;
+        lease.assertPublicationCurrent();
+      },
+      () => {
+        if (cancelled) throw Error('Fictional request cancelled');
+      },
+    ),
+    /request cancelled/,
+  );
+  owner.close();
+});

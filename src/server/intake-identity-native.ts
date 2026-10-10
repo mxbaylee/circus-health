@@ -894,6 +894,77 @@ async function build(
   const { db, root, profileId, id, view, workflow, group, scope } = context;
   const currentSelf = selfSnapshot(db),
     people = selectedIdentityPeopleSnapshots(db);
+  const prerequisites = disposableSqlite('fictional-identity-prerequisites-');
+  try {
+    context.assertCurrent();
+    const selectionStamp = reviewPreparationStamp(db);
+    if (selectionStamp === undefined)
+      reject('Identity prerequisite selection requires current authority');
+    const assertSelectionCurrent = () => {
+      context.assertCurrent();
+      if (reviewPreparationStamp(db) !== selectionStamp)
+        reject('Identity prerequisite selection changed');
+    };
+    prerequisites.db.exec(
+      'CREATE TABLE proposal(ordinal INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL)',
+    );
+    const add = prerequisites.db.prepare('INSERT OR IGNORE INTO proposal VALUES(?,?)');
+    let ordinal = 0;
+    await runClinicalReviewWork(
+      (function* () {
+        for (const member of context.membership()) {
+          yield;
+          const candidate = view.find('candidate', workflow, member.candidateId),
+            version = candidate && view.find('version', candidate, member.candidateVersionId);
+          if (!candidate || !version) reject('A report member no longer exists');
+          const latest = view.childAt(
+            candidate!,
+            'versions',
+            view.childCount(candidate!, 'versions') - 1,
+          );
+          if (!latest || scalar(view, latest, 'id') !== member.candidateVersionId) continue;
+          for (const occurrence of member.occurrences) {
+            add.run(ordinal++, canonicalLiteral(occurrence.proposalId));
+            yield;
+          }
+        }
+      })(),
+      {
+        capture: () => (assertSelectionCurrent(), assertSelectionCurrent),
+      },
+    );
+    assertSelectionCurrent();
+    let after = -1;
+    for (;;) {
+      const page = prerequisites.db
+        .prepare('SELECT id,ordinal FROM proposal WHERE ordinal>? ORDER BY ordinal LIMIT 64')
+        .all(after);
+      if (!page.length) break;
+      for (const row of page) {
+        context.assertCurrent();
+        stored.assertArtifacts();
+        const grounding = identityGroundingGeneration(db);
+        const assertPreparationCurrent = () => {
+          context.assertCurrent();
+          stored.assertArtifacts();
+          if (identityGroundingGeneration(db) !== grounding)
+            reject('Identity grounding changed during prerequisite preparation');
+        };
+        await prepareCollectionClinicalReviewDependencies(
+          db,
+          root,
+          profileId,
+          id,
+          JSON.parse(String(row.id)) as string | null,
+          { assertRunning: assertPreparationCurrent },
+        );
+        assertPreparationCurrent();
+        after = Number(row.ordinal);
+      }
+    }
+  } finally {
+    prerequisites.close();
+  }
   let cached:
     | {
         proposalId: string | null;
@@ -976,9 +1047,6 @@ async function build(
         if (identityGroundingGeneration(db) !== grounding)
           reject('Identity grounding changed during occurrence preparation');
       };
-      await prepareCollectionClinicalReviewDependencies(db, root, profileId, id, proposalId, {
-        assertRunning: assertPreparationCurrent,
-      });
       const borrowed = tryBorrowRetainedCollectionClinicalPolicy(
         db,
         root,

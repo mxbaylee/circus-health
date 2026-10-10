@@ -3,7 +3,7 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import {
-  prepareIntakeJsonCanonical,
+  prepareIntakeJsonCanonicalSteps,
   type PreparedIntakeJsonCanonical,
   type IntakeJsonCanonicalHandle,
 } from './intake-json-canonical.ts';
@@ -19,10 +19,10 @@ export interface PreparedRecordPriorFields {
   close(): void;
 }
 
-export async function prepareRecordPriorFields(
+export function* prepareRecordPriorFieldsSteps(
   pieces: Iterable<string>,
   ownerRunning: () => void,
-): Promise<PreparedRecordPriorFields> {
+): Generator<void, PreparedRecordPriorFields> {
   let canceled: unknown;
   let stopped = false;
   const assertRunning = () => {
@@ -50,12 +50,12 @@ export async function prepareRecordPriorFields(
       'INSERT INTO fields VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash,bytes=excluded.bytes,signature=excluded.signature',
     );
     let steps = 0;
-    const checkpoint = async () => {
+    const checkpoint = function* () {
       assertRunning();
-      await setImmediate();
+      yield;
       assertRunning();
     };
-    const fieldName = async (pieces: Iterable<string>) => {
+    const fieldName = function* (pieces: Iterable<string>): Generator<void, string> {
       let name = '';
       const scalar = hashIntakeJsonScalarSteps(pieces, [], (unit) => {
         name += unit;
@@ -64,28 +64,28 @@ export async function prepareRecordPriorFields(
         for (;;) {
           assertRunning();
           if (scalar.next().done) return name;
-          await checkpoint();
+          yield* checkpoint();
         }
       } finally {
         scalar.return(undefined as never);
       }
     };
-    const digest = async (tree: PreparedIntakeJsonCanonical, value: IntakeJsonCanonicalHandle) => {
+    const digest = function* (tree: PreparedIntakeJsonCanonical, value: IntakeJsonCanonicalHandle) {
       const hash = createHash('sha256');
       let bytes = 0;
       for (const piece of tree.pieces(value)) {
         assertRunning();
         hash.update(piece);
         bytes += Buffer.byteLength(piece);
-        await checkpoint();
+        yield* checkpoint();
       }
       return { hash: hash.digest('hex'), bytes };
     };
-    const visit = async (
+    const visit = function* (
       tree: PreparedIntakeJsonCanonical,
       root: IntakeJsonCanonicalHandle,
       rootPath: string,
-    ) => {
+    ): Generator<void> {
       const pending: Array<{
         path: string;
         children: Iterator<{ name(): Iterable<string>; value: IntakeJsonCanonicalHandle }>;
@@ -95,11 +95,11 @@ export async function prepareRecordPriorFields(
       while (value || pending.length) {
         assertRunning();
         if (value) {
-          const found = await digest(tree, value);
+          const found = yield* digest(tree, value);
           insert.run(path, found.hash, found.bytes, signature(path, found.hash, found.bytes));
           if (++steps === 64) {
             steps = 0;
-            await checkpoint();
+            yield* checkpoint();
           }
           if (tree.kind(value) === 'object')
             pending.push({ path, children: tree.objectFields(value)[Symbol.iterator]() });
@@ -110,18 +110,21 @@ export async function prepareRecordPriorFields(
             child = parent.children.next();
           if (child.done) pending.pop();
           else {
-            path = parent.path + '.' + (await fieldName(child.value.name()));
+            path = parent.path + '.' + (yield* fieldName(child.value.name()));
             value = child.value.value;
           }
         }
       }
     };
-    const tree = await prepareIntakeJsonCanonical(pieces, { mode: 'stringify', assertRunning });
+    const tree = yield* prepareIntakeJsonCanonicalSteps(pieces, {
+      mode: 'stringify',
+      assertRunning,
+    });
     try {
       if (tree.kind(tree.root) !== 'object') throw Error('Prior record must be an object');
       for (const field of tree.objectFields(tree.root)) {
-        const name = await fieldName(field.name());
-        await visit(tree, field.value, name);
+        const name = yield* fieldName(field.name());
+        yield* visit(tree, field.value, name);
         if (!name.endsWith('_json') || tree.kind(field.value) !== 'string') continue;
         // Decode only a bounded scalar window before the second cooperative parser.
         const decoded = function* () {
@@ -145,7 +148,7 @@ export async function prepareRecordPriorFields(
         };
         let nested: PreparedIntakeJsonCanonical;
         try {
-          nested = await prepareIntakeJsonCanonical(decoded(), {
+          nested = yield* prepareIntakeJsonCanonicalSteps(decoded(), {
             mode: 'stringify',
             assertRunning,
           });
@@ -159,7 +162,7 @@ export async function prepareRecordPriorFields(
         try {
           if (nested.kind(nested.root) === 'object')
             for (const child of nested.objectFields(nested.root))
-              await visit(nested, child.value, name + '.' + (await fieldName(child.name())));
+              yield* visit(nested, child.value, name + '.' + (yield* fieldName(child.name())));
         } finally {
           nested.close();
         }
@@ -235,6 +238,22 @@ export async function prepareRecordPriorFields(
       key.fill(0);
       scratch.close();
     }
+  }
+}
+
+export async function prepareRecordPriorFields(
+  pieces: Iterable<string>,
+  ownerRunning: () => void,
+): Promise<PreparedRecordPriorFields> {
+  const steps = prepareRecordPriorFieldsSteps(pieces, ownerRunning);
+  try {
+    for (;;) {
+      const next = steps.next();
+      if (next.done) return next.value;
+      await setImmediate();
+    }
+  } finally {
+    steps.return(undefined as never);
   }
 }
 

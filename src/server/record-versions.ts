@@ -4,10 +4,13 @@ import {
   recordVersionWork,
   recordVersionWorkMaximum,
   recordVersionColumns,
+  recordReplayCheckpoint,
   withRecordVersionWorkPhase,
 } from './record-version-work.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
+import { readRecordJsonLines, readRecordJsonLinesSteps } from './record-json-lines.ts';
+import { recordSourceFieldChanges } from './record-source-field-changes.ts';
 import {
   prepareRecordPriorFields,
   recordFieldDigest,
@@ -60,7 +63,22 @@ import {
   expectIntakeFrontierMetaWrite,
   expectIntakeFrontierStateWrite,
   finishIntakeFrontierMetaWrite,
+  intakeFrontierOwnedMetadataKeys,
+  clearIntakeFrontierRecordCapture,
 } from './intake-lookup-frontier-observer.ts';
+
+interface RecordBookkeeping {
+  writes: bigint;
+  metadataKeys: Set<string>;
+  metadataOnly: boolean;
+}
+const maintenanceBookkeeping = new WeakMap<Database, { token: object; writes: bigint }>();
+/** Only the accepted-record owner can mint these literal, transaction-bound counts. */
+export function consumeRecordMaintenanceBookkeeping(db: Database, token: object): bigint {
+  const receipt = maintenanceBookkeeping.get(db);
+  maintenanceBookkeeping.delete(db);
+  return receipt?.token === token ? receipt.writes : 0n;
+}
 
 export interface RecordStorage {
   read(name: string): Buffer | null | undefined;
@@ -559,37 +577,32 @@ function committedSince(
     throw error;
   }
 }
-/** Reiterable bounded reader: keep at most a segment plus one logical record in memory. */
+/** Reiterable reader: giant JSONL framing is spooled, not repeatedly concatenated. */
 function readSegmentVersions(
   storage: RecordStorage,
   commit: RecordCommit,
 ): Iterable<DurableRecordVersion> {
   return {
     *[Symbol.iterator]() {
-      let pending: Buffer = Buffer.alloc(0),
-        count = 0;
-      for (const ref of iterateRecordCommitSegments(storage, commit)) {
-        const bytes = readObject(storage, ref);
-        let offset = 0;
-        for (let end = bytes.indexOf(10, offset); end !== -1; end = bytes.indexOf(10, offset)) {
-          const line = pending.length
-            ? Buffer.concat([pending, bytes.subarray(offset, end)])
-            : bytes.subarray(offset, end);
-          const text = line.toString('utf8');
-          if (!Buffer.from(text).equals(line)) fail('invalid UTF-8');
-          const version = parseRecordJson(text) as DurableRecordVersion;
-          recordVersionWork('decodedVersions');
-          yield version;
-          count++;
-          pending = Buffer.alloc(0);
-          offset = end + 1;
-        }
-        if (offset < bytes.length)
-          pending = pending.length
-            ? Buffer.concat([pending, bytes.subarray(offset)])
-            : bytes.subarray(offset);
+      const segments = function* () {
+        for (const ref of iterateRecordCommitSegments(storage, commit))
+          yield readObject(storage, ref);
+      };
+      let count = 0;
+      for (const version of readRecordJsonLines(segments(), {
+        parseSmall: parseRecordJson,
+        checkpoint: recordReplayCheckpoint,
+        onWork(work) {
+          recordVersionWork('journalRecordsSpooled', work.spooledRecords);
+          recordVersionWork('journalRecordSpoolBytes', work.spooledBytes);
+          recordVersionWorkMaximum('maxJournalRecordBufferBytes', work.maxRecordBufferBytes);
+          recordVersionWorkMaximum('maxJournalRecordDecodeWindowBytes', work.maxSpoolReadBytes);
+        },
+      })) {
+        recordVersionWork('decodedVersions');
+        yield version as DurableRecordVersion;
+        count++;
       }
-      if (pending.length) fail('partial final JSONL record');
       if (count !== commit.records) fail('partial transaction');
     },
   };
@@ -734,7 +747,12 @@ function indexTransaction(
   config: RecordConfig,
   { ref, commit, versions }: IndexedTransaction,
   prior?: SourcePriorData,
-): void {
+): RecordBookkeeping {
+  const bookkeeping: RecordBookkeeping = {
+    writes: 0n,
+    metadataKeys: new Set(),
+    metadataOnly: true,
+  };
   if (prior) prior.indexedWrites = 0;
   const indexed = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as
     RecordStateRow | undefined;
@@ -770,6 +788,7 @@ function indexTransaction(
       const previous = validateVersion(db, config, commit, version, identities, prior);
       const implicitFields = implicitInitialMetadataFields(version);
       const { contents, ...metadata } = version;
+      const contentsJson = stringifyRecordJson(contents);
       const versionWrite = insertVersion.run(
         version.versionId,
         config.profileId,
@@ -780,10 +799,16 @@ function indexTransaction(
         version.previousVersion,
         version.operationId,
         Number(version.deleted),
-        stringifyRecordJson(contents),
+        contentsJson,
         stringifyRecordJson(metadata),
       );
       const currentWrite = selectVersion.run(version.entity, version.recordId, version.versionId);
+      if (versionWrite.changes !== 1 || currentWrite.changes !== 1)
+        fail('indexed version write count');
+      bookkeeping.writes += 2n;
+      if (version.entity === 'app_meta' && bookkeeping.metadataKeys.size < 4100)
+        bookkeeping.metadataKeys.add(contents.key as string);
+      else bookkeeping.metadataOnly = false;
       if (prior) {
         if (versionWrite.changes !== 1 || currentWrite.changes !== 1)
           fail('indexed version write count');
@@ -792,12 +817,54 @@ function indexTransaction(
           if (prior.newSource) fail('duplicate compact indexed source');
           prior.newSource = {
             versionId: version.versionId,
-            contents: stringifyRecordJson(contents),
+            contents: contentsJson,
             metadata: stringifyRecordJson(metadata),
           };
         }
       }
       if (!implicitFields) {
+        if (
+          !prior &&
+          version.entity === 'source_files' &&
+          (contentsJson.length > 65536 || (previous?.contents_json.length ?? 0) > 65536)
+        ) {
+          const fields: SQLInputValue[] = [];
+          const flush = () => {
+            if (!fields.length) return;
+            const rows = fields.length / 9;
+            let insert = fieldStatements.get(rows);
+            if (!insert) {
+              insert = db.prepare(
+                'INSERT INTO __record_fields VALUES' +
+                  Array(rows).fill('(?,?,?,?,?,?,?,?,?)').join(','),
+              );
+              fieldStatements.set(rows, insert);
+            }
+            if (insert.run(...fields).changes !== rows) fail('indexed field write count');
+            bookkeeping.writes += BigInt(rows);
+            fields.length = 0;
+          };
+          for (const change of recordSourceFieldChanges(
+            previous && !previous.deleted ? previous.contents_json : undefined,
+            version.deleted ? undefined : contentsJson,
+            recordReplayCheckpoint,
+          )) {
+            fields.push(
+              version.versionId,
+              config.profileId,
+              version.entity,
+              version.recordId,
+              change.field,
+              version.sequence,
+              previous?.version_id ?? null,
+              Number(change.beforePresent),
+              Number(change.afterPresent),
+            );
+            if (fields.length === 32 * 9) flush();
+          }
+          flush();
+          continue;
+        }
         const preparedBefore =
           prior && version.entity === 'source_files' && version.recordId === prior.recordId
             ? prior.fields
@@ -821,6 +888,8 @@ function indexTransaction(
             fieldStatements.set(rows, insert);
           }
           const written = insert.run(...fields);
+          if (written.changes !== rows) fail('indexed field write count');
+          bookkeeping.writes += BigInt(rows);
           if (prior) {
             if (written.changes !== rows) fail('indexed field write count');
             prior.indexedWrites! += rows;
@@ -875,6 +944,8 @@ function indexTransaction(
     if (transactionWrite.changes !== 1) fail('indexed transaction write count');
     prior.indexedWrites!++;
   }
+  if (transactionWrite.changes !== 1) fail('indexed transaction write count');
+  bookkeeping.writes++;
   const expectedState = expectIntakeFrontierStateWrite(db);
   let wroteState = false;
   try {
@@ -905,6 +976,7 @@ function indexTransaction(
     });
     prior.indexed = proof;
   }
+  return bookkeeping;
 }
 function* collect(
   db: Database,
@@ -996,7 +1068,7 @@ function publish(
     if (count !== plan.pending.length) fail('compact prepared publication rows missing');
     plan.consumed = true;
     prior.assertCurrent();
-    indexTransaction(
+    const bookkeeping = indexTransaction(
       db,
       config,
       {
@@ -1011,7 +1083,12 @@ function publish(
     installVaultRecordHead(staging!, encode(plan.ref));
     if (!eq(readHead(config.storage), plan.ref))
       fail('compact HEAD publication failed verification');
-    return { sequence: plan.commit.sequence, operationId: plan.commit.operationId, records: count };
+    return {
+      sequence: plan.commit.sequence,
+      operationId: plan.commit.operationId,
+      records: count,
+      bookkeeping,
+    };
   }
   if (
     meta(db, 'owner_profile_id') !== config.profileId ||
@@ -1105,7 +1182,7 @@ function publish(
   prior?.assertCurrent();
   // All validation/indexing happens before the one acceptance boundary. The
   // SQLite transaction can roll back; the published commit remains recoverable.
-  indexTransaction(
+  const bookkeeping = indexTransaction(
     db,
     config,
     {
@@ -1123,7 +1200,7 @@ function publish(
     else config.storage.publishHead(encode(ref));
   } else config.storage.publishHead(encode(ref));
   if (!eq(readHead(config.storage), ref)) fail('head publication failed verification');
-  return { sequence, operationId, records: count };
+  return { sequence, operationId, records: count, bookkeeping };
 }
 function applyVersions(
   db: Database,
@@ -1400,11 +1477,18 @@ export function attachRecordDurability(
         );
     },
     capture() {
-      db.exec('DELETE FROM __record_changed');
-      return true;
+      maintenanceBookkeeping.delete(db);
+      const token = currentTransactionToken(db)!;
+      const empty = !db.prepare('SELECT 1 FROM temp.__record_changed LIMIT 1').get();
+      const cleared = clearIntakeFrontierRecordCapture(db);
+      return {
+        token,
+        empty: empty && cleared === 0,
+        bookkeeping: undefined as RecordBookkeeping | undefined,
+      };
     },
     markDirty: markPersisted,
-    prepare(_captured, { operation, result }) {
+    prepare(captured, { operation, result }) {
       const prior = operation.intakeMaintenance
         ? consumeIntakeMaintenancePriorFields(db, operation.intakeMaintenance)
         : undefined;
@@ -1423,10 +1507,43 @@ export function attachRecordDurability(
           );
         };
       prepared?.assertCurrent();
-      publish(db, config, collect(db, config, false, prepared), operation, result, prepared);
+      const publication = publish(
+        db,
+        config,
+        collect(db, config, false, prepared),
+        operation,
+        result,
+        prepared,
+      );
+      if (captured && operation.intakeMaintenance) captured.bookkeeping = publication.bookkeeping;
     },
     release(captured) {
-      if (captured) db.exec('DELETE FROM __record_changed');
+      if (!captured) return;
+      const keys = intakeFrontierOwnedMetadataKeys(db, captured.token);
+      const bookkeeping = captured.bookkeeping;
+      let exact = !!(captured.empty && keys && bookkeeping?.metadataOnly);
+      if (exact) {
+        const expected = new Set([...keys!].map((key) => JSON.stringify([key])));
+        for (const row of db
+          .prepare('SELECT entity,record_id FROM temp.__record_changed')
+          .iterate()) {
+          if (row.entity !== 'app_meta' || !expected.delete(row.record_id as string)) {
+            exact = false;
+            break;
+          }
+        }
+        exact &&= expected.size === 0;
+        const indexed = new Set([...keys!].filter((key) => !internalKey(key)));
+        exact &&=
+          indexed.size === bookkeeping!.metadataKeys.size &&
+          [...indexed].every((key) => bookkeeping!.metadataKeys.has(key));
+      }
+      const cleared = clearIntakeFrontierRecordCapture(db);
+      if (exact && BigInt(cleared) === BigInt(keys!.size))
+        maintenanceBookkeeping.set(db, {
+          token: captured.token,
+          writes: bookkeeping!.writes + 2n * BigInt(keys!.size),
+        });
     },
   });
   const status = recordDurabilityStatus(db)!;
@@ -1797,6 +1914,172 @@ export async function prepareRecordCompactPublication(
     consumed: false,
   };
 }
+function* sourcePreimagePieces(contents: Record<string, unknown>): Generator<string> {
+  yield '{';
+  let first = true;
+  for (const name of Object.keys(contents)) {
+    if (!first) yield ',';
+    first = false;
+    yield JSON.stringify(name) + ':';
+    const value = contents[name];
+    if (typeof value !== 'string') {
+      yield stringifyRecordJson(value);
+      continue;
+    }
+    yield '"';
+    for (let offset = 0; offset < value.length;) {
+      let end = Math.min(offset + 4096, value.length);
+      if (
+        end < value.length &&
+        value.charCodeAt(end - 1) >= 0xd800 &&
+        value.charCodeAt(end - 1) <= 0xdbff &&
+        value.charCodeAt(end) >= 0xdc00 &&
+        value.charCodeAt(end) <= 0xdfff
+      )
+        end++;
+      yield JSON.stringify(value.slice(offset, end)).slice(1, -1);
+      offset = end;
+    }
+    yield '"';
+  }
+  yield '}';
+}
+async function digestRecordPieces(pieces: Iterable<string>, check: () => void) {
+  const hash = createHash('sha256');
+  let bytes = 0;
+  for (const piece of pieces) {
+    check();
+    hash.update(piece);
+    bytes += Buffer.byteLength(piece);
+    await yieldHost();
+    check();
+  }
+  return { hash: hash.digest('hex'), bytes };
+}
+
+/** SQL version rows are locators only. On an uncertified contributor adapter,
+ * prove the latest selected preimage from its original accepted object chain. */
+async function authenticateSelectedSourcePrior(
+  config: RecordConfig,
+  head: RecordObjectReference | null,
+  recordId: string,
+  previous: CurrentVersionRow,
+  check: () => void,
+): Promise<void> {
+  let ref = head,
+    expectedSequence: number | undefined;
+  const table = config.schema.find((table) => table.name === 'source_files')!;
+  while (ref) {
+    check();
+    const commit = readCommit(config.storage, ref, config.profileId, config.schemaVersion);
+    check();
+    if (expectedSequence !== undefined && commit.sequence !== expectedSequence)
+      fail('accepted source ancestry sequence');
+    expectedSequence = commit.sequence - 1;
+    const segments = function* () {
+      for (const segment of iterateRecordCommitSegments(config.storage, commit)) {
+        check();
+        const bytes = readObject(config.storage, segment);
+        check();
+        yield bytes;
+      }
+    };
+    let count = 0,
+      selected: { hash: string; bytes: number } | undefined;
+    const identities = versionIdentityIndex();
+    const steps = readRecordJsonLinesSteps(segments(), { parseSmall: parseRecordJson });
+    try {
+      for (;;) {
+        check();
+        const next = steps.next();
+        check();
+        if (next.done) break;
+        if (next.value) {
+          count++;
+          const version = next.value.record as DurableRecordVersion;
+          const shape = config.schema.find((table) => table.name === version?.entity);
+          if (
+            !shape ||
+            version.format !== FORMAT ||
+            version.profileId !== config.profileId ||
+            version.schemaVersion !== config.schemaVersion ||
+            version.sequence !== commit.sequence ||
+            version.operationId !== commit.operationId ||
+            version.recordedAt !== commit.recordedAt ||
+            !/^[0-9a-f-]{36}$/.test(version.versionId) ||
+            typeof version.deleted !== 'boolean' ||
+            !version.contents ||
+            typeof version.contents !== 'object' ||
+            Array.isArray(version.contents) ||
+            !eq(Object.keys(version.contents).sort(), [...shape.columns].sort()) ||
+            identity(shape, version.contents) !== version.recordId ||
+            (shape.name === 'app_meta' && internalKey(version.contents.key as string))
+          )
+            fail('invalid complete accepted source transaction record');
+          const identityKey = stringifyRecordJson([version.entity, version.recordId]);
+          if (identities.has(identityKey)) fail('duplicate record in accepted source transaction');
+          identities.add(identityKey);
+          if (version?.entity === 'source_files' && version.recordId === recordId) {
+            if (
+              selected ||
+              version.deleted ||
+              version.versionId !== previous.version_id ||
+              version.format !== FORMAT ||
+              version.profileId !== config.profileId ||
+              version.schemaVersion !== config.schemaVersion ||
+              version.sequence !== commit.sequence ||
+              version.operationId !== commit.operationId ||
+              version.recordedAt !== commit.recordedAt ||
+              !version.contents ||
+              typeof version.contents !== 'object' ||
+              Array.isArray(version.contents) ||
+              !eq(Object.keys(version.contents).sort(), [...table.columns].sort()) ||
+              identity(table, version.contents) !== recordId
+            )
+              fail('selected source differs from accepted prior version');
+            selected = await digestRecordPieces(sourcePreimagePieces(version.contents), check);
+          }
+        }
+        await yieldHost();
+        check();
+      }
+    } finally {
+      try {
+        steps.return(undefined);
+      } finally {
+        identities.close();
+      }
+    }
+    if (count !== commit.records) fail('partial accepted source transaction');
+    if (selected) {
+      const pieces = function* () {
+        for (let offset = 0; offset < previous.contents_json.length;) {
+          let end = Math.min(offset + 4096, previous.contents_json.length);
+          if (
+            end < previous.contents_json.length &&
+            previous.contents_json.charCodeAt(end - 1) >= 0xd800 &&
+            previous.contents_json.charCodeAt(end - 1) <= 0xdbff &&
+            previous.contents_json.charCodeAt(end) >= 0xdc00 &&
+            previous.contents_json.charCodeAt(end) <= 0xdfff
+          )
+            end++;
+          yield previous.contents_json.slice(offset, end);
+          offset = end;
+        }
+      };
+      const cached = await digestRecordPieces(pieces(), check);
+      if (selected.hash !== cached.hash || selected.bytes !== cached.bytes)
+        fail('source preimage differs from accepted immutable history');
+      check();
+      return;
+    }
+    ref = commit.previous;
+    await yieldHost();
+    check();
+  }
+  fail('selected source absent from accepted history');
+}
+
 export async function prepareRecordSourcePriorFields(
   db: Database,
   sourceId: string,
@@ -1829,6 +2112,14 @@ export async function prepareRecordSourcePriorFields(
     )
       fail('prior source comparison authority changed');
   };
+  if (!authorityData!.staging)
+    await authenticateSelectedSourcePrior(
+      authorityData!.config,
+      authorityData!.head,
+      recordId,
+      previous!,
+      check,
+    );
   const fields = await prepareRecordPriorFields([previous!.contents_json], check);
   try {
     check();

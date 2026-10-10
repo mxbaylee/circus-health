@@ -143,9 +143,10 @@ test('attention and frontier observers coexist without replacing function regist
     /SELECT (__source_attention_event_[a-f0-9]+)\(\)/,
   )![1]!;
   f.db.function(attentionFunction, () => null);
-  assert.ok(
+  assert.equal(
     readIntakeFrontierAttempts(f.db, frontier),
-    'unrelated private registration does not revoke frontier',
+    undefined,
+    'managed function replacement invalidates the original method-bound frontier',
   );
   assert.deepEqual(await f.read(), first);
   assert.equal(f.calls(), 2);

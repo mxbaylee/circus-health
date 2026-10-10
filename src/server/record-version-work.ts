@@ -25,6 +25,10 @@ const empty = () => ({
   indexedVersionValidations: 0,
   validatedColumns: 0,
   decodedVersions: 0,
+  journalRecordsSpooled: 0,
+  journalRecordSpoolBytes: 0,
+  maxJournalRecordBufferBytes: 0,
+  maxJournalRecordDecodeWindowBytes: 0,
   indexedVersionAttempts: 0,
   fieldVisits: 0,
   replayDeleteAttempts: 0,
@@ -42,6 +46,14 @@ export function createRecordVersionWorkCounters() {
 }
 type Counters = ReturnType<typeof createRecordVersionWorkCounters>;
 const scope = new AsyncLocalStorage<{ counters: Counters; phase: Phase }>();
+const replayCheckpoints = new AsyncLocalStorage<() => void>();
+/** Background replay drivers can report bounded work without carrying records. */
+export function withRecordReplayCheckpoints<T>(checkpoint: () => void, run: () => T): T {
+  return replayCheckpoints.run(checkpoint, run);
+}
+export function recordReplayCheckpoint(): void {
+  replayCheckpoints.getStore()?.();
+}
 export function withRecordVersionWork<T>(counters: Counters, run: () => T): T {
   return scope.run({ counters, phase: 'operation' }, run);
 }

@@ -102,6 +102,7 @@ export function* prepareIntakeJsonCanonicalSteps(
       options.assertRunning?.();
       engine.work.yields++;
       yield;
+      options.assertRunning?.();
     }
     options.assertRunning?.();
     const result = engine.result();

@@ -11,6 +11,7 @@ import {
   rearmManagedDatabaseAuthorization,
 } from './database.ts';
 import { intakeClinicalCachePin } from './intake-clinical-cache-pin.ts';
+import { consumeRecordMaintenanceBookkeeping } from './record-versions.ts';
 
 type Operation = 'insert' | 'update' | 'delete';
 
@@ -19,6 +20,7 @@ interface ExpectedWrite {
   readonly key: string;
   readonly operations: readonly Operation[];
   readonly headSourceId?: string;
+  readonly insertsLookupDirty?: boolean;
   seen: number;
 }
 
@@ -52,6 +54,10 @@ interface Observer {
   activeToken?: object;
   activeChanges?: bigint;
   activeAttempts?: number;
+  activeMetadata?: Set<string>;
+  activeLookupDirtyWrites: bigint;
+  captureClearCount: number;
+  clearingCapture?: { seen: boolean };
   changesetPragma?: { phase: 0 | 1 | 2 };
   expected?: ExpectedWrite;
   auxiliary?: AuxiliaryPreparation;
@@ -288,6 +294,11 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
     else {
       expected.seen = 1;
       observer.ownedWrites++;
+      if (table === 'app_meta' && observer.activeMetadata) {
+        if (observer.activeMetadata.size >= 4100 && !observer.activeMetadata.has(key!))
+          revoke(observer, 'maintenance metadata window');
+        else observer.activeMetadata.add(key!);
+      }
       if (expected.headSourceId) {
         observer.headChanges.delete(expected.headSourceId);
         if (observer.headChanges.size >= MAX_HEAD_SOURCES) {
@@ -332,6 +343,8 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
     return sql;
   });
   observer = {
+    activeLookupDirtyWrites: 0n,
+    captureClearCount: 0,
     identity: {},
     functionName,
     triggerNames,
@@ -364,12 +377,34 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
     db,
     (action, name, detail, _database, origin) => {
       if (observer) {
+        const captureDelete =
+          action === constants.SQLITE_DELETE && _database === 'temp' && name === '__record_changed';
+        const ownedCaptureDelete =
+          captureDelete && observer.clearingCapture && !observer.clearingCapture.seen;
+        if (ownedCaptureDelete) observer.clearingCapture!.seen = true;
+        if (
+          _database === 'temp' &&
+          name === '__record_changed' &&
+          writeActions.has(action) &&
+          !(
+            ownedCaptureDelete ||
+            (action === constants.SQLITE_INSERT &&
+              /^__record_capture_[a-z_]+_(INSERT|UPDATE|DELETE)$/.test(origin ?? ''))
+          )
+        )
+          revoke(observer, 'unowned accepted-row capture write');
         if (
           writeActions.has(action) &&
           ((_database === 'main' && name?.startsWith('__record_intake_lookup_')) ||
             (_database === 'temp' &&
               name?.startsWith('__intake_lookup_') &&
-              !(name === '__intake_lookup_dirty' && action === constants.SQLITE_INSERT)))
+              !(
+                name === '__intake_lookup_dirty' &&
+                action === constants.SQLITE_INSERT &&
+                /^__intake_lookup_(authority_(INSERT|UPDATE|DELETE)|insert|update|delete)$/.test(
+                  origin ?? '',
+                )
+              )))
         )
           revoke(observer, 'lookup projection write');
         const auxiliary = observer.auxiliary;
@@ -432,6 +467,9 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
     observer.activeToken = token;
     observer.activeChanges = changes;
     observer.activeAttempts = observer.attempts;
+    observer.activeMetadata = new Set();
+    observer.activeLookupDirtyWrites = 0n;
+    observer.captureClearCount = 0;
   });
   observeTransactionOutcome(db, (outcome) => {
     if (!observer || observer.revoked) return;
@@ -448,7 +486,11 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
       revoke(observer, 'outcome failure');
     } else {
       const protectedWrites = BigInt(observer.attempts - observer.activeAttempts);
-      const extra = changes - observer.activeChanges - protectedWrites;
+      const bookkeeping = outcome.intakeMaintenance
+        ? consumeRecordMaintenanceBookkeeping(db, outcome.token)
+        : 0n;
+      const dirtyWrites = outcome.intakeMaintenance ? observer.activeLookupDirtyWrites : 0n;
+      const extra = changes - observer.activeChanges - protectedWrites - bookkeeping - dirtyWrites;
       if (extra < 0n) revoke(observer, 'outcome write count');
       else observer.unrelatedChanges += extra;
     }
@@ -469,7 +511,39 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
     observer.activeToken = undefined;
     observer.activeChanges = undefined;
     observer.activeAttempts = undefined;
+    observer.activeMetadata = undefined;
   });
+}
+
+/** Read only genuine, original protected events for this exact transaction. */
+export function intakeFrontierOwnedMetadataKeys(
+  db: DatabaseSync,
+  token: object,
+): ReadonlySet<string> | undefined {
+  const observer = observers.get(db);
+  if (!observer || observer.revoked || observer.activeToken !== token) return undefined;
+  return observer.activeMetadata && new Set(observer.activeMetadata);
+}
+
+/** The capture owner alone runs this fixed cleanup statement, never a callback. */
+export function clearIntakeFrontierRecordCapture(db: DatabaseSync): number | bigint {
+  const observer = observers.get(db);
+  if (observer?.clearingCapture) revoke(observer, 'reentrant accepted-row cleanup');
+  if (observer) {
+    if (!observer.activeToken || observer.captureClearCount >= 2)
+      revoke(observer, 'accepted-row cleanup phase');
+    observer.captureClearCount++;
+  }
+  const clearing = { seen: false };
+  if (observer) observer.clearingCapture = clearing;
+  try {
+    // Fresh bytecode must consume this slot. Rearming here would invalidate
+    // every unrelated prepared statement twice per durable publication.
+    return db.prepare('DELETE FROM temp.__record_changed').run().changes;
+  } finally {
+    if (observer && !clearing.seen) revoke(observer, 'capture cleanup authorization missing');
+    if (observer) observer.clearingCapture = undefined;
+  }
 }
 
 export function captureIntakeFrontierAttempts(
@@ -660,7 +734,34 @@ export function expectIntakeFrontierMetaWrite(
     revoke(observer, 'owned write setup');
     return undefined;
   }
-  const expected = { table: 'app_meta' as const, key, operations, headSourceId, seen: 0 };
+  let insertsLookupDirty = false;
+  if (
+    headSourceId &&
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_temp_schema WHERE type='table' AND name='__intake_lookup_authorities'",
+      )
+      .get()
+  ) {
+    const authorities = db
+      .prepare(
+        'SELECT source_id FROM temp.__intake_lookup_authorities WHERE authority_key=? LIMIT 2',
+      )
+      .all(key);
+    if (authorities.length === 1 && authorities[0]!.source_id === headSourceId)
+      insertsLookupDirty = !db
+        .prepare('SELECT 1 FROM temp.__intake_lookup_dirty WHERE source_id=?')
+        .get(headSourceId);
+    else if (authorities.length) revoke(observer, 'lookup dirty authority binding');
+  }
+  const expected = {
+    table: 'app_meta' as const,
+    key,
+    operations,
+    headSourceId,
+    insertsLookupDirty,
+    seen: 0,
+  };
   observer.expected = expected;
   return expected;
 }
@@ -692,6 +793,15 @@ export function finishIntakeFrontierMetaWrite(
   const observer = observers.get(db);
   if (!observer || observer.expected !== expected) return;
   if (expected.seen !== Number(written)) revoke(observer, 'owned write completion');
+  if (written && expected.insertsLookupDirty && expected.headSourceId) {
+    if (
+      !db
+        .prepare('SELECT 1 FROM temp.__intake_lookup_dirty WHERE source_id=?')
+        .get(expected.headSourceId)
+    )
+      revoke(observer, 'lookup dirty insertion missing');
+    else observer.activeLookupDirtyWrites++;
+  }
   observer.expected = undefined;
 }
 

@@ -714,7 +714,7 @@ export async function ensureNativeIntakeSchema(
   db: DatabaseSync,
   profileId: string,
   id: string,
-  options: { assertRunning?: () => void } = {},
+  options: { assertRunning?: () => void; assertPublicationCurrent?: () => void } = {},
 ): Promise<void> {
   return runExclusiveClinicalOperation(
     db,
@@ -3058,18 +3058,25 @@ interface IntakeChildContext {
   root: string;
   profileId: string;
   assertRunning?: () => void;
+  assertPublicationCurrent?: () => void;
   signal?: AbortSignal;
 }
 
 /** Host-only verified descriptor. No extraction-size ceiling applies to ranges. */
 export async function withVerifiedIntakeOriginalDescriptor<T>(
   context: IntakeChildContext & { id: string },
-  writer: (source: { sourceFd: number; assertRunning: () => void }) => Promise<T>,
+  writer: (source: {
+    sourceFd: number;
+    assertRunning: () => void;
+    assertPublicationCurrent: () => void;
+  }) => Promise<T>,
 ): Promise<T> {
   const { db, root, profileId, id } = context;
   getRetainedIntakeOriginalReference(db, root, profileId, id);
-  return withPackageSessionSource(context, ({ sourceFd, assertCurrent }) =>
-    writer({ sourceFd, assertRunning: assertCurrent }),
+  return withPackageSessionSource(
+    context,
+    ({ sourceFd, assertCurrent, assertPublicationCurrent }) =>
+      writer({ sourceFd, assertRunning: assertCurrent, assertPublicationCurrent }),
   );
 }
 
@@ -3264,8 +3271,19 @@ export async function withStagedIntakeChild(
           context.assertRunning?.();
         },
       },
-      async ({ sourceFd, assertCurrent: assertUnchanged }) => {
+      async ({
+        sourceFd,
+        assertCurrent: assertUnchanged,
+        assertPublicationCurrent: assertParentPublicationCurrent,
+      }) => {
         const { id } = childIdentity(parentId, member.locator, member.sourceHash);
+        const assertParentPublicationScope = () => {
+          assertParentPublicationCurrent();
+          const currentParent = row(db, parentId);
+          for (const field of ['id', 'path', 'sha256', 'bytes', 'provider_id', 'batch_id'] as const)
+            if (currentParent[field] !== parent[field])
+              throw new HttpError(409, 'SOURCE_CHANGED', 'Retained parent scope changed');
+        };
         // Extraction uses the original source lease outside admission. Recheck
         // the retained parent and child under the current publication owner.
         const publish = (staged: StagedUpload | null) =>
@@ -3298,7 +3316,7 @@ export async function withStagedIntakeChild(
                   throw new HttpError(409, 'SOURCE_CHANGED', 'Retained member scope changed');
                 return withVerifiedIntakeOriginalDescriptor(
                   { ...context, id },
-                  async ({ assertRunning }) => {
+                  async ({ assertRunning, assertPublicationCurrent }) => {
                     assertUnchanged();
                     assertRunning();
                     if (nativeParent)
@@ -3306,6 +3324,10 @@ export async function withStagedIntakeChild(
                         assertRunning: () => {
                           assertUnchanged();
                           assertRunning();
+                        },
+                        assertPublicationCurrent: () => {
+                          assertParentPublicationScope();
+                          assertPublicationCurrent();
                         },
                       });
                     assertUnchanged();
@@ -3325,9 +3347,20 @@ export async function withStagedIntakeChild(
               publicationAttempted = true;
               const retained = publishIntakeChildren(context, [file])[0]!;
               if (nativeParent)
-                await ensureNativeIntakeSchema(db, profileId, retained.id, {
-                  assertRunning: assertUnchanged,
-                });
+                await withVerifiedIntakeOriginalDescriptor(
+                  { ...context, id: retained.id },
+                  async ({ assertRunning, assertPublicationCurrent }) =>
+                    ensureNativeIntakeSchema(db, profileId, retained.id, {
+                      assertRunning: () => {
+                        assertUnchanged();
+                        assertRunning();
+                      },
+                      assertPublicationCurrent: () => {
+                        assertParentPublicationScope();
+                        assertPublicationCurrent();
+                      },
+                    }),
+                );
               assertUnchanged();
               return nativeParent
                 ? childDescriptor(db, row(db, retained.id), intakeSourceMetadata(db, retained.id))

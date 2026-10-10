@@ -56,7 +56,7 @@ function line(id: string) {
 
 for (const count of [1, 65])
   test(
-    `native public acceptance admits a complete ${count}-source frontier outside its transaction`,
+    `native public acceptance reuses its complete ${count}-source discovery frontier`,
     { timeout: 120000 },
     async (t) => {
       const root = mkdtempSync(join(tmpdir(), 'fictional-frontier-acceptance-'));
@@ -209,9 +209,8 @@ for (const count of [1, 65])
         0,
         'Complete source enumeration must precede the application transaction',
       );
-      assert.equal(outsideRows, count, 'Every retained source participates in the final digest');
-      if (count > 64)
-        assert.equal(rowsAtHostTurn, 64, 'A real host turn occurs before scanning the next source');
+      assert.equal(outsideRows, 0, 'The complete prepared discovery proof avoids a second scan');
+      assert.equal(rowsAtHostTurn, -1, 'Admission does not start a redundant paged scan');
     },
   );
 

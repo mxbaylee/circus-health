@@ -53,6 +53,7 @@ interface PackageContext {
   profileId: string;
   id: string;
   assertRunning?: () => void;
+  assertPublicationCurrent?: () => void;
   signal?: AbortSignal;
   modelContext?: boolean;
   onSourceTextCaptured?: (
@@ -352,7 +353,12 @@ function packagePublication<T>(
         context.signal?.throwIfAborted();
         context.assertRunning?.();
       };
-      return work({ ...context, assertRunning });
+      const assertPublicationCurrent = () => {
+        assertClinicalOperation(context.db, operation);
+        context.signal?.throwIfAborted();
+        (context.assertPublicationCurrent ?? context.assertRunning)?.();
+      };
+      return work({ ...context, assertRunning, assertPublicationCurrent });
     },
     {
       operation: currentClinicalOperation(context.db),
@@ -363,8 +369,10 @@ function packagePublication<T>(
 }
 async function durablePackage(context: PackageContext) {
   return packagePublication(context, (owned) =>
-    withVerifiedIntakeOriginalDescriptor(owned, async ({ assertRunning }) =>
-      durablePackageOwned({ ...owned, assertRunning }, context),
+    withVerifiedIntakeOriginalDescriptor(
+      owned,
+      async ({ assertRunning, assertPublicationCurrent }) =>
+        durablePackageOwned({ ...owned, assertRunning, assertPublicationCurrent }, context),
     ),
   );
 }
@@ -720,8 +728,14 @@ export async function readIntakePackageMemberPaged(
 async function readPackageMember(context: PackageContext, paged: boolean) {
   // Keep the captured original lease live through worker publication and any
   // later failure admission. A fresh hash cannot authorize a replaced inode.
-  return withVerifiedIntakeOriginalDescriptor(context, async ({ assertRunning }) =>
-    readPackageMemberForSource({ ...context, assertRunning }, paged, context),
+  return withVerifiedIntakeOriginalDescriptor(
+    context,
+    async ({ assertRunning, assertPublicationCurrent }) =>
+      readPackageMemberForSource(
+        { ...context, assertRunning, assertPublicationCurrent },
+        paged,
+        context,
+      ),
   );
 }
 async function readPackageMemberForSource(
@@ -870,6 +884,7 @@ async function readPackageMemberForSource(
       await packageOriginal(owned, true);
       await prepareIntakeSourceDependencyHeaders(context.db, retainedChild.id, {
         assertRunning: owned.assertRunning,
+        assertPublicationCurrent: owned.assertPublicationCurrent,
       });
     });
   }

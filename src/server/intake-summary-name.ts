@@ -30,7 +30,7 @@ import { setImmediate } from 'node:timers/promises';
 export async function prepareIntakeFilenameSummary(
   db: Database,
   source: IntakeEnvelopeSource,
-  options: { assertRunning?: () => void } = {},
+  options: { assertRunning?: () => void; assertPublicationCurrent?: () => void } = {},
 ): Promise<{ changed: boolean }> {
   options.assertRunning?.();
   const compact = await prepareIntakeCompactMetadata(db, source, options);

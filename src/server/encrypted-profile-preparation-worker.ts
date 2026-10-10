@@ -3,12 +3,17 @@ import { resolve } from 'node:path';
 import { createEncryptedProfiles } from './encrypted-profiles.ts';
 import { createImportDiagnostics } from './import-diagnostics.ts';
 import { HttpError } from './database.ts';
+import { isArchiveRefusal } from './archive-refusal.ts';
 import { assertUnlockAuthority, unlockPathIdentity } from './encrypted-profile-preparation.ts';
 import {
   captureUnlockPhysicalWitness,
   verifyUnlockPhysicalWitness,
 } from './encrypted-unlock-physical.ts';
-import { createRecordVersionWorkCounters, withRecordVersionWork } from './record-version-work.ts';
+import {
+  createRecordVersionWorkCounters,
+  withRecordVersionWork,
+  withRecordReplayCheckpoints,
+} from './record-version-work.ts';
 import { intakeWorkCounters } from './intake-work-accounting.ts';
 
 const key = Buffer.from(workerData.key);
@@ -44,8 +49,15 @@ function prepare(): void {
       diagnostics,
     });
     const records = createRecordVersionWorkCounters();
-    state = withRecordVersionWork(records, () =>
-      manager.prepareUnlockWithKey(workerData.profileId, key),
+    let replaySteps = 0;
+    state = withRecordReplayCheckpoints(
+      () => {
+        if (++replaySteps % 64 === 0) parentPort!.postMessage({ progress: true });
+      },
+      () =>
+        withRecordVersionWork(records, () =>
+          manager.prepareUnlockWithKey(workerData.profileId, key),
+        ),
     );
     const intake = intakeWorkCounters(state.db);
     const selectedHead = state.recordStorage.read('head')!.toString('utf8');
@@ -69,7 +81,7 @@ function prepare(): void {
   } catch (error) {
     parentPort!.postMessage({
       failure:
-        error instanceof HttpError
+        error instanceof HttpError || isArchiveRefusal(error)
           ? { status: error.status, code: error.code, message: error.message }
           : {
               status: 500,

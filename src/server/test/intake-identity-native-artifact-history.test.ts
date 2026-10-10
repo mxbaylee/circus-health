@@ -645,6 +645,7 @@ test(
         'fictional-identity-scope-',
         'fictional-identity-delta-',
         'fictional-identity-original-proof-',
+        'fictional-identity-prerequisites-',
       ].map((prefix) => join(tmpdir(), prefix)),
       originalMkdtemp = fs.mkdtempSync;
     const allocationObserver = t.mock.method(fs, 'mkdtempSync', ((

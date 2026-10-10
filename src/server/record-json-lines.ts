@@ -14,17 +14,30 @@ export interface RecordJsonLineWork {
   maxRecordBufferBytes: number;
   maxSpoolReadBytes: number;
 }
+export type RecordJsonLineStep = { record: unknown } | undefined;
+interface RecordJsonLineOptions {
+  parseSmall?: (text: string) => unknown;
+  checkpoint?: () => void;
+  onWork?: (work: Readonly<RecordJsonLineWork>) => void;
+}
 
 /** Segment authentication remains the caller's responsibility. A scratch spool
  * cannot replace those bytes: its full digest closes before yielding a record. */
 export function* readRecordJsonLines(
   segments: Iterable<Uint8Array>,
-  options: {
-    parseSmall?: (text: string) => unknown;
-    checkpoint?: () => void;
-    onWork?: (work: Readonly<RecordJsonLineWork>) => void;
-  } = {},
+  options: RecordJsonLineOptions = {},
 ): Generator<unknown> {
+  for (const step of readRecordJsonLinesSteps(segments, options)) {
+    if (step) yield step.record;
+    else options.checkpoint?.();
+  }
+}
+
+/** The same framing/decoder with explicit owner-check and host-yield boundaries. */
+export function* readRecordJsonLinesSteps(
+  segments: Iterable<Uint8Array>,
+  options: RecordJsonLineOptions = {},
+): Generator<RecordJsonLineStep> {
   const work: RecordJsonLineWork = {
     records: 0,
     spooledRecords: 0,
@@ -37,7 +50,7 @@ export function* readRecordJsonLines(
     directory: string | undefined,
     fd: number | undefined,
     inputHash = createHash('sha256');
-  const append = (bytes: Uint8Array) => {
+  const append = function* (bytes: Uint8Array): Generator<undefined> {
     if (!bytes.length) return;
     if (fd === undefined && length + bytes.length <= SMALL_RECORD) {
       small.push(Buffer.from(bytes));
@@ -48,14 +61,14 @@ export function* readRecordJsonLines(
     if (fd === undefined) {
       directory = mkdtempSync(join(tmpdir(), 'circus-record-line-'));
       fd = openSync(join(directory, 'line'), 'wx+', 0o600);
-      for (const bytes of small) write(bytes);
+      for (const bytes of small) yield* write(bytes);
       small = [];
     }
-    write(bytes);
+    yield* write(bytes);
     length += bytes.length;
     if (!Number.isSafeInteger(length)) throw Error('Record JSONL byte count overflow');
   };
-  const write = (bytes: Uint8Array) => {
+  const write = function* (bytes: Uint8Array): Generator<undefined> {
     for (let offset = 0; offset < bytes.length;) {
       const take = Math.min(WINDOW, bytes.length - offset),
         written = writeSync(fd!, bytes, offset, take);
@@ -63,18 +76,18 @@ export function* readRecordJsonLines(
       inputHash.update(bytes.subarray(offset, offset + written));
       offset += written;
       work.spooledBytes += written;
-      options.checkpoint?.();
+      yield;
     }
   };
-  const decode = (): unknown => {
+  const decode = function* (): Generator<undefined, unknown> {
     if (fd === undefined) {
       const bytes = Buffer.concat(small, length),
-        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
       return (options.parseSmall ?? JSON.parse)(text);
     }
     const expected = inputHash.digest('hex'),
       readHash = createHash('sha256'),
-      decoder = new TextDecoder('utf-8', { fatal: true });
+      decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
     const pieces = function* () {
       const buffer = Buffer.alloc(WINDOW);
       for (let offset = 0; offset < length;) {
@@ -98,7 +111,7 @@ export function* readRecordJsonLines(
           work.spooledRecords++;
           return next.value;
         }
-        options.checkpoint?.();
+        yield;
       }
     } finally {
       steps.return(undefined as never);
@@ -109,10 +122,10 @@ export function* readRecordJsonLines(
       const bytes = Buffer.isBuffer(segment) ? segment : Buffer.from(segment);
       let offset = 0;
       for (let end = bytes.indexOf(10); end !== -1; end = bytes.indexOf(10, offset)) {
-        append(bytes.subarray(offset, end));
-        const value = decode();
+        yield* append(bytes.subarray(offset, end));
+        const value = yield* decode();
         work.records++;
-        yield value;
+        yield { record: value };
         small = [];
         length = 0;
         offset = end + 1;
@@ -124,7 +137,7 @@ export function* readRecordJsonLines(
         }
         inputHash = createHash('sha256');
       }
-      append(bytes.subarray(offset));
+      yield* append(bytes.subarray(offset));
     }
     if (length) throw Error('Partial final JSONL record');
   } finally {

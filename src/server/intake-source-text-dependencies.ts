@@ -89,7 +89,7 @@ function dependencyHeader(db: DatabaseSync, id: string) {
 export async function prepareIntakeSourceDependencyHeaders(
   db: DatabaseSync,
   id: string,
-  options: { assertRunning?: () => void } = {},
+  options: { assertRunning?: () => void; assertPublicationCurrent?: () => void } = {},
 ): Promise<void> {
   const profileId = db
     .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")

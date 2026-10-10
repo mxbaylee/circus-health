@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DatabaseSync, StatementSync } from 'node:sqlite';
+import { constants, DatabaseSync, StatementSync } from 'node:sqlite';
 import { setImmediate } from 'node:timers';
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -54,6 +54,57 @@ import {
 } from '../intake-lookup-state.ts';
 
 const summaryOptions = { mappingVersion: 'fictional-v1', isSourceContextVersion: () => false };
+
+for (const mode of ['native-only', 'mixed'] as const)
+  test(`native fallback maximum refuses a late selected-head change in ${mode} lookup`, async (t) => {
+    const f = await fixture(
+      t,
+      '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportGroups":[{"discoveryOrder":13}]}}}',
+    );
+    if (mode === 'mixed')
+      registerRawIntakeFixture(
+        f.db,
+        'fictional-legacy-cast',
+        '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportGroups":[{"discoveryOrder":11}]}}}',
+      );
+    await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+    assert.equal(maximumIntakeDiscoveryOrder(f.db), 13);
+    const reader = openIntakeCollectionEnvelope(f.db, f.source);
+    const intake = reader.child(reader.root(), 'intake')!;
+    const workflow = reader.child(intake, 'workflow')!;
+    const group = reader.childAt(workflow, 'reportGroups', 0)!;
+    const operationId = randomUUID();
+    const mutation = prepareIntakeEnvelopeFieldMutation(f.db, f.source, {
+      reader,
+      record: group,
+      field: 'discoveryOrder',
+      jsonText: '23',
+      operationId,
+      requestDigest: createHash('sha256').update(operationId).digest('hex'),
+      domainVersion: 0,
+    });
+    const original = StatementSync.prototype.get;
+    let changed = false;
+    StatementSync.prototype.get = function (
+      this: StatementSync,
+      ...parameters: Parameters<StatementSync['get']>
+    ) {
+      const row = Reflect.apply(original, this, parameters);
+      if (!changed && this.sourceSQL === "SELECT CAST(json_extract(?,'$') AS INTEGER) n") {
+        changed = true;
+        transaction(f.db, () => stageIntakeEnvelopeFieldMutation(f.db, f.source, mutation));
+      }
+      return row;
+    } as typeof StatementSync.prototype.get;
+    try {
+      assert.throws(() => maximumIntakeDiscoveryOrder(f.db), /projection answer witness changed/);
+    } finally {
+      StatementSync.prototype.get = original;
+    }
+    assert.equal(changed, true);
+    await prepareIntakeLookupIndices(f.db);
+    assert.equal(maximumIntakeDiscoveryOrder(f.db), 23);
+  });
 
 for (const count of [1, 8])
   test(`warm lookup preparation reads only changed retained sources among ${count} originals`, async (t) => {
@@ -776,7 +827,11 @@ for (const change of ['unrelated-sql', 'sql-aba', 'rollback', 'source-write'] as
       if (change === 'sql-aba')
         f.db.prepare('DELETE FROM app_meta WHERE key=?').run('fictional-unknown');
     }
-    assert.equal(nativeIntakeLookupCatalogHeadBindingsEqual(f.db, token, [f.source.id]), true);
+    assert.equal(
+      nativeIntakeLookupCatalogHeadBindingsEqual(f.db, token, [f.source.id]),
+      change !== 'rollback',
+      'Rollback discards the catalog; other unknown writes cannot be excused by equal heads',
+    );
     assert.equal(preparedIntakeLookupReadToken(f.db), undefined);
     assert.equal(preparedIntakeDiscoveryRevision(f.db), undefined);
     assert.ok(
@@ -788,6 +843,169 @@ for (const change of ['unrelated-sql', 'sql-aba', 'rollback', 'source-write'] as
     assert.notEqual(preparedIntakeLookupReadToken(f.db), token);
     assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
     assert.equal(retainedIntakeAcceptance(f.db, 'fictional-missing'), null);
+  });
+
+test('maintenance-only renewal does not credit an unrelated write inside its owned transaction', async (t) => {
+  const f = await lookupProofFixture(t);
+  f.db.exec('CREATE TEMP TABLE fictional_unowned_maintenance(value TEXT)');
+  const before = await prepareIntakeLookupIndices(f.db);
+  const token = preparedIntakeLookupReadToken(f.db)!;
+  const original = StatementSync.prototype.run;
+  let changed = false;
+  StatementSync.prototype.run = function (
+    this: StatementSync,
+    ...parameters: Parameters<StatementSync['run']>
+  ) {
+    const result = Reflect.apply(original, this, parameters);
+    if (
+      !changed &&
+      this.sourceSQL ===
+        'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value'
+    ) {
+      changed = true;
+      f.db.prepare('INSERT INTO fictional_unowned_maintenance VALUES(?)').run('unowned');
+    }
+    return result;
+  } as typeof StatementSync.prototype.run;
+  try {
+    rewriteLookupBuildHead(f);
+  } finally {
+    StatementSync.prototype.run = original;
+  }
+  assert.equal(changed, true);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM fictional_unowned_maintenance').get()!.n, 1);
+  assert.equal(nativeIntakeLookupCatalogHeadBindingsEqual(f.db, token, [f.source.id]), true);
+  assert.equal(preparedIntakeLookupReadToken(f.db), undefined);
+  assert.equal(preparedIntakeDiscoveryRevision(f.db), before.discoveryRevision);
+  assert.ok(
+    (await lookupSourceRows(f.db, async () => {
+      assert.equal(
+        (await prepareIntakeLookupIndices(f.db)).discoveryRevision,
+        before.discoveryRevision,
+      );
+    })) >= 2,
+  );
+  assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
+  assert.equal(retainedIntakeAcceptance(f.db, 'fictional-missing'), null);
+});
+
+for (const change of [
+  'capture-preinsert',
+  'dirty-preinsert',
+  'reentrant-clear',
+  'retained-clear-replay',
+] as const)
+  test(`maintenance bookkeeping refuses ${change} callback write substitution`, async (t) => {
+    const f = await lookupProofFixture(t);
+    f.db.exec('CREATE TEMP TABLE fictional_bookkeeping_substitution(value TEXT)');
+    let armed = false;
+    let changed = false;
+    let retainedClear: StatementSync | undefined;
+    const substitute = () => {
+      changed = true;
+      if (change === 'capture-preinsert')
+        f.db
+          .prepare('INSERT INTO temp.__record_changed VALUES(?,?)')
+          .run('app_meta', '["revision"]');
+      else if (change === 'dirty-preinsert')
+        f.db.prepare('INSERT INTO temp.__intake_lookup_dirty VALUES(?)').run(f.source.id);
+      else if (change === 'retained-clear-replay') retainedClear!.run();
+      else f.db.prepare('DELETE FROM temp.__record_changed').run();
+      f.db.prepare('INSERT INTO fictional_bookkeeping_substitution VALUES(?)').run('unowned');
+    };
+    if (change === 'reentrant-clear')
+      f.db.setAuthorizer((action, name, _detail, schema) => {
+        if (
+          armed &&
+          !changed &&
+          action === constants.SQLITE_DELETE &&
+          name === '__record_changed' &&
+          schema === 'temp'
+        )
+          substitute();
+        return constants.SQLITE_OK;
+      });
+    const before = await prepareIntakeLookupIndices(f.db);
+    const originalRun = StatementSync.prototype.run;
+    const originalGet = StatementSync.prototype.get;
+    StatementSync.prototype.run = function (
+      this: StatementSync,
+      ...parameters: Parameters<StatementSync['run']>
+    ) {
+      const result = Reflect.apply(originalRun, this, parameters);
+      if (
+        armed &&
+        change === 'retained-clear-replay' &&
+        !retainedClear &&
+        this.sourceSQL === 'DELETE FROM temp.__record_changed'
+      )
+        retainedClear = this;
+      if (
+        armed &&
+        !changed &&
+        change === 'capture-preinsert' &&
+        this.sourceSQL === 'DELETE FROM temp.__record_changed'
+      )
+        substitute();
+      if (
+        armed &&
+        !changed &&
+        change === 'retained-clear-replay' &&
+        retainedClear &&
+        this.sourceSQL ===
+          'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value'
+      )
+        substitute();
+      return result;
+    } as typeof StatementSync.prototype.run;
+    StatementSync.prototype.get = function (
+      this: StatementSync,
+      ...parameters: Parameters<StatementSync['get']>
+    ) {
+      const result = Reflect.apply(originalGet, this, parameters);
+      if (
+        armed &&
+        !changed &&
+        change === 'dirty-preinsert' &&
+        result === undefined &&
+        this.sourceSQL === 'SELECT 1 FROM temp.__intake_lookup_dirty WHERE source_id=?' &&
+        (parameters as unknown[])[0] === f.source.id
+      )
+        substitute();
+      return result;
+    } as typeof StatementSync.prototype.get;
+    armed = true;
+    try {
+      if (change === 'capture-preinsert')
+        assert.throws(() => rewriteLookupBuildHead(f), /unexpected accepted key/);
+      else if (change === 'retained-clear-replay')
+        assert.throws(() => rewriteLookupBuildHead(f), /missing prepared write/);
+      else rewriteLookupBuildHead(f);
+    } finally {
+      armed = false;
+      StatementSync.prototype.run = originalRun;
+      StatementSync.prototype.get = originalGet;
+    }
+    assert.equal(changed, true);
+    assert.equal(
+      f.db.prepare('SELECT COUNT(*) n FROM fictional_bookkeeping_substitution').get()!.n,
+      change === 'capture-preinsert' || change === 'retained-clear-replay' ? 0 : 1,
+    );
+    assert.equal(preparedIntakeLookupReadToken(f.db), undefined);
+    assert.equal(preparedIntakeDiscoveryRevision(f.db), undefined);
+    assert.ok(
+      (await lookupSourceRows(f.db, async () => {
+        assert.equal(
+          (await prepareIntakeLookupIndices(f.db)).discoveryRevision,
+          before.discoveryRevision,
+        );
+      })) >= 2,
+    );
+    assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
+    assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-proof'), {
+      receipt: { operationId: 'fictional-proof' },
+      marker: 'retained',
+    });
   });
 
 for (const change of ['source-order', 'source-hash', 'source-kind', 'source-delete'] as const)

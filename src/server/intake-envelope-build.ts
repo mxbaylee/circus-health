@@ -52,6 +52,7 @@ export async function buildIntakeCollectionEnvelope(
             assertClinicalOperation(db, operation);
             options.assertRunning?.();
           },
+          assertPublicationCurrent: options.assertPublicationCurrent,
         });
         return undefined;
       }
@@ -68,6 +69,7 @@ export async function buildIntakeCollectionEnvelope(
           assertClinicalOperation(db, operation);
           options.assertRunning?.();
         },
+        assertPublicationCurrent: options.assertPublicationCurrent,
       });
       return result;
     },
@@ -79,6 +81,7 @@ async function buildIntakeCollectionEnvelopeOwned(
   source: IntakeEnvelopeSource,
   options: {
     assertRunning?: () => void;
+    assertPublicationCurrent?: () => void;
     onCheckpoint?: () => void | Promise<void>;
   } = {},
 ) {

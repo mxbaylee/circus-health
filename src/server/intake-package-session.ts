@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { resolve } from 'node:path';
 import { HttpError } from './database.ts';
+import { assertClinicalOperation, currentClinicalOperation } from './clinical-operation.ts';
 import { profileOriginal, profilePaths } from './profile-storage.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
@@ -23,12 +24,15 @@ interface SourceRow {
   bytes: number;
 }
 
-function assertSession(db: DatabaseSync, profileId: string) {
+function assertSessionOwner(db: DatabaseSync, profileId: string) {
   if (!db.isOpen) throw new HttpError(409, 'PROFILE_LOCKED', 'The source session is closed');
   if (
     db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value !== profileId
   )
     throw new HttpError(403, 'PROFILE_BOUNDARY', 'Source belongs to another profile');
+}
+function assertSession(db: DatabaseSync, profileId: string) {
+  assertSessionOwner(db, profileId);
   const status = recordDurabilityStatus(db);
   if (!status?.configured || status.dirty)
     throw new HttpError(409, 'SOURCE_AUTHORITY', 'Retained source authority requires recovery');
@@ -55,10 +59,21 @@ export async function withPackageSessionSource<T>(
     profileId,
     id,
     assertRunning,
-  }: { db: DatabaseSync; root: string; profileId: string; id: string; assertRunning?: () => void },
+    assertPublicationCurrent,
+    signal,
+  }: {
+    db: DatabaseSync;
+    root: string;
+    profileId: string;
+    id: string;
+    assertRunning?: () => void;
+    assertPublicationCurrent?: () => void;
+    signal?: AbortSignal;
+  },
   writer: (lease: PackageSourceLease) => Promise<T>,
 ): Promise<T> {
   const canonicalRoot = resolve(root);
+  const operation = currentClinicalOperation(db);
   const existing = sessions.get(db);
   if (existing && (existing.root !== canonicalRoot || existing.profileId !== profileId))
     throw new HttpError(403, 'PROFILE_BOUNDARY', 'Source session binding changed');
@@ -88,6 +103,7 @@ export async function withPackageSessionSource<T>(
       root: profilePaths(canonicalRoot, profileId).root,
       cacheEntries: 64,
       assertAuthorized: () => assertSession(db, profileId),
+      assertPublicationAuthorized: () => assertSessionOwner(db, profileId),
     }),
   };
   if (!existing) sessions.set(db, session);
@@ -95,5 +111,14 @@ export async function withPackageSessionSource<T>(
     { profileId, intakeId: id, sourceHash: source.sha256, bytes: source.bytes, path },
     writer,
     check,
+    () => {
+      signal?.throwIfAborted();
+      if (operation) assertClinicalOperation(db, operation);
+      if (assertPublicationCurrent) assertPublicationCurrent();
+      else assertRunning?.();
+      assertSessionOwner(db, profileId);
+      if (JSON.stringify(query.get(id)) !== sourceIdentity)
+        throw new HttpError(409, 'SOURCE_CHANGED', 'Retained source binding changed');
+    },
   );
 }

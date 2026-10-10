@@ -28,16 +28,20 @@ export interface PackageSourceLease {
   readonly binding: PackageSourceBinding;
   readonly verificationWork: Readonly<PackageSourceVerificationWork>;
   assertCurrent(): void;
+  /** Fixed own-publication liveness; full source authority still guards bytes and handoff. */
+  assertPublicationCurrent(): void;
 }
 export function createPackageSourceLeaseOwner({
   profileId,
   root,
   assertAuthorized,
+  assertPublicationAuthorized,
   cacheEntries = 64,
 }: {
   profileId: string;
   root: string;
   assertAuthorized: () => void;
+  assertPublicationAuthorized?: () => void;
   cacheEntries?: number;
 }) {
   if (!Number.isInteger(cacheEntries) || cacheEntries < 1 || cacheEntries > 4096)
@@ -77,6 +81,7 @@ export function createPackageSourceLeaseOwner({
       source: PackageSourceBinding & { path: string },
       consume: (lease: PackageSourceLease) => Promise<T>,
       assertRunning?: () => void,
+      assertPublicationRunning?: () => void,
     ): Promise<T> {
       current();
       assertRunning?.();
@@ -110,6 +115,19 @@ export function createPackageSourceLeaseOwner({
         const assertCurrent = () => {
           current();
           assertRunning?.();
+          if (
+            epoch !== generation ||
+            realpathSync(dirname(path)) !== parent ||
+            statIdentity(fd, path) !== expectedIdentity
+          ) {
+            verified.delete(cacheKey);
+            changed();
+          }
+        };
+        const assertPublicationCurrent = () => {
+          if (closed) throw new HttpError(409, 'PROFILE_LOCKED', 'The source session is closed');
+          (assertPublicationAuthorized ?? assertAuthorized)();
+          (assertPublicationRunning ?? assertRunning)?.();
           if (
             epoch !== generation ||
             realpathSync(dirname(path)) !== parent ||
@@ -173,6 +191,7 @@ export function createPackageSourceLeaseOwner({
             bytes: source.bytes,
           },
           assertCurrent,
+          assertPublicationCurrent,
           verificationWork: Object.freeze({ ...operationWork }),
         });
         assertCurrent();

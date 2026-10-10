@@ -17,7 +17,7 @@ import { ensureIntakeFrontierObserver } from './intake-lookup-frontier-observer.
 export async function prepareIntakeCompactMetadata(
   db: Database,
   input: IntakeEnvelopeSource,
-  options: { assertRunning?: () => void } = {},
+  options: { assertRunning?: () => void; assertPublicationCurrent?: () => void } = {},
 ): Promise<{ changed: boolean }> {
   const source = db
     .prepare(
@@ -46,6 +46,10 @@ export async function prepareIntakeCompactMetadata(
         assertClinicalOperation(db, operation);
         options.assertRunning?.();
       };
+      const assertPublicationCurrent = () => {
+        assertClinicalOperation(db, operation);
+        (options.assertPublicationCurrent ?? options.assertRunning)?.();
+      };
       assertRunning();
       const collections = createIntakeStateStorage(db, {
         profileId,
@@ -70,7 +74,7 @@ export async function prepareIntakeCompactMetadata(
         if (!(await collections.certifyCompactMetadataAsync(prepared, { assertRunning })))
           return { changed: false };
         assertRunning();
-        collections.commitMaintenance(prepared, { assertCurrent: assertRunning });
+        collections.commitMaintenance(prepared, { assertCurrent: assertPublicationCurrent });
         return { changed: true };
       } finally {
         collections.disposePreparation(prepared);
