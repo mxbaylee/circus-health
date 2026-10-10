@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -363,7 +364,7 @@ test('native review HTTP exposes bounded pages and exact fragments with stale-to
     action: 'review',
     method: 'GET',
     params: new URLSearchParams({ proposalId, limit: '1', bytes: '1024' }),
-    req: { headers: { 'content-type': 'application/json' } },
+    req: Object.assign(new EventEmitter(), { headers: { 'content-type': 'application/json' } }),
     db: f.db,
     root: f.root,
     profileId: f.profileId,
@@ -418,7 +419,7 @@ test('native standalone proposal uses the public route and retains exact replay 
     action: 'proposals',
     method: 'POST',
     params: new URLSearchParams(),
-    req: { headers: { 'content-type': 'application/json' } },
+    req: Object.assign(new EventEmitter(), { headers: { 'content-type': 'application/json' } }),
     db: f.db,
     root: f.root,
     profileId: f.profileId,

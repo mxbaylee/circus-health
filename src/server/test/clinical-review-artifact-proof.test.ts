@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { syncBuiltinESMExports } from 'node:module';
 import { createClinicalReviewArtifactProof } from '../clinical-review-artifact-proof.ts';
 import { intakeFileIdentity } from '../intake-files.ts';
+import { beginManagedPhysicalMutation } from '../clinical-review-physical-epoch.ts';
 
 test('artifact proof prepares one private HMAC key per owner without skipping verification', (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'fictional-artifact-key-')),
@@ -100,4 +101,120 @@ test('aggregate verified artifact proofs preserve prior sessions and reject forg
   assert.throws(() => proof.retain([{ ...a, identity: intakeFileIdentity(first) }]), {
     code: 'SOURCE_CHANGED',
   });
+});
+
+test('worker terminal proof completes only after every original signed physical identity', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'fictional-artifact-terminal-')),
+    sql = new DatabaseSync(':memory:');
+  t.after(() => {
+    sql.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const proof = createClinicalReviewArtifactProof(sql, 'proof');
+  for (let index = 0; index < 65; index++) {
+    const path = join(directory, `source-${index}`);
+    writeFileSync(path, `Independently fictional source ${index}`);
+    proof.retain([{ id: `source-${index}`, path, identity: intakeFileIdentity(path) }]);
+  }
+  let checks = 0;
+  const value = await proof.withVerifiedTerminal({ assertCurrent: () => checks++ }, () => {
+    assert.ok(checks >= 6, 'two bounded worker pages were checked at their boundaries');
+    return 'verified';
+  });
+  assert.equal(value, 'verified');
+});
+
+test('worker terminal proof refuses physical and scratch changes before completion', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'fictional-artifact-terminal-')),
+    sql = new DatabaseSync(':memory:');
+  t.after(() => {
+    sql.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const path = join(directory, 'source');
+  writeFileSync(path, 'Independently fictional original');
+  const proof = createClinicalReviewArtifactProof(sql, 'proof');
+  proof.retain([{ id: 'source', path, identity: intakeFileIdentity(path) }]);
+  let completed = false;
+  let checks = 0;
+  await assert.rejects(
+    proof.withVerifiedTerminal(
+      {
+        assertCurrent: () => {
+          if (++checks === 3) writeFileSync(path, 'Changed independently fictional original');
+        },
+      },
+      () => {
+        completed = true;
+      },
+    ),
+    /physical evidence changed/,
+  );
+  assert.equal(completed, false);
+  const scratchProof = createClinicalReviewArtifactProof(sql, 'scratch_proof');
+  scratchProof.retain([{ id: 'source', path, identity: intakeFileIdentity(path) }]);
+  checks = 0;
+  await assert.rejects(
+    scratchProof.withVerifiedTerminal(
+      {
+        assertCurrent: () => {
+          if (++checks === 4) {
+            sql.exec('SAVEPOINT fictional_scratch_change');
+            sql.prepare("UPDATE scratch_proof SET path=path WHERE id='source'").run();
+            sql.exec('ROLLBACK TO fictional_scratch_change; RELEASE fictional_scratch_change');
+          }
+        },
+      },
+      () => {
+        completed = true;
+      },
+    ),
+    { code: 'SOURCE_CHANGED' },
+  );
+  assert.equal(completed, false);
+});
+
+test('worker terminal proof rejects a managed mutation attempt between worker pages', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'fictional-artifact-terminal-')),
+    sql = new DatabaseSync(':memory:');
+  t.after(() => {
+    sql.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const path = join(directory, 'source');
+  writeFileSync(path, 'Independently fictional original');
+  const proof = createClinicalReviewArtifactProof(sql, 'proof');
+  proof.retain([{ id: 'source', path, identity: intakeFileIdentity(path) }]);
+  let checks = 0;
+  await assert.rejects(
+    proof.withVerifiedTerminal(
+      {
+        assertCurrent: () => {
+          if (++checks === 4) beginManagedPhysicalMutation()();
+        },
+      },
+      () => assert.fail('no result may be published after an attempted managed write'),
+    ),
+    { code: 'SOURCE_CHANGED' },
+  );
+});
+
+test('worker terminal proof refuses a managed mutation in synchronous completion', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'fictional-artifact-terminal-')),
+    sql = new DatabaseSync(':memory:');
+  t.after(() => {
+    sql.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const path = join(directory, 'source');
+  writeFileSync(path, 'Independently fictional original');
+  const proof = createClinicalReviewArtifactProof(sql, 'proof');
+  proof.retain([{ id: 'source', path, identity: intakeFileIdentity(path) }]);
+  await assert.rejects(
+    proof.withVerifiedTerminal({ assertCurrent: () => {} }, () => {
+      beginManagedPhysicalMutation()();
+      return 'unpublishable';
+    }),
+    { code: 'SOURCE_CHANGED' },
+  );
 });

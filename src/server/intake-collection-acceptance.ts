@@ -60,6 +60,7 @@ import {
   preparedClinicalProjectionResult,
   preparedClinicalProjectionMatchingRows,
   applyPreparedClinicalProjection,
+  withVerifiedClinicalProjectionPublication,
   disposePreparedClinicalProjection,
 } from './intake-clinical-projection-plan.ts';
 import {
@@ -717,6 +718,10 @@ export async function prepareNativeIntakeAcceptance(
       intakeVersion: before.version + 1,
       projectDetailsJson: prepared.projectDetailsJson!,
       assertCurrent,
+      withVerifiedPublication<T>(complete: () => T): Promise<T> {
+        if (disposed) throw Error('Disposed acceptance preparation');
+        return withVerifiedClinicalProjectionPublication(db, projection, complete);
+      },
       /** Must be first accepted application write in the final ordinary transaction. */
       apply() {
         if (disposed) throw Error('Disposed acceptance preparation');

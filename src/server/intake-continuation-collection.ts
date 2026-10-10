@@ -768,7 +768,10 @@ function checkReadScope(scope: CollectionConversionScope, args: ReadArgs) {
   const sourceHash = db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(args.id)?.sha256;
   const assetHash = text(scope, collectionName(scope), 'asset:' + hash(args.id));
   if (assetHash && assetHash === sourceHash) return;
-  if (child.parentSourceFileId !== scope.intakeId || child.locator !== unit.locator)
+  if (
+    child.parentSourceFileId !== scope.intakeId ||
+    !intakeMetadataScalarMatches(child.locator, unit.locator)
+  )
     throw Error('Read does not belong to the retained package occurrence');
   if (sourceHash !== unit.sourceHash) throw Error('Retained child source hash changed');
 }
@@ -1843,3 +1846,4 @@ async function checkChildCoverageTargets(
   }
   check();
 }
+import { intakeMetadataScalarMatches } from './intake-compact-scalar.ts';

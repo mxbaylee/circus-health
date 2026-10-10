@@ -233,59 +233,60 @@ export async function readNativeReportSourceReview(
             evidence: reference('sourceEvidence', ordinal),
           });
         }
-        scope.assertCurrent();
-        artifacts.assertCurrent();
         const total = scope.entryCount;
-        return {
-          format: 'health-intake-report-source-review-v2',
-          profileId,
-          intakeId: source.id,
-          intakeVersion: intakeSourceVersion(db, source.id).version,
-          groupId: scope.groupId,
-          groupVersionId: scope.groupVersionId,
-          view: scope.view,
-          scopeToken: scope.scopeToken,
-          targets: {
-            items: targets,
-            total,
-            nextCursor:
-              targetStart + targets.length < total
-                ? cursor(pagePin, 'targets', targetStart + targets.length)
-                : null,
-          },
-          coverage: {
-            total,
-            covered,
-            uncovered: total - covered,
-            status: !total
-              ? 'empty'
-              : !covered
-                ? 'uncovered'
-                : covered < total
-                  ? 'partial'
-                  : sourceCount === 1
-                    ? 'single'
-                    : 'mixed',
-            sourceCount,
-            bySource: {
-              items: bySource,
-              total: sourceCount,
+        return await artifacts.withVerifiedTerminal(
+          { assertCurrent: () => scope.assertCurrent() },
+          () => ({
+            format: 'health-intake-report-source-review-v2',
+            profileId,
+            intakeId: source.id,
+            intakeVersion: intakeSourceVersion(db, source.id).version,
+            groupId: scope.groupId,
+            groupVersionId: scope.groupVersionId,
+            view: scope.view,
+            scopeToken: scope.scopeToken,
+            targets: {
+              items: targets,
+              total,
               nextCursor:
-                sourceStart + bySource.length < sourceCount
-                  ? cursor(pagePin, 'sources', sourceStart + bySource.length)
+                targetStart + targets.length < total
+                  ? cursor(pagePin, 'targets', targetStart + targets.length)
                   : null,
             },
-          },
-          sourceEvidence: {
-            items: sourceEvidence,
-            total: scope.sourceEvidenceCount,
-            nextCursor:
-              evidenceStart + sourceEvidence.length < scope.sourceEvidenceCount
-                ? cursor(pagePin, 'evidence', evidenceStart + sourceEvidence.length)
-                : null,
-          },
-          conflictingSourceEvidence: scope.sourceEvidenceCount > 1,
-        };
+            coverage: {
+              total,
+              covered,
+              uncovered: total - covered,
+              status: !total
+                ? 'empty'
+                : !covered
+                  ? 'uncovered'
+                  : covered < total
+                    ? 'partial'
+                    : sourceCount === 1
+                      ? 'single'
+                      : 'mixed',
+              sourceCount,
+              bySource: {
+                items: bySource,
+                total: sourceCount,
+                nextCursor:
+                  sourceStart + bySource.length < sourceCount
+                    ? cursor(pagePin, 'sources', sourceStart + bySource.length)
+                    : null,
+              },
+            },
+            sourceEvidence: {
+              items: sourceEvidence,
+              total: scope.sourceEvidenceCount,
+              nextCursor:
+                evidenceStart + sourceEvidence.length < scope.sourceEvidenceCount
+                  ? cursor(pagePin, 'evidence', evidenceStart + sourceEvidence.length)
+                  : null,
+            },
+            conflictingSourceEvidence: scope.sourceEvidenceCount > 1,
+          }),
+        );
       } finally {
         if (cached?.status === 'ready') cached.session.close();
         scope.close();

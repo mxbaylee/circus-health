@@ -2,9 +2,9 @@ import { createHash, randomUUID, type BinaryLike } from 'node:crypto';
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite';
 import type { Asset, Attachment, AttachmentInput } from '../shared/api.ts';
 import {
-  mkdirSync,
-  writeFileSync,
-  renameSync,
+  mkdirSync as rawMkdirSync,
+  writeFileSync as rawWriteFileSync,
+  renameSync as rawRenameSync,
   existsSync,
   realpathSync,
   readFileSync,
@@ -13,6 +13,14 @@ import {
   closeSync,
   fsyncSync,
 } from 'node:fs';
+import { withManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
+
+const mkdirSync: typeof rawMkdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawMkdirSync(...args));
+const writeFileSync: typeof rawWriteFileSync = (...args) =>
+  withManagedPhysicalMutation(() => rawWriteFileSync(...args));
+const renameSync: typeof rawRenameSync = (...args) =>
+  withManagedPhysicalMutation(() => rawRenameSync(...args));
 import { resolve, dirname, relative, isAbsolute, basename } from 'node:path';
 import { HttpError, required, optionalText, safeText, now, transaction } from './database.ts';
 import { assetDTO, attachmentDTO, noteRow, checkEditable, attachments } from './notes.ts';

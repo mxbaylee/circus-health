@@ -315,16 +315,33 @@ the selected exact representation unchanged. A shortened filename has explicit
 reference pins and exact bounded JSON-string fragments, never a silent truncate.
 Interrupted build transcripts are bound to the current derivative recipe.
 
-These filename facts do not bound the separate compact source row. Its
-`originalName` and child `locator` can still retain complete large strings;
-metadata parsing and assistant source-binding serialization remain proportional
-to those retained values. ZIP names have their format's declared name-byte bound,
-but PDF attachment keys and internal child locators have no separate application
-length cap. New upload filenames and provider names have existing input limits;
-arbitrary older retained acquisition and metadata are not universally bounded.
-The versioned compact-scalar publication helpers are not yet wired into public
-readiness. No end-to-end bounded compact-metadata claim follows from zero
-filename-scalar reads.
+The native compact source projection uses `health-intake-envelope-v2` when an
+original name or child locator needs a large scalar reference. Each explicit
+`health-intake-source-scalar-v1` descriptor retains its exact scalar hash and
+lexical byte count with bounded preview and suffix. Display labels mark shortened
+values; they are not exact names or locators. Pinned metadata references support
+bounded exact JSON-string reads through `metadata-fragment`; the existing
+`filename-fragment` contract is unchanged. Locator identity joins validate the
+checked derivative against the selected exact occurrence, preserving SQLite's
+first-member and operational last-member semantics rather than joining labels.
+
+HTTP and assistant readiness cooperatively prepare complete older native
+projections before presentation. The private, single-use publication proof
+certifies the exact retained graph and complete source row, then permits only
+the derived `details_json` replacement in its owner transaction. Ordinary
+maintenance cannot write source rows. The original and exact selected envelope
+remain unchanged, and the public/domain version does not advance. Policy,
+schema, peer, source, selected-head or physical-authority drift refuses the proof;
+cancellation does not publish a partial proof. Warm name/locator metadata and
+assistant source bindings do not reread those giant scalar bytes.
+
+This contracts these two known string fields, not arbitrary metadata. ZIP names
+have their format's declared name-byte bound, while PDF attachment keys and
+internal child locators have no separate application length cap. New upload
+filenames and provider names retain their existing input limits; arbitrary older
+acquisition, other metadata and non-string retained values are not universally
+bounded. Compatibility, adversarial and integrated validation remains an open
+release gate while CRS-231 is unfinished.
 Decoded assistant headers retain at most 32 entries and 256 KiB of encoded
 headers, source bindings and keys per database. Reuse requires unchanged exact
 SQLite, collection-registry and policy epochs, current profile/source and

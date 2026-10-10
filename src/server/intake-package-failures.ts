@@ -314,7 +314,9 @@ export async function recordIntakePackageFailurePaged(
     sourceFileId: id,
     sourceHash: current.source.sha256,
     operationKey: key,
-    originalFilename: intakeSourceMetadata(db, id).originalName,
+    originalFilename: (await import('./intake-compact-scalar.ts')).intakeMetadataLabel(
+      intakeSourceMetadata(db, id).originalName,
+    ),
     contentUrl: `/api/sources/${encodeURIComponent(id)}/content`,
     ...(input.memberId === undefined ? {} : { memberId: input.memberId }),
     ...(input.ordinal === undefined ? {} : { ordinal: input.ordinal }),

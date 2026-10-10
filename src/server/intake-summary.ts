@@ -9,6 +9,8 @@ import type {
   IntakePlanHeader,
   IntakeFilenameReference,
   IntakeFilenameFragment,
+  IntakeMetadataScalarReference,
+  IntakeMetadataScalarFragment,
   IntakePackageFailureField,
   IntakePackageFailureFieldReference,
   IntakePackageFailureFieldFragment,
@@ -20,7 +22,11 @@ import {
   type IntakeCollectionEnvelopeReader,
   type IntakeEnvelopeRecord,
 } from './intake-collection-envelope.ts';
-import { intakeSourceVersion } from './intake-state-access.ts';
+import {
+  intakeSourceVersion,
+  intakeSourceMetadata,
+  intakeMetadataScalarReference,
+} from './intake-state-access.ts';
 import {
   readVerifiedWorkflowSummary,
   openSelectedAcceptedDestinations,
@@ -159,6 +165,51 @@ export function collectionIntakeFilenameFragment(
   if (Buffer.byteLength(fragment.text) > limit) return invalid('filename fragment');
   return {
     format: 'health-intake-filename-fragment-v1',
+    reference: expected,
+    encoding: 'json-string',
+    text: fragment.text,
+    complete: fragment.complete,
+    nextCursor: fragment.after,
+  };
+}
+export function collectionIntakeMetadataScalarFragment(
+  db: Database,
+  source: IntakeEnvelopeSource,
+  input: { reference: IntakeMetadataScalarReference; cursor?: string; limit?: number },
+): IntakeMetadataScalarFragment {
+  const actual = input.reference;
+  if (!actual || !['originalName', 'locator'].includes(actual.field))
+    throw new HttpError(400, 'INTAKE_METADATA_REFERENCE', 'Select an exact source metadata field.');
+  const metadata = intakeSourceMetadata(db, source.id);
+  const expected = intakeMetadataScalarReference(db, source.id, actual.field, metadata);
+  if (
+    !expected ||
+    typeof actual !== 'object' ||
+    !actual.pins ||
+    Object.keys(actual).length !== Object.keys(expected).length ||
+    Object.keys(actual.pins).length !== 4 ||
+    (['format', 'intakeId', 'field', 'scalarHash', 'bytes'] as const).some(
+      (key) => actual[key] !== expected[key],
+    ) ||
+    (['sourceHash', 'logicalRoot', 'domainVersion', 'version'] as const).some(
+      (key) => actual.pins[key] !== expected.pins[key],
+    )
+  )
+    throw new HttpError(409, 'INTAKE_METADATA_CHANGED', 'The selected source metadata changed.');
+  const limit = input.limit ?? 32768;
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < 4096 ||
+    limit > 32768 ||
+    (input.cursor !== undefined &&
+      (typeof input.cursor !== 'string' || !input.cursor || input.cursor.length > 8192))
+  )
+    throw new HttpError(400, 'INTAKE_METADATA_WINDOW', 'Read a bounded exact metadata fragment.');
+  const { view, intake } = selection(db, source);
+  const fragment = view.fieldFragment(intake, actual.field, { after: input.cursor, bytes: limit });
+  if (Buffer.byteLength(fragment.text) > limit) return invalid('metadata fragment');
+  return {
+    format: 'health-intake-metadata-scalar-fragment-v1',
     reference: expected,
     encoding: 'json-string',
     text: fragment.text,

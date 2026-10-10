@@ -9,11 +9,15 @@ import {
   intakeDetails as details,
   intakeSourceMetadata,
   intakeSourceVersion,
+  intakeMetadataScalarReference,
   maximumReportDiscoveryOrder,
   registerIntakeFile as registerFile,
   writeIntakeDetails,
   type IntakeDetails,
+  type IntakeSourceMetadata,
 } from './intake-state-access.ts';
+import { intakeMetadataLabel, isIntakeCompactScalar } from './intake-compact-scalar.ts';
+import { isRetainOnlyIntake } from '../shared/intake-source-policy.ts';
 import { readIntakeEnvelopeText } from './intake-authority.ts';
 import {
   expectIntakeFrontierMetaWrite,
@@ -751,7 +755,20 @@ export function getIntakeEvidenceHeader(
   return {
     format: 'health-intake-evidence-header-v1' as const,
     id: file.id,
-    filename: metadata.originalName,
+    filename: intakeMetadataLabel(metadata.originalName),
+    ...(isIntakeCompactScalar(metadata.originalName)
+      ? {
+          filenameDescriptor: metadata.originalName,
+          filenameReference: intakeMetadataScalarReference(db, id, 'originalName', metadata),
+        }
+      : {}),
+    retainOnly: isRetainOnlyIntake({
+      filename:
+        typeof metadata.originalName === 'string'
+          ? metadata.originalName
+          : metadata.originalName.suffix,
+      mimeType: file.mime_type,
+    }),
     mimeType: file.mime_type,
     providerId: metadata.metadata?.sourceProviderId || file.provider_id,
     sourceHash: file.sha256,
@@ -795,13 +812,27 @@ export function getRetainedIntakeOriginalReference(
 ) {
   owner(db, profileId);
   const file = row(db, id);
+  const metadata = intakeSourceMetadata(db, id);
   return {
     id: file.id,
     path: profileOriginal(root, file.path, profileId),
     size: file.bytes,
     sourceHash: file.sha256,
     mimeType: file.mime_type,
-    filename: intakeSourceMetadata(db, id).originalName,
+    filename: intakeMetadataLabel(metadata.originalName),
+    ...(isIntakeCompactScalar(metadata.originalName)
+      ? {
+          filenameDescriptor: metadata.originalName,
+          filenameReference: intakeMetadataScalarReference(db, id, 'originalName', metadata),
+        }
+      : {}),
+    retainOnly: isRetainOnlyIntake({
+      filename:
+        typeof metadata.originalName === 'string'
+          ? metadata.originalName
+          : metadata.originalName.suffix,
+      mimeType: file.mime_type,
+    }),
   };
 }
 export function getIntakeOriginal(db: DatabaseSync, root: string, profileId: string, id: string) {
@@ -2726,15 +2757,17 @@ export async function importIntakeRead(
                   { assertRunning },
                 );
                 try {
-                  intakeTransaction(
-                    db,
-                    () => {
-                      assertRunning();
-                      assertDerived?.();
-                      consumeIntakeDiscoveryAdmission(db, admission);
-                      prepared.apply();
-                    },
-                    { operationId, fingerprint },
+                  await prepared.withVerifiedPublication(() =>
+                    intakeTransaction(
+                      db,
+                      () => {
+                        assertRunning();
+                        assertDerived?.();
+                        consumeIntakeDiscoveryAdmission(db, admission);
+                        prepared.apply();
+                      },
+                      { operationId, fingerprint },
+                    ),
                   );
                 } finally {
                   disposeIntakeDiscoveryAdmission(admission);
@@ -3047,13 +3080,40 @@ function childIdentity(parentId: string, locator: string, digest: string) {
   return { key, id: 'intake:' + key };
 }
 function childDescriptor(
+  db: DatabaseSync,
   file: SourceFileRow,
-  d: Pick<IntakeDetails, 'originalName' | 'locator' | 'derivative'>,
+  d: Pick<IntakeSourceMetadata, 'originalName' | 'locator' | 'derivative'>,
 ) {
   return {
     id: file.id,
-    filename: d.originalName,
-    locator: d.locator,
+    filename: intakeMetadataLabel(d.originalName),
+    locator: d.locator === undefined ? undefined : intakeMetadataLabel(d.locator),
+    ...(isIntakeCompactScalar(d.originalName)
+      ? {
+          filenameDescriptor: d.originalName,
+          filenameReference: intakeMetadataScalarReference(
+            db,
+            file.id,
+            'originalName',
+            d as IntakeSourceMetadata,
+          ),
+        }
+      : {}),
+    ...(isIntakeCompactScalar(d.locator)
+      ? {
+          locatorDescriptor: d.locator,
+          locatorReference: intakeMetadataScalarReference(
+            db,
+            file.id,
+            'locator',
+            d as IntakeSourceMetadata,
+          ),
+        }
+      : {}),
+    retainOnly: isRetainOnlyIntake({
+      filename: typeof d.originalName === 'string' ? d.originalName : d.originalName.suffix,
+      mimeType: file.mime_type,
+    }),
     derivative: d.derivative,
     mimeType: file.mime_type,
     bytes: file.bytes,
@@ -3169,7 +3229,7 @@ function publishIntakeChildren(
   }
   return files.map((f) => {
     const retained = row(db, f.id);
-    return childDescriptor(retained, intakeSourceMetadata(db, retained.id));
+    return childDescriptor(db, retained, intakeSourceMetadata(db, retained.id));
   });
 }
 
@@ -3249,7 +3309,7 @@ export async function withStagedIntakeChild(
                         },
                       });
                     assertUnchanged();
-                    return childDescriptor(row(db, id), intakeSourceMetadata(db, id));
+                    return childDescriptor(db, row(db, id), intakeSourceMetadata(db, id));
                   },
                 );
               }
@@ -3269,7 +3329,9 @@ export async function withStagedIntakeChild(
                   assertRunning: assertUnchanged,
                 });
               assertUnchanged();
-              return retained;
+              return nativeParent
+                ? childDescriptor(db, row(db, retained.id), intakeSourceMetadata(db, retained.id))
+                : retained;
             },
             {
               operation: currentClinicalOperation(db),
@@ -4884,6 +4946,7 @@ export async function saveIntakeReviewDraftRead(
               prepareCollectionClinicalTerminalPairProjectionWithEvidence,
               preparedClinicalEvidenceChanges,
               applyPreparedClinicalProjection,
+              withVerifiedClinicalProjectionPublication,
               disposePreparedClinicalProjection,
             } = await import('./intake-clinical-projection-plan.ts');
             const mappingVersion = () =>
@@ -5202,20 +5265,24 @@ export async function saveIntakeReviewDraftRead(
                 });
                 if (!prepared.replayed) {
                   let beforeCommit: number | undefined;
-                  intakeTransaction(
-                    db,
-                    () => {
-                      assertRunning();
-                      beforeCommit = revision(db);
-                      prepared.assertCurrent();
-                      context.assertCurrent();
-                      history.assertCurrent();
-                      assertDerived?.();
-                      if (projection) applyPreparedClinicalProjection(db, projection);
-                      selectedEnvelopeStore(db, file).collections.stage(prepared.prepared);
-                    },
-                    { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
-                  );
+                  const publish = () =>
+                    intakeTransaction(
+                      db,
+                      () => {
+                        assertRunning();
+                        beforeCommit = revision(db);
+                        prepared.assertCurrent();
+                        context.assertCurrent();
+                        history.assertCurrent();
+                        assertDerived?.();
+                        if (projection) applyPreparedClinicalProjection(db, projection);
+                        selectedEnvelopeStore(db, file).collections.stage(prepared.prepared);
+                      },
+                      { operationId: prepared.publicationId, fingerprint: prepared.fingerprint },
+                    );
+                  if (projection)
+                    await withVerifiedClinicalProjectionPublication(db, projection, publish);
+                  else publish();
                   if (beforeCommit !== undefined && revision(db) === beforeCommit + 1)
                     draftTransition = {
                       format: 'health-intake-own-draft-transition-v1',

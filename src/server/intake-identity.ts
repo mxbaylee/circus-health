@@ -129,10 +129,16 @@ async function identityEvidence(context: Context, groupId: string): Promise<Evid
     // Bind parent, exact occurrence locator and bytes; equal bytes in another member do not qualify.
     const child = db
       .prepare(
-        "SELECT id FROM source_files WHERE sha256=? AND json_extract(details_json,'$.intake.parentSourceFileId')=? AND json_extract(details_json,'$.intake.locator')=?",
+        "SELECT id FROM source_files WHERE sha256=? AND json_extract(details_json,'$.intake.parentSourceFileId')=? AND (json_extract(details_json,'$.intake.locator')=? OR (json_extract(details_json,'$.intake.locator.format')=? AND json_extract(details_json,'$.intake.locator.field')='locator' AND json_extract(details_json,'$.intake.locator.scalarHash')=?))",
       )
-      .get(member.sourceHash, id, member.locator) as { id: string } | undefined;
-    if (!child)
+      .get(
+        member.sourceHash,
+        id,
+        member.locator,
+        COMPACT_SCALAR_FORMAT,
+        locatorScalarHash(member.locator),
+      ) as { id: string } | undefined;
+    if (!child || !intakeFirstLocatorMatches(db, child.id, member.locator))
       return reject('Open and retain this exact package member before confirming its identity');
     evidenceId = child.id;
   } else if (intake.mimeType === 'application/zip') {
@@ -1405,3 +1411,6 @@ export function applyIdentityConfirmationPeople(
         : undefined,
   };
 }
+import { intakeFirstLocatorMatches } from './intake-state-access.ts';
+import { COMPACT_SCALAR_FORMAT } from './intake-compact-scalar.ts';
+import { schemaKey as locatorScalarHash } from './intake-envelope-schema.ts';

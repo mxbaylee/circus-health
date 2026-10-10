@@ -12,8 +12,16 @@ presentation; original bytes, selected envelope syntax and public/domain version
 remain unchanged. Interrupted builder transcripts use a new recipe discriminator
 and do not reuse an older partial transcript as a matching prefix. Keep the
 checked pre-update backup for prior-build recovery; this is not a general
-downgrade qualification. Compact source-row contraction is not yet activated:
-large original names and child locators still incur separate metadata work.
+downgrade qualification. Large native original names and child locators now
+prepare an explicit v2 compact metadata projection before presentation. Reload
+open views to obtain current pinned `metadata-fragment` references; exact source
+syntax remains in the selected envelope, not its shortened labels. Complete
+older native envelopes upgrade cooperatively without changing public/domain
+versions or requiring operator configuration. A prior checkout that supports
+only v1 projections can refuse the updated runtime state: use the separate
+checked pre-update backup for prior-build recovery, not the candidate's working
+runtime. Arbitrary older acquisition and other metadata remain outside this
+two-field contraction; CRS-231's integrated release qualification is still open.
 See the [bounded-view contract](../data/intake-bounded-views.md).
 
 Native Import report-group pages now use a disposable indexed group order and retained page totals. After updating, reload an open Import queue if its older group cursor is refused; its cursor is navigation state and is not portable across this change. No original, accepted-record or operator-configuration migration is required. The prior build continues to use its own queue ordering and cache behavior. See the [report review queue contract](../../src/server/INTAKE.md#report-review-queue).

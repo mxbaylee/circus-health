@@ -1,17 +1,28 @@
 import { backup, DatabaseSync } from 'node:sqlite';
 import {
-  mkdirSync,
+  mkdirSync as rawMkdirSync,
   opendirSync,
   statSync,
   existsSync,
-  copyFileSync,
+  copyFileSync as rawCopyFileSync,
   readdirSync,
-  renameSync,
-  rmSync,
-  rmdirSync,
+  renameSync as rawRenameSync,
+  rmSync as rawRmSync,
+  rmdirSync as rawRmdirSync,
   realpathSync,
   lstatSync,
 } from 'node:fs';
+import { withManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
+
+const mkdirSync: typeof rawMkdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawMkdirSync(...args));
+const copyFileSync: typeof rawCopyFileSync = (...args) =>
+  withManagedPhysicalMutation(() => rawCopyFileSync(...args));
+const renameSync: typeof rawRenameSync = (...args) =>
+  withManagedPhysicalMutation(() => rawRenameSync(...args));
+const rmSync: typeof rawRmSync = (...args) => withManagedPhysicalMutation(() => rawRmSync(...args));
+const rmdirSync: typeof rawRmdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawRmdirSync(...args));
 import { resolve, dirname, isAbsolute, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { profileFile, containedFile } from './assets.ts';

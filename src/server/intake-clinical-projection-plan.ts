@@ -5,6 +5,7 @@ import {
   HttpError,
   revision,
   currentTransactionToken,
+  installTransactionTerminalGuard,
   rejectCurrentTransaction,
   observeTransactionOutcome,
 } from './database.ts';
@@ -41,10 +42,14 @@ export interface PreparedClinicalProjection {
 type Result = ReturnType<typeof projectClinicalReview> & { newMedications: number };
 interface State {
   db: DatabaseSync;
+  artifacts: ReturnType<typeof createClinicalReviewArtifactProof>;
+  terminalPhysicalCurrent?: () => void;
+  stopTerminalGuard?: () => void;
   results: (Result | undefined)[];
   changes: Uint8Array;
   guards: Session[];
   assertCurrent(): void;
+  assertWithoutArtifacts(): void;
   applied: boolean;
   appliedToken?: object;
   sessions: CollectionClinicalReviewSession[];
@@ -337,9 +342,9 @@ function prepareProjectionGroup(
     const artifacts = createClinicalReviewArtifactProof(artifactScratch.db, 'artifacts');
     for (const { context } of blocks) artifacts.retain(context.verifiedArtifacts());
     for (const { context } of blocks) restoreConsumption.push(context.beginProjectionConsumption());
-    const assertContextsCurrent = () => {
+    const assertContextsCurrent = (includeArtifacts = true) => {
       for (const { context } of blocks) context.assertAuthorityCurrent();
-      artifacts.assertCurrent();
+      if (includeArtifacts) artifacts.assertCurrent();
     };
     assertContextsCurrent();
     const dataVersion = Number(db.prepare('PRAGMA data_version').get()!.data_version);
@@ -469,8 +474,19 @@ function prepareProjectionGroup(
       guardedRevision = revision(db);
       invalidated = false;
     });
+    const assertNonArtifactCurrent = () => {
+      evidence?.assertCurrent();
+      if (
+        invalidated ||
+        revision(db) !== guardedRevision ||
+        Number(db.prepare('PRAGMA data_version').get()!.data_version) !== dataVersion ||
+        guards.some((guard) => guard.changeset().length !== 0)
+      )
+        throw changed();
+    };
     plans.set(plan, {
       db,
+      artifacts,
       results: structuredClone(results),
       changes: changes!,
       guards,
@@ -483,14 +499,11 @@ function prepareProjectionGroup(
       evidence,
       assertCurrent() {
         assertContextsCurrent();
-        evidence?.assertCurrent();
-        if (
-          invalidated ||
-          revision(db) !== guardedRevision ||
-          Number(db.prepare('PRAGMA data_version').get()!.data_version) !== dataVersion ||
-          guards.some((guard) => guard.changeset().length !== 0)
-        )
-          throw changed();
+        assertNonArtifactCurrent();
+      },
+      assertWithoutArtifacts() {
+        assertContextsCurrent(false);
+        assertNonArtifactCurrent();
       },
     });
     let active = activePlans.get(db);
@@ -514,6 +527,37 @@ export function preparedClinicalProjectionMatchingRows(plan: PreparedClinicalPro
   if (!value.applied) value.assertCurrent();
   if (value.results.length !== 1) throw Error('Use grouped projection results');
   return value.matchingEarlierRows[0]!;
+}
+
+/** Only the fixed synchronous publication callback may omit the second artifact
+ * sweep. All other plan guards and the pre-durability physical witness remain. */
+export async function withVerifiedClinicalProjectionPublication<T>(
+  db: DatabaseSync,
+  plan: PreparedClinicalProjection,
+  complete: () => T,
+): Promise<T> {
+  const value = state(plan);
+  if (value.db !== db || value.terminalPhysicalCurrent) throw Error('Foreign clinical projection');
+  const assertPreflightCurrent = () => {
+    if (!db.isOpen || db.isTransaction || currentTransactionToken(db)) throw changed();
+    value.assertWithoutArtifacts();
+  };
+  assertPreflightCurrent();
+  return value.artifacts.withVerifiedTerminal(
+    { assertCurrent: assertPreflightCurrent },
+    (terminalPhysicalCurrent) => {
+      value.terminalPhysicalCurrent = terminalPhysicalCurrent;
+      try {
+        assertPreflightCurrent();
+        return complete();
+      } finally {
+        value.terminalPhysicalCurrent = undefined;
+        value.stopTerminalGuard?.();
+        value.stopTerminalGuard = undefined;
+      }
+    },
+    'publication',
+  );
 }
 
 /** Exact result produced by the retained projector, not an estimate or fabricated receipt. */
@@ -584,7 +628,14 @@ export function applyPreparedClinicalProjectionGroup(
     throw Error('Clinical projection requires its ordinary application transaction');
   try {
     if (value.applied) throw changed();
-    value.assertCurrent();
+    if (value.terminalPhysicalCurrent) {
+      value.assertWithoutArtifacts();
+      value.stopTerminalGuard = installTransactionTerminalGuard(
+        db,
+        token,
+        value.terminalPhysicalCurrent,
+      );
+    } else value.assertCurrent();
     value.evidence?.applyStandalone();
     if (!applyObservedClinicalProjectionChangeset(db, value.changes)) throw changed();
     value.applied = true;

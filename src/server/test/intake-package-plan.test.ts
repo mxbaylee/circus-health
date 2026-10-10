@@ -258,6 +258,7 @@ test('selected package routes use authorized bounded pages and exact unit detail
     resource: 'intakes',
     method: 'GET',
     action: 'package-units',
+    req: new IncomingMessage(new Socket()),
     params: new URLSearchParams('limit=2'),
     respond: (value: unknown) => {
       result = value;

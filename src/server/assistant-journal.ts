@@ -1,20 +1,22 @@
 import {
-  mkdirSync,
   readdirSync,
   realpathSync,
   existsSync,
-  openSync,
   fsyncSync,
   closeSync,
   fstatSync,
   readSync,
-  writeFileSync,
   constants,
   opendirSync,
+} from 'node:fs';
+import {
+  mkdirSync,
+  openSync,
+  writeFileSync,
   linkSync,
   unlinkSync,
   renameSync,
-} from 'node:fs';
+} from './journal-physical-write.ts';
 import { join, resolve, dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { profilePaths } from './profile-storage.ts';

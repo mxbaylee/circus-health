@@ -20,13 +20,15 @@ export async function prepareIntakeCompactMetadata(
   options: { assertRunning?: () => void } = {},
 ): Promise<{ changed: boolean }> {
   const source = db
-    .prepare('SELECT id,kind,sha256,details_json FROM main.source_files WHERE id=?')
+    .prepare(
+      'SELECT id,kind,sha256,length(CAST(details_json AS BLOB)) AS metadataBytes,substr(details_json,1,128) AS metadataPrefix FROM main.source_files WHERE id=?',
+    )
     .get(input.id);
-  if (!source || source.kind !== 'intake_original' || typeof source.details_json !== 'string')
+  if (!source || source.kind !== 'intake_original' || typeof source.metadataPrefix !== 'string')
     return { changed: false };
   if (
-    Buffer.byteLength(source.details_json) <= COMPACT_SCALAR_BYTES ||
-    source.details_json.startsWith(
+    Number(source.metadataBytes) <= COMPACT_SCALAR_BYTES ||
+    source.metadataPrefix.startsWith(
       '{"intakeAuthority":{"format":"' + INTAKE_COMPACT_ENVELOPE_FORMAT + '"',
     )
   )

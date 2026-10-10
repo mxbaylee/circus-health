@@ -358,7 +358,7 @@ export async function prepareCorrectionSupportingEvidence(
           const exactMember =
             !!member &&
             file.details?.parentSourceFileId === ref.intakeId &&
-            file.details.locator === member.locator &&
+            intakeMetadataScalarMatches(file.details.locator, member.locator) &&
             file.row.sha256 === member.sourceHash;
           if (
             (!selectedEvidence && !exactMember) ||
@@ -399,7 +399,9 @@ export async function prepareCorrectionSupportingEvidence(
             ...ref,
             intakeVersion: sourceVersion.version,
             originalSourceHash: String(file.row.sha256),
-            filename: file.details?.originalName || String(file.row.path).split('/').at(-1)!,
+            filename: file.details?.originalName
+              ? intakeMetadataLabel(file.details.originalName)
+              : String(file.row.path).split('/').at(-1)!,
             contentUrl,
             locator: exactMember ? member!.locator : selectedEvidence!.locator,
             memberId: exactMember ? member!.memberId : null,
@@ -431,3 +433,4 @@ export async function prepareCorrectionSupportingEvidence(
     { operation: currentClinicalOperation(db), onDiscardResult: (value) => value.dispose() },
   );
 }
+import { intakeMetadataLabel, intakeMetadataScalarMatches } from './intake-compact-scalar.ts';

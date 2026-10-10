@@ -350,10 +350,35 @@ export type TransactionOutcome = {
 };
 const transactionTokens = new WeakMap<DatabaseSync, object>();
 const transactionFailures = new WeakMap<DatabaseSync, unknown>();
+const terminalTransactionGuards = new WeakMap<
+  DatabaseSync,
+  {
+    token: object;
+    check: () => void;
+  }
+>();
 /** A failed staged storage write must abort its outer transaction even if caught. */
 export function rejectCurrentTransaction(db: DatabaseSync, error: unknown): void {
   if (!transactionTokens.has(db)) throw Error('No application transaction');
   transactionFailures.set(db, error);
+}
+/** A fixed owner may close a synchronous publication witness immediately before
+ * revision and durability work. The guard is bound to this exact transaction. */
+export function installTransactionTerminalGuard(
+  db: DatabaseSync,
+  token: object,
+  check: () => void,
+): () => void {
+  if (transactionTokens.get(db) !== token || terminalTransactionGuards.has(db))
+    throw Error('Foreign or competing terminal transaction guard');
+  const guard = { token, check };
+  terminalTransactionGuards.set(db, guard);
+  return () => {
+    if (!terminalTransactionGuards.has(db) && transactionTokens.get(db) !== token) return;
+    if (terminalTransactionGuards.get(db) !== guard)
+      throw Error('Terminal transaction guard changed');
+    terminalTransactionGuards.delete(db);
+  };
 }
 const outcomeObservers = new WeakMap<DatabaseSync, Set<(outcome: TransactionOutcome) => void>>();
 const closeObservers = new WeakMap<DatabaseSync, Set<() => void>>();
@@ -408,9 +433,8 @@ export function observeTransactionStart(
   observers.add(observer);
   return () => observers.delete(observer);
 }
-/** Read-only witnesses inspect the complete caller write set before owner
- * revision/durability bookkeeping. Observer failure can only suppress its own
- * optimization; it cannot alter the transaction acknowledgement. */
+/** Read-only witnesses inspect the caller write set before durability work.
+ * Their exceptions are isolated; an owner may explicitly reject this transaction. */
 export function observeTransactionBeforePublication(
   db: DatabaseSync,
   observer: (token: object) => void,
@@ -480,6 +504,12 @@ export function transaction<T>(
         /* memory-only witnesses must remain ineligible after a failed check */
       }
     }
+    if (transactionFailures.has(db)) throw transactionFailures.get(db);
+    const terminalGuard = terminalTransactionGuards.get(db);
+    if (terminalGuard) {
+      if (terminalGuard.token !== token) throw Error('Foreign terminal transaction guard');
+      terminalGuard.check();
+    }
     const clinicalInsert = expectIntakeFrontierMetaWrite(db, 'clinical_review_revision', [
       'insert',
     ]);
@@ -531,6 +561,7 @@ export function transaction<T>(
       finishIntakeMaintenancePublication(operation.intakeMaintenance, token);
     transactionTokens.delete(db);
     transactionFailures.delete(db);
+    terminalTransactionGuards.delete(db);
     // Read at completion: observers can register while fn stages its first value.
     try {
       hooks?.release?.(captured);

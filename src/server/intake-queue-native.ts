@@ -74,14 +74,62 @@ export function clearPreparedCollectionQueues(db: DatabaseSync) {
   preparedQueues.delete(db);
 }
 
-export function hasNativeIntakeQueue(db: DatabaseSync, profileId: string): boolean {
+function assertQueueDependencies(db: DatabaseSync, profileId: string): void {
   assertIntakeOwner(db, profileId);
+  if (
+    db
+      .prepare(
+        "SELECT 1 FROM temp.sqlite_schema t JOIN main.sqlite_schema m ON lower(t.name)=lower(m.name) WHERE t.type IN ('table','view') AND m.type IN ('table','view') LIMIT 1",
+      )
+      .get()
+  )
+    throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+}
+
+export async function hasNativeIntakeQueue(
+  db: DatabaseSync,
+  profileId: string,
+  assertRunning?: () => void,
+): Promise<boolean> {
+  assertQueueDependencies(db, profileId);
   prepareCollectionQueueTransitions(db);
-  for (const row of db
-    .prepare("SELECT id,kind,sha256,details_json FROM source_files WHERE kind='intake_original'")
-    .iterate())
-    if (hasIntakeCollectionEnvelope(db, { id: String(row.id) })) return true;
-  return false;
+  const stamp = reviewReadStamp(db),
+    methods = managedDatabaseMethodEpoch(db),
+    operation = currentClinicalOperation(db);
+  const check = () => {
+    if (operation) assertClinicalOperation(db, operation);
+    assertRunning?.();
+    assertIntakeOwner(db, profileId);
+    if (
+      !stamp ||
+      !methods ||
+      reviewReadStamp(db) !== stamp ||
+      managedDatabaseMethodEpoch(db) !== methods
+    )
+      throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+  };
+  check();
+  let after: bigint | undefined;
+  for (;;) {
+    const statement = db.prepare(
+      "SELECT rowid,id FROM main.source_files WHERE kind='intake_original'" +
+        (after === undefined ? '' : ' AND rowid>?') +
+        ' ORDER BY rowid LIMIT 64',
+    );
+    statement.setReadBigInts(true);
+    const rows = after === undefined ? statement.all() : statement.all(after);
+    for (const row of rows) {
+      if (hasIntakeCollectionEnvelope(db, { id: String(row.id) })) {
+        check();
+        return true;
+      }
+      after = row.rowid as bigint;
+    }
+    check();
+    if (rows.length < 64) return false;
+    await setImmediate();
+    check();
+  }
 }
 type QueueInput = Parameters<typeof listIntakeReportQueue>[3] & {
   bytes?: unknown;
@@ -150,15 +198,7 @@ async function prepareCollectionQueueReadNow(
   profileId: string,
   options: { assertRunning?: () => void },
 ) {
-  assertIntakeOwner(db, profileId);
-  if (
-    db
-      .prepare(
-        "SELECT 1 FROM temp.sqlite_schema t JOIN main.sqlite_schema m ON lower(t.name)=lower(m.name) WHERE t.type IN ('table','view') AND m.type IN ('table','view') LIMIT 1",
-      )
-      .get()
-  )
-    throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+  assertQueueDependencies(db, profileId);
   prepareCollectionQueueTransitions(db);
   const revision = clinicalReviewRevision(db),
     policyPin = intakeClinicalCachePin(db),
@@ -473,7 +513,7 @@ export async function listIntakeReportQueueRead(
         options.signal?.throwIfAborted();
       };
       assertRunning();
-      if (!hasNativeIntakeQueue(db, profileId))
+      if (!(await hasNativeIntakeQueue(db, profileId, assertRunning)))
         return listIntakeReportQueue(db, root, profileId, input);
       await prepareCollectionQueueRead(db, root, profileId, { assertRunning });
       assertRunning();
@@ -498,7 +538,7 @@ export async function getIntakeReportQueueGroupRead(
         options.signal?.throwIfAborted();
       };
       assertRunning();
-      if (!hasNativeIntakeQueue(db, profileId))
+      if (!(await hasNativeIntakeQueue(db, profileId, assertRunning)))
         return getIntakeReportQueueGroup(db, root, profileId, groupId, input);
       await prepareCollectionQueueRead(db, root, profileId, { assertRunning });
       assertRunning();
@@ -524,7 +564,7 @@ export async function listIntakeImportFeedRead(
   return runExclusiveClinicalOperation(
     db,
     async () => {
-      if (!hasNativeIntakeQueue(db, profileId))
+      if (!(await hasNativeIntakeQueue(db, profileId)))
         return listIntakeImportFeed(db, root, profileId, input);
       await prepareCollectionQueueRead(db, root, profileId);
       return readCollectionImportFeed(db, root, profileId, {
@@ -560,7 +600,7 @@ export async function getIntakePeopleQueueRead(
     async () => {
       if (input.view && !['active', 'deferred', 'all'].includes(input.view))
         throw new HttpError(400, 'INTAKE_PERSON_WINDOW', 'Choose active, deferred or all People');
-      if (!hasNativeIntakeQueue(db, profileId))
+      if (!(await hasNativeIntakeQueue(db, profileId)))
         return getIntakePeopleQueue(db, root, profileId, groupId, input);
       await prepareCollectionQueueRead(db, root, profileId);
       const detail = await readCollectionReportGroupDetail(db, root, profileId, groupId, {

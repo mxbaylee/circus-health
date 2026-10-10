@@ -398,7 +398,11 @@ test('native prefix still checks physical accepted HEAD with unchanged SQL', asy
   } finally {
     f.authority.objects.set('head', head);
   }
-  assert.equal(reviewReadStamp(f.db), stamp);
+  // A physical refusal may revoke disposable read caches without changing SQL.
+  const after = reviewReadStamp(f.db);
+  assert.ok(stamp);
+  assert.ok(after);
+  assert.equal(after.split(':').slice(1).join(':'), stamp.split(':').slice(1).join(':'));
 });
 
 test('already pinned native prefix refuses caller transaction admission', async (t) => {

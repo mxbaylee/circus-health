@@ -1,10 +1,20 @@
-import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
+import { setImmediate } from 'node:timers/promises';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
 /** Complete filters and counts with bounded native feed rows and referenced group evidence. */
 import type { DatabaseSync } from 'node:sqlite';
 import { createHmac, randomBytes } from 'node:crypto';
 import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
-import { HttpError } from './database.ts';
+import { HttpError, managedDatabaseMethodEpoch } from './database.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import {
+  captureManagedPhysicalEpoch,
+  managedPhysicalEpochCurrent,
+} from './clinical-review-physical-epoch.ts';
 import {
   identityGroundingGeneration,
   identityGroundingReadStamp,
@@ -30,7 +40,7 @@ import type { IntakeReviewFragmentReference } from './intake-review-collection.t
 import type { IntakeClinicalReviewReference } from './intake-review-collection-session.ts';
 import { hashSourceScalar } from './intake-report-source-resolution-index.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
-import { journalActivityBinding } from './journal-activity-index.ts';
+import { prepareJournalActivityBinding } from './journal-activity-index.ts';
 import { verifyIntakeOriginal, withVerifiedIntakeOriginalDescriptor } from './intake.ts';
 import { verifyIntakeFileHash } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
@@ -334,38 +344,52 @@ async function feedWindow(
     peopleLast = String(row.ordering);
   }
   input.assertRunning();
-  const activity = readCollectionQueueActivity(db, root, profileId, queue);
-  feed.artifacts.assertCurrent();
-  queue.assertCurrent();
-  // Each cached row was admitted against its raw certificate above. A later
-  // row's awaited preparation may perform certified disposable maintenance;
-  // preserve the authority of every admitted row across the complete window.
-  if (preparationStamp === undefined || preparationStamp !== reviewPreparationStamp(db))
-    throw new HttpError(
-      409,
-      'REPORT_QUEUE_CURSOR',
-      'Review changed while reading; refresh this feed',
-    );
-  return {
-    format: 'health-intake-import-feed-v2' as const,
-    view: input.view,
-    records,
-    totalRecords: feed.totalRecords,
-    totalGroups: feed.totalGroups,
-    nextCursor: more ? input.cursor('records', last) : null,
-    counts: { ...feed.counts },
-    kindCounts: { ...feed.kindCounts },
-    groups: [...groups.values()].sort((a, b) =>
-      a.intakeId < b.intakeId ? -1 : a.intakeId > b.intakeId ? 1 : a.ordinal - b.ordinal,
-    ),
-    people: {
-      groups: peopleGroups,
-      totalGroups: feed.totalPeopleGroups,
-      counts: { ...feed.peopleCounts },
-      nextCursor: peopleMore ? input.cursor('people', peopleLast) : null,
+  const activity = await readCollectionQueueActivity(db, root, profileId, queue);
+  const terminalActivity = await prepareJournalActivityBinding(root, profileId, {
+    assertRunning: input.assertRunning,
+  });
+  if (terminalActivity.binding !== activity.binding)
+    throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Reading activity changed');
+  return feed.artifacts.withVerifiedTerminal(
+    {
+      assertCurrent: () => {
+        input.assertRunning();
+        queue.assertCurrent();
+        terminalActivity.assertCurrent();
+      },
     },
-    activity,
-  };
+    () => {
+      // Each cached row was admitted against its raw certificate above. A later
+      // row's awaited preparation may perform certified disposable maintenance;
+      // preserve the authority of every admitted row across the complete window.
+      if (preparationStamp === undefined || preparationStamp !== reviewPreparationStamp(db))
+        throw new HttpError(
+          409,
+          'REPORT_QUEUE_CURSOR',
+          'Review changed while reading; refresh this feed',
+        );
+      return {
+        format: 'health-intake-import-feed-v2' as const,
+        view: input.view,
+        records,
+        totalRecords: feed.totalRecords,
+        totalGroups: feed.totalGroups,
+        nextCursor: more ? input.cursor('records', last) : null,
+        counts: { ...feed.counts },
+        kindCounts: { ...feed.kindCounts },
+        groups: [...groups.values()].sort((a, b) =>
+          a.intakeId < b.intakeId ? -1 : a.intakeId > b.intakeId ? 1 : a.ordinal - b.ordinal,
+        ),
+        people: {
+          groups: peopleGroups,
+          totalGroups: feed.totalPeopleGroups,
+          counts: { ...feed.peopleCounts },
+          nextCursor: peopleMore ? input.cursor('people', peopleLast) : null,
+        },
+        activity,
+      };
+    },
+  );
 }
 export async function readCollectionImportFeed(
   db: DatabaseSync,
@@ -401,7 +425,8 @@ export async function readCollectionImportFeed(
           'IMPORT_FEED_FILTER',
           'Choose supported filters and a bounded feed window',
         );
-      const activityPin = journalActivityBinding(root, profileId),
+      const activityProof = await prepareJournalActivityBinding(root, profileId),
+        activityPin = activityProof.binding,
         queue = await openCollectionReportQueue(db, root, profileId),
         grounding = identityGroundingGeneration(db),
         epoch = feedEpochs.get(db) || 0;
@@ -415,6 +440,27 @@ export async function readCollectionImportFeed(
       const assertRunning = () => {
         queue.assertActive();
         if (readingFeed?.disposed || reused?.disposed || (feedEpochs.get(db) || 0) !== epoch)
+          throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this import feed');
+      };
+      const operation = currentClinicalOperation(db);
+      let visited = 0;
+      const cooperate = async () => {
+        assertRunning();
+        if (operation) assertClinicalOperation(db, operation);
+        const stamp = reviewReadStamp(db),
+          methods = managedDatabaseMethodEpoch(db),
+          physical = captureManagedPhysicalEpoch();
+        await setImmediate();
+        assertRunning();
+        if (operation) assertClinicalOperation(db, operation);
+        if (
+          !stamp ||
+          !methods ||
+          !physical ||
+          reviewReadStamp(db) !== stamp ||
+          managedDatabaseMethodEpoch(db) !== methods ||
+          !managedPhysicalEpochCurrent(physical)
+        )
           throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this import feed');
       };
       scratch.db.exec(
@@ -733,6 +779,7 @@ export async function readCollectionImportFeed(
           }
         };
         for (const source of queue.sources()) {
+          if (++visited % 64 === 0) await cooperate();
           const prior = scratch.db.prepare('SELECT * FROM sources WHERE id=?').get(source.id);
           const sourceGrounding = queue.groundingStamp(source.id);
           scratch.db.prepare('UPDATE sources SET seen=1 WHERE id=?').run(source.id);
@@ -764,6 +811,7 @@ export async function readCollectionImportFeed(
           scratch.db.exec('DELETE FROM changedCandidates;DELETE FROM changedGroups');
           if (effects)
             for (const effect of effects) {
+              if (++visited % 64 === 0) await cooperate();
               if (effect.kind === 'proposal') continue;
               if (effect.kind === 'group') {
                 const value = JSON.parse(effect.value) as { groupAddress: string },
@@ -773,16 +821,20 @@ export async function readCollectionImportFeed(
                     reader.resolve(value.groupAddress),
                   ).at(-1)!;
                 scratch.db.prepare('INSERT OR IGNORE INTO changedGroups VALUES(?)').run(ordinal);
-                for (const member of queue.members(source.id, ordinal))
+                for (const member of queue.members(source.id, ordinal)) {
+                  if (++visited % 64 === 0) await cooperate();
                   scratch.db
                     .prepare('INSERT OR IGNORE INTO changedCandidates VALUES(?,?)')
                     .run(member.candidateId, '');
+                }
                 for (const row of scratch.db
                   .prepare('SELECT candidate FROM facts WHERE intake=? AND groupOrdinal=?')
-                  .iterate(source.id, ordinal))
+                  .iterate(source.id, ordinal)) {
+                  if (++visited % 64 === 0) await cooperate();
                   scratch.db
                     .prepare('INSERT OR IGNORE INTO changedCandidates VALUES(?,?)')
                     .run(row.candidate, '');
+                }
                 continue;
               }
               if (effect.kind !== 'candidate') {
@@ -809,6 +861,7 @@ export async function readCollectionImportFeed(
             for (const changedGroup of scratch.db
               .prepare('SELECT ordinal FROM changedGroups')
               .iterate()) {
+              if (++visited % 64 === 0) await cooperate();
               if (peopleChanged && query)
                 forgetPeopleMatch(source.id, Number(changedGroup.ordinal));
               const pointer = queue.groupPointer(source.id, Number(changedGroup.ordinal));
@@ -873,9 +926,11 @@ export async function readCollectionImportFeed(
             for (const changed of scratch.db
               .prepare('SELECT id,version FROM changedCandidates')
               .iterate()) {
+              if (++visited % 64 === 0) await cooperate();
               for (const fact of scratch.db
                 .prepare('SELECT * FROM facts WHERE intake=? AND candidate=?')
                 .iterate(source.id, changed.id)) {
+                if (++visited % 64 === 0) await cooperate();
                 const oldCounts = JSON.parse(String(fact.counts)) as IntakeReportQueueCounts;
                 for (const key of Object.keys(counts) as (keyof typeof counts)[])
                   counts[key] -= oldCounts[key];
@@ -890,6 +945,7 @@ export async function readCollectionImportFeed(
                 source.id,
                 String(changed.id),
               )) {
+                if (++visited % 64 === 0) await cooperate();
                 if (
                   (input.groupId && input.groupId !== pointer.groupId) ||
                   (input.intakeId && input.intakeId !== pointer.intakeId)
@@ -949,6 +1005,7 @@ export async function readCollectionImportFeed(
           totalRecords = 0;
           totalPeopleGroups = 0;
           for (const pointer of queue.groups('all', source.id)) {
+            if (++visited % 64 === 0) await cooperate();
             if (
               (input.groupId && input.groupId !== pointer.groupId) ||
               (input.intakeId && input.intakeId !== pointer.intakeId)
@@ -977,6 +1034,7 @@ export async function readCollectionImportFeed(
                 .run(groupOrder, canonicalLiteral(groupReference), source.id);
             }
             for (const member of queue.members(pointer.intakeId, pointer.ordinal)) {
+              if (++visited % 64 === 0) await cooperate();
               await visitMember(pointer, summary, member, groupOrder, groupReference);
             }
           }
@@ -993,9 +1051,11 @@ export async function readCollectionImportFeed(
               queue.groundingStamp(source.id),
             );
         }
-        for (const row of scratch.db.prepare('SELECT id FROM sources WHERE seen=0').iterate())
+        for (const row of scratch.db.prepare('SELECT id FROM sources WHERE seen=0').iterate()) {
+          if (++visited % 64 === 0) await cooperate();
           for (const table of ['records', 'people', 'matches', 'facts', 'peopleMatches'])
             scratch.db.prepare(`DELETE FROM ${table} WHERE intake=?`).run(row.id);
+        }
         scratch.db.exec('DELETE FROM sources WHERE seen=0');
         for (const key of Object.keys(counts) as (keyof typeof counts)[]) counts[key] = 0;
         for (const key of Object.keys(peopleCounts) as (keyof typeof peopleCounts)[])
@@ -1008,6 +1068,7 @@ export async function readCollectionImportFeed(
             'SELECT counts,peopleCounts,kindCounts,totalRecords,totalPeopleGroups FROM sources',
           )
           .iterate()) {
+          if (++visited % 64 === 0) await cooperate();
           const c = JSON.parse(String(row.counts)),
             p = JSON.parse(String(row.peopleCounts)),
             k = JSON.parse(String(row.kindCounts));
@@ -1026,7 +1087,11 @@ export async function readCollectionImportFeed(
             'REPORT_QUEUE_CURSOR',
             'Review changed while preparing; refresh this feed',
           );
-        if (journalActivityBinding(root, profileId) !== activityPin)
+        const terminalActivity = await prepareJournalActivityBinding(root, profileId, {
+          assertRunning,
+        });
+        terminalActivity.assertCurrent();
+        if (terminalActivity.binding !== activityPin)
           throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Reading activity changed');
         if ((feedEpochs.get(db) || 0) !== epoch)
           throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this import feed');

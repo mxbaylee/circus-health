@@ -417,17 +417,19 @@ export async function applyNativeAcceptanceGroup(
             assertRunning,
           });
           try {
-            const receipt = intakeTransaction(
-              db,
-              () => {
-                assertRunning();
-                for (const check of publicationChecks.values()) check();
-                consumeIntakeDiscoveryAdmission(db, admission);
-                const result = prepared.apply();
-                options.retainResult?.(result);
-                return result;
-              },
-              { operationId: selected.operationId, fingerprint },
+            const receipt = await prepared.withVerifiedPublication(() =>
+              intakeTransaction(
+                db,
+                () => {
+                  assertRunning();
+                  for (const check of publicationChecks.values()) check();
+                  consumeIntakeDiscoveryAdmission(db, admission);
+                  const result = prepared.apply();
+                  options.retainResult?.(result);
+                  return result;
+                },
+                { operationId: selected.operationId, fingerprint },
+              ),
             );
             return { receipt, replayed: false, durability: flushIntake(db, root, profileId) };
           } finally {

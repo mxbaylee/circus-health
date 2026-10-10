@@ -1,4 +1,8 @@
-import { mkdirSync, existsSync, realpathSync, statSync } from 'node:fs';
+import { mkdirSync as rawMkdirSync, existsSync, realpathSync, statSync } from 'node:fs';
+import { withManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
+
+const mkdirSync: typeof rawMkdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawMkdirSync(...args));
 import { resolve, relative, isAbsolute } from 'node:path';
 
 import { validProfileId } from './profiles.ts';

@@ -4,6 +4,7 @@ import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import type { IncomingMessage } from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -2053,7 +2054,9 @@ test('conversion awaits failed capability preflight before creating or linking a
       action: 'convert',
       method: 'POST',
       params: new URLSearchParams(),
-      req: { headers: { 'content-type': 'application/json' } } as IncomingMessage,
+      req: Object.assign(new EventEmitter(), {
+        headers: { 'content-type': 'application/json' },
+      }) as IncomingMessage,
       body: async () => Buffer.from(JSON.stringify({ version: item.version })),
       respond: () => undefined,
       list: () => undefined,

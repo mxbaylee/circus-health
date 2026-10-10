@@ -8,6 +8,7 @@ import {
   type PathLike,
   type PathOrFileDescriptor,
 } from 'node:fs';
+import { beginManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
 
 /** Filesystem API payload work for the calling intake APIs, not physical disk
  * traffic. Fixed numeric totals only; no paths, identities or file contents.
@@ -85,6 +86,7 @@ export function readIntakeFileSync(path: PathOrFileDescriptor): Buffer {
   return bytes;
 }
 export function writeIntakeFileSync(fd: number, bytes: Uint8Array): void {
+  const finishMutation = beginManagedPhysicalMutation();
   recordIntakeFileWork('writeAttempts');
   try {
     writeFileSync(fd, bytes);
@@ -93,17 +95,29 @@ export function writeIntakeFileSync(fd: number, bytes: Uint8Array): void {
   } catch (error) {
     recordIntakeFileWork('writeFailures');
     throw error;
+  } finally {
+    finishMutation();
   }
 }
 export function fsyncIntakeFileSync(fd: number): void {
-  recordIntakeFileWork('fsyncAttempts');
-  fsyncSync(fd);
-  recordIntakeFileWork('fsyncCalls');
+  const finishMutation = beginManagedPhysicalMutation();
+  try {
+    recordIntakeFileWork('fsyncAttempts');
+    fsyncSync(fd);
+    recordIntakeFileWork('fsyncCalls');
+  } finally {
+    finishMutation();
+  }
 }
 export function renameIntakeFileSync(from: PathLike, to: PathLike): void {
-  recordIntakeFileWork('renameAttempts');
-  renameSync(from, to);
-  recordIntakeFileWork('renames');
+  const finishMutation = beginManagedPhysicalMutation();
+  try {
+    recordIntakeFileWork('renameAttempts');
+    renameSync(from, to);
+    recordIntakeFileWork('renames');
+  } finally {
+    finishMutation();
+  }
 }
 export function copyIntakeFileSync(
   from: PathLike,
@@ -111,8 +125,13 @@ export function copyIntakeFileSync(
   flags: number,
   requestedBytes: number,
 ): void {
-  recordIntakeFileWork('copyAttempts');
-  recordIntakeFileWork('copyRequestedBytes', requestedBytes);
-  copyFileSync(from, to, flags);
-  recordIntakeFileWork('copies');
+  const finishMutation = beginManagedPhysicalMutation();
+  try {
+    recordIntakeFileWork('copyAttempts');
+    recordIntakeFileWork('copyRequestedBytes', requestedBytes);
+    copyFileSync(from, to, flags);
+    recordIntakeFileWork('copies');
+  } finally {
+    finishMutation();
+  }
 }

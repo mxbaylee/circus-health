@@ -10,7 +10,7 @@ import { readCollectionQueueActivity } from './intake-queue-activity-collection.
 import { readCollectionIntakeReportRecords } from './intake-report-queue-collection.ts';
 import { readCollectionPeoplePage } from './intake-people-collection.ts';
 import { canonicalLiteral } from './intake-format.ts';
-import { journalActivityBinding } from './journal-activity-index.ts';
+import { prepareJournalActivityBinding } from './journal-activity-index.ts';
 import type { IntakeReportQueueView } from '../shared/intake.ts';
 
 export interface CollectionReportGroupReference {
@@ -78,7 +78,8 @@ export async function readCollectionReportQueuePage(
   profileId: string,
   input: Options = {},
 ) {
-  const activityPin = journalActivityBinding(root, profileId),
+  const activityProof = await prepareJournalActivityBinding(root, profileId),
+    activityPin = activityProof.binding,
     queue = await openCollectionReportQueue(db, root, profileId);
   try {
     const page = window(input, queue.binding + ':' + activityPin, 'groups-v3'),
@@ -86,6 +87,7 @@ export async function readCollectionReportQueuePage(
         | { kind: 'group'; group: CollectionReportGroupSummary }
         | { kind: 'reference'; reference: CollectionReportGroupReference }
       )[] = [];
+    await queue.prepareCurrent();
     const selected = queue.groupWindow(page.view, page.after, page.limit + 1);
     let used = 0,
       more = false,
@@ -120,7 +122,8 @@ export async function readCollectionReportQueuePage(
       used += size;
       last = [pointer.order, pointer.intakeId, pointer.groupId, pointer.ordinal];
     }
-    if (journalActivityBinding(root, profileId) !== activityPin)
+    const activity = await readCollectionQueueActivity(db, root, profileId, queue);
+    if (activity.binding !== activityPin)
       throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Reading activity changed');
     return {
       format: 'health-intake-report-queue-page-v2' as const,
@@ -128,7 +131,7 @@ export async function readCollectionReportQueuePage(
       groups,
       totalGroups: selected.totalGroups,
       nextCursor: more && last ? page.cursor(last) : null,
-      activity: readCollectionQueueActivity(db, root, profileId, queue),
+      activity,
     };
   } finally {
     queue.close();

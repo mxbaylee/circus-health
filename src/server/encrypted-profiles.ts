@@ -14,16 +14,22 @@ import {
 import { personDisplayKey } from '../shared/person-display.ts';
 import { randomUUID, randomBytes } from 'node:crypto';
 import {
-  mkdirSync,
+  mkdirSync as rawMkdirSync,
   readFileSync,
   existsSync,
   readdirSync,
   lstatSync,
-  rmSync,
-  cpSync,
+  rmSync as rawRmSync,
+  cpSync as rawCpSync,
   statSync,
   realpathSync,
 } from 'node:fs';
+import { withManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
+
+const mkdirSync: typeof rawMkdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawMkdirSync(...args));
+const rmSync: typeof rawRmSync = (...args) => withManagedPhysicalMutation(() => rawRmSync(...args));
+const cpSync: typeof rawCpSync = (...args) => withManagedPhysicalMutation(() => rawCpSync(...args));
 import { resolve, relative, isAbsolute } from 'node:path';
 import {
   importDiagnostics,

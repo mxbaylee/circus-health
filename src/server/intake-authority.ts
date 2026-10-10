@@ -14,6 +14,8 @@ import {
   type IntakeJson,
 } from './intake-state-codec.ts';
 import { createIntakeStateStorage } from './intake-state-storage.ts';
+import { parseSchemaControl } from './intake-envelope-schema.ts';
+import { INTAKE_LEGACY_BRIDGE_CONTROL } from './intake-state-migration.ts';
 import {
   intakeNamespace,
   limits,
@@ -309,10 +311,10 @@ export function intakeEnvelopeAuthorityBinding(
     readNonIntakeEnvelope(source.details_json);
     return { key: null, head: null };
   }
-  intakeEnvelopeMode(source.details_json);
   const selected = identity(db, source);
   const status = recordDurabilityStatus(db);
-  if (!status?.configured || status.dirty) fail('requires configured current accepted authority');
+  if (!status?.configured || status.dirty || status.conflicted)
+    fail('requires configured current accepted authority');
   const key = intakeNamespace(selected) + 'head';
   const head = db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
   if (
@@ -321,10 +323,37 @@ export function intakeEnvelopeAuthorityBinding(
     (parse(head) as Record<string, unknown>)?.format === COLLECTION_FORMAT
   ) {
     const checked = parseIntakeCollectionHead(head, selected)!;
+    // Classification is not metadata admission. Cold giant native metadata is
+    // checked cooperatively against the exact graph before presentation.
+    if (
+      typeof source.details_json === 'string' &&
+      source.details_json.length > COMPACT_SCALAR_BYTES
+    ) {
+      const collections = createIntakeStateStorage(db, selected).collections;
+      const view = collections.openView();
+      const control = collections.get(view, 'logical', 'envelope.control', 'representation');
+      if (control !== INTAKE_LEGACY_BRIDGE_CONTROL) {
+        parseSchemaControl(control);
+        if (!collections.collection(view, 'logical', 'envelope.data'))
+          fail('missing selected envelope data');
+        return { key, head, logicalHead: JSON.stringify(checked.logical) };
+      }
+    }
+    intakeEnvelopeMode(source.details_json);
     return { key, head, logicalHead: JSON.stringify(checked.logical) };
   }
+  intakeEnvelopeMode(source.details_json);
   if (!parseIntakeHead(head, selected, limits())) return fail('missing selected intake head');
   return { key, head: head as string };
+}
+/** Reader formatting hint only; never certifies metadata or grants publication. */
+export function intakeEnvelopeProjectionFormatHint(raw: unknown): IntakeEnvelopeProjectionFormat {
+  if (typeof raw === 'string' && raw.length > COMPACT_SCALAR_BYTES) {
+    return raw.startsWith('{"intakeAuthority":{"format":"' + INTAKE_COMPACT_ENVELOPE_FORMAT + '"')
+      ? INTAKE_COMPACT_ENVELOPE_FORMAT
+      : INTAKE_ENVELOPE_FORMAT;
+  }
+  return intakeEnvelopeProjection(raw).format;
 }
 
 type StateMaterialization = NonNullable<

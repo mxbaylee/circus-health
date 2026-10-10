@@ -16,6 +16,8 @@ import {
   consumeIntakeCompactMetadataProof,
   type IntakeCompactMetadataProof,
   intakeCompactSourceRowsEqual,
+  intakeCompactMetadataStampCurrent,
+  type IntakeCompactMetadataStamp,
 } from './intake-state-migration.ts';
 
 declare const maintenanceBrand: unique symbol;
@@ -58,6 +60,7 @@ interface Publication {
     sourceRow: Readonly<Record<string, unknown>>;
     target: string;
     sequence: number;
+    stamp: IntakeCompactMetadataStamp;
   };
   sourceStaged?: boolean;
   token?: object;
@@ -287,7 +290,9 @@ export function stageIntakeCompactMetadataPublication(
     item.sourceStaged ||
     !status?.configured ||
     status.dirty ||
+    status.conflicted ||
     status.sequence !== proof.sequence ||
+    !intakeCompactMetadataStampCurrent(db, proof.stamp, false) ||
     metadataReader(db)(item.headKey) !== item.afterHead ||
     !intakeCompactSourceRowsEqual(
       db
@@ -314,6 +319,17 @@ export function beginIntakeMaintenancePublication(
   const publication = selected(db, capability);
   const readMeta = metadataReader(db);
   if (publication.token) fail('capability already entered');
+  if (publication.compactMetadata) {
+    const status = recordDurabilityStatus(db);
+    if (
+      !status?.configured ||
+      status.dirty ||
+      status.conflicted ||
+      status.sequence !== publication.compactMetadata.sequence ||
+      !intakeCompactMetadataStampCurrent(db, publication.compactMetadata.stamp, true)
+    )
+      fail('compact metadata authority changed before publication');
+  }
   publication.token = token;
   if (
     operation.operationId !== publication.operationId ||
@@ -354,6 +370,17 @@ export function verifyIntakeMaintenancePublication(
   const publication = selected(db, capability);
   const readMeta = metadataReader(db);
   if (publication.token !== token || publication.verified) fail('transaction binding');
+  if (publication.compactMetadata) {
+    const status = recordDurabilityStatus(db);
+    if (
+      !status?.configured ||
+      status.dirty ||
+      status.conflicted ||
+      status.sequence !== publication.compactMetadata.sequence ||
+      !intakeCompactMetadataStampCurrent(db, publication.compactMetadata.stamp, false)
+    )
+      fail('compact metadata authority changed during publication');
+  }
   if (
     Number(db.prepare('PRAGMA main.schema_version').get()!.schema_version) !==
       publication.mainSchema ||

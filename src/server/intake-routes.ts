@@ -732,6 +732,15 @@ export async function handleIntakeRoute({
           },
         ),
       );
+    } else if (id && action === 'metadata-fragment') {
+      const { collectionIntakeMetadataScalarFragment } = await import('./intake-summary.ts');
+      respond(
+        collectionIntakeMetadataScalarFragment(
+          db,
+          selectedPageSource(db, profileId, id),
+          input as unknown as Parameters<typeof collectionIntakeMetadataScalarFragment>[2],
+        ),
+      );
     } else if (id && action === 'filename-fragment') {
       const { collectionIntakeFilenameFragment } = await import('./intake-summary.ts');
       respond(

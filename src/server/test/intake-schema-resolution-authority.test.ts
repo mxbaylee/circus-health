@@ -590,13 +590,13 @@ test('named field lookup shares one sealed scope without losing lexical values',
       );
       assert.equal(
         heads,
-        6,
-        'two source/handle checks, field entry/final proofs and two payload checks',
+        5,
+        'one sealed source view, field entry/final proofs and two payload checks',
       );
       assert.equal(
         witnessQueries,
-        22,
-        'three six-query scopes plus the four-query fixed field scope',
+        20,
+        'two six-query scopes and two four-query scopes share their entry certificates',
       );
       assert.equal(items, 6, 'four field witnesses and both original payload reads are retained');
     } finally {

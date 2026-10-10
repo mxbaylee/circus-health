@@ -3,6 +3,7 @@
 import { setImmediate } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
 import type { Database } from './database.ts';
+import { managedDatabaseMethodEpoch } from './database.ts';
 import {
   HEAD_BYTES,
   intakeNamespace,
@@ -53,6 +54,28 @@ interface CompactProofData {
   sourceRow: Readonly<Record<string, unknown>>;
   target: string;
   sequence: number;
+  stamp: IntakeCompactMetadataStamp;
+}
+export interface IntakeCompactMetadataStamp {
+  readonly methods: object;
+  readonly mainSchema: unknown;
+  readonly tempSchema: unknown;
+  readonly peer: unknown;
+  readonly writes: unknown;
+}
+export function intakeCompactMetadataStampCurrent(
+  db: Database,
+  stamp: IntakeCompactMetadataStamp,
+  beforeWrites: boolean,
+): boolean {
+  return (
+    managedDatabaseMethodEpoch(db) === stamp.methods &&
+    !protectedIntakeLookupTempShadow(db) &&
+    db.prepare('PRAGMA main.schema_version').get()!.schema_version === stamp.mainSchema &&
+    db.prepare('PRAGMA temp.schema_version').get()!.schema_version === stamp.tempSchema &&
+    db.prepare('PRAGMA main.data_version').get()!.data_version === stamp.peer &&
+    (!beforeWrites || db.prepare('SELECT total_changes() AS writes').get()!.writes === stamp.writes)
+  );
 }
 const compactProofs = new WeakMap<IntakeCompactMetadataProof, CompactProofData>();
 const compactRetained = new WeakMap<Database, Set<IntakeCompactMetadataProof>>();
@@ -165,7 +188,8 @@ export async function prepareIntakeCompactMetadataProofAsync(
       Buffer.byteLength(source.details_json as string),
     ),
   );
-  if (!status?.configured || status.dirty) invalid('compact metadata physical authority');
+  if (!status?.configured || status.dirty || status.conflicted)
+    invalid('compact metadata physical authority');
   const key = intakeNamespace(candidate.identity) + 'head',
     pin = db
       .prepare('SELECT value FROM app_meta WHERE key=?')
@@ -175,6 +199,15 @@ export async function prepareIntakeCompactMetadataProofAsync(
     mainSchema = db.prepare('PRAGMA main.schema_version').get()!.schema_version,
     tempSchema = db.prepare('PRAGMA temp.schema_version').get()!.schema_version,
     peer = db.prepare('PRAGMA main.data_version').get()!.data_version;
+  const methods = managedDatabaseMethodEpoch(db);
+  if (!methods) invalid('compact metadata managed database policy');
+  const stamp: IntakeCompactMetadataStamp = Object.freeze({
+    methods: methods!,
+    mainSchema,
+    tempSchema,
+    peer,
+    writes,
+  });
   const assertCurrent = () => {
     options.assertRunning?.();
     withIntakeWork(db, 'reconstruction', () =>
@@ -184,12 +217,9 @@ export async function prepareIntakeCompactMetadataProofAsync(
     if (
       !current?.configured ||
       current.dirty ||
+      current.conflicted ||
       current.sequence !== status!.sequence ||
-      protectedIntakeLookupTempShadow(db) ||
-      guard.get()!.writes !== writes ||
-      db.prepare('PRAGMA main.schema_version').get()!.schema_version !== mainSchema ||
-      db.prepare('PRAGMA temp.schema_version').get()!.schema_version !== tempSchema ||
-      db.prepare('PRAGMA main.data_version').get()!.data_version !== peer ||
+      !intakeCompactMetadataStampCurrent(db, stamp, true) ||
       db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value !==
         candidate.beforeHead ||
       db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value !==
@@ -201,7 +231,7 @@ export async function prepareIntakeCompactMetadataProofAsync(
       invalid('compact metadata source/head/physical authority changed');
   };
   assertCurrent();
-  const adoption = prepareIntakeSchemaAdoptionProofSteps(db, candidate, true);
+  const adoption = prepareIntakeSchemaAdoptionProofSteps(db, candidate, true, sourceRow);
   let bridge: IntakeLegacyBridgeProof;
   try {
     for (;;) {
@@ -285,6 +315,7 @@ export async function prepareIntakeCompactMetadataProofAsync(
       sourceRow,
       target: target!,
       sequence: status!.sequence,
+      stamp,
       binding: certificate({
         ...candidate,
         sourcePin: pin as string | undefined,
@@ -304,7 +335,12 @@ export function consumeIntakeCompactMetadataProof(
   db: Database,
   proof: IntakeCompactMetadataProof,
   binding: IntakeLegacyBridgeBinding,
-): { sourceRow: Readonly<Record<string, unknown>>; target: string; sequence: number } {
+): {
+  sourceRow: Readonly<Record<string, unknown>>;
+  target: string;
+  sequence: number;
+  stamp: IntakeCompactMetadataStamp;
+} {
   const item = compactProofs.get(proof);
   compactProofs.delete(proof);
   compactRetained.get(db)?.delete(proof);
@@ -315,7 +351,9 @@ export function consumeIntakeCompactMetadataProof(
   if (
     !current?.configured ||
     current.dirty ||
+    current.conflicted ||
     current.sequence !== item!.sequence ||
+    !intakeCompactMetadataStampCurrent(db, item!.stamp, true) ||
     !intakeCompactSourceRowsEqual(
       db
         .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
@@ -324,7 +362,12 @@ export function consumeIntakeCompactMetadataProof(
     )
   )
     invalid('compact metadata proof source or physical authority changed');
-  return { sourceRow: item!.sourceRow, target: item!.target, sequence: item!.sequence };
+  return {
+    sourceRow: item!.sourceRow,
+    target: item!.target,
+    sequence: item!.sequence,
+    stamp: item!.stamp,
+  };
 }
 export function intakeCompactSourceRowsEqual(
   actual: Record<string, unknown> | undefined,
@@ -514,6 +557,7 @@ function* prepareIntakeSchemaAdoptionProofSteps(
   db: Database,
   candidate: Omit<IntakeLegacyBridgeBinding, 'sourcePin' | 'detailsJson'>,
   compactSameData = false,
+  compactSourceRow?: Readonly<Record<string, unknown>>,
 ): Generator<void, IntakeLegacyBridgeProof> {
   let work = 0;
   const { identity, beforeHead, afterHead, writes } = candidate,
@@ -530,9 +574,11 @@ function* prepareIntakeSchemaAdoptionProofSteps(
   const initialPin = get(intakeSourcePinKey(identity.intakeId));
   const status = recordDurabilityStatus(db);
   if (!status?.configured || status.dirty) invalid('schema adoption accepted authority');
-  const source = db
-    .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
-    .get(identity.intakeId);
+  const source = compactSameData
+    ? compactSourceRow
+    : db
+        .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
+        .get(identity.intakeId);
   if (
     !source ||
     source.kind !== 'intake_original' ||
@@ -696,15 +742,20 @@ function* prepareIntakeSchemaAdoptionProofSteps(
   visit(after.receipts, 'receipts');
   visit(after.history, 'history');
   if (consumed.size !== rows.size) invalid('schema adoption disconnected writes');
+  // The distinct compact factory performs the complete final-row readback.
   const finalSource = db
-    .prepare('SELECT kind,sha256,details_json FROM source_files WHERE id=?')
+    .prepare(
+      compactSameData
+        ? 'SELECT kind,sha256 FROM source_files WHERE id=?'
+        : 'SELECT kind,sha256,details_json FROM source_files WHERE id=?',
+    )
     .get(identity.intakeId);
   if (
     get(headKey) !== beforeHead ||
     get('owner_profile_id') !== identity.profileId ||
     finalSource?.kind !== source.kind ||
     finalSource?.sha256 !== source.sha256 ||
-    finalSource?.details_json !== source.details_json ||
+    (!compactSameData && finalSource?.details_json !== source.details_json) ||
     get(intakeSourcePinKey(identity.intakeId)) !== initialPin
   )
     invalid('schema adoption source/head changed during verification');

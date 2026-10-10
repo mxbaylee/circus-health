@@ -21,6 +21,21 @@ import { createSourceDetailsSearch } from './source-details-search.ts';
 import { reconcileActiveSourceTextProjection } from './source-text-projection.ts';
 import { withIntakeWork } from './intake-work-accounting.ts';
 import { recordIntakeFileHash } from './intake-file-work.ts';
+import { HttpError } from './database.ts';
+import { INTAKE_ENVELOPE_FORMAT, intakeEnvelopeProjectionFormatHint } from './intake-authority.ts';
+import {
+  hasIntakeCollectionEnvelope,
+  openIntakeCollectionEnvelope,
+  intakeEnvelopeFilenameCell,
+} from './intake-collection-envelope.ts';
+import {
+  isIntakeCompactScalar,
+  compactIntakeScalar,
+  type IntakeCompactScalar,
+} from './intake-compact-scalar.ts';
+import { parseIntakeFilenameFacts } from './intake-filename-facts.ts';
+import { schemaKey } from './intake-envelope-schema.ts';
+import type { IntakeMetadataScalarReference } from '../shared/intake-summary.ts';
 import type {
   Intake,
   IntakeMetadata,
@@ -86,18 +101,24 @@ interface DetailsRow {
   details_json?: string | null;
   source_pin?: unknown;
 }
-export type IntakeSourceMetadata = Pick<
-  IntakeDetails,
-  | 'originalName'
-  | 'acquisition'
-  | 'metadata'
-  | 'receivedMimeType'
-  | 'createdAt'
-  | 'parentSourceFileId'
-  | 'locator'
-  | 'derivative'
-  | 'sourceTextRevisionId'
->;
+export type IntakeSourceMetadata = Omit<
+  Pick<
+    IntakeDetails,
+    | 'originalName'
+    | 'acquisition'
+    | 'metadata'
+    | 'receivedMimeType'
+    | 'createdAt'
+    | 'parentSourceFileId'
+    | 'locator'
+    | 'derivative'
+    | 'sourceTextRevisionId'
+  >,
+  'originalName' | 'locator'
+> & {
+  originalName: string | IntakeCompactScalar;
+  locator?: string | IntakeCompactScalar;
+};
 
 /** A checked compact source header, independent of inventory/workflow size.
  * Current authority and source identity are still checked on every call. The
@@ -113,8 +134,133 @@ export function intakeSourceMetadata(db: DatabaseSync, id: string): IntakeSource
     db,
     source as unknown as Parameters<typeof intakeEnvelopeAuthorityBinding>[1],
   );
+  const native = hasIntakeCollectionEnvelope(
+    db,
+    source as unknown as Parameters<typeof openIntakeCollectionEnvelope>[1],
+  );
+  const view = native
+    ? openIntakeCollectionEnvelope(db, { id, sha256: source.sha256 as string })
+    : undefined;
+  if (
+    view &&
+    typeof source.details_json === 'string' &&
+    source.details_json.length > 16384 &&
+    intakeEnvelopeProjectionFormatHint(source.details_json) === INTAKE_ENVELOPE_FORMAT
+  ) {
+    const intake = view.child(view.root(), 'intake');
+    if (!intake) throw Error('Source intake header missing');
+    for (const field of ['originalName', 'locator'] as const) {
+      const scalar = view.field(intake, field, { bytes: 16384 });
+      if (
+        scalar.kind === 'fragmented' &&
+        view.fieldFragment(intake, field, { bytes: 4096 }).text.trimStart().startsWith('"')
+      )
+        throw new HttpError(
+          409,
+          'INTAKE_SUMMARY_UNAVAILABLE',
+          'Prepare the selected source metadata first.',
+        );
+    }
+  }
   const value = JSON.parse(source.details_json as string) as { intake: IntakeSourceMetadata };
+  for (const field of ['originalName', 'locator'] as const) {
+    const scalar = value.intake?.[field];
+    if (!isIntakeCompactScalar(scalar)) continue;
+    if (!view || scalar.field !== field)
+      throw Error('Source metadata scalar requires native evidence');
+    const intake = view.child(view.root(), 'intake');
+    if (!intake) throw Error('Source intake header missing');
+    const cell = intakeEnvelopeFilenameCell(view, intake, field);
+    if (cell.facts === undefined)
+      throw new HttpError(
+        409,
+        'INTAKE_SUMMARY_UNAVAILABLE',
+        'Prepare the selected source metadata first.',
+      );
+    const facts = parseIntakeFilenameFacts(cell.facts);
+    if (
+      facts.binding !== cell.binding ||
+      facts.bytes !== cell.bytes ||
+      JSON.stringify(compactIntakeScalar(field, facts)) !== JSON.stringify(scalar)
+    )
+      throw Error('Source metadata scalar conflicts with exact evidence');
+  }
   return value.intake;
+}
+export function intakeMetadataScalarReference(
+  db: DatabaseSync,
+  id: string,
+  field: 'originalName' | 'locator',
+  metadata: IntakeSourceMetadata,
+): IntakeMetadataScalarReference | undefined {
+  const scalar = metadata[field];
+  if (!isIntakeCompactScalar(scalar)) return undefined;
+  const source = db.prepare('SELECT sha256 FROM main.source_files WHERE id=?').get(id);
+  const view = openIntakeCollectionEnvelope(db, { id, sha256: source?.sha256 as string });
+  const version = intakeSourceVersion(db, id);
+  return {
+    format: 'health-intake-metadata-scalar-reference-v1',
+    intakeId: id,
+    field,
+    pins: {
+      sourceHash: source?.sha256 as string,
+      logicalRoot: view.logical.root?.hash || '',
+      domainVersion: view.logical.domainVersion,
+      version: version.version,
+    },
+    scalarHash: scalar.scalarHash,
+    bytes: scalar.bytes,
+  };
+}
+/** SQLite JSON extraction selects the first raw occurrence, unlike JSON.parse. */
+export function intakeFirstLocatorMatcher(
+  db: DatabaseSync,
+  id: string,
+): (exact: string) => boolean {
+  const source = db
+    .prepare(
+      "SELECT id,kind,sha256,details_json,json_extract(details_json,'$.intake.locator') locator FROM main.source_files WHERE id=?",
+    )
+    .get(id);
+  if (!source || source.kind !== 'intake_original') return () => false;
+  intakeEnvelopeAuthorityBinding(
+    db,
+    source as unknown as Parameters<typeof intakeEnvelopeAuthorityBinding>[1],
+  );
+  if (typeof source.locator !== 'string') return () => false;
+  let value: unknown;
+  try {
+    value = JSON.parse(source.locator);
+  } catch {
+    return (exact) => source.locator === exact;
+  }
+  if (!isIntakeCompactScalar(value) || value.field !== 'locator')
+    return (exact) => source.locator === exact;
+  const view = openIntakeCollectionEnvelope(
+    db,
+    { id, sha256: source.sha256 as string },
+    { fieldSelection: 'first' },
+  );
+  const intake = view.child(view.root(), 'intake');
+  if (!intake) return () => false;
+  const cell = intakeEnvelopeFilenameCell(view, intake, 'locator');
+  if (cell.facts === undefined)
+    throw new HttpError(
+      409,
+      'INTAKE_SUMMARY_UNAVAILABLE',
+      'Prepare the selected source metadata first.',
+    );
+  const facts = parseIntakeFilenameFacts(cell.facts);
+  if (
+    facts.binding !== cell.binding ||
+    facts.bytes !== cell.bytes ||
+    JSON.stringify(compactIntakeScalar('locator', facts)) !== JSON.stringify(value)
+  )
+    throw Error('Source locator conflicts with exact first-occurrence evidence');
+  return (exact) => facts.scalarHash === schemaKey(exact);
+}
+export function intakeFirstLocatorMatches(db: DatabaseSync, id: string, exact: string): boolean {
+  return intakeFirstLocatorMatcher(db, id)(exact);
 }
 
 /** Public stale-tab version without hydrating a selected V4 workflow. The

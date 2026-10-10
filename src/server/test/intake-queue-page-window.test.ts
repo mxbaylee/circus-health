@@ -146,6 +146,13 @@ test(
     await prepareCollectionReviewMembership(db, { id: changing.id });
     await prepareCollectionPeopleIndex(db, root, profileId, changing.id);
     const baseline = await openCollectionReportQueue(db, root, profileId);
+    const beforeAssertions = intakeWorkCounters(db).warm.hashedBytes;
+    for (let index = 0; index < 10; index++) baseline.assertCurrent();
+    assert.equal(
+      intakeWorkCounters(db).warm.hashedBytes,
+      beforeAssertions,
+      'warm queue assertions do not rebuild complete source bindings',
+    );
     const anchored = [...baseline.groups('all', changing.id)];
     assert.equal(anchored.length, 1);
     assert.ok(anchored.every((group) => group.address !== null));

@@ -47,6 +47,22 @@ export interface IntakeFilenameReference {
   scalarHash: string;
   bytes: number;
 }
+export interface IntakeMetadataScalarReference {
+  format: 'health-intake-metadata-scalar-reference-v1';
+  intakeId: string;
+  field: 'originalName' | 'locator';
+  pins: IntakeSummaryPins;
+  scalarHash: string;
+  bytes: number;
+}
+export interface IntakeMetadataScalarFragment {
+  format: 'health-intake-metadata-scalar-fragment-v1';
+  reference: IntakeMetadataScalarReference;
+  encoding: 'json-string';
+  text: string;
+  complete: boolean;
+  nextCursor: string | null;
+}
 export type IntakeFilename =
   | {
       filename: string;

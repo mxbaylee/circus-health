@@ -2261,6 +2261,16 @@ export function createAssistant({
     const db = dbFor(profileId),
       args = params.arguments;
     if (
+      state.checkpoint &&
+      chat.reading &&
+      params.tool === 'health_intake_plan' &&
+      object(args) &&
+      args.action === 'create'
+    ) {
+      chat.reading.phase = 'indexing_source';
+      persist(profileId, chat, 'conversion-tool-started');
+    }
+    if (
       object(args) &&
       typeof args.id === 'string' &&
       db.prepare("SELECT 1 FROM source_files WHERE id=? AND kind='intake_original'").get(args.id)
@@ -2502,13 +2512,16 @@ export function createAssistant({
         : null;
     if (state.checkpoint) {
       if (chat.reading) {
-        chat.reading.phase =
+        const phase =
           params.tool === 'health_intake_plan' && args.action === 'create'
             ? 'indexing_source'
             : readKey
               ? 'reading_source'
               : 'preparing_results';
-        persist(profileId, chat, 'conversion-tool-started');
+        if (chat.reading.phase !== phase) {
+          chat.reading.phase = phase;
+          persist(profileId, chat, 'conversion-tool-started');
+        }
       }
     }
     if (params.tool === 'health_assistant_progress') {

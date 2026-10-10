@@ -5,6 +5,7 @@ import type { IntakeCollectionHead } from './intake-state-evidence.ts';
 import type { Database } from './database.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
 import { hashIntakeJsonScalar } from './intake-json-scalar.ts';
+import { intakeEnvelopeProjectionFormatHint } from './intake-authority.ts';
 import {
   selectedEnvelopeStore,
   collectionCellReader,
@@ -126,6 +127,9 @@ export async function prepareIntakeEnvelopeMutation(
       collections.get(collections.openView(), 'logical', 'envelope.control', 'representation'),
     ),
     old.logical,
+    undefined,
+    'last',
+    intakeEnvelopeProjectionFormatHint(expectedSource.details_json),
   );
   const address = (record: IntakeEnvelopeRecord) => {
     try {

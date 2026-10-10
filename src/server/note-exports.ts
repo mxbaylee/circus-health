@@ -1133,8 +1133,9 @@ function includedReadingGaps(
         selected = {
           sourceFileId: sourceId,
           filename: String(
-            (native ? intakeSourceMetadata(db, sourceId).originalName : details?.originalName) ||
-              sourceId,
+            (native
+              ? intakeMetadataLabel(intakeSourceMetadata(db, sourceId).originalName)
+              : details?.originalName) || sourceId,
           ),
           gaps: [],
         };
@@ -2561,3 +2562,4 @@ export function createNoteExports() {
     throw new HttpError(404, 'NOT_FOUND', 'Export action not found.');
   };
 }
+import { intakeMetadataLabel } from './intake-compact-scalar.ts';

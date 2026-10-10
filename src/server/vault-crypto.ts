@@ -11,6 +11,7 @@ import {
   rmSync,
   mkdirSync,
 } from 'node:fs';
+import { beginManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
 import { dirname } from 'node:path';
 import { entropyToMnemonic, mnemonicToEntropy } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
@@ -152,6 +153,14 @@ function readExact(fd: number, length: number, allowEnd = false): Buffer | null 
   return out;
 }
 function atomicOutput(path: string, fn: (fd: number) => void): void {
+  const finishMutation = beginManagedPhysicalMutation();
+  try {
+    atomicOutputOwned(path, fn);
+  } finally {
+    finishMutation();
+  }
+}
+function atomicOutputOwned(path: string, fn: (fd: number) => void): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const pending = `${path}.pending-${randomBytes(12).toString('hex')}`;
   let fd: number | undefined;

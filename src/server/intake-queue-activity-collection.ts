@@ -3,13 +3,13 @@ import type { DatabaseSync } from 'node:sqlite';
 import { getIntakeRead } from './intake.ts';
 import { openIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import {
-  collectionQueueSources,
+  collectionQueueSourcesAsync,
   type openCollectionReportQueue,
 } from './intake-report-group-collection.ts';
 import {
   readChatActivityHeader,
-  iterateIntakeBatchActivity,
-  journalActivityBinding,
+  iterateIntakeBatchActivityAsync,
+  prepareJournalActivityBinding,
 } from './journal-activity-index.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { HttpError } from './database.ts';
@@ -27,14 +27,22 @@ export interface CollectionQueueActivity {
   allCurrentReportsReviewed: boolean;
   readingAccounting: { state: 'referenced'; scope: 'complete_reading_accounting'; binding: string };
 }
-export function readCollectionQueueActivity(
+export async function readCollectionQueueActivity(
   db: DatabaseSync,
   root: string,
   profileId: string,
   queue: Awaited<ReturnType<typeof openCollectionReportQueue>>,
-): CollectionQueueActivity {
-  const binding = journalActivityBinding(root, profileId),
+): Promise<CollectionQueueActivity> {
+  await queue.prepareCurrent();
+  const initial = await prepareJournalActivityBinding(root, profileId, {
+      assertRunning: queue.assertCurrent,
+    }),
+    binding = initial.binding,
     scratch = disposableSqlite('circus-queue-activity-');
+  const assertCurrent = () => {
+    queue.assertCurrent();
+    initial.assertCurrent();
+  };
   scratch.db.exec('CREATE TABLE intakes(id TEXT PRIMARY KEY,seen INTEGER NOT NULL)');
   let runningFiles = 0,
     pausedFiles = 0,
@@ -44,7 +52,7 @@ export function readCollectionQueueActivity(
     countsExact = true,
     sourceCount = 0;
   try {
-    for (const source of collectionQueueSources(db, profileId)) {
+    for await (const source of collectionQueueSourcesAsync(db, profileId, assertCurrent)) {
       sourceCount++;
       const view = openIntakeCollectionEnvelope(db, source),
         intake = view.child(view.root(), 'intake')!,
@@ -85,7 +93,7 @@ export function readCollectionQueueActivity(
       scratch.db.prepare('INSERT INTO intakes VALUES(?,?)').run(source.id, running ? 1 : 0);
       if (running) runningFiles++;
     }
-    for (const item of iterateIntakeBatchActivity(root, profileId)) {
+    for await (const item of iterateIntakeBatchActivityAsync(root, profileId, assertCurrent)) {
       const source = scratch.db.prepare('SELECT seen FROM intakes WHERE id=?').get(item.intakeId);
       if (!source || source.seen) continue;
       scratch.db.prepare('UPDATE intakes SET seen=1 WHERE id=?').run(item.intakeId);
@@ -109,8 +117,12 @@ export function readCollectionQueueActivity(
     const allCurrentReportsReviewed =
       queue.groups('active')[Symbol.iterator]().next().done === true &&
       queue.groups('deferred')[Symbol.iterator]().next().done === true;
-    queue.assertCurrent();
-    if (journalActivityBinding(root, profileId) !== binding)
+    assertCurrent();
+    const terminal = await prepareJournalActivityBinding(root, profileId, {
+      assertRunning: assertCurrent,
+    });
+    terminal.assertCurrent();
+    if (terminal.binding !== binding)
       throw new HttpError(
         409,
         'REPORT_QUEUE_CURSOR',

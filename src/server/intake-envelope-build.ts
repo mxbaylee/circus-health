@@ -55,13 +55,21 @@ export async function buildIntakeCollectionEnvelope(
         });
         return undefined;
       }
-      return buildIntakeCollectionEnvelopeOwned(db, source, {
+      const result = await buildIntakeCollectionEnvelopeOwned(db, source, {
         ...options,
         assertRunning() {
           assertClinicalOperation(db, operation);
           options.assertRunning?.();
         },
       });
+      const { prepareIntakeFilenameSummary } = await import('./intake-summary-name.ts');
+      await prepareIntakeFilenameSummary(db, source, {
+        assertRunning() {
+          assertClinicalOperation(db, operation);
+          options.assertRunning?.();
+        },
+      });
+      return result;
     },
     { operation: currentClinicalOperation(db), assertRunning: options.assertRunning },
   );
@@ -369,6 +377,15 @@ export function createEnvelopeBuildWriter(
     if (typeof value === 'string' || value.bytes <= 16384) {
       if (peek('q:' + id) !== undefined) await remove('q:' + id);
       return;
+    }
+    const first = iterateSchemaCellText(store, 'c:' + id);
+    try {
+      if (!first.next().value?.trimStart().startsWith('"')) {
+        if (peek('q:' + id) !== undefined) await remove('q:' + id);
+        return;
+      }
+    } finally {
+      first.return(undefined);
     }
     const binding = store.byteBinding!(value);
     const steps = prepareIntakeFilenameFactsSteps(iterateSchemaCellText(store, 'c:' + id), binding);

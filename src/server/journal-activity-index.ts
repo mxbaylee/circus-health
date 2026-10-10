@@ -23,6 +23,14 @@ import {
   type JournalJsonWork,
 } from './journal-json-index.ts';
 import { JournalActivityOrder } from './journal-activity-order.ts';
+import {
+  captureManagedPhysicalEpoch,
+  managedPhysicalEpochCurrent,
+} from './clinical-review-physical-epoch.ts';
+import {
+  openClinicalPhysicalVerifier,
+  type ClinicalPhysicalItem,
+} from './clinical-review-physical-worker.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CHAT_EVENT = /^(\d{12})-([0-9a-f]{64})\.json$/;
@@ -522,10 +530,16 @@ export async function prepareJournalActivity(
   profileId: string,
   options: { signal?: AbortSignal; assertRunning?: () => void; work?: JournalJsonWork } = {},
 ): Promise<void> {
+  let interrupted = false;
   const assertRunning = () => {
-    options.signal?.throwIfAborted();
-    options.assertRunning?.();
-    options.signal?.throwIfAborted();
+    try {
+      options.signal?.throwIfAborted();
+      options.assertRunning?.();
+      options.signal?.throwIfAborted();
+    } catch (error) {
+      interrupted = true;
+      throw error;
+    }
   };
   assertRunning();
   const key = scope(root, profileId),
@@ -534,13 +548,15 @@ export async function prepareJournalActivity(
   if (existing?.ready) {
     let valid = false;
     try {
-      journalActivityBinding(root, profileId);
+      const proof = await activityBindingAsync(existing, { ...options, assertRunning });
+      proof.assertCurrent();
       valid = true;
-    } catch {
+    } catch (error) {
+      if (interrupted || indexes.get(key) !== existing) throw error;
+      options.signal?.throwIfAborted();
       clearJournalActivityIndex(root, profileId);
     }
     if (valid) {
-      assertRunning();
       if (indexes.get(key) !== existing) pending();
       return;
     }
@@ -698,8 +714,8 @@ export async function prepareJournalActivity(
       }
     }
     assertActive();
-    activityBinding(index);
-    assertActive();
+    const proof = await activityBindingAsync(index, { ...options, assertRunning: assertActive });
+    proof.assertCurrent();
     index.ready = true;
   } catch (error) {
     if (indexes.get(key) === index) indexes.delete(key);
@@ -719,6 +735,118 @@ function checked(index: ActivityIndex, row: Selected): void {
  * growing array of pins and never an implicit cold replay during a GET. */
 export function journalActivityBinding(root: string, profileId: string): string {
   return activityBinding(current(root, profileId));
+}
+/** Awaited native consumers retain the exact selected marker baseline while physical work runs off host. */
+export async function prepareJournalActivityBinding(
+  root: string,
+  profileId: string,
+  options: { signal?: AbortSignal; assertRunning?: () => void } = {},
+) {
+  const proof = await activityBindingAsync(current(root, profileId), options);
+  proof.assertCurrent();
+  return proof;
+}
+async function activityBindingAsync(
+  index: ActivityIndex,
+  options: { signal?: AbortSignal; assertRunning?: () => void },
+) {
+  const key = scope(index.root, index.profileId);
+  const assertActive = () => {
+    options.signal?.throwIfAborted();
+    options.assertRunning?.();
+    if (indexes.get(key) !== index || !index.scratch.db.isOpen) pending();
+  };
+  assertActive();
+  const sql = index.scratch.db;
+  const changes = [
+    'SELECT total_changes() AS value',
+    'PRAGMA main.schema_version',
+    'PRAGMA main.data_version',
+    'PRAGMA temp.schema_version',
+    'PRAGMA temp.data_version',
+  ].map((query) => {
+    const statement = sql.prepare(query);
+    statement.setReadBigInts(true);
+    return statement;
+  });
+  const stamp = () => {
+    return changes.map((statement) => Object.values(statement.get()!)[0]).join(':');
+  };
+  const original = stamp(),
+    epoch = captureManagedPhysicalEpoch();
+  const assertCurrent = () => {
+    assertActive();
+    if (!epoch || !managedPhysicalEpochCurrent(epoch) || stamp() !== original) pending();
+  };
+  assertCurrent();
+  const worker = await openClinicalPhysicalVerifier(options.signal);
+  let closed = false;
+  try {
+    assertCurrent();
+    const containers: ClinicalPhysicalItem[] = (['chat', 'batch'] as const).map((kind) => ({
+      kind: 'directory',
+      path: join(key, kind === 'chat' ? 'chats' : 'intake-batches'),
+      expectedIdentity: index.containers[kind],
+    }));
+    await worker.verifyPage(containers);
+    assertCurrent();
+    const hash = createHash('sha256');
+    let kind = '',
+      id = '',
+      seen = 0;
+    const count = Number(sql.prepare('SELECT count(*) AS n FROM activity_journals').get()!.n);
+    for (;;) {
+      const rows = sql
+        .prepare(
+          'SELECT kind,id,pin FROM activity_journals WHERE kind>? OR (kind=? AND id>?) ORDER BY kind,id LIMIT 64',
+        )
+        .all(kind, kind, id);
+      if (!rows.length) break;
+      const items: ClinicalPhysicalItem[] = [];
+      for (const row of rows) {
+        if (
+          (row.kind !== 'chat' && row.kind !== 'batch') ||
+          typeof row.id !== 'string' ||
+          !UUID.test(row.id) ||
+          typeof row.pin !== 'string'
+        )
+          invalid();
+        items.push({
+          kind: 'marker',
+          path: join(path(index, row.kind, row.id), 'current'),
+          expected: row.pin === 'legacy' ? 'absent' : { sha256: row.pin },
+        });
+        hash.update(JSON.stringify([row.kind, row.id, row.pin]));
+        kind = row.kind;
+        id = row.id;
+        seen++;
+      }
+      await worker.verifyPage(items);
+      assertCurrent();
+    }
+    if (seen !== count) pending();
+    await worker.verifyPage(containers);
+    assertCurrent();
+    await worker.close();
+    closed = true;
+    assertCurrent();
+    for (const kind of ['chat', 'batch'] as const)
+      if (container(index, kind) !== index.containers[kind]) pending();
+    // These are callback-free checks after the final owner/cancellation callback.
+    if (!epoch || !managedPhysicalEpochCurrent(epoch) || stamp() !== original) pending();
+    const binding = hash.digest('hex');
+    return {
+      binding,
+      assertCurrent() {
+        assertCurrent();
+        for (const kind of ['chat', 'batch'] as const)
+          if (container(index, kind) !== index.containers[kind]) pending();
+        if (!epoch || !managedPhysicalEpochCurrent(epoch) || stamp() !== original) pending();
+      },
+    };
+  } finally {
+    if (!closed) await worker.abort();
+  }
 }
 function activityBinding(index: ActivityIndex): string {
   const hash = createHash('sha256');
@@ -816,35 +944,62 @@ export function* iterateIntakeBatchActivity(
   root: string,
   profileId: string,
 ): Generator<IntakeBatchActivityHeader> {
-  const index = current(root, profileId),
-    json = index.json;
+  const index = current(root, profileId);
   if (container(index, 'batch') !== index.containers.batch) pending();
   for (const id of index.order.ids()) {
-    const selected = select(index, 'batch', id)!;
-    checked(index, selected);
-    const items = json.child(selected.root, 'items');
-    for (let i = 0; i < json.node(items).length; i++) {
-      const item = json.child(items, String(i)),
-        reading = json.maybe(item, 'reading');
-      yield {
-        pin: selected.pin,
-        batchId: selected.id,
-        batchStatus: json.nullable(selected.root, 'status'),
-        updatedAt: String(json.nullable(selected.root, 'updatedAt') ?? ''),
-        itemIndex: i,
-        intakeId: String(json.nullable(item, 'intakeId')),
-        sourceHash: json.nullable(item, 'sourceHash'),
-        status: json.nullable(item, 'status'),
-        reason: json.nullable(item, 'reason'),
-        reading:
-          reading === undefined || json.node(reading).kind === 'null'
-            ? null
-            : {
-                status: json.nullable(reading, 'status'),
-                reason: json.nullable(reading, 'reason'),
-              },
-      };
+    yield* batchActivity(index, id);
+  }
+}
+export async function* iterateIntakeBatchActivityAsync(
+  root: string,
+  profileId: string,
+  assertCurrent: () => void,
+): AsyncGenerator<IntakeBatchActivityHeader> {
+  const index = current(root, profileId);
+  let work = 0;
+  for (const id of index.order.ids()) {
+    if (++work % 64 === 0) {
+      assertCurrent();
+      await setImmediate();
+      assertCurrent();
     }
+    for (const item of batchActivity(index, id)) {
+      if (++work % 64 === 0) {
+        assertCurrent();
+        await setImmediate();
+        assertCurrent();
+      }
+      yield item;
+    }
+  }
+  assertCurrent();
+}
+function* batchActivity(index: ActivityIndex, id: string): Generator<IntakeBatchActivityHeader> {
+  const json = index.json,
+    selected = select(index, 'batch', id)!;
+  checked(index, selected);
+  const items = json.child(selected.root, 'items');
+  for (let i = 0; i < json.node(items).length; i++) {
+    const item = json.child(items, String(i)),
+      reading = json.maybe(item, 'reading');
+    yield {
+      pin: selected.pin,
+      batchId: selected.id,
+      batchStatus: json.nullable(selected.root, 'status'),
+      updatedAt: String(json.nullable(selected.root, 'updatedAt') ?? ''),
+      itemIndex: i,
+      intakeId: String(json.nullable(item, 'intakeId')),
+      sourceHash: json.nullable(item, 'sourceHash'),
+      status: json.nullable(item, 'status'),
+      reason: json.nullable(item, 'reason'),
+      reading:
+        reading === undefined || json.node(reading).kind === 'null'
+          ? null
+          : {
+              status: json.nullable(reading, 'status'),
+              reason: json.nullable(reading, 'reason'),
+            },
+    };
   }
 }
 /** Called only after the owning journal publishes its marker. Cache failure

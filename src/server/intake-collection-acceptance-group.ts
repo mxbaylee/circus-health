@@ -12,6 +12,7 @@ import {
   preparedClinicalEvidenceChanges,
   preparedClinicalProjectionMember,
   applyPreparedClinicalProjectionGroup,
+  withVerifiedClinicalProjectionPublication,
   assertPreparedClinicalProjectionMember,
   disposePreparedClinicalProjection,
 } from './intake-clinical-projection-plan.ts';
@@ -196,6 +197,7 @@ export async function prepareNativeIntakeAcceptanceGroup(
         { intakeId: member.source.id, imported: prepared.imported, context: member.context },
       ],
       assertCurrent: prepared.assertCurrent,
+      withVerifiedPublication: prepared.withVerifiedPublication,
       apply() {
         prepared.apply();
         return structuredClone(prepared.reportReceipt!);
@@ -453,6 +455,10 @@ export async function prepareNativeIntakeAcceptanceGroup(
         context: b.member.context,
       })),
       assertCurrent,
+      withVerifiedPublication<T>(complete: () => T): Promise<T> {
+        if (disposed) throw Error('Disposed approval preparation');
+        return withVerifiedClinicalProjectionPublication(db, projection, complete);
+      },
       apply() {
         if (disposed) throw Error('Disposed approval preparation');
         assertCurrent();

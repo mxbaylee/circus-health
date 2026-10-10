@@ -447,10 +447,16 @@ async function evidence(context: Context) {
     if (!member) return reject('This package occurrence is not in the retained inventory');
     const child = db
       .prepare(
-        "SELECT id FROM source_files WHERE sha256=? AND json_extract(details_json,'$.intake.parentSourceFileId')=? AND json_extract(details_json,'$.intake.locator')=?",
+        "SELECT id FROM source_files WHERE sha256=? AND json_extract(details_json,'$.intake.parentSourceFileId')=? AND (json_extract(details_json,'$.intake.locator')=? OR (json_extract(details_json,'$.intake.locator.format')=? AND json_extract(details_json,'$.intake.locator.field')='locator' AND json_extract(details_json,'$.intake.locator.scalarHash')=?))",
       )
-      .get(member.sourceHash, id, member.locator);
-    if (!child)
+      .get(
+        member.sourceHash,
+        id,
+        member.locator,
+        COMPACT_SCALAR_FORMAT,
+        locatorScalarHash(member.locator),
+      );
+    if (!child || !intakeFirstLocatorMatches(db, String(child.id), member.locator))
       return reject('Open and retain this exact package member before confirming its identity');
     evidenceId = String(child.id);
   } else if (file.mime_type === 'application/zip')
@@ -721,6 +727,13 @@ function rows() {
     },
     assertArtifacts() {
       artifacts?.assertCurrent();
+    },
+    withVerifiedTerminal<T>(
+      controls: { assertCurrent(): void; signal?: AbortSignal },
+      complete: () => T,
+    ): Promise<T> {
+      if (!artifacts) throw Error('Retained artifact proof is unavailable');
+      return artifacts.withVerifiedTerminal(controls, complete);
     },
     count,
     get,
@@ -2033,16 +2046,20 @@ export function getNativeIntakeIdentityReview(
             proof = rows();
             await runNativeIdentityWork(context, proof, verifyPreviewArtifactsWork(context, proof));
             const value = detachIdentityPreview(cached.value);
-            // The complete first-verified set is still current after encoding.
-            // This final sweep checks metadata only; it never rehashes payloads.
-            proof.assertArtifacts();
-            context.assertCurrent();
-            if (
-              cached.stamp === reviewReadStamp(db) &&
-              readKey === previewReadKey(db, root, profileId, id, groupId) &&
-              nativeIdentityPreviewCurrent(db, epoch)
-            )
-              return value;
+            const current = await proof.withVerifiedTerminal(
+              {
+                assertCurrent: () => {
+                  assertRunning();
+                  context.assertCurrent();
+                },
+                signal,
+              },
+              () =>
+                cached.stamp === reviewReadStamp(db) &&
+                readKey === previewReadKey(db, root, profileId, id, groupId) &&
+                nativeIdentityPreviewCurrent(db, epoch),
+            );
+            if (current) return value;
           } catch (error) {
             if (!signal?.aborted) clearNativeIdentityPreviews(db);
             throw error;
@@ -2063,6 +2080,7 @@ export function getNativeIntakeIdentityReview(
           id,
           groupId,
           assertRunning,
+          signal,
           (key, stamp) => {
             certificate = { key, stamp };
           },
@@ -2111,6 +2129,7 @@ async function getNativeIntakeIdentityReviewInner(
   id: string,
   groupId: string,
   assertRunning: () => void,
+  signal?: AbortSignal,
   certified?: (key: string, stamp: string) => void,
 ): Promise<IntakeIdentityReview> {
   let context: Context;
@@ -2302,13 +2321,24 @@ async function getNativeIntakeIdentityReviewInner(
         ...peoplePreview(db),
       };
       await runNativeIdentityWork(context, stored, verifyPreviewArtifactsWork(context, stored));
-      if (
-        constructionStamp !== undefined &&
-        constructionStamp === reviewReadStamp(db) &&
-        constructionKey === previewReadKey(db, root, profileId, id, groupId)
-      )
-        certified?.(constructionKey, constructionStamp);
-      return value;
+      return await stored.withVerifiedTerminal(
+        {
+          assertCurrent: () => {
+            assertRunning();
+            context.assertCurrent();
+          },
+          signal,
+        },
+        () => {
+          if (
+            constructionStamp !== undefined &&
+            constructionStamp === reviewReadStamp(db) &&
+            constructionKey === previewReadKey(db, root, profileId, id, groupId)
+          )
+            certified?.(constructionKey, constructionStamp);
+          return value;
+        },
+      );
     } catch (error) {
       if (error instanceof IntakeReviewFragmentRequired)
         return {
@@ -2979,3 +3009,6 @@ async function confirmNativeIntakeIdentityScopeInner(
     },
   );
 }
+import { intakeFirstLocatorMatches } from './intake-state-access.ts';
+import { COMPACT_SCALAR_FORMAT } from './intake-compact-scalar.ts';
+import { schemaKey as locatorScalarHash } from './intake-envelope-schema.ts';

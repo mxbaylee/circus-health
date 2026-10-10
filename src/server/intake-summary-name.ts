@@ -9,6 +9,7 @@ import {
   hasIntakeCollectionEnvelope,
   openIntakeCollectionEnvelope,
   selectedEnvelopeStore,
+  intakeEnvelopeMissingScalarFactsSteps,
 } from './intake-collection-envelope.ts';
 import type { IntakeFilename, IntakeSummaryPins } from '../shared/intake-summary.ts';
 import { parseIntakeFilenameFacts } from './intake-filename-facts.ts';
@@ -20,6 +21,9 @@ import {
   runExclusiveClinicalOperation,
 } from './clinical-operation.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
+import { intakeEnvelopeProjectionFormatHint, INTAKE_ENVELOPE_FORMAT } from './intake-authority.ts';
+import { prepareIntakeCompactMetadata } from './intake-compact-metadata.ts';
+import { setImmediate } from 'node:timers/promises';
 
 /** One cooperative compatibility preparation; all later reads remain point reads.
  * The selected map is shared, and only its bounded derivative entry is added. */
@@ -29,7 +33,8 @@ export async function prepareIntakeFilenameSummary(
   options: { assertRunning?: () => void } = {},
 ): Promise<{ changed: boolean }> {
   options.assertRunning?.();
-  if (intakeFilenameSummaryPrepared(db, source)) return { changed: false };
+  const compact = await prepareIntakeCompactMetadata(db, source, options);
+  if (!compact.changed && intakeFilenameSummaryPrepared(db, source)) return compact;
   return runExclusiveClinicalOperation(
     db,
     async (operation) => {
@@ -42,13 +47,6 @@ export async function prepareIntakeFilenameSummary(
       const view = openIntakeCollectionEnvelope(db, source);
       const intake = view.child(view.root(), 'intake');
       if (!intake) throw Error('The selected filename header is missing');
-      const selected = view.field(intake, 'originalName', { bytes: 16384 });
-      if (selected.kind !== 'fragmented' || !selected.bytes) return { changed: false };
-      const cell = intakeEnvelopeFilenameCell(view, intake);
-      if (cell.facts !== undefined) {
-        checkedFilenameFacts(view, intake);
-        return { changed: false };
-      }
       const { collections, source: expectedSource } = selectedEnvelopeStore(db, source);
       const logical = JSON.stringify(view.logical);
       const assertCurrent = () => {
@@ -88,7 +86,19 @@ export async function prepareIntakeFilenameSummary(
       const writer = createEnvelopeBuildWriter(db, source, build, view.logical.domainVersion, {
         assertRunning: assertCurrent,
       });
-      await writer.filenameFacts(cell.id);
+      const cells = intakeEnvelopeMissingScalarFactsSteps(db, source);
+      try {
+        for (;;) {
+          assertCurrent();
+          const next = cells.next();
+          assertCurrent();
+          if (next.done) break;
+          if (next.value !== undefined) await writer.filenameFacts(next.value);
+          else await setImmediate();
+        }
+      } finally {
+        cells.return(undefined);
+      }
       await writer.flush();
       const prepared = prepare([
         {
@@ -115,14 +125,30 @@ export async function prepareIntakeFilenameSummary(
 
 export function intakeFilenameSummaryPrepared(db: Database, source: IntakeEnvelopeSource): boolean {
   if (!hasIntakeCollectionEnvelope(db, source)) return true;
+  const actual = db
+    .prepare('SELECT details_json FROM main.source_files WHERE id=?')
+    .get(source.id)?.details_json;
+  const oldLarge =
+    typeof actual === 'string' &&
+    actual.length > 16384 &&
+    intakeEnvelopeProjectionFormatHint(actual) === INTAKE_ENVELOPE_FORMAT;
   const view = openIntakeCollectionEnvelope(db, source);
   const intake = view.child(view.root(), 'intake');
   if (!intake) throw Error('The selected filename header is missing');
-  const selected = view.field(intake, 'originalName', { bytes: 16384 });
-  if (selected.kind !== 'fragmented' || !selected.bytes) return true;
-  const cell = intakeEnvelopeFilenameCell(view, intake);
-  if (cell.facts === undefined) return false;
-  checkedFilenameFacts(view, intake);
+  for (const field of ['originalName', 'locator'] as const) {
+    const selected = view.field(intake, field, { bytes: 16384 });
+    if (selected.kind !== 'fragmented' || !selected.bytes) continue;
+    const cell = intakeEnvelopeFilenameCell(view, intake, field);
+    if (cell.facts === undefined) {
+      const fragment = view.fieldFragment(intake, field, { bytes: 4096 });
+      if (!fragment.text.trimStart().startsWith('"')) continue;
+      return false;
+    }
+    if (oldLarge) return false;
+    const facts = parseIntakeFilenameFacts(cell.facts);
+    if (facts.binding !== cell.binding || facts.bytes !== cell.bytes)
+      throw Error('The prepared metadata scalar is stale');
+  }
   return true;
 }
 

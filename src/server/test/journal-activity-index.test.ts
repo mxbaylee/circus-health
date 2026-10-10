@@ -21,8 +21,11 @@ import {
   readChatActivityHeader,
   iterateIntakeBatchActivity,
   journalActivityBinding,
+  prepareJournalActivityBinding,
+  iterateIntakeBatchActivityAsync,
 } from '../journal-activity-index.ts';
 import { journalJsonWork } from '../journal-json-index.ts';
+import { withManagedPhysicalMutation } from '../clinical-review-physical-epoch.ts';
 
 function fixture(t: test.TestContext) {
   const root = fs.mkdtempSync(join(tmpdir(), 'fictional-journal-activity-')),
@@ -78,6 +81,59 @@ function fixture(t: test.TestContext) {
     batchDirectory: join(profilePaths(root, profileId).root, 'intake-batches', batch.id, 'events'),
   };
 }
+
+test('async activity markers retain their exact baseline across managed writes and cancellation', async (t) => {
+  const f = fixture(t);
+  f.chat.messages = [];
+  for (let index = 0; index < 130; index++)
+    writeChat(f.root, f.profileId, { ...f.chat, id: randomUUID() }, 'initial');
+  await prepareJournalActivity(f.root, f.profileId);
+  t.after(() => clearJournalActivityIndex(f.root, f.profileId));
+  const expected = journalActivityBinding(f.root, f.profileId);
+  let turns = 0;
+  const turn = setImmediate(() => turns++);
+  const proof = await prepareJournalActivityBinding(f.root, f.profileId);
+  clearImmediate(turn);
+  assert.equal(proof.binding, expected);
+  assert.ok(turns > 0, 'complete physical marker verification yields the host');
+  proof.assertCurrent();
+  withManagedPhysicalMutation(() => {});
+  assert.throws(() => proof.assertCurrent(), { code: 'JOURNAL_ACTIVITY_NOT_PREPARED' });
+  const controller = new AbortController();
+  setImmediate(() => controller.abort());
+  await assert.rejects(
+    prepareJournalActivityBinding(f.root, f.profileId, { signal: controller.signal }),
+    { name: 'AbortError' },
+  );
+  assert.equal(journalActivityBinding(f.root, f.profileId), expected);
+  setImmediate(() => withManagedPhysicalMutation(() => {}));
+  await assert.rejects(prepareJournalActivityBinding(f.root, f.profileId), {
+    code: 'JOURNAL_ACTIVITY_NOT_PREPARED',
+  });
+});
+
+test('async activity enumeration yields for empty batches before any visible item', async (t) => {
+  const f = fixture(t);
+  for (let index = 0; index < 130; index++)
+    writeIntakeBatch(
+      f.root,
+      f.profileId,
+      trackIntakeBatch({ ...f.batch, id: randomUUID(), items: [] }),
+      'initial',
+    );
+  await prepareJournalActivity(f.root, f.profileId);
+  t.after(() => clearJournalActivityIndex(f.root, f.profileId));
+  let stopped = false;
+  setImmediate(() => {
+    stopped = true;
+  });
+  await assert.rejects(async () => {
+    for await (const _item of iterateIntakeBatchActivityAsync(f.root, f.profileId, () => {
+      if (stopped) throw Error('fictional stop');
+    }))
+      assert.fail('empty batches never invent activity');
+  }, /fictional stop/);
+});
 
 for (const kind of ['journals', 'events'] as const)
   test(`activity enumeration cooperates for ignored and empty ${kind} before cancellation`, async (t) => {

@@ -1,4 +1,16 @@
-import { existsSync, readFileSync, readdirSync, lstatSync, mkdirSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  lstatSync,
+  mkdirSync as rawMkdirSync,
+  rmSync as rawRmSync,
+} from 'node:fs';
+import { withManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
+
+const mkdirSync: typeof rawMkdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawMkdirSync(...args));
+const rmSync: typeof rawRmSync = (...args) => withManagedPhysicalMutation(() => rawRmSync(...args));
 import { resolve } from 'node:path';
 import { validProfileId, profileDefinition } from './profiles.ts';
 import { durableWrite, syncDirectory, publishedPersonalHeaders } from './portable.ts';

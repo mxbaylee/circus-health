@@ -19,6 +19,7 @@ import {
   intakeEnvelopeAuthorityBinding,
   readIntakeEnvelopeMaterialized,
   intakeEnvelopeProjection,
+  intakeEnvelopeProjectionFormatHint,
   INTAKE_ENVELOPE_FORMAT,
   INTAKE_COMPACT_ENVELOPE_FORMAT,
   type IntakeEnvelopeProjectionFormat,
@@ -222,6 +223,52 @@ export function intakeEnvelopeFilenameCell(
   field: IntakeCompactScalarField = 'originalName',
 ) {
   return filenameCells.get(reader)?.(record, field) ?? fail('foreign filename reader');
+}
+/** All exact raw occurrences participate, not only JSON's last-member view. */
+export function* intakeEnvelopeMissingScalarFactsSteps(
+  db: Database,
+  source: IntakeEnvelopeSource,
+): Generator<string | void> {
+  const { store, collections } = collectionCellReader(db, source);
+  const control = parseSchemaControl(
+    collections.get(collections.openView(), 'logical', 'envelope.control', 'representation'),
+  );
+  let work = 0;
+  for (const rootEntry of orderEntries(store, control.root)) {
+    if (++work % 64 === 0) yield;
+    if (rootEntry.name === undefined) continue;
+    if (
+      (yield* hashIntakeJsonScalarSteps(cellChunks(store, 'n:' + rootEntry.name))).hash !==
+      schemaKey('intake')
+    )
+      continue;
+    if (rootEntry.target.type !== 'record' || header(store, rootEntry.target.id).shape !== 'object')
+      continue;
+    for (const entry of orderEntries(store, rootEntry.target.id)) {
+      if (++work % 64 === 0) yield;
+      if (entry.name === undefined || entry.target.type !== 'cell') continue;
+      const name = (yield* hashIntakeJsonScalarSteps(cellChunks(store, 'n:' + entry.name))).hash;
+      if (name !== schemaKey('originalName') && name !== schemaKey('locator')) continue;
+      const cell = store.get('c:' + entry.target.id);
+      if (!cell || typeof cell === 'string' || cell.bytes <= COMPACT_SCALAR_BYTES) continue;
+      const pieces = cellChunks(store, 'c:' + entry.target.id);
+      let stringCell: boolean;
+      try {
+        stringCell = pieces.next().value?.trimStart().startsWith('"') ?? false;
+      } finally {
+        pieces.return(undefined);
+      }
+      if (!stringCell) continue;
+      const raw = store.get('q:' + entry.target.id);
+      if (raw === undefined) yield entry.target.id;
+      else {
+        if (typeof raw !== 'string' || !store.byteBinding) fail('scalar facts representation');
+        const facts = parseIntakeFilenameFacts(raw as string);
+        if (facts.bytes !== cell.bytes || facts.binding !== store.byteBinding!(cell))
+          fail('scalar facts binding');
+      }
+    }
+  }
 }
 /** Exact compact source projection, including raw known-key duplicates and spelling.
  * The caller supplies a bounded metadata budget and publishes the source row in
@@ -979,10 +1026,8 @@ export function collectionCellReader(
   const check = () => {
     if (attempts && !db.isTransaction) {
       const equality = readIntakeFrontierSourceEquality(db, attempts);
-      const current = collections.openView(),
-        logical = collections.binding(current)?.logical;
       if (equality) {
-        if (JSON.stringify(logical) !== binding.logicalHead) fail('stale logical envelope');
+        const current = collections.openView(binding.logicalHead);
         view = current;
         return;
       }
@@ -1072,10 +1117,10 @@ export function openIntakeCollectionEnvelope(
           : fail('semantic index target');
     },
     options.fieldSelection ?? 'last',
-    intakeEnvelopeProjection(
+    intakeEnvelopeProjectionFormatHint(
       db.prepare('SELECT details_json FROM main.source_files WHERE id=?').get(source.id)
         ?.details_json,
-    ).format,
+    ),
   );
 }
 export function* iterateIntakeEnvelopeText(
@@ -1393,12 +1438,22 @@ export function* projectSchemaCompactMetadataSteps(
       if (!field) continue;
       let text: string;
       const cell = entry.target.type === 'cell' ? store.get('c:' + entry.target.id) : undefined;
+      let stringCell = false;
+      if (cell && typeof cell !== 'string') {
+        const pieces = cellChunks(store, 'c:' + entry.target.id);
+        try {
+          stringCell = pieces.next().value?.trimStart().startsWith('"') ?? false;
+        } finally {
+          pieces.return(undefined);
+        }
+      }
       if (
         format !== INTAKE_ENVELOPE_FORMAT &&
         ['originalName', 'locator'].includes(field) &&
         cell &&
         typeof cell !== 'string' &&
-        cell.bytes > COMPACT_SCALAR_BYTES
+        cell.bytes > COMPACT_SCALAR_BYTES &&
+        stringCell
       ) {
         if (!store.byteBinding) fail('compact scalar requires checked evidence');
         const raw = store.get('q:' + entry.target.id);

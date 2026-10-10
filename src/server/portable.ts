@@ -22,25 +22,40 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   openSync,
   opendirSync,
-  chmodSync,
+  chmodSync as rawChmodSync,
   closeSync,
   fsyncSync,
   writeFileSync,
   writeSync,
   readFileSync,
-  mkdirSync,
-  renameSync,
+  mkdirSync as rawMkdirSync,
+  renameSync as rawRenameSync,
   existsSync,
-  copyFileSync,
+  copyFileSync as rawCopyFileSync,
   readdirSync,
-  rmSync,
-  rmdirSync,
+  rmSync as rawRmSync,
+  rmdirSync as rawRmdirSync,
   realpathSync,
-  unlinkSync,
+  unlinkSync as rawUnlinkSync,
   statSync,
   lstatSync,
   readSync,
 } from 'node:fs';
+import { withManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
+
+const chmodSync: typeof rawChmodSync = (...args) =>
+  withManagedPhysicalMutation(() => rawChmodSync(...args));
+const mkdirSync: typeof rawMkdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawMkdirSync(...args));
+const renameSync: typeof rawRenameSync = (...args) =>
+  withManagedPhysicalMutation(() => rawRenameSync(...args));
+const copyFileSync: typeof rawCopyFileSync = (...args) =>
+  withManagedPhysicalMutation(() => rawCopyFileSync(...args));
+const rmSync: typeof rawRmSync = (...args) => withManagedPhysicalMutation(() => rawRmSync(...args));
+const rmdirSync: typeof rawRmdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawRmdirSync(...args));
+const unlinkSync: typeof rawUnlinkSync = (...args) =>
+  withManagedPhysicalMutation(() => rawUnlinkSync(...args));
 import { resolve, dirname, relative, isAbsolute } from 'node:path';
 import {
   openDatabase,

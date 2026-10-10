@@ -4,17 +4,19 @@ import {
   existsSync,
   fstatSync,
   fsyncSync,
-  linkSync,
-  mkdirSync,
-  openSync,
   opendirSync,
   readSync,
   realpathSync,
-  renameSync,
   statSync,
-  unlinkSync,
-  writeFileSync,
 } from 'node:fs';
+import {
+  mkdirSync,
+  openSync,
+  writeFileSync,
+  linkSync,
+  unlinkSync,
+  renameSync,
+} from './journal-physical-write.ts';
 import { dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { HttpError } from './database.ts';

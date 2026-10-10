@@ -1,15 +1,20 @@
 import { randomUUID, createHash } from 'node:crypto';
 import {
   existsSync,
-  mkdirSync,
+  mkdirSync as rawMkdirSync,
   readdirSync,
   lstatSync,
   statSync,
-  rmSync,
+  rmSync as rawRmSync,
   openSync,
   closeSync,
   readSync,
 } from 'node:fs';
+import { withManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
+
+const mkdirSync: typeof rawMkdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawMkdirSync(...args));
+const rmSync: typeof rawRmSync = (...args) => withManagedPhysicalMutation(() => rawRmSync(...args));
 import { resolve, relative } from 'node:path';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { recentPerformanceLimits } from './import-performance.ts';

@@ -4,6 +4,7 @@ import {
   runExclusiveClinicalOperation,
 } from './clinical-operation.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import { captureManagedPhysicalEpoch } from './clinical-review-physical-epoch.ts';
 import {
   collectionClinicalProjectionContext,
   type VerifiedClinicalArtifact,
@@ -13,8 +14,15 @@ import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 /** Complete native report summaries. Pages never become a clinical decision scope. */
 import { createHash, randomUUID } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 import type { DatabaseSync } from 'node:sqlite';
-import { HttpError, clinicalReviewRevision, revision, observeDatabaseClose } from './database.ts';
+import {
+  HttpError,
+  clinicalReviewRevision,
+  managedDatabaseMethodEpoch,
+  revision,
+  observeDatabaseClose,
+} from './database.ts';
 import {
   identityGroundingGeneration,
   identityGroundingSourceStamp,
@@ -215,6 +223,72 @@ export function* collectionQueueSources(
     yield source;
   }
 }
+/** Complete visible source traversal with no native cursor held across a host turn. */
+export async function* collectionQueueSourcesAsync(
+  db: DatabaseSync,
+  profileId: string,
+  assertRunning?: () => void,
+): AsyncGenerator<IntakeEnvelopeSource> {
+  if (db.isTransaction) {
+    for (const source of collectionQueueSources(db, profileId)) {
+      assertRunning?.();
+      yield source;
+    }
+    return;
+  }
+  const stamp = reviewReadStamp(db),
+    methodEpoch = managedDatabaseMethodEpoch(db),
+    physicalEpoch = captureManagedPhysicalEpoch();
+  if (!stamp || !methodEpoch || !physicalEpoch) throw changed();
+  const assertWitness = () => {
+    assertRunning?.();
+    if (
+      reviewReadStamp(db) !== stamp ||
+      managedDatabaseMethodEpoch(db) !== methodEpoch ||
+      captureManagedPhysicalEpoch() !== physicalEpoch
+    )
+      throw changed();
+    assertIntakeOwner(db, profileId);
+  };
+  const visible = visibilityCondition(
+    new URLSearchParams({ visibility: 'visible' }),
+    visibilitySQL("'source_file'", 'f.id'),
+  );
+  let lastId: string | undefined;
+  for (;;) {
+    assertWitness();
+    const pageStamp = reviewReadStamp(db);
+    if (!pageStamp) throw changed();
+    const rows = db
+      .prepare(
+        "SELECT f.id,f.sha256,f.kind,f.details_json FROM source_files f WHERE f.kind='intake_original' AND " +
+          visible +
+          (lastId === undefined ? '' : ' AND f.id>?') +
+          ' ORDER BY f.id LIMIT 64',
+      )
+      .all(...(lastId === undefined ? [] : [lastId])) as unknown as IntakeEnvelopeSource[];
+    assertWitness();
+    if (reviewReadStamp(db) !== pageStamp) throw changed();
+    for (const source of rows) {
+      assertWitness();
+      if (!hasIntakeCollectionEnvelope(db, source))
+        throw new HttpError(
+          409,
+          'INTAKE_REVIEW_PENDING_MIGRATION',
+          'Prepare retained intakes before opening the native report queue',
+        );
+      yield source;
+      assertWitness();
+    }
+    if (rows.length < 64) return;
+    lastId = rows[rows.length - 1]!.id;
+    const turnStamp = reviewReadStamp(db);
+    if (!turnStamp) throw changed();
+    await setImmediate();
+    assertWitness();
+    if (reviewReadStamp(db) !== turnStamp) throw changed();
+  }
+}
 type QueueCache = {
   db: DatabaseSync;
   root: string;
@@ -261,7 +335,7 @@ function reserveQueueSlot() {
     closeQueueCache(oldest);
   }
 }
-function collectionQueueBinding(db: DatabaseSync, profileId: string) {
+function newCollectionQueueBindingHash(db: DatabaseSync, profileId: string) {
   const hash = createHash('sha256');
   withIntakeWork(db, 'warm', () => recordIntakeWork('hashCalls'));
   const update = (input: string) => {
@@ -270,9 +344,52 @@ function collectionQueueBinding(db: DatabaseSync, profileId: string) {
     withIntakeWork(db, 'warm', () => recordIntakeWork('hashedBytes', Buffer.byteLength(input)));
   };
   update(canonicalLiteral([profileId, clinicalReviewRevision(db), intakeClinicalCachePin(db)]));
-  for (const source of collectionQueueSources(db, profileId))
-    update(canonicalLiteral([source.id, intakeSourceVersion(db, source.id)]));
+  return { hash, update };
+}
+function collectionQueueBindingSync(
+  db: DatabaseSync,
+  profileId: string,
+  retain?: (source: IntakeEnvelopeSource, pin: string) => void,
+) {
+  const { hash, update } = newCollectionQueueBindingHash(db, profileId);
+  for (const source of collectionQueueSources(db, profileId)) {
+    const version = intakeSourceVersion(db, source.id),
+      pin = canonicalLiteral(version);
+    update(canonicalLiteral([source.id, version]));
+    retain?.(source, pin);
+  }
   return hash.digest('hex');
+}
+interface CollectionQueueBindingWitness {
+  binding: string;
+  stamp: string;
+  methodEpoch: object;
+  physicalEpoch: object;
+}
+async function collectionQueueBinding(
+  db: DatabaseSync,
+  profileId: string,
+  retain?: (source: IntakeEnvelopeSource, pin: string) => void,
+): Promise<CollectionQueueBindingWitness | undefined> {
+  if (db.isTransaction) return undefined;
+  const stamp = reviewReadStamp(db),
+    methodEpoch = managedDatabaseMethodEpoch(db),
+    physicalEpoch = captureManagedPhysicalEpoch();
+  if (!stamp || !methodEpoch || !physicalEpoch) throw changed();
+  const { hash, update } = newCollectionQueueBindingHash(db, profileId);
+  for await (const source of collectionQueueSourcesAsync(db, profileId)) {
+    const version = intakeSourceVersion(db, source.id),
+      pin = canonicalLiteral(version);
+    update(canonicalLiteral([source.id, version]));
+    retain?.(source, pin);
+  }
+  if (
+    reviewReadStamp(db) !== stamp ||
+    managedDatabaseMethodEpoch(db) !== methodEpoch ||
+    captureManagedPhysicalEpoch() !== physicalEpoch
+  )
+    throw changed();
+  return { binding: hash.digest('hex'), stamp, methodEpoch, physicalEpoch };
 }
 /** Internal complete-policy access; records/providers stay local to the pinned consumer. */
 export interface RetainedCollectionClinicalPolicy {
@@ -376,7 +493,8 @@ async function openCollectionReportQueueNow(db: DatabaseSync, root: string, prof
     observedQueues.add(db);
   }
   if (db.isTransaction) clearCollectionQueueReviews(db);
-  const binding = collectionQueueBinding(db, profileId),
+  const openWitness = await collectionQueueBinding(db, profileId),
+    binding = openWitness?.binding ?? collectionQueueBindingSync(db, profileId),
     epoch = queueEpochs.get(db) || 0;
   let cache = [...queueCaches].find(
     (cache) =>
@@ -386,6 +504,7 @@ async function openCollectionReportQueueNow(db: DatabaseSync, root: string, prof
       cache.binding === binding &&
       !cache.closed,
   );
+  if (cache && openWitness) cache.queue.certifyBinding(openWitness);
   if (!cache) {
     const prior = [...queueCaches].find(
       (value) =>
@@ -546,7 +665,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     String(member.memberOrder).padStart(12, '0') +
     ':' +
     JSON.stringify([member.candidateId, member.candidateVersionId]);
-  const bindingNow = () => collectionQueueBinding(db, profileId);
+  const bindingNow = () => collectionQueueBindingSync(db, profileId);
   let grounding = identityGroundingGeneration(db),
     groundingEpoch = 0;
   cache.exec(
@@ -595,6 +714,9 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
   cache.exec(
     'CREATE TABLE memberFacts(intake TEXT,groupOrdinal INTEGER,candidate TEXT,version TEXT,value TEXT,grounding INTEGER,PRIMARY KEY(intake,groupOrdinal,candidate,version));CREATE TABLE dates(intake TEXT,groupOrdinal INTEGER,date TEXT,count INTEGER,PRIMARY KEY(intake,groupOrdinal,date))',
   );
+  cache.exec(
+    'CREATE TABLE stagedSources(id TEXT PRIMARY KEY,sha256 TEXT,kind TEXT,details_json TEXT,pin TEXT)',
+  );
   const putFacts = (intakeId: string, member: CollectionReportQueueMember, facts: MemberFacts) => {
     const prior = cache
       .prepare(
@@ -628,18 +750,96 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     return prior?.grounding === currentGroundingEpoch(intakeId) ? old : undefined;
   };
   let binding = '',
+    bindingWitness: CollectionQueueBindingWitness | undefined,
     clinicalRevision = '';
   const refresh = async () => {
-    const expected = bindingNow(),
+    cache.exec('DELETE FROM stagedSources');
+    const retainSource = (source: IntakeEnvelopeSource, pin: string) => {
+      cache
+        .prepare('INSERT INTO stagedSources VALUES(?,?,?,?,?)')
+        .run(
+          source.id,
+          source.sha256 ?? null,
+          source.kind ?? null,
+          source.details_json ?? null,
+          pin,
+        );
+    };
+    const initial = db.isTransaction
+        ? undefined
+        : await collectionQueueBinding(db, profileId, retainSource),
+      expected = initial?.binding ?? collectionQueueBindingSync(db, profileId, retainSource),
       currentRevision = intakeClinicalCachePin(db),
       removedSources: string[] = [];
+    const expectedPreparation = reviewPreparationStamp(db),
+      expectedMethodEpoch = managedDatabaseMethodEpoch(db),
+      expectedPhysicalEpoch = captureManagedPhysicalEpoch();
+    if (!expectedMethodEpoch || !expectedPhysicalEpoch) throw changed();
+    const assertRefresh = () => {
+      assertIntakeOwner(db, profileId);
+      if (
+        managedDatabaseMethodEpoch(db) !== expectedMethodEpoch ||
+        captureManagedPhysicalEpoch() !== expectedPhysicalEpoch ||
+        (!db.isTransaction &&
+          (!expectedPreparation || reviewPreparationStamp(db) !== expectedPreparation))
+      )
+        throw changed();
+    };
+    const assertStagedSource = (source: IntakeEnvelopeSource, pin: string) => {
+      assertRefresh();
+      const current = db
+        .prepare('SELECT id,sha256,kind,details_json FROM source_files WHERE id=?')
+        .get(source.id);
+      if (
+        !current ||
+        current.sha256 !== (source.sha256 ?? null) ||
+        current.kind !== (source.kind ?? null) ||
+        current.details_json !== (source.details_json ?? null) ||
+        canonicalLiteral(intakeSourceVersion(db, source.id)) !== pin
+      )
+        throw changed();
+    };
+    const stagedSources = async function* (dirtyOnly = false): AsyncGenerator<{
+      source: IntakeEnvelopeSource;
+      pin: string;
+    }> {
+      let lastId: string | undefined;
+      for (;;) {
+        assertRefresh();
+        const rows = cache
+          .prepare(
+            'SELECT t.id,t.sha256,t.kind,t.details_json,t.pin FROM stagedSources t' +
+              (dirtyOnly ? ' JOIN sources s ON s.id=t.id AND s.dirty=1' : '') +
+              (lastId === undefined ? '' : ' WHERE t.id>?') +
+              ' ORDER BY t.id LIMIT 64',
+          )
+          .all(...(lastId === undefined ? [] : [lastId]));
+        for (const row of rows) {
+          assertRefresh();
+          const source = {
+              id: String(row.id),
+              sha256: row.sha256 === null ? undefined : String(row.sha256),
+              kind: row.kind === null ? undefined : String(row.kind),
+              details_json: row.details_json === null ? null : String(row.details_json),
+            },
+            pin = String(row.pin);
+          yield { source, pin };
+          assertStagedSource(source, pin);
+        }
+        if (rows.length < 64) return;
+        lastId = String(rows[rows.length - 1]!.id);
+        assertRefresh();
+        await setImmediate();
+        assertRefresh();
+      }
+    };
     const proofScratch = disposableSqlite('circus-queue-refresh-proof-');
     const artifacts = createClinicalReviewArtifactProof(proofScratch.db, 'clinical_artifacts');
     cache.exec('BEGIN;UPDATE sources SET seen=0,dirty=0;DELETE FROM visibilityDirty');
     try {
-      for (const source of collectionQueueSources(db, profileId)) {
-        const pin = canonicalLiteral(intakeSourceVersion(db, source.id)),
-          prior = cache.prepare('SELECT pin FROM sources WHERE id=?').get(source.id);
+      for await (const { source, pin } of stagedSources()) {
+        assertStagedSource(source, pin);
+        const prior = cache.prepare('SELECT pin FROM sources WHERE id=?').get(source.id);
         cache
           .prepare('INSERT INTO sources VALUES(?,?,1,0) ON CONFLICT(id) DO UPDATE SET seen=1')
           .run(source.id, pin);
@@ -1028,9 +1228,8 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       }
       cache.exec('DELETE FROM sources WHERE seen=0');
       // Report acceptance receipts can cover other intake blocks. Preserve every retained receipt occurrence.
-      for (const source of collectionQueueSources(db, profileId)) {
-        if (cache.prepare('SELECT dirty FROM sources WHERE id=?').get(source.id)?.dirty !== 1)
-          continue;
+      for await (const { source, pin } of stagedSources(true)) {
+        assertStagedSource(source, pin);
         const view = openIntakeCollectionEnvelope(db, source),
           intake = view.child(view.root(), 'intake')!,
           flow = view.child(intake, 'workflow');
@@ -1135,10 +1334,14 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         cache.prepare(insertVisibility + ' AND g.groupOrdinal=?').run(intakeId, ordinal);
         changeVisibilityTotals(old, visibilityCounts(intakeId, ordinal));
       }
-      if (bindingNow() !== expected) throw changed();
+      assertRefresh();
+      const terminal = await collectionQueueBinding(db, profileId);
+      assertRefresh();
+      if ((terminal?.binding ?? bindingNow()) !== expected) throw changed();
       artifacts.assertCurrent();
       cache.exec('COMMIT');
       binding = expected;
+      bindingWitness = terminal;
       clinicalRevision = currentRevision;
     } catch (error) {
       cache.exec('ROLLBACK');
@@ -1155,7 +1358,28 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
   }
   let closed = false;
   const assertCurrent = () => {
-    if (closed || bindingNow() !== binding) throw changed();
+    if (closed) throw changed();
+    if (db.isTransaction) {
+      if (bindingNow() !== binding) throw changed();
+      return;
+    }
+    if (
+      !bindingWitness ||
+      reviewReadStamp(db) !== bindingWitness.stamp ||
+      managedDatabaseMethodEpoch(db) !== bindingWitness.methodEpoch ||
+      captureManagedPhysicalEpoch() !== bindingWitness.physicalEpoch
+    )
+      throw changed();
+  };
+  const prepareCurrent = async () => {
+    if (closed) throw changed();
+    const current = await collectionQueueBinding(db, profileId);
+    if (current) {
+      if (current.binding !== binding) throw changed();
+      bindingWitness = current;
+    } else if (bindingNow() !== binding) {
+      throw changed();
+    }
   };
   const groupPointer = (row: { [key: string]: unknown }) => ({
     intakeId: String(row.intake),
@@ -1197,6 +1421,11 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     get clinicalRevision() {
       return clinicalRevision;
     },
+    certifyBinding(witness: CollectionQueueBindingWitness) {
+      if (closed || witness.binding !== binding) throw changed();
+      bindingWitness = witness;
+    },
+    prepareCurrent,
     refresh,
     groundingStamp: currentGroundingEpoch,
     *sources() {
@@ -1299,13 +1528,20 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       // leases and transactions cannot seed a session for a later window.
       let retained = false;
       try {
-        retained = !!(
+        if (
           success &&
           reviewCertificate &&
           reviewCertificate.stamp === reviewReadStamp(db) &&
           reviewCertificate.requestRevision === revision(db) &&
-          reviewCertificate.queueBinding === bindingNow()
-        );
+          reviewCertificate.queueBinding === binding
+        ) {
+          try {
+            assertCurrent();
+            retained = true;
+          } catch {
+            retained = false;
+          }
+        }
       } finally {
         if (!retained) {
           // Closing another lease cannot invalidate the session being prepared by
@@ -1740,6 +1976,7 @@ export async function collectionReportGroupSummary(
             scope.close();
           }
         }
+        if (sourceReview) await queue.prepareCurrent();
         for (const member of queue.members(intakeId, pointer.ordinal)) {
           if (member.state === 'kept_original') tally.keptOriginal++;
           else tally[member.state]++;

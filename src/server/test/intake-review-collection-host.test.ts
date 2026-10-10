@@ -741,7 +741,7 @@ test('native report clinical pages preserve legacy records and reject stale poli
       oracle.group.sourceCoverage.saved.bySource,
     );
     assert.equal(summary.sourceCoverage.current.total, oracle.group.sourceCoverage.current.total);
-    const activity = readCollectionQueueActivity(db, root, profileId, nativeQueue);
+    const activity = await readCollectionQueueActivity(db, root, profileId, nativeQueue);
     for (const key of [
       'runningFiles',
       'pausedFiles',

@@ -665,27 +665,32 @@ export async function readCollectionIntakeReportRecords(
             { db, root, profileId, id: intakeId, assertRunning: () => queue?.assertCurrent() },
             async ({ assertRunning }) => consumeMembers(assertRunning),
           );
-        artifacts.assertCurrent();
-        const current = intakeSourceVersion(db, intakeId);
-        queue?.assertCurrent();
-        if (
-          current.logicalBinding !== binding.logicalBinding ||
-          current.version !== binding.version ||
-          clinicalReviewRevision(db) !== policy
-        )
-          throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
-        return {
-          format: 'health-intake-report-record-page-v2',
-          scope: 'clinical_records',
-          intakeId,
-          version: binding.version,
-          view,
-          records,
-          totalRecords,
-          nextCursor: remaining
-            ? Buffer.from(JSON.stringify([query, last])).toString('base64url')
-            : null,
-        };
+        return await artifacts.withVerifiedTerminal(
+          {
+            assertCurrent: () => {
+              const current = intakeSourceVersion(db, intakeId);
+              queue?.assertCurrent();
+              if (
+                current.logicalBinding !== binding.logicalBinding ||
+                current.version !== binding.version ||
+                clinicalReviewRevision(db) !== policy
+              )
+                throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report queue');
+            },
+          },
+          () => ({
+            format: 'health-intake-report-record-page-v2',
+            scope: 'clinical_records',
+            intakeId,
+            version: binding.version,
+            view,
+            records,
+            totalRecords,
+            nextCursor: remaining
+              ? Buffer.from(JSON.stringify([query, last])).toString('base64url')
+              : null,
+          }),
+        );
       } finally {
         if (cached?.status === 'ready') cached.session.close();
         physical.close();

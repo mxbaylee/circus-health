@@ -1000,11 +1000,22 @@ export function createIntakeCollections(owner: {
         return owner.legacyMaterialization(event.previous.head);
       });
     },
-    openView(): IntakeCollectionView {
-      return runRead(() => {
+    openView(expectedLogical?: string): IntakeCollectionView {
+      if (
+        expectedLogical !== undefined &&
+        (typeof expectedLogical !== 'string' || Buffer.byteLength(expectedLogical) > HEAD_BYTES)
+      )
+        invalid('logical view binding');
+      return runRead((_readTree, certificate) => {
         const view = Object.freeze({}) as IntakeCollectionView,
           registry = registryFor(db);
-        registry.views.set(view, selected());
+        const current = selected(expectedLogical === undefined ? undefined : certificate);
+        if (
+          expectedLogical !== undefined &&
+          JSON.stringify(current.head?.logical) !== expectedLogical
+        )
+          invalid('stale logical envelope');
+        registry.views.set(view, current);
         // A live reader owns this opaque view until it lets go. Weak keys avoid
         // retaining discarded handles without evicting another active reader.
         return view;

@@ -4,7 +4,13 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDatabase, transaction, HttpError } from '../database.ts';
+import {
+  openDatabase,
+  transaction,
+  HttpError,
+  observeTransactionBeforePublication,
+} from '../database.ts';
+import { withManagedPhysicalMutation } from '../clinical-review-physical-epoch.ts';
 import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
 import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state-storage.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
@@ -299,7 +305,7 @@ test('native acceptance preserves saved-answer and identity/source blockers', ()
   );
 });
 
-for (const extra of ['none', 'write', 'restored', 'changed-source'] as const) {
+for (const extra of ['none', 'write', 'restored', 'changed-source', 'late-physical'] as const) {
   test(`native acceptance composes actual clinical SQL and certifies only its owned writes: ${extra}`, async (t) => {
     const { ensureProfileDirectories } = await import('../profile-storage.ts'),
       { attachPersonalDurability } = await import('../portable.ts'),
@@ -466,6 +472,35 @@ for (const extra of ['none', 'write', 'restored', 'changed-source'] as const) {
     }
     prepared = await prepareNativeIntakeAcceptance(db, root, profileId, input);
     if (!prepared.prepared) throw Error('Unexpected replay after rollback');
+    if (extra === 'late-physical') {
+      const stop = observeTransactionBeforePublication(db, () =>
+        withManagedPhysicalMutation(() =>
+          writeFileSync(
+            profileOriginal(root, String(original.path), profileId),
+            'Fictional replacement during publication',
+          ),
+        ),
+      );
+      try {
+        await assert.rejects(
+          prepared.withVerifiedPublication(() =>
+            transaction(
+              db,
+              () => {
+                prepared.apply!();
+                return prepared.reportReceipt;
+              },
+              { operationId: input.operationId, fingerprint: input.fingerprint },
+            ),
+          ),
+          { code: 'SOURCE_CHANGED' },
+        );
+      } finally {
+        stop();
+      }
+      assert.equal(db.prepare('SELECT count(*) AS n FROM documents').get()!.n, 0);
+      return;
+    }
     transaction(
       db,
       () => {
