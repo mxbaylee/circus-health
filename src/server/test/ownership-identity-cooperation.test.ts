@@ -109,11 +109,11 @@ test('native ownership identity preparation yields during complete referenced is
       assert.ok(firstInspected <= 16, `first turn followed ${firstInspected} issue reads`);
     assert.equal(pointReads, count);
     assert.equal(iteratorReads, 0);
-    assert.deepEqual(
-      readOwnershipSourceSnapshot(db, plan.forSource(source.id, record.id).snapshot)
-        .sourceRecordIds,
-      [...new Set(expected)],
-    );
+    const issues = plan.forSource(source.id, record.id);
+    assert.ok(!Array.isArray(issues));
+    assert.deepEqual(readOwnershipSourceSnapshot(db, issues.snapshot).sourceRecordIds, [
+      ...new Set(expected),
+    ]);
     plan.assertCurrent();
   }
 });

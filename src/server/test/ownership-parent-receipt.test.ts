@@ -1,12 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, revision, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
-import { attachPersonalDurability } from '../portable.ts';
 import { uploadIntake, reviewIntake, importIntake } from '../intake.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import {
@@ -24,44 +23,76 @@ import { ownershipHash, appendOwnershipDecision } from '../ownership-journal.ts'
 import { retainOwnershipPlan, childOwnershipOperation } from '../ownership-groups.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import {
+  contributorAuthorityPath,
+  contributorOriginalVerifier,
+  openContributorRecordStorage,
+} from '../contributor-record-storage.ts';
+import { intakeFileIdentity } from '../intake-files.ts';
+import {
   prepareOwnershipDecisionIndex,
   ownershipDecisionIndexWork,
   ownershipReceiptIndexWork,
 } from '../ownership-decision-index.ts';
-import {
-  attachRecordDurability,
-  rebuildRecordDatabase,
-  type RecordStorage,
-} from '../record-versions.ts';
+import { attachRecordDurability, rebuildRecordDatabase } from '../record-versions.ts';
 import type { OwnershipOutcomeEvidenceItem } from '../../shared/ownership-report-reference.ts';
 import type { HealthRecordEnvelope } from '../../shared/intake.ts';
 import type { IncomingMessage } from 'node:http';
 import { handleRecordOwnershipRoute } from '../record-ownership-routes.ts';
 
 for (const partial of [false, true])
-  test(`native independent group receipts page exact outcomes and replay after recovery (partial=${partial})`, async (t) => {
+  test(`native independent group receipts preserve exact outcomes through second-child preparation failure and recovery (partial=${partial})`, async (t) => {
     const root = mkdtempSync(join(tmpdir(), 'fictional-native-parent-receipt-')),
       profileId = 'fictional-parent',
       db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId),
-      objects = new Map<string, Buffer>();
-    const storage: RecordStorage = {
-      read(name) {
-        const bytes = objects.get(name);
-        return bytes ? Buffer.from(bytes) : null;
+      storage = openContributorRecordStorage(root, profileId, { initialize: true }),
+      authorityPath = contributorAuthorityPath(root, profileId),
+      headPath = join(authorityPath, 'head'),
+      verifyOriginals = contributorOriginalVerifier(root, profileId);
+    const selectedHead = () =>
+      db.prepare('SELECT head_json,sequence FROM __record_state WHERE singleton=1').get();
+    const immutableObjects = () =>
+      readdirSync(join(authorityPath, 'objects'))
+        .sort()
+        .map((name) => [name, intakeFileIdentity(join(authorityPath, 'objects', name))]);
+    let armed = false,
+      clinicalPreparations = 0,
+      refusedHead: Buffer | undefined,
+      refusedHeadIdentity: string | undefined,
+      refusedSelection: ReturnType<typeof selectedHead>;
+    const children = new Set<string>();
+    attachRecordDurability(db, {
+      profileId,
+      storage,
+      verifyReferences(versions) {
+        verifyOriginals(versions);
+        if (!armed) return;
+        for (const version of versions) {
+          if (
+            version.entity !== 'manual_batches' ||
+            version.deleted ||
+            version.contents.title !== 'Record ownership correction'
+          )
+            continue;
+          const coverage = JSON.parse(String(version.contents.coverage_json)),
+            childOperationId = coverage.receipt?.operationId;
+          assert.equal(typeof childOperationId, 'string');
+          assert.equal(childOperationId, version.operationId);
+          if (children.has(childOperationId)) continue;
+          children.add(childOperationId);
+          clinicalPreparations++;
+          if (partial && clinicalPreparations === 2) {
+            refusedHead = readFileSync(headPath);
+            refusedHeadIdentity = intakeFileIdentity(headPath);
+            refusedSelection = selectedHead();
+            throw Error('Fictional second clinical child preparation failure');
+          }
+        }
       },
-      writeImmutable(name, bytes) {
-        const prior = objects.get(name);
-        if (prior) assert.deepEqual(prior, Buffer.from(bytes));
-        else objects.set(name, Buffer.from(bytes));
-      },
-      publishHead(bytes) {
-        objects.set('head', Buffer.from(bytes));
-      },
-    };
-    attachPersonalDurability(db, { root, profileId, recordStorage: storage });
+    });
     t.after(() => {
       clearNativeOwnershipPlans(db);
       db.close();
+      storage.close();
       rmSync(root, { recursive: true, force: true });
     });
     const originals: string[] = [];
@@ -132,32 +163,7 @@ for (const partial of [false, true])
         version: preview.version,
         scopeToken: preview.scopeToken,
       };
-    let clinicalPublications = 0,
-      publications = 0;
-    const children = new Set<string>();
-    attachRecordDurability(db, {
-      profileId,
-      storage: {
-        ...storage,
-        publishHead(bytes) {
-          publications++;
-          // Preparation can publish auxiliary snapshots. Fail only the second actual clinical unit.
-          const publishedChildren = db
-            .prepare(
-              "SELECT json_extract(coverage_json,'$.receipt.operationId') operationId FROM manual_batches WHERE title='Record ownership correction'",
-            )
-            .all();
-          for (const row of publishedChildren)
-            if (!children.has(String(row.operationId))) {
-              children.add(String(row.operationId));
-              clinicalPublications++;
-              if (partial && clinicalPublications === 2)
-                throw Error('Fictional later clinical group failure');
-            }
-          storage.publishHead(bytes);
-        },
-      },
-    });
+    armed = true;
     const receipt = await commitNativeRecordOwnership(db, root, profileId, command);
     assert.equal(receipt.outcomesIncluded, false);
     assert.equal('outcomes' in receipt, false);
@@ -168,7 +174,13 @@ for (const partial of [false, true])
       receipt.groups?.map((group) => group.status),
       partial ? ['committed', 'needs_review'] : ['committed', 'committed'],
     );
-    assert.equal(clinicalPublications, 2);
+    assert.equal(clinicalPreparations, 2);
+    if (partial) {
+      assert.ok(refusedHead, 'the second clinical child reaches genuine tentative-row preparation');
+      assert.deepEqual(readFileSync(headPath), refusedHead);
+      assert.equal(intakeFileIdentity(headPath), refusedHeadIdentity);
+      assert.deepEqual(selectedHead(), refusedSelection);
+    }
     assert.equal(
       db.prepare("SELECT COUNT(*) n FROM notes WHERE kind='person'").get()!.n,
       previousPeople + 1,
@@ -239,8 +251,11 @@ for (const partial of [false, true])
     assert.equal(indexedAfter.eventChecks - indexedBefore.eventChecks, partial ? 1 : 0);
     const before = {
       revision: revision(db),
-      publications,
-      head: Buffer.from(objects.get('head')!),
+      head: readFileSync(headPath),
+      headIdentity: intakeFileIdentity(headPath),
+      selection: selectedHead(),
+      transactions: db.prepare('SELECT count(*) n FROM __record_transactions').get()!.n,
+      objects: immutableObjects(),
     };
     assert.deepEqual(replayOwnershipReceiptReference(db, profileId, command), {
       ...receipt,
@@ -259,8 +274,14 @@ for (const partial of [false, true])
       { code: 'OPERATION_CONFLICT' },
     );
     assert.equal(revision(db), before.revision);
-    assert.equal(publications, before.publications);
-    assert.deepEqual(objects.get('head'), before.head);
+    assert.deepEqual(readFileSync(headPath), before.head);
+    assert.equal(intakeFileIdentity(headPath), before.headIdentity);
+    assert.deepEqual(selectedHead(), before.selection);
+    assert.equal(
+      db.prepare('SELECT count(*) n FROM __record_transactions').get()!.n,
+      before.transactions,
+    );
+    assert.deepEqual(immutableObjects(), before.objects);
     assert.throws(() => ownershipReceiptReference(db, 'foreign', operationId), {
       code: 'PROFILE_BOUNDARY',
     });
@@ -323,7 +344,7 @@ for (const partial of [false, true])
 
     clearNativeOwnershipPlans(db);
     const recoveredPath = join(root, 'recovered.sqlite');
-    rebuildRecordDatabase(recoveredPath, { profileId, storage });
+    rebuildRecordDatabase(recoveredPath, { profileId, storage, verifyReferences: verifyOriginals });
     const recovered = openDatabase(recoveredPath, profileId);
     try {
       assert.deepEqual(ownershipReceiptReference(recovered, profileId, operationId), {

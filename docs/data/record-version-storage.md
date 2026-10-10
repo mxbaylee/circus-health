@@ -84,14 +84,15 @@ two independent groups with an existing destination, and two groups creating one
 new destination. They do not qualify every clinical, name, link or report-selection
 combination, nor remove complete physical verification.
 
-Within one ownership preparation, fresh records with no prior issue authority can
-share an authenticated empty issue snapshot from the same original. Each record
-still receives complete current policy inspection and unchanged-policy checks;
-the reference retains its source binding, empty membership digest and current
-catalog validation. An empty report union can use that same reference. Nonempty
-sets and prior issue authority retain their separate preparation paths. Reuse
-avoids publishing another identical empty snapshot; it does not skip evidence
-verification or apply across preparation lifetimes.
+Within one ownership preparation, fresh records with no prior issue authority use
+the existing inline `[]` representation after complete current policy inspection
+and unchanged-policy checks prove their issue set empty. A fresh empty report
+union uses the same representation. Original source and logical-envelope guards
+remain retained and checked; no empty catalog snapshot or prerequisite publication
+is needed. Nonempty sets and prior issue authority, including a prior inline empty
+set, retain their authenticated snapshot preparation paths. The accepted receipt
+retains the exact empty issue evidence; this avoids unused snapshot writes, not
+source evidence verification or final physical checks.
 
 Ownership name-evidence hashing preserves the complete canonical order and
 membership while yielding at bounded piece and byte intervals. Individual hash

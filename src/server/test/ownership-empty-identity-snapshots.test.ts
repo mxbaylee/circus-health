@@ -8,11 +8,11 @@ import { openDatabase, transaction } from '../database.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { appendOwnershipDecision } from '../ownership-journal.ts';
-import { prepareOwnershipIdentitySnapshots } from '../ownership-identity-snapshots.ts';
 import {
-  createOwnershipSourceSnapshotPreparation,
-  readOwnershipSourceSnapshot,
-} from '../ownership-source-snapshots.ts';
+  prepareOwnershipIdentitySnapshots,
+  type OwnershipIdentityIssues,
+} from '../ownership-identity-snapshots.ts';
+import { createOwnershipSourceSnapshotPreparation } from '../ownership-source-snapshots.ts';
 import {
   memoryRecordAuthority,
   registerRawIntakeFixture,
@@ -47,12 +47,18 @@ const record = (id: string, nonempty = false) =>
       : [],
   }) as IntakeReviewRecord;
 
-test('fresh empty issue snapshots share one source-bound publication without skipping record review', async (t) => {
+const reference = (value: OwnershipIdentityIssues) => {
+  assert.ok(!Array.isArray(value), 'prior or nonempty issues retain snapshot authority');
+  return value;
+};
+
+test('fresh empty issue evidence publishes no snapshot without skipping record review', async (t) => {
   const db = await fixture(t);
-  let baseline: number | undefined;
   for (const count of [1, 8]) {
     let reviewed = 0;
     const before = intakeWorkCounters(db).warm.reportSnapshotCheckpointBatches;
+    const acceptedBefore = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get();
+    const transactionsBefore = db.prepare('SELECT count(*) n FROM __record_transactions').get()!.n;
     const plan = await prepareOwnershipIdentitySnapshots(db, db, {
       sources: Array.from({ length: count }, (_, index) => ({
         intakeId: 'first',
@@ -69,21 +75,40 @@ test('fresh empty issue snapshots share one source-bound publication without ski
       report: { intakeId: 'first', groupId: 'fictional-report' },
     });
     const batches = intakeWorkCounters(db).warm.reportSnapshotCheckpointBatches - before;
-    assert.ok(batches > 0);
-    baseline ??= batches;
-    assert.equal(batches, baseline);
+    assert.equal(batches, 0);
+    assert.deepEqual(
+      db.prepare('SELECT * FROM __record_state WHERE singleton=1').get(),
+      acceptedBefore,
+    );
+    assert.equal(
+      db.prepare('SELECT count(*) n FROM __record_transactions').get()!.n,
+      transactionsBefore,
+    );
     assert.equal(reviewed, count);
-    const first = plan.forSource('first', 'record-0');
     for (let index = 0; index < count; index++)
-      assert.deepEqual(plan.forSource('first', `record-${index}`), first);
-    assert.deepEqual(plan.forReport(), first);
-    assert.deepEqual(readOwnershipSourceSnapshot(db, first.snapshot).sourceRecordIds, []);
+      assert.deepEqual(plan.forSource('first', `record-${index}`), []);
+    assert.deepEqual(plan.forReport(), []);
+    const returnedReport = plan.forReport(),
+      returnedSource = plan.forSource('first', 'record-0');
+    assert.ok(Array.isArray(returnedReport));
+    assert.ok(Array.isArray(returnedSource));
+    returnedReport.push('fictional-unissued-report-issue');
+    returnedSource.push('fictional-unissued-source-issue');
+    assert.deepEqual(plan.forReport(), []);
+    assert.deepEqual(plan.forSource('first', 'record-0'), []);
     plan.assertCurrent();
+    db.prepare('UPDATE ownership_identity_snapshots SET value=? WHERE intake=? AND record=?').run(
+      JSON.stringify(['fictional-forged-inline-issue']),
+      'first',
+      'record-0',
+    );
+    assert.throws(() => plan.forSource('first', 'record-0'), /Invalid inline/);
+    assert.throws(() => plan.assertCurrent(), /Invalid inline/);
     t.diagnostic(JSON.stringify({ count, batches, reviewed }));
   }
 });
 
-test('empty reuse remains source scoped and excludes prior authority and nonempty issues', async (t) => {
+test('inline empty evidence retains source guards and excludes prior authority and nonempty issues', async (t) => {
   const db = await fixture(t);
   transaction(db, () =>
     appendOwnershipDecision(db, 'fictional-prior', 'Record ownership source', {
@@ -107,14 +132,16 @@ test('empty reuse remains source scoped and excludes prior authority and nonempt
     },
   });
   const fresh = plan.forSource('first', 'fresh');
-  assert.notEqual(plan.forSource('first', 'prior').snapshot.snapshotId, fresh.snapshot.snapshotId);
-  assert.equal(plan.forSource('first', 'question').snapshot.count, 1);
-  assert.equal(plan.forSource('second', 'other').snapshot.source.intakeId, 'second');
-  assert.notEqual(plan.forSource('second', 'other').snapshot.snapshotId, fresh.snapshot.snapshotId);
+  assert.deepEqual(fresh, []);
+  assert.equal(reference(plan.forSource('first', 'prior')).snapshot.count, 0);
+  assert.equal(reference(plan.forSource('first', 'question')).snapshot.count, 1);
+  assert.deepEqual(plan.forSource('second', 'other'), []);
   plan.assertCurrent();
+  db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('f'.repeat(64), 'second');
+  assert.throws(() => plan.assertCurrent());
 });
 
-test('empty reuse refuses changed source authority between reviewed records', async (t) => {
+test('inline empty evidence refuses changed source authority between reviewed records', async (t) => {
   const db = await fixture(t);
   let visited = 0;
   await assert.rejects(
@@ -134,4 +161,29 @@ test('empty reuse refuses changed source authority between reviewed records', as
     }),
   );
   assert.equal(visited, 2);
+});
+
+test('prior empty report issue authority still publishes an authenticated snapshot', async (t) => {
+  const db = await fixture(t);
+  transaction(db, () =>
+    appendOwnershipDecision(db, 'fictional-prior-report', 'Report ownership default', {
+      groupId: 'fictional-report',
+      identityIssues: [],
+    }),
+  );
+  const before = intakeWorkCounters(db).warm.reportSnapshotCheckpointBatches;
+  const plan = await prepareOwnershipIdentitySnapshots(db, db, {
+    sources: [{ intakeId: 'first', recordId: 'fresh', reportMember: true }],
+    record(_intake, id) {
+      return record(id);
+    },
+    factory(id) {
+      return createOwnershipSourceSnapshotPreparation(db, { id });
+    },
+    report: { intakeId: 'first', groupId: 'fictional-report' },
+  });
+  assert.deepEqual(plan.forSource('first', 'fresh'), []);
+  assert.equal(reference(plan.forReport()).snapshot.count, 0);
+  assert.ok(intakeWorkCounters(db).warm.reportSnapshotCheckpointBatches > before);
+  plan.assertCurrent();
 });

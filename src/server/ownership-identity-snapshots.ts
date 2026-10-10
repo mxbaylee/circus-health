@@ -3,7 +3,7 @@ import {
   ownershipSourceAuthority,
 } from './record-ownership-authority.ts';
 import { setImmediate } from 'node:timers/promises';
-import { createHash } from 'node:crypto';
+import { selectedEnvelopeStore } from './intake-collection-envelope.ts';
 import { latestOwnershipDecision } from './ownership-journal.ts';
 /** Ownership issue membership shares the checked immutable string-set codec. Its
  * wrapper identifies hashes as reviewed identity evidence, never source IDs. */
@@ -70,37 +70,41 @@ export async function prepareOwnershipIdentitySnapshots(
   },
 ) {
   sql.exec(
-    'CREATE TABLE IF NOT EXISTS ownership_identity_snapshots(intake TEXT,record TEXT,value TEXT,PRIMARY KEY(intake,record)); CREATE TABLE IF NOT EXISTS ownership_identity_union(value TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS ownership_identity_empty(intake TEXT PRIMARY KEY,value TEXT NOT NULL); DELETE FROM ownership_identity_snapshots; DELETE FROM ownership_identity_union; DELETE FROM ownership_identity_empty;',
+    'CREATE TABLE IF NOT EXISTS ownership_identity_snapshots(intake TEXT,record TEXT,value TEXT,PRIMARY KEY(intake,record)); CREATE TABLE IF NOT EXISTS ownership_identity_union(value TEXT PRIMARY KEY); DELETE FROM ownership_identity_snapshots; DELETE FROM ownership_identity_union;',
   );
-  const emptyDigest = createHash('sha256').update('[]').digest('hex');
-  const retainedEmpty = (intakeId: string) => {
-    const row = sql
-      .prepare('SELECT value FROM ownership_identity_empty WHERE intake=?')
-      .get(intakeId);
-    if (!row) return undefined;
-    const reference = JSON.parse(String(row.value)) as OwnershipIdentityIssuesReference;
-    if (
-      reference.format !== 'health-ownership-identity-issues-v1' ||
-      reference.snapshot.source.intakeId !== intakeId ||
-      reference.snapshot.count !== 0 ||
-      reference.snapshot.digest !== emptyDigest
-    )
-      throw Error('Invalid retained empty ownership issue snapshot');
-    assertOwnershipSourceSnapshot(db, reference.snapshot);
-    return reference;
-  };
-  const retainEmpty = (intakeId: string, reference: OwnershipIdentityIssuesReference) => {
-    if (reference.snapshot.count === 0 && reference.snapshot.digest === emptyDigest)
-      sql
-        .prepare('INSERT OR IGNORE INTO ownership_identity_empty VALUES(?,?)')
-        .run(intakeId, JSON.stringify(reference));
+  // Inline empty evidence has no catalog reference to recheck. Retain its
+  // original source and logical envelope while own build checkpoints advance.
+  const sourceGuards = new Map<string, () => void>();
+  const sourceGuard = (intakeId: string) => {
+    let guard = sourceGuards.get(intakeId);
+    if (!guard) {
+      const initial = selectedEnvelopeStore(db, { id: intakeId }),
+        sourceHash = initial.source.sha256,
+        detailsJson = initial.source.details_json,
+        logical = JSON.stringify(initial.collections.collectionState('logical', 'envelope.data'));
+      guard = () => {
+        const current = selectedEnvelopeStore(db, { id: intakeId });
+        if (
+          current.source.sha256 !== sourceHash ||
+          current.source.details_json !== detailsJson ||
+          JSON.stringify(current.collections.collectionState('logical', 'envelope.data')) !==
+            logical
+        )
+          throw Error('Ownership identity source changed after preparation');
+      };
+      sourceGuards.set(intakeId, guard);
+    }
+    guard();
+    return guard;
   };
   for (const source of input.sources) {
     const prepared = !!sql
       .prepare('SELECT 1 FROM ownership_identity_snapshots WHERE intake=? AND record=?')
       .get(source.intakeId, source.recordId);
     if (prepared && !source.reportMember) continue;
+    const sourceCurrent = sourceGuard(source.intakeId);
     const record = await input.record(source.intakeId, source.recordId);
+    sourceCurrent();
     if (!record) throw Error('Ownership identity source is no longer reviewable');
     const previous = source.identity
       ? ownershipSourceAuthority(db, source.identity)?.identityIssues
@@ -110,15 +114,14 @@ export async function prepareOwnershipIdentitySnapshots(
     try {
       const values = () => sorted.distinctValues(),
         empty = values().at(0) === undefined;
-      let reference: OwnershipIdentityIssuesReference | undefined;
-      let reused = false;
+      let reference: OwnershipIdentityIssues | undefined;
       if (!prepared) {
         if (empty && previous === undefined) {
           factory.assertCurrent();
-          reference = retainedEmpty(source.intakeId);
+          sourceCurrent();
+          reference = [];
           factory.assertCurrent();
         }
-        reused = reference !== undefined;
         reference ??= await prepareOwnershipIdentityIssueSnapshot(factory, values, previous, {
           deferMaintenance: true,
         });
@@ -136,14 +139,13 @@ export async function prepareOwnershipIdentitySnapshots(
         }
         factory.assertCurrent();
       }
-      if (!prepared && !reused) await factory.finishMaintenance();
+      if (reference && !Array.isArray(reference)) await factory.finishMaintenance();
       const assertCurrent = () => {
-        if (reference && reused) {
-          factory.assertCurrent();
-          assertOwnershipSourceSnapshot(db, reference.snapshot);
-          factory.assertCurrent();
-        } else if (reference) factory.assertPublishedCurrent(reference.snapshot);
+        sourceCurrent();
+        if (reference && !Array.isArray(reference))
+          factory.assertPublishedCurrent(reference.snapshot);
         else factory.assertCurrent();
+        sourceCurrent();
       };
       assertCurrent();
       sorted.assertSame(assertCurrent);
@@ -151,13 +153,12 @@ export async function prepareOwnershipIdentitySnapshots(
         sql
           .prepare('INSERT INTO ownership_identity_snapshots VALUES(?,?,?)')
           .run(source.intakeId, source.recordId, JSON.stringify(reference));
-        if (empty) retainEmpty(source.intakeId, reference);
       }
     } finally {
       sorted.close();
     }
   }
-  let report: OwnershipIdentityIssuesReference | undefined;
+  let report: OwnershipIdentityIssues | undefined;
   if (input.report) {
     const prior = latestOwnershipDecision<{ identityIssues?: OwnershipIdentityIssues }>(
       db,
@@ -165,13 +166,15 @@ export async function prepareOwnershipIdentitySnapshots(
       'groupId',
       input.report.groupId,
     )?.identityIssues;
-    const factory = input.factory(input.report.intakeId);
+    const sourceCurrent = sourceGuard(input.report.intakeId),
+      factory = input.factory(input.report.intakeId);
     factory.assertCurrent();
     if (
       prior === undefined &&
       !sql.prepare('SELECT 1 FROM ownership_identity_union LIMIT 1').get()
     ) {
-      report = retainedEmpty(input.report.intakeId);
+      report = [];
+      sourceCurrent();
       factory.assertCurrent();
     }
     report ??= await prepareOwnershipIdentityIssueSnapshot(
@@ -192,27 +195,33 @@ export async function prepareOwnershipIdentitySnapshots(
     );
   }
   return {
-    forSource(intakeId: string, recordId: string): OwnershipIdentityIssuesReference {
+    forSource(intakeId: string, recordId: string): OwnershipIdentityIssues {
       const value = sql
         .prepare('SELECT value FROM ownership_identity_snapshots WHERE intake=? AND record=?')
         .get(intakeId, recordId)?.value;
       if (!value)
         throw Error('Ownership identity snapshot was not prepared for this exact occurrence');
-      return JSON.parse(String(value));
+      const parsed = JSON.parse(String(value)) as OwnershipIdentityIssues;
+      if (Array.isArray(parsed) && parsed.length)
+        throw Error('Invalid inline ownership identity evidence');
+      return parsed;
     },
     assertCurrent() {
+      for (const guard of sourceGuards.values()) guard();
       for (const row of sql
         .prepare('SELECT value FROM ownership_identity_snapshots ORDER BY intake,record')
-        .iterate())
-        assertOwnershipSourceSnapshot(
-          db,
-          (JSON.parse(String(row.value)) as OwnershipIdentityIssuesReference).snapshot,
-        );
-      if (report) assertOwnershipSourceSnapshot(db, report.snapshot);
+        .iterate()) {
+        const value = JSON.parse(String(row.value)) as OwnershipIdentityIssues;
+        if (!Array.isArray(value)) assertOwnershipSourceSnapshot(db, value.snapshot);
+        else if (value.length) throw Error('Invalid inline ownership identity evidence');
+      }
+      if (report && !Array.isArray(report)) assertOwnershipSourceSnapshot(db, report.snapshot);
+      else if (report?.length) throw Error('Invalid inline ownership report identity evidence');
+      for (const guard of sourceGuards.values()) guard();
     },
     forReport() {
       if (!report) throw Error('No prepared report identity snapshot');
-      return report;
+      return Array.isArray(report) ? [...report] : report;
     },
   };
 }

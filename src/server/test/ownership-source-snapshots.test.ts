@@ -207,11 +207,15 @@ test('prepared ownership issue evidence stays inert and report defaults include 
     report: { intakeId: 'selected-original', groupId: 'selected-group' },
   });
   plan.assertCurrent();
-  assert.deepEqual(readOwnershipSourceSnapshot(db, plan.forReport().snapshot).sourceRecordIds, [
+  const snapshot = (value: ReturnType<typeof plan.forReport>) => {
+    assert.ok(!Array.isArray(value));
+    return value.snapshot;
+  };
+  assert.deepEqual(readOwnershipSourceSnapshot(db, snapshot(plan.forReport())).sourceRecordIds, [
     ...ownershipIdentityIssues(selected),
   ]);
   assert.deepEqual(
-    readOwnershipSourceSnapshot(db, plan.forSource('other-original', other.id).snapshot)
+    readOwnershipSourceSnapshot(db, snapshot(plan.forSource('other-original', other.id)))
       .sourceRecordIds,
     [...ownershipIdentityIssues(other)],
   );
@@ -241,7 +245,7 @@ test('prepared ownership issue evidence stays inert and report defaults include 
         area: 'builds',
         collection: 'ownership.snapshots',
         op: 'delete',
-        key: plan.forReport().snapshot.snapshotId,
+        key: snapshot(plan.forReport()).snapshotId,
       },
     ],
   });
@@ -255,12 +259,13 @@ test('prepared ownership issue evidence stays inert and report defaults include 
   // A physical-source change also invalidates its own exact snapshot.
   db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('f'.repeat(64), 'other-original');
   assert.throws(() =>
-    readOwnershipSourceSnapshot(db, plan.forSource('other-original', other.id).snapshot),
+    readOwnershipSourceSnapshot(db, snapshot(plan.forSource('other-original', other.id))),
   );
 });
 
 test('cancellation across originals leaves only inert prepared ownership evidence', async (t) => {
   const { prepareOwnershipIdentitySnapshots } = await import('../ownership-identity-snapshots.ts');
+  const { ownershipIdentityIssues } = await import('../record-ownership-authority.ts');
   const { selectedEnvelopeStore } = await import('../intake-collection-envelope.ts');
   const root = mkdtempSync(join(tmpdir(), 'fictional-canceled-ownership-')),
     db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
@@ -276,7 +281,18 @@ test('cancellation across originals leaves only inert prepared ownership evidenc
   }
   const revision = clinicalReviewRevision(db),
     first = selectedEnvelopeStore(db, { id: 'first-original' }),
-    logical = first.collections.binding(first.collections.openView())!.logical;
+    logical = first.collections.binding(first.collections.openView())!.logical,
+    firstRecord = {
+      id: 'first',
+      issues: [
+        {
+          id: 'fictional-first-question',
+          kind: 'identity',
+          prompt: 'Fictional retained identity question',
+          textAnchor: 'Fictional first original',
+        },
+      ],
+    } as import('../../shared/intake.ts').IntakeReviewRecord;
   let factories = 0;
   await assert.rejects(
     prepareOwnershipIdentitySnapshots(db, db, {
@@ -285,6 +301,7 @@ test('cancellation across originals leaves only inert prepared ownership evidenc
         { intakeId: 'second-original', recordId: 'second' },
       ],
       record(_id, id) {
+        if (id === firstRecord.id) return firstRecord;
         return { id, issues: [] } as unknown as import('../../shared/intake.ts').IntakeReviewRecord;
       },
       factory(id) {
@@ -312,7 +329,10 @@ test('cancellation across originals leaves only inert prepared ownership evidenc
         .get('first-original')!.value,
     ),
   );
-  assert.equal(readOwnershipSourceSnapshot(db, retained.snapshot).count, 0);
+  assert.equal(readOwnershipSourceSnapshot(db, retained.snapshot).count, 1);
+  assert.deepEqual(readOwnershipSourceSnapshot(db, retained.snapshot).sourceRecordIds, [
+    ...ownershipIdentityIssues(firstRecord),
+  ]);
   assert.equal(
     db
       .prepare(
