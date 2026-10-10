@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DatabaseSync } from 'node:sqlite';
 import { observeDatabaseClose } from './database.ts';
+import { authorizationSignalAborted } from './authorization-signal.ts';
 
 /** Private, active ownership; never a transported or retained review authority. */
 export interface ClinicalOperation {
@@ -25,9 +26,15 @@ const unavailable = () => new Error('Clinical operation is no longer active');
 
 function check(frame: Frame, assertions = true) {
   if (!frame.active || !frame.db.isOpen) throw unavailable();
-  frame.controller.signal.throwIfAborted();
-  frame.signal?.throwIfAborted();
-  if (assertions) frame.assertRunning?.();
+  if (assertions) {
+    frame.controller.signal.throwIfAborted();
+    frame.signal?.throwIfAborted();
+    frame.assertRunning?.();
+  } else if (
+    authorizationSignalAborted(frame.controller.signal) ||
+    (frame.signal && authorizationSignalAborted(frame.signal))
+  )
+    throw unavailable();
 }
 /** Trusted nested entry points explicitly pass this token to the coordinator. */
 export function currentClinicalOperation(db: DatabaseSync): ClinicalOperation | undefined {

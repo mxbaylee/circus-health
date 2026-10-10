@@ -6,10 +6,12 @@ import {
 } from './clinical-operation.ts';
 import { collectionClinicalProjectionContextAsync } from './intake-review-collection-session.ts';
 import {
-  tryBorrowRetainedCollectionClinicalPolicy,
+  tryBorrowPreparedCollectionClinicalPolicy,
+  checkedRetainedCollectionClinicalPolicyContext,
   type RetainedCollectionClinicalPolicy,
 } from './intake-report-group-collection.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import { ClinicalPhysicalEvidenceChanged } from './clinical-review-physical-worker.ts';
 import {
   captureManagedPhysicalEpoch,
   managedPhysicalEpochCurrent,
@@ -48,7 +50,10 @@ import {
 import { collectSelectedEvidencedIdentityWork } from './intake-identity-name-evidence.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
-import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
+import {
+  reviewPreparationMethodStamp,
+  reviewPreparationStamp,
+} from './clinical-review-maintenance.ts';
 import {
   beginNativeIdentityPreview,
   nativeIdentityPreviewCurrent,
@@ -885,6 +890,73 @@ async function runNativeIdentityArtifactVerification(context: Context, stored: R
     originalScratch.close();
   }
 }
+/** Only unpublished identity DTO work may use this growing physical proof. */
+async function nativeIdentitySpeculativePhase(context: Context, stored: Rows) {
+  const { db } = context;
+  context.assertCurrent();
+  const stamp = reviewPreparationStamp(db),
+    methods = reviewPreparationMethodStamp(db),
+    epoch = captureManagedPhysicalEpoch();
+  if (stamp === undefined || methods === undefined || !epoch)
+    reject('Identity speculative work requires current authority');
+  const originalEpoch = epoch!;
+  const scratch = disposableSqlite('fictional-identity-build-original-proof-');
+  try {
+    const original = createClinicalReviewArtifactProof(scratch.db, 'original_artifacts');
+    const assertAuthority = () => {
+      context.assertCurrent();
+      if (
+        reviewPreparationStamp(db) !== stamp ||
+        reviewPreparationMethodStamp(db) !== methods ||
+        !managedPhysicalEpochCurrent(originalEpoch)
+      )
+        reject('Identity evidence changed during speculative preparation');
+    };
+    await runClinicalReviewWork(
+      (function* () {
+        for (const artifact of stored.verifiedArtifacts()) {
+          original.retain([artifact]);
+          yield;
+        }
+      })(),
+      { capture: () => (assertAuthority(), assertAuthority) },
+    );
+    const originalCurrent = await original.withVerifiedTerminal(
+      { assertCurrent: assertAuthority },
+      (physicalCurrent) => physicalCurrent,
+    );
+    const assertCurrent = () => {
+      assertAuthority();
+      originalCurrent();
+    };
+    stored.retainArtifacts([]);
+    return {
+      assertCurrent,
+      async run<T>(work: Generator<void, T, void>, assertBorrowed?: () => void) {
+        const current = () => {
+          assertCurrent();
+          assertBorrowed?.();
+        };
+        current();
+        const result = await runClinicalReviewWork(work, {
+          capture: () => (current(), current),
+        });
+        current();
+        return result;
+      },
+      async finish() {
+        assertCurrent();
+        await stored.withVerifiedTerminal({ assertCurrent }, () => undefined);
+      },
+      [Symbol.dispose]() {
+        scratch.close();
+      },
+    };
+  } catch (error) {
+    scratch.close();
+    throw error;
+  }
+}
 async function build(
   context: Context,
   original: Awaited<ReturnType<typeof evidence>>,
@@ -965,11 +1037,13 @@ async function build(
   } finally {
     prerequisites.close();
   }
+  using phase = await nativeIdentitySpeculativePhase(context, stored);
   let cached:
     | {
         proposalId: string | null;
         selected?: Extract<ReturnType<typeof prepareCollectionClinicalReview>, { status: 'ready' }>;
         borrowed?: RetainedCollectionClinicalPolicy;
+        checkedBorrow?: ReturnType<typeof checkedRetainedCollectionClinicalPolicyContext>;
       }
     | undefined;
   const closeCached = () => {
@@ -977,14 +1051,12 @@ async function build(
     else cached?.selected?.session.close();
     cached = undefined;
   };
-  const assertBorrowed = () => cached?.borrowed?.assertCurrent();
+  const assertBorrowed = () => {
+    if (cached?.checkedBorrow) cached.checkedBorrow.assertAuthorityCurrent();
+    else cached?.borrowed?.assertCurrent();
+  };
   const run = async <T>(work: Generator<void, T, void>) => {
-    const borrowed = cached?.borrowed;
-    const assertSelectedBorrow = () => borrowed?.assertCurrent();
-    assertSelectedBorrow();
-    const result = await runNativeIdentityWork(context, stored, work, assertSelectedBorrow);
-    assertSelectedBorrow();
-    return result;
+    return phase.run(work, assertBorrowed);
   };
   let receipts: Iterable<IdentityPolicyReceipt> | undefined;
   const currentReceipts = () =>
@@ -1042,12 +1114,11 @@ async function build(
       closeCached();
       const grounding = identityGroundingGeneration(db);
       const assertPreparationCurrent = () => {
-        context.assertCurrent();
-        stored.assertArtifacts();
+        phase.assertCurrent();
         if (identityGroundingGeneration(db) !== grounding)
           reject('Identity grounding changed during occurrence preparation');
       };
-      const borrowed = tryBorrowRetainedCollectionClinicalPolicy(
+      const borrowed = tryBorrowPreparedCollectionClinicalPolicy(
         db,
         root,
         profileId,
@@ -1056,8 +1127,11 @@ async function build(
         assertPreparationCurrent,
       );
       if (borrowed) {
-        cached = { proposalId, borrowed };
-        borrowed.retainArtifacts((artifacts) => stored.retainArtifacts(artifacts));
+        const checkedBorrow = checkedRetainedCollectionClinicalPolicyContext(db, borrowed);
+        phase.assertCurrent();
+        stored.retainArtifacts(checkedBorrow.verifiedArtifacts());
+        phase.assertCurrent();
+        cached = { proposalId, borrowed, checkedBorrow };
       } else {
         const selected = await prepareCollectionClinicalReviewAsync(
           db,
@@ -1083,8 +1157,8 @@ async function build(
       receipts = await run(scope.receiptsWork!());
     }
     assertBorrowed();
-    const record = cached.borrowed
-      ? cached.borrowed.record(recordId, candidateId, candidateVersionId)
+    const record = cached.checkedBorrow
+      ? cached.checkedBorrow.record(recordId, candidateId, candidateVersionId)
       : cached.selected!.session.record(recordId, candidateId, candidateVersionId);
     if (!record) return reject('The current report occurrence differs from the displayed member');
     return record;
@@ -1669,7 +1743,7 @@ async function build(
             : 'This report was assigned to ' + assignedPerson.fullName + '.',
         }
       : {};
-  stored.assertArtifacts();
+  await phase.finish();
   return {
     display,
     evidenceCommitment,
@@ -2268,7 +2342,12 @@ export function getNativeIntakeIdentityReview(
         return value;
       },
       { signal, operation: parent },
-    );
+    ).catch((error: unknown) => {
+      if (signal?.aborted) throw signal.reason;
+      if (error instanceof ClinicalPhysicalEvidenceChanged)
+        throw new HttpError(409, 'SOURCE_CHANGED', 'Retained clinical evidence changed');
+      throw error;
+    });
   // A held owner cannot wait on a foreign flight queued behind itself.
   if (options.operation)
     return prepare(options.signal, options.operation).then(detachIdentityPreview);

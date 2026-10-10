@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
+import { authorizationSignalAborted } from './authorization-signal.ts';
 import { createApp, type AppOptions } from './index.ts';
 import { vaultStorageTotals } from './vault-storage-totals.ts';
 import {
@@ -56,6 +57,34 @@ interface Session {
   id: string;
   profiles: Set<string>;
 }
+const sessionUnlockAuthorizations = new WeakMap<
+  object,
+  {
+    manager: object;
+    scope: string;
+    sessions: Map<string, Session>;
+    client: Session;
+    lifecycle: { closed: boolean };
+    signal: AbortSignal;
+  }
+>();
+
+/** Read-only validation of tokens issued by real HTTP session routes. */
+export function vaultSessionUnlockAuthorized(
+  authorization: object,
+  manager: object,
+  scope: string,
+): boolean {
+  const found = sessionUnlockAuthorizations.get(authorization);
+  return (
+    !!found &&
+    found.manager === manager &&
+    found.scope === scope &&
+    !found.lifecycle.closed &&
+    !authorizationSignalAborted(found.signal) &&
+    Map.prototype.get.call(found.sessions, found.client.id) === found.client
+  );
+}
 type ProfileCard = ReturnType<ReturnType<typeof createEncryptedProfiles>['card']>;
 export function createVaultApp({
   dataDirectory,
@@ -76,6 +105,21 @@ export function createVaultApp({
     sessions = new Map<string, Session>();
   let closed = false,
     activation: Promise<unknown> = Promise.resolve();
+  const lifecycle = { closed: false };
+  const sessionUnlockAuthorization = (client: Session, scope: string, signal: AbortSignal) => {
+    if (closed || sessions.get(client.id) !== client || signal.aborted)
+      throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+    const authorization = Object.freeze({});
+    sessionUnlockAuthorizations.set(authorization, {
+      manager,
+      scope,
+      sessions,
+      client,
+      lifecycle,
+      signal,
+    });
+    return authorization;
+  };
   const origins = new Set([
     ...allowedOrigins,
     `http://127.0.0.1:${port}`,
@@ -262,6 +306,7 @@ export function createVaultApp({
           send(res, 200, {
             data: await manager.resumeAsync((await body(req)).recovery, {
               signal: controller.signal,
+              authorization: sessionUnlockAuthorization(client, 'resume', controller.signal),
               assertAuthorized: () => {
                 if (closed || sessions.get(client.id) !== client)
                   throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
@@ -293,6 +338,11 @@ export function createVaultApp({
                 manager.verifyAsync(setup[1], input, {
                   authorizeCopySource: (sourceId) => requireAccess(sourceId, client),
                   signal: controller.signal,
+                  authorization: sessionUnlockAuthorization(
+                    client,
+                    'setup:' + setup[1],
+                    controller.signal,
+                  ),
                   assertAuthorized: () => {
                     if (closed || sessions.get(client.id) !== client)
                       throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
@@ -321,6 +371,11 @@ export function createVaultApp({
             () =>
               manager.unlockAsync(id, input.recovery, {
                 signal: controller.signal,
+                authorization: sessionUnlockAuthorization(
+                  client,
+                  'profile:' + id,
+                  controller.signal,
+                ),
                 assertAuthorized: () => {
                   if (closed || sessions.get(client.id) !== client)
                     throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
@@ -470,6 +525,7 @@ export function createVaultApp({
     manager,
     close() {
       closed = true;
+      lifecycle.closed = true;
       server.closeAllConnections();
       for (const p of manager.list()) passkeys.invalidate(p.id);
       try {

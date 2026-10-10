@@ -87,10 +87,10 @@ parentPort!.on('message', (message: unknown) => {
     return parentPort!.postMessage({ failure: true });
   try {
     for (const item of command.items) if (!verify(item)) throw Error('physical mismatch');
-    parentPort!.postMessage({ id: nextId++, count: command.items.length });
   } catch {
-    parentPort!.postMessage({ id: nextId++, failure: true });
+    return parentPort!.postMessage({ id: nextId++, sourceChanged: true });
   }
+  parentPort!.postMessage({ id: nextId++, count: command.items.length });
 });
 // Cancellation may terminate the worker only after its module graph has finished loading.
 setImmediate(() => parentPort!.postMessage({ ready: true }));

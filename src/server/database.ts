@@ -14,7 +14,9 @@ import {
 import {
   expectIntakeFrontierMetaWrite,
   finishIntakeFrontierMetaWrite,
+  intakeFrontierTerminalEvent,
 } from './intake-lookup-frontier-observer.ts';
+import { intakeProjectionTerminalEvent } from './intake-lookup-projection-witness.ts';
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const LATEST_SCHEMA_VERSION = 7;
 export type Database = DatabaseSync;
@@ -29,31 +31,102 @@ interface ManagedAuthorization {
   readonly policyChanges: Set<() => void>;
   policy: Authorizer | null;
   callbackDepth: number;
+  protectCallbacks: boolean;
 }
 const managedAuthorizers = new WeakMap<DatabaseSync, ManagedAuthorization>();
 const managedMethodEpochs = new WeakMap<DatabaseSync, object>();
 const managedMethodSerials = new WeakMap<DatabaseSync, bigint>();
+const callbackBarriers = new WeakMap<DatabaseSync, number>();
+let nativeFunctionSignatures: Set<string> | undefined;
+const functionSignature = (row: SqliteRow) =>
+  JSON.stringify([row.name, row.builtin, row.type, row.enc, row.narg, row.flags]);
+function sqliteNativeFunctions(): Set<string> {
+  if (!nativeFunctionSignatures) {
+    const native = new DatabaseSync(':memory:');
+    try {
+      nativeFunctionSignatures = new Set(
+        native.prepare('PRAGMA function_list').all().map(functionSignature),
+      );
+    } finally {
+      native.close();
+    }
+  }
+  return nativeFunctionSignatures;
+}
+function assertManagedDatabaseCallbackAllowed(db: DatabaseSync): void {
+  if (callbackBarriers.has(db))
+    throw Error('Managed database callback refused during terminal publication');
+}
+
+/** Cached native statements may execute after evidence verification, but a
+ * reprepare or custom scalar must not enter JavaScript inside that last seal. */
+export function withoutManagedDatabaseCallbacks<T>(db: DatabaseSync, run: () => T): T {
+  if (
+    !managedDatabaseMethodEpoch(db) ||
+    managedFunctions.get(db)!.unwrapped.size ||
+    !managedAuthorizers.get(db)?.protectCallbacks
+  )
+    throw Error('Terminal database callback barrier requires managed scalar registration');
+  const depth = callbackBarriers.get(db) ?? 0;
+  callbackBarriers.set(db, depth + 1);
+  try {
+    const result = run();
+    if (
+      result &&
+      (typeof result === 'object' || typeof result === 'function') &&
+      (typeof (result as { then?: unknown }).then === 'function' ||
+        typeof (result as { next?: unknown }).next === 'function')
+    )
+      throw Error('Terminal database callback barrier requires synchronous work');
+    return result;
+  } finally {
+    if (depth) callbackBarriers.set(db, depth);
+    else callbackBarriers.delete(db);
+  }
+}
+
+/** Arm before compiling terminal statements, never after their authorization. */
+export function prepareManagedDatabaseCallbackBarrier(db: DatabaseSync): void {
+  const state = managedAuthorizers.get(db);
+  if (!state || !managedDatabaseMethodEpoch(db) || managedFunctions.get(db)!.unwrapped.size)
+    throw Error('Terminal database callback barrier requires managed scalar registration');
+  if (!state.protectCallbacks) {
+    state.protectCallbacks = true;
+    state.refresh();
+  }
+}
 function rotateManagedMethodEpoch(db: DatabaseSync): void {
   managedMethodEpochs.set(db, {});
   managedMethodSerials.set(db, (managedMethodSerials.get(db) ?? 0n) + 1n);
 }
 const managedFunctions = new WeakMap<
   DatabaseSync,
-  { setter: DatabaseSync['function']; observers: Set<(name: string) => void> }
+  {
+    setter: DatabaseSync['function'];
+    aggregateSetter: DatabaseSync['aggregate'];
+    observers: Set<(name: string) => void>;
+    unwrapped: Set<string>;
+  }
 >();
 
 export function installManagedDatabaseFunctionRegistration(db: DatabaseSync): void {
   if (managedFunctions.has(db)) return;
   const nativeFunction = db.function;
+  const nativeAggregate = db.aggregate;
   const observers = new Set<(name: string) => void>();
+  const functions = db.prepare('PRAGMA function_list').all();
+  const unwrapped = new Set(
+    functions
+      .filter((row) => !sqliteNativeFunctions().has(functionSignature(row)))
+      .map((row) => String(row.name).toLowerCase()),
+  );
   const builtins = new Set(
-    db
-      .prepare('PRAGMA function_list')
-      .all()
+    functions
       .filter((row) => row.builtin === 1 && typeof row.name === 'string')
       .map((row) => (row.name as string).toLowerCase()),
   );
   const setter = function (this: DatabaseSync, ...args: Parameters<DatabaseSync['function']>) {
+    if (this === db) assertManagedDatabaseCallbackAllowed(db);
     if (this === db) {
       rotateManagedMethodEpoch(db);
       for (const observer of observers) {
@@ -66,10 +139,56 @@ export function installManagedDatabaseFunctionRegistration(db: DatabaseSync): vo
     }
     if (this === db && builtins.has(args[0].toLowerCase()))
       throw Error('Replacing a SQLite built-in function is unsupported');
+    const callbackIndex = args.length - 1,
+      callback = args[callbackIndex];
+    if (this === db && typeof callback === 'function') {
+      const guarded = function (this: unknown, ...values: unknown[]) {
+        if (
+          !intakeFrontierTerminalEvent(db, callback) &&
+          !intakeProjectionTerminalEvent(db, callback)
+        )
+          assertManagedDatabaseCallbackAllowed(db);
+        return Reflect.apply(callback, this, values);
+      };
+      Object.defineProperty(guarded, 'length', { value: callback.length });
+      args[callbackIndex] = guarded as never;
+    }
+    // A same-name registration may replace only one SQLite arity. Never
+    // rehabilitate a connection that already contained an unwrapped overload.
     return Reflect.apply(nativeFunction, this, args);
   } as DatabaseSync['function'];
+  const aggregateSetter = function (
+    this: DatabaseSync,
+    ...args: Parameters<DatabaseSync['aggregate']>
+  ) {
+    if (this !== db) return Reflect.apply(nativeAggregate, this, args);
+    assertManagedDatabaseCallbackAllowed(db);
+    rotateManagedMethodEpoch(db);
+    for (const observer of observers) {
+      try {
+        observer(args[0]);
+      } catch {
+        /* Observation cannot replace native registration. */
+      }
+    }
+    if (builtins.has(args[0].toLowerCase()))
+      throw Error('Replacing a SQLite built-in function is unsupported');
+    const options = { ...args[1] };
+    for (const name of ['start', 'step', 'inverse', 'result'] as const) {
+      const callback = options[name];
+      if (typeof callback !== 'function') continue;
+      const guarded = function (this: unknown, ...values: unknown[]) {
+        assertManagedDatabaseCallbackAllowed(db);
+        return Reflect.apply(callback, this, values);
+      };
+      Object.defineProperty(guarded, 'length', { value: callback.length });
+      options[name] = guarded as never;
+    }
+    return Reflect.apply(nativeAggregate, this, [args[0], options]);
+  } as DatabaseSync['aggregate'];
   db.function = setter;
-  managedFunctions.set(db, { setter, observers });
+  db.aggregate = aggregateSetter;
+  managedFunctions.set(db, { setter, aggregateSetter, observers, unwrapped });
   rotateManagedMethodEpoch(db);
 }
 
@@ -78,6 +197,7 @@ export function managedDatabaseMethodEpoch(db: DatabaseSync): object | undefined
   if (
     !db.isOpen ||
     db.function !== managedFunctions.get(db)?.setter ||
+    db.aggregate !== managedFunctions.get(db)?.aggregateSetter ||
     db.setAuthorizer !== managedAuthorizers.get(db)?.setter
   )
     return undefined;
@@ -116,6 +236,7 @@ export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
     policyChanges: new Set(),
     policy: null,
     callbackDepth: 0,
+    protectCallbacks: false,
   };
   const notify = (callback: () => void) => {
     state.callbackDepth++;
@@ -134,11 +255,15 @@ export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
   } as DatabaseSync['setAuthorizer'];
   state.setter = setter;
   const dispatch: Authorizer = (...args) => {
+    assertManagedDatabaseCallbackAllowed(db);
     for (const observer of state.observers) notify(() => observer(...args));
     return state.policy?.(...args) ?? constants.SQLITE_OK;
   };
   state.refresh = () =>
-    nativeSetter.call(db, state.policy || state.observers.size ? dispatch : null);
+    nativeSetter.call(
+      db,
+      state.policy || state.observers.size || state.protectCallbacks ? dispatch : null,
+    );
   db.setAuthorizer = setter;
   managedAuthorizers.set(db, state);
   rotateManagedMethodEpoch(db);

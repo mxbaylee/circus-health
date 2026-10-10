@@ -1056,12 +1056,24 @@ queues, not long-lived SQL transactions or a server-wide HTTP lock.
 Identity preparation can borrow a complete clinical policy already retained by
 an idle report-queue owner for the exact database, root, profile, intake and
 proposal. It pins that existing owner against eviction, checks its original
-revision, source, raw SQL and complete physical proof, and checks the selected
+revision, source, SQL and complete physical proof, and checks the selected
 owner again across cooperative work. Borrowing neither constructs a queue nor
 refreshes its proof. An unavailable owner takes the ordinary preparation path;
 a failed check after selection refuses the request. Releasing a borrow releases
 only its pin. Closing, clearing or replacing the owner invalidates the borrow.
 Grounding changes still require the second complete policy construction.
+
+Guarded feed construction retains a separate private completion proof tied to
+the exact original queue guard, ready session and generation. Certified disposable
+maintenance can preserve that original normalized guard without producing a raw
+public review certificate. Repeated rows under the same guard share one completed
+policy; a different guard cannot inherit that proof. Internal identity preparation
+may borrow the completed policy after checking its original pins and complete
+physical evidence. A proof already stale at admission is a cache miss, not a new
+baseline; changes after selection refuse. Public raw-certificate admission remains
+separate. Closing a borrow invalidates its checked records and paused artifact
+iterators. These changes do not eliminate complete physical verification or the
+remaining prerequisite-preparation scans.
 
 Within one preview request, the first complete build and its private scratch rows
 can survive the context reopen only while the exact pre-build SQL/registry

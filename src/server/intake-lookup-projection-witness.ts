@@ -10,6 +10,7 @@ import {
 
 const names = ['state', 'sources', 'groups', 'acceptances', 'identities', 'payloads'] as const;
 interface Witness {
+  readonly event: (...values: unknown[]) => unknown;
   readonly functionName: string;
   readonly triggerNames: readonly string[];
   readonly triggerSql: readonly string[];
@@ -43,6 +44,12 @@ export interface ProjectionWriteTicket {
   subkey?: string;
 }
 const witnesses = new WeakMap<DatabaseSync, Witness>();
+
+/** Read-only recognition; callers cannot enroll a callback or replace its body. */
+export function intakeProjectionTerminalEvent(db: DatabaseSync, callback: unknown): boolean {
+  const witness = witnesses.get(db);
+  return !!witness && !witness.functionReplaced && witness.event === callback;
+}
 const suffixes = new WeakMap<DatabaseSync, string>();
 const MAX_PENDING_INPUTS = 100;
 const scalar = (db: DatabaseSync, pragma: string): unknown =>
@@ -84,7 +91,7 @@ export function ensureIntakeProjectionWitness(db: DatabaseSync): void {
   const functionName = `__intake_projection_event_${suffix}`;
   const triggerNames: string[] = [];
   let witness: Witness | undefined;
-  db.function(functionName, (table: unknown, operation: unknown, key: unknown, subkey: unknown) => {
+  const event = (table: unknown, operation: unknown, key: unknown, subkey: unknown) => {
     if (witness) {
       if (table === 'source_files' || table === 'app_meta') {
         witness.inputVersion++;
@@ -116,7 +123,8 @@ export function ensureIntakeProjectionWitness(db: DatabaseSync): void {
       }
     }
     return null;
-  });
+  };
+  db.function(functionName, event);
   for (const name of names) {
     for (const operation of ['INSERT', 'UPDATE', 'DELETE']) {
       const trigger = `__intake_projection_${name}_${operation.toLowerCase()}_${suffix}`;
@@ -209,6 +217,7 @@ export function ensureIntakeProjectionWitness(db: DatabaseSync): void {
     witnesses.delete(db);
   });
   witness = {
+    event,
     functionName,
     triggerNames,
     triggerSql,

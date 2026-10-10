@@ -1,4 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { authorizationSignalAborted } from './authorization-signal.ts';
 import { isIP } from 'node:net';
 import sodium from 'libsodium-wrappers-sumo';
 import {
@@ -69,6 +70,38 @@ interface AuthenticationChallenge extends ChallengeBase {
 }
 
 type PasskeyChallenge = RegistrationChallenge | ConfirmationChallenge | AuthenticationChallenge;
+const passkeyUnlockAuthorizations = new WeakMap<
+  object,
+  {
+    manager: object;
+    profileId: string;
+    challengeId: string;
+    challenge: AuthenticationChallenge;
+    challenges: Map<string, PasskeyChallenge>;
+    generations: Map<string, number>;
+    expires: number;
+    signal: AbortSignal;
+  }
+>();
+
+/** Foreign tokens cannot stand in for a claimed, verified passkey challenge. */
+export function passkeyUnlockAuthorized(
+  authorization: object,
+  manager: object,
+  profileId: string,
+): boolean {
+  const found = passkeyUnlockAuthorizations.get(authorization);
+  return (
+    !!found &&
+    found.manager === manager &&
+    found.profileId === profileId &&
+    !authorizationSignalAborted(found.signal) &&
+    found.expires >= Date.now() &&
+    Map.prototype.get.call(found.challenges, found.challengeId) === found.challenge &&
+    found.challenge.used === true &&
+    (Map.prototype.get.call(found.generations, profileId) || 0) === found.challenge.generation
+  );
+}
 type NewChallenge =
   | Omit<RegistrationChallenge, 'expires'>
   | Omit<ConfirmationChallenge, 'expires'>
@@ -611,11 +644,30 @@ export function createProfilePasskeys(
             )
               throw new HttpError(409, 'PASSKEY_CHANGED', 'Passkey state changed. Try again.');
           };
+          authorize();
+          const authorization = Object.freeze({});
+          passkeyUnlockAuthorizations.set(authorization, {
+            manager,
+            profileId,
+            challengeId: input.challengeId as string,
+            challenge,
+            challenges,
+            generations,
+            expires: challenge.expires,
+            signal: controller.signal,
+          });
           const profile = await manager.unlockWithKeyAsync(profileId, key, {
             signal: controller.signal,
             assertAuthorized: authorize,
+            authorization,
           });
-          authorize();
+          if (!passkeyUnlockAuthorized(authorization, manager, profileId))
+            throw new HttpError(
+              409,
+              'PASSKEY_CANCELLED',
+              'Profile access changed. Start the passkey request again.',
+            );
+          passkeyUnlockAuthorizations.delete(authorization);
           key = null;
           return profile;
         } finally {

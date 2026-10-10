@@ -380,7 +380,7 @@ interface CollectionQueueBindingWitness {
 export interface PreparedCollectionQueueGuard {
   readonly kind: 'prepared-collection-queue-guard';
 }
-const preparedQueueGuards = new WeakMap<object, { owner: object; assertCurrent: () => void }>();
+const preparedQueueGuards = new WeakMap<object, { owner: object; current: () => boolean }>();
 async function collectionQueueBinding(
   db: DatabaseSync,
   root: string,
@@ -468,6 +468,48 @@ export function tryBorrowRetainedCollectionClinicalPolicy(
   proposalId: string | null,
   assertRunning: () => void,
 ): RetainedCollectionClinicalPolicy | undefined {
+  return borrowCompletedCollectionPolicy(
+    db,
+    root,
+    profileId,
+    assertRunning,
+    (queue, assertOwner, assertOwnerCurrent) =>
+      queue.tryBorrowReview(intakeId, proposalId, assertOwner, assertOwnerCurrent),
+  );
+}
+/** Internal policy consumption can retain an original prepared queue proof.
+ * This separate admission never supplies a raw public review certificate. */
+export function tryBorrowPreparedCollectionClinicalPolicy(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  proposalId: string | null,
+  assertRunning: () => void,
+): RetainedCollectionClinicalPolicy | undefined {
+  return borrowCompletedCollectionPolicy(
+    db,
+    root,
+    profileId,
+    assertRunning,
+    (queue, assertOwner, assertOwnerCurrent) =>
+      queue.tryBorrowPreparedReview(intakeId, proposalId, assertOwner, assertOwnerCurrent) ??
+      queue.tryBorrowReview(intakeId, proposalId, assertOwner, assertOwnerCurrent),
+  );
+}
+function borrowCompletedCollectionPolicy(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  assertRunning: () => void,
+  select: (
+    queue: QueueCache['queue'],
+    assertOwner: () => void,
+    assertOwnerCurrent: () => void,
+  ) =>
+    | (Omit<RetainedCollectionClinicalPolicy, 'close'> & { checked: CheckedRetainedPolicy })
+    | undefined,
+): RetainedCollectionClinicalPolicy | undefined {
   const operation = currentClinicalOperation(db);
   assertClinicalOperation(db, operation);
   assertRunning();
@@ -509,12 +551,7 @@ export function tryBorrowRetainedCollectionClinicalPolicy(
     assertRunning();
   };
   try {
-    const borrowed = selected.queue.tryBorrowReview(
-      intakeId,
-      proposalId,
-      assertOwner,
-      assertOwnerCurrent,
-    );
+    const borrowed = select(selected.queue, assertOwner, assertOwnerCurrent);
     if (!borrowed) {
       close();
       return miss();
@@ -618,7 +655,11 @@ async function openCollectionReportQueueNow(db: DatabaseSync, root: string, prof
     verified.add(id);
   };
   // Private admission is reachable only through the active clinical owner and users pin.
-  const { tryBorrowReview: _privateBorrow, ...methods } = selected.queue;
+  const {
+    tryBorrowReview: _privateBorrow,
+    tryBorrowPreparedReview: _privatePreparedBorrow,
+    ...methods
+  } = selected.queue;
   return {
     ...methods,
     assertActive,
@@ -1490,7 +1531,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       (!originalTransactionToken || !originalTransactionMethods || !originalTransactionPhysical)
     )
       throw changed();
-    const assertPreparedCurrent = () => {
+    const preparedCurrent = () => {
       if (
         closed ||
         binding !== originalBinding ||
@@ -1498,35 +1539,31 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         db.isTransaction !== originalTransaction ||
         currentTransactionToken(db) !== originalTransactionToken
       )
-        throw changed();
+        return false;
       if (originalTransaction) {
-        if (
-          bindingNow() !== originalBinding ||
-          managedDatabaseMethodEpoch(db) !== originalTransactionMethods ||
-          captureManagedPhysicalEpoch() !== originalTransactionPhysical
-        )
-          throw changed();
-        return;
+        return (
+          bindingNow() === originalBinding &&
+          managedDatabaseMethodEpoch(db) === originalTransactionMethods &&
+          captureManagedPhysicalEpoch() === originalTransactionPhysical
+        );
       }
-      if (
-        !original ||
-        reviewPreparationStamp(db) !== original.preparationStamp ||
-        reviewPreparationMethodStamp(db) !== original.preparationMethods ||
-        !managedPhysicalScopeCurrent(original.physicalEpoch)
-      )
-        throw changed();
+      return (
+        original !== undefined &&
+        reviewPreparationStamp(db) === original.preparationStamp &&
+        reviewPreparationMethodStamp(db) === original.preparationMethods &&
+        managedPhysicalScopeCurrent(original.physicalEpoch)
+      );
     };
     const guard = Object.freeze({ kind: 'prepared-collection-queue-guard' as const });
     preparedQueueGuards.set(guard, {
       owner: preparedGuardOwner,
-      assertCurrent: assertPreparedCurrent,
+      current: preparedCurrent,
     });
     return guard;
   };
   const assertPreparedGuard = (guard: PreparedCollectionQueueGuard) => {
     const retained = preparedQueueGuards.get(guard);
-    if (!retained || retained.owner !== preparedGuardOwner) throw changed();
-    retained.assertCurrent();
+    if (!retained || retained.owner !== preparedGuardOwner || !retained.current()) throw changed();
   };
   const prepareCurrent = async () => {
     if (closed) throw changed();
@@ -1558,6 +1595,18 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     reviewKey = '',
     reviewObservedStamp: string | undefined,
     reviewCertificate: CollectionReviewRowCertificate | undefined;
+  let preparedReview:
+    | {
+        guard: PreparedCollectionQueueGuard;
+        selected: Extract<NonNullable<typeof reviewCache>, { status: 'ready' }>;
+        generation: number;
+        intakeId: string;
+        key: string;
+        sourcePin: string;
+        requestRevision: number;
+        queueBinding: string;
+      }
+    | undefined;
   let reviewGeneration = 0,
     pendingReviews = 0,
     discardReleasedReview = false,
@@ -1568,6 +1617,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     reviewKey = '';
     reviewObservedStamp = undefined;
     reviewCertificate = undefined;
+    preparedReview = undefined;
   };
   const resetReview = () => {
     reviewGeneration++;
@@ -1600,6 +1650,95 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     assertCurrent,
     capturePreparedGuard,
     assertPreparedGuard,
+    tryBorrowPreparedReview(
+      intakeId: string,
+      proposalId: string | null,
+      assertOwner: () => void,
+      assertOwnerCurrent: () => void,
+    ):
+      | (Omit<RetainedCollectionClinicalPolicy, 'close'> & { checked: CheckedRetainedPolicy })
+      | undefined {
+      const proof = preparedReview;
+      if (
+        !proof ||
+        closed ||
+        pendingReviews ||
+        discardReleasedReview ||
+        proof.key !== canonicalLiteral([intakeId, proposalId]) ||
+        proof.selected !== reviewCache ||
+        proof.generation !== reviewGeneration ||
+        proof.queueBinding !== binding ||
+        proof.requestRevision !== revision(db) ||
+        proof.sourcePin !== canonicalLiteral(intakeSourceVersion(db, intakeId)) ||
+        !preparedQueueGuards.get(proof.guard)?.current()
+      )
+        return undefined;
+      const assertSelected = () => {
+        if (
+          closed ||
+          pendingReviews ||
+          discardReleasedReview ||
+          preparedReview !== proof ||
+          reviewCache !== proof.selected ||
+          reviewGeneration !== proof.generation ||
+          reviewKey !== proof.key ||
+          binding !== proof.queueBinding
+        )
+          throw changed();
+        assertPreparedGuard(proof.guard);
+      };
+      let projection: ReturnType<typeof collectionClinicalProjectionContext> | undefined;
+      const assertAuthorityCurrent = () => {
+        assertOwner();
+        assertSelected();
+        if (
+          proof.requestRevision !== revision(db) ||
+          proof.sourcePin !== canonicalLiteral(intakeSourceVersion(db, intakeId))
+        )
+          throw changed();
+        projection?.assertAuthorityCurrent();
+        assertOwnerCurrent();
+        assertSelected();
+      };
+      const assertCurrent = () => {
+        assertAuthorityCurrent();
+        projection = collectionClinicalProjectionContext(proof.selected.session);
+        assertAuthorityCurrent();
+      };
+      assertCurrent();
+      const checked = Object.freeze({
+        assertAuthorityCurrent,
+        record(recordId: string, candidateId: string, candidateVersionId: string) {
+          assertAuthorityCurrent();
+          const value = proof.selected.session.record(recordId, candidateId, candidateVersionId);
+          assertAuthorityCurrent();
+          return value;
+        },
+        *verifiedArtifacts() {
+          assertAuthorityCurrent();
+          for (const artifact of projection!.verifiedArtifacts()) {
+            assertAuthorityCurrent();
+            yield { ...artifact };
+            assertAuthorityCurrent();
+          }
+        },
+      });
+      return {
+        checked,
+        assertCurrent,
+        record(recordId, candidateId, candidateVersionId) {
+          assertCurrent();
+          const value = checked.record(recordId, candidateId, candidateVersionId);
+          assertCurrent();
+          return value;
+        },
+        retainArtifacts(retain) {
+          assertCurrent();
+          retain(projection!.verifiedArtifacts());
+          assertCurrent();
+        },
+      };
+    },
     tryBorrowReview(
       intakeId: string,
       proposalId: string | null,
@@ -1724,7 +1863,23 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       // leases and transactions cannot seed a session for a later window.
       let retained = false;
       try {
+        if (success && preparedReview && !pendingReviews && !discardReleasedReview) {
+          try {
+            assertPreparedGuard(preparedReview.guard);
+            retained =
+              preparedReview.selected === reviewCache &&
+              preparedReview.generation === reviewGeneration &&
+              preparedReview.key === reviewKey &&
+              preparedReview.queueBinding === binding &&
+              preparedReview.requestRevision === revision(db) &&
+              preparedReview.sourcePin ===
+                canonicalLiteral(intakeSourceVersion(db, preparedReview.intakeId));
+          } catch {
+            retained = false;
+          }
+        }
         if (
+          !retained &&
           success &&
           reviewCertificate &&
           reviewCertificate.stamp === reviewReadStamp(db) &&
@@ -1920,7 +2075,19 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
               stamp = reviewReadStamp(db),
               requestRevision = revision(db),
               sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId));
-            if (
+            const retainedPreparedReview = preparedReview;
+            const reusePrepared =
+              preparedGuard !== undefined &&
+              retainedPreparedReview !== undefined &&
+              retainedPreparedReview.guard === preparedGuard &&
+              retainedPreparedReview.selected === reviewCache &&
+              retainedPreparedReview.generation === reviewGeneration &&
+              retainedPreparedReview.key === key &&
+              retainedPreparedReview.sourcePin === sourcePin &&
+              retainedPreparedReview.requestRevision === requestRevision &&
+              retainedPreparedReview.queueBinding === binding;
+            if (reusePrepared) assertPreparedGuard(retainedPreparedReview.guard);
+            else if (
               !reviewCache ||
               reviewKey !== key ||
               stamp === undefined ||
@@ -1957,6 +2124,7 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
             }
             assertRunning();
             assertPreparedGuard(retainedGuard);
+            if (!reviewCache) throw changed();
             if (reviewCache.status !== 'ready')
               throw new IntakeReviewFragmentRequired(reviewCache.reference);
             // A queued lease may have waited after its initial file verification.
@@ -2003,6 +2171,25 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
             });
             assertRunning();
             assertPreparedGuard(retainedGuard);
+            if (
+              preparedGuard &&
+              !preparedReview &&
+              requestRevision === revision(db) &&
+              sourcePin === canonicalLiteral(intakeSourceVersion(db, intakeId))
+            ) {
+              // A completed internal policy retains its original normalized guard.
+              // It never grants a raw review certificate to public consumers.
+              preparedReview = {
+                guard: preparedGuard,
+                selected: selectedReview,
+                generation: reviewGeneration,
+                intakeId,
+                key,
+                sourcePin,
+                requestRevision,
+                queueBinding: binding,
+              };
+            }
             return {
               certificate: reviewCertificate && { ...reviewCertificate },
               version: reviewCache.session.review.version,

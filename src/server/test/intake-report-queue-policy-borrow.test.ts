@@ -26,6 +26,7 @@ import {
   clearCollectionQueueReviews,
   checkedRetainedCollectionClinicalPolicyContext,
   openCollectionReportQueue,
+  tryBorrowPreparedCollectionClinicalPolicy,
   tryBorrowRetainedCollectionClinicalPolicy,
 } from '../intake-report-group-collection.ts';
 import { runExclusiveClinicalOperation } from '../clinical-operation.ts';
@@ -327,6 +328,165 @@ test('queued review continuation credits only certified disposable maintenance',
   });
   methods.close({ discard: true });
 });
+
+test('prepared queue policy reuses its original guard without minting a raw certificate', async (t) => {
+  const f = await retained(t, 4);
+  clearCollectionQueueReviews(f.db);
+  execClinicalReviewMaintenance(
+    f.db,
+    'attention',
+    'CREATE TEMP TABLE IF NOT EXISTS source_attention_counts_v1(source_id TEXT PRIMARY KEY,sections INTEGER NOT NULL)',
+  );
+  const queue = await openCollectionReportQueue(f.db, f.root, f.profileId);
+  t.after(() => queue.close({ discard: true }));
+  const guard = queue.capturePreparedGuard(),
+    replacementGuard = queue.capturePreparedGuard();
+  runClinicalReviewMaintenance(
+    f.db,
+    'attention',
+    'INSERT OR REPLACE INTO source_attention_counts_v1 VALUES(?,?)',
+    f.source.id,
+    0,
+  );
+  assert.throws(() => queue.assertCurrent(), { code: 'REPORT_QUEUE_CURSOR' });
+  const before = intakeWorkCounters(f.db).warm.collectionQueueClinicalReviews;
+  for (const member of f.members) {
+    const row = await queue.reviewMember(f.source.id, member, undefined, undefined, guard);
+    assert.equal(row.certificate, undefined);
+    assert.equal(row.record.id, member.recordId);
+  }
+  assert.equal(
+    intakeWorkCounters(f.db).warm.collectionQueueClinicalReviews - before,
+    1,
+    'one complete policy serves all records under the same original guard',
+  );
+  await queue.reviewMember(f.source.id, f.members[0]!, undefined, undefined, replacementGuard);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.collectionQueueClinicalReviews - before,
+    2,
+    'a new guard does not inherit a prior private preparation proof',
+  );
+  queue.close({ retainReview: true });
+  await runExclusiveClinicalOperation(f.db, async () => {
+    assert.equal(borrow(f), undefined, 'private completion does not mint a raw certificate');
+    const selected = tryBorrowPreparedCollectionClinicalPolicy(
+      f.db,
+      f.root,
+      f.profileId,
+      f.source.id,
+      null,
+      () => {},
+    );
+    assert.ok(selected, 'the internal route borrows the original completed private proof');
+    const checked = checkedRetainedCollectionClinicalPolicyContext(f.db, selected);
+    const artifacts = checked.verifiedArtifacts()[Symbol.iterator]();
+    assert.equal(artifacts.next().done, false);
+    const member = f.members[0]!;
+    assert.ok(checked.record(member.recordId, member.candidateId, member.candidateVersionId));
+    selected.close();
+    assert.throws(() =>
+      checked.record(member.recordId, member.candidateId, member.candidateVersionId),
+    );
+    assert.throws(() => artifacts.next());
+  });
+  const reopened = await openCollectionReportQueue(f.db, f.root, f.profileId);
+  t.after(() => reopened.close({ discard: true }));
+  f.db.exec('CREATE TEMP TABLE fictional_unowned_policy_change(n INTEGER)');
+  await assert.rejects(
+    reopened.reviewMember(f.source.id, f.members[0]!, undefined, undefined, replacementGuard),
+    { code: 'REPORT_QUEUE_CURSOR' },
+  );
+});
+
+test('prepared policy borrow refuses a same-byte original replacement before admission', async (t) => {
+  const f = await retained(t);
+  clearCollectionQueueReviews(f.db);
+  const queue = await openCollectionReportQueue(f.db, f.root, f.profileId);
+  const guard = queue.capturePreparedGuard();
+  await queue.reviewMember(f.source.id, f.members[0]!, undefined, undefined, guard);
+  queue.close({ retainReview: true });
+  await runExclusiveClinicalOperation(f.db, async () => {
+    const selected = tryBorrowPreparedCollectionClinicalPolicy(
+      f.db,
+      f.root,
+      f.profileId,
+      f.source.id,
+      null,
+      () => {},
+    );
+    assert.ok(selected);
+    const checked = checkedRetainedCollectionClinicalPolicyContext(f.db, selected);
+    const original = [...checked.verifiedArtifacts()].find(
+      (artifact) => artifact.id === f.source.id,
+    );
+    assert.ok(original, 'the selected policy includes the actual signed original');
+    selected.close();
+    const bytes = readFileSync(original.path);
+    const before = nodeFs.statSync(original.path, { bigint: true });
+    writeFileSync(original.path, bytes);
+    assert.notEqual(nodeFs.statSync(original.path, { bigint: true }).ctimeNs, before.ctimeNs);
+    assert.throws(() =>
+      tryBorrowPreparedCollectionClinicalPolicy(
+        f.db,
+        f.root,
+        f.profileId,
+        f.source.id,
+        null,
+        () => {},
+      ),
+    );
+  });
+});
+
+for (const mutation of ['source-aba', 'method', 'discard', 'foreign-temp'] as const)
+  test('prepared policy borrow refuses original proof after ' + mutation, async (t) => {
+    const f = await retained(t);
+    clearCollectionQueueReviews(f.db);
+    const queue = await openCollectionReportQueue(f.db, f.root, f.profileId);
+    const guard = queue.capturePreparedGuard();
+    await queue.reviewMember(f.source.id, f.members[0]!, undefined, undefined, guard);
+    queue.close({ retainReview: true });
+    await runExclusiveClinicalOperation(f.db, async () => {
+      const selected = tryBorrowPreparedCollectionClinicalPolicy(
+        f.db,
+        f.root,
+        f.profileId,
+        f.source.id,
+        null,
+        () => {},
+      );
+      assert.ok(selected);
+      const checked = checkedRetainedCollectionClinicalPolicyContext(f.db, selected);
+      if (mutation === 'source-aba') {
+        f.db.exec('SAVEPOINT fictional_policy_aba');
+        f.db
+          .prepare('UPDATE source_files SET details_json=details_json WHERE id=?')
+          .run(f.source.id);
+        f.db.exec('ROLLBACK TO fictional_policy_aba');
+        f.db.exec('RELEASE fictional_policy_aba');
+      } else if (mutation === 'method') {
+        f.db.setAuthorizer(null);
+      } else if (mutation === 'foreign-temp') {
+        f.db.exec('CREATE TEMP TABLE fictional_foreign_policy(n INTEGER)');
+      } else {
+        clearCollectionQueueReviews(f.db);
+      }
+      assert.throws(() => checked.assertAuthorityCurrent());
+      selected.close();
+      assert.equal(
+        tryBorrowPreparedCollectionClinicalPolicy(
+          f.db,
+          f.root,
+          f.profileId,
+          f.source.id,
+          null,
+          () => {},
+        ),
+        undefined,
+        'an already stale proof is a cache miss, never a renewed policy',
+      );
+    });
+  });
 
 test(
   'actual users pin protects retained policy across fifth database LRU churn and releases only its lease',

@@ -18,6 +18,12 @@ function invalid(): Error {
   return Error('Retained physical evidence changed');
 }
 
+export class ClinicalPhysicalEvidenceChanged extends Error {
+  constructor() {
+    super('Retained physical evidence changed');
+  }
+}
+
 function boundedField(value: string): boolean {
   return Buffer.byteLength(value) <= FIELD_BYTES;
 }
@@ -115,6 +121,7 @@ export async function openClinicalPhysicalVerifier(signal?: AbortSignal): Promis
       count?: number;
       closed?: boolean;
       failure?: boolean;
+      sourceChanged?: boolean;
     };
     if (!ready) {
       if (received.ready !== true) return fail(invalid());
@@ -127,9 +134,16 @@ export async function openClinicalPhysicalVerifier(signal?: AbortSignal): Promis
       return;
     }
     const current = pending;
+    if (!current || received.id !== current.id) return fail(invalid());
     if (
-      !current ||
-      received.id !== current.id ||
+      !current.close &&
+      received.sourceChanged === true &&
+      received.count === undefined &&
+      received.closed === undefined &&
+      received.failure === undefined
+    )
+      return fail(new ClinicalPhysicalEvidenceChanged());
+    if (
       received.failure ||
       (current.close ? received.closed !== true : received.count !== current.count)
     )

@@ -13,6 +13,7 @@ import {
   withManagedPhysicalMutation,
 } from '../clinical-review-physical-epoch.ts';
 import {
+  ClinicalPhysicalEvidenceChanged,
   clinicalPhysicalVerificationPages,
   openClinicalPhysicalVerifier,
   type ClinicalPhysicalItem,
@@ -105,7 +106,7 @@ test('physical worker refuses replacement and oversized transport', async (t) =>
     writeFileSync(original, 'different fictional original');
     await assert.rejects(
       verifier.verifyPage([{ kind: 'identity', path: original, expectedIdentity: identity }]),
-      /physical evidence changed/,
+      (error) => error instanceof ClinicalPhysicalEvidenceChanged,
     );
   } finally {
     await verifier.abort();
@@ -120,7 +121,10 @@ test('physical worker refuses replacement and oversized transport', async (t) =>
           expectedIdentity: identity,
         })),
       ),
-      /physical evidence changed/,
+      (error) =>
+        error instanceof Error &&
+        !(error instanceof ClinicalPhysicalEvidenceChanged) &&
+        /physical evidence changed/.test(error.message),
     );
   } finally {
     await second.abort();

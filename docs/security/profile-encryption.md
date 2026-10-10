@@ -87,6 +87,18 @@ never recovery authority. The final admission rechecks ownership, cancellation,
 authorization, selected/indexed heads, root/database/WAL identity and the original
 managed-filesystem epoch without another await. It never renews a changed proof.
 
+HTTP and passkey unlocks retain private issuer-owned authorization tokens bound
+to the original manager, profile and live session or verified challenge. Their
+closing checks read only that issuer's retained lifecycle state; they do not run
+caller callbacks or reread storage. Contributor authorization callbacks remain
+supported during preparation, but their effects finish before both the source
+and target closing physical rosters. The final database reads reuse statements
+compiled under the installed authorization policy before those rosters. A
+private synchronous barrier refuses policy re-entry, custom SQL callbacks or
+automatic statement re-preparation rather than bypassing the installed policy.
+No caller callback, storage adapter read or database compilation follows the
+closing seal before activation.
+
 The target preparation lease rejects concurrent target opens and is cancelled by
 target lock, removal, keyring writes or application closure. No target app, batch
 publisher or original resolver can use its prepared runtime before attachment.

@@ -42,6 +42,17 @@ final SQLite values remain materialized. No operator migration or setting is
 needed; current old-profile recovery and integration qualification remain open.
 See the [bounded-view contract](../data/intake-bounded-views.md).
 
+Encrypted unlock admission now retains genuine session or passkey ownership
+through its final physical checks and refuses database callback re-entry during
+the closing seal. Restart into the reviewed build and retry a refused unlock;
+there is no accepted-format migration or new operator setting. Contributor
+authorization callbacks still run during preparation, before final physical
+verification, rather than after it. A callback that changes original ciphertext
+refuses activation even when the bytes and manifest are unchanged. This unlock
+boundary does not qualify the separate compact-publication callback repair or
+CRS-231's remaining integrated release gates. See the [profile encryption
+contract](../security/profile-encryption.md).
+
 Native Import report-group pages now use a disposable indexed group order and retained page totals. After updating, reload an open Import queue if its older group cursor is refused; its cursor is navigation state and is not portable across this change. No original, accepted-record or operator-configuration migration is required. The prior build continues to use its own queue ordering and cache behavior. See the [report review queue contract](../../src/server/INTAKE.md#report-review-queue).
 
 Native identity reviews add an optional complete evidence commitment for one

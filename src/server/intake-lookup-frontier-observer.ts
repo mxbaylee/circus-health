@@ -34,6 +34,7 @@ interface AuxiliaryPreparation {
 }
 
 interface Observer {
+  readonly event: (...values: unknown[]) => unknown;
   identity: object;
   readonly functionName: string;
   readonly triggerNames: readonly string[];
@@ -81,6 +82,12 @@ export interface IntakeFrontierAttemptSnapshot {
 }
 
 const observers = new WeakMap<DatabaseSync, Observer>();
+
+/** Only the issuer's bounded memory-only event can run in a closing SQL seal. */
+export function intakeFrontierTerminalEvent(db: DatabaseSync, callback: unknown): boolean {
+  const observer = observers.get(db);
+  return !!observer && !observer.functionReplaced && observer.event === callback;
+}
 function revoke(observer: Observer, reason: string): void {
   if (!observer.revoked) observer.firstRevocation = reason;
   observer.revoked = true;
@@ -343,6 +350,7 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
     return sql;
   });
   observer = {
+    event,
     activeLookupDirtyWrites: 0n,
     captureClearCount: 0,
     identity: {},

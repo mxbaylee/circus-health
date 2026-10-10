@@ -1,5 +1,8 @@
 import { clearSourceContextClassificationCache } from './intake-source-context-classification.ts';
 import { archiveRefusal } from './archive-refusal.ts';
+import { vaultSessionUnlockAuthorized } from './vault-app.ts';
+import { passkeyUnlockAuthorized } from './profile-passkeys.ts';
+import { authorizationSignalAborted } from './authorization-signal.ts';
 import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
@@ -64,6 +67,9 @@ import {
   HttpError,
   LATEST_SCHEMA_VERSION,
   transaction,
+  managedDatabaseMethodEpoch,
+  withoutManagedDatabaseCallbacks,
+  prepareManagedDatabaseCallbackBarrier,
   type Database,
 } from './database.ts';
 import { durableWrite, attachPersonalDurability } from './portable.ts';
@@ -229,6 +235,7 @@ interface VerifyOptions {
   authorizeCopySource?: (profileId: string) => void;
   signal?: AbortSignal;
   assertAuthorized?: () => void;
+  authorization?: object;
 }
 
 interface RemoveInput {
@@ -296,6 +303,41 @@ export function createEncryptedProfiles({
   availableRuntimeBytes = () => runtimeCapacity(runtimeDirectory).reportedAvailableBytes,
   unlockCheckpoint,
 }: CreateEncryptedProfilesOptions) {
+  let managerApi: object;
+  const setupUnlockAuthorizations = new WeakMap<
+    object,
+    {
+      setupId: string;
+      setup: SetupState;
+      owner?: object;
+      signal?: AbortSignal;
+      source?: OpenedProfile;
+      sourceId?: string;
+      sourceDirectory?: string;
+      sourceAuthority?: UnlockAuthorityWitness;
+    }
+  >();
+  const setupUnlockAuthorization = (
+    setupId: string,
+    setup: SetupState,
+    owner?: object,
+    signal?: AbortSignal,
+    source?: OpenedProfile,
+    sourceAuthority?: UnlockAuthorityWitness,
+  ) => {
+    const token = Object.freeze({});
+    setupUnlockAuthorizations.set(token, {
+      setupId,
+      setup,
+      owner,
+      signal,
+      source,
+      sourceId: source?.id,
+      sourceDirectory: source ? pathFor(source.id) : undefined,
+      sourceAuthority,
+    });
+    return token;
+  };
   const data = realpathSync(dataDirectory),
     registryPath = resolve(data, 'profiles.json'),
     profilesDir = resolve(data, 'profiles'),
@@ -1126,7 +1168,7 @@ export function createEncryptedProfiles({
   async function verifyAsync(
     setupId: string,
     input: VerifyInput,
-    { signal, assertAuthorized, authorizeCopySource }: VerifyOptions = {},
+    { signal, assertAuthorized, authorizeCopySource, authorization }: VerifyOptions = {},
   ) {
     const setup = setups.get(setupId);
     if (!setup || setup.expires < Date.now())
@@ -1140,6 +1182,7 @@ export function createEncryptedProfiles({
     if (registry.profiles.some((p) => p.id === setup.id))
       return unlockWithKeyAsync(setup.id, secretKey(setup.id, input.recovery), {
         signal,
+        authorization: setupUnlockAuthorization(setupId, setup, authorization, signal),
         assertAuthorized: () => {
           assertAuthorized?.();
           if (setups.get(setupId) !== setup || setup.expires < Date.now())
@@ -1167,9 +1210,9 @@ export function createEncryptedProfiles({
     try {
       if (!registryPublished) writeRegistry();
       let authority = unlockAuthorityWitness(pathFor(id));
-      const check = () => {
-        controller.signal.throwIfAborted();
-        assertAuthorized?.();
+      const check = (effects = true) => {
+        if (authorizationSignalAborted(controller.signal)) throw Error('Setup access changed');
+        if (effects) assertAuthorized?.();
         if (
           preparing.get(id) !== controller ||
           setups.get(setupId) !== setup ||
@@ -1178,19 +1221,26 @@ export function createEncryptedProfiles({
           unlockPathIdentity(registryPath) !== registryIdentity
         )
           throw Error('Setup access changed');
+        if (
+          !effects &&
+          authorization &&
+          !vaultSessionUnlockAuthorized(authorization, managerApi, 'setup:' + setupId)
+        )
+          throw Error('Setup authorization changed');
         assertUnlockAuthority(pathFor(id), authority);
         if (source) {
-          authorizeCopySource?.(source.id);
+          if (effects) authorizeCopySource?.(source.id);
           if (
             opened.get(source.id) !== source ||
-            source.closing ||
-            source.recordStorage.read('head')?.toString('utf8') !== sourceHead
+            Object.getOwnPropertyDescriptor(source, 'closing')?.value !== false ||
+            (effects && source.recordStorage.read('head')?.toString('utf8') !== sourceHead)
           )
             throw Error('Copy source changed');
           assertUnlockAuthority(pathFor(source.id), sourceAuthority!);
-          flushRecordDurability(source.db);
+          if (effects) flushRecordDurability(source.db);
         }
       };
+      const checkPublication = () => check();
       check();
       witnessDirectory = await mkdtemp(resolve(runtime, '.unlock-physical-'));
       const inspected = await setupWorker<InspectedSetup>(
@@ -1260,7 +1310,7 @@ export function createEncryptedProfiles({
         sourcePhysicalWitness = staged.sourcePhysicalWitness;
         check();
         unlockCheckpoint?.('publication');
-        check();
+        checkPublication();
         const physicalEpoch = captureManagedPhysicalEpoch();
         if (!physicalEpoch) throw Error('Setup physical evidence is being changed');
         const verifyPhysical = async (
@@ -1289,7 +1339,7 @@ export function createEncryptedProfiles({
         };
         await verifyPhysical(id, staged.physicalWitness, 'physical.sqlite');
         if (source) await verifyPhysical(source.id, staged.sourcePhysicalWitness!, 'source.sqlite');
-        check();
+        check(false);
         if (
           !managedPhysicalEpochCurrent(physicalEpoch) ||
           unlockPhysicalIdentity(resolve(pathFor(id), 'vault')).value !==
@@ -1356,7 +1406,18 @@ export function createEncryptedProfiles({
       const result = await unlockWithKeyAsync(
         id,
         key,
-        { signal: controller.signal, assertAuthorized: check },
+        {
+          signal: controller.signal,
+          assertAuthorized: check,
+          authorization: setupUnlockAuthorization(
+            setupId,
+            setup,
+            authorization,
+            controller.signal,
+            source,
+            sourceAuthority,
+          ),
+        },
         {
           entry: pendingEntry,
           authority,
@@ -1421,7 +1482,15 @@ export function createEncryptedProfiles({
   async function unlockWithKeyAsync(
     id: string,
     key: VaultKey,
-    { signal, assertAuthorized }: { signal?: AbortSignal; assertAuthorized?: () => void } = {},
+    {
+      signal,
+      assertAuthorized,
+      authorization,
+    }: {
+      signal?: AbortSignal;
+      assertAuthorized?: () => void;
+      authorization?: object;
+    } = {},
     activation?: {
       entry: ProfileRegistry['profiles'][number];
       authority: UnlockAuthorityWitness;
@@ -1486,6 +1555,26 @@ export function createEncryptedProfiles({
         activation
           ? !registry.profiles.some((p) => p.id === id)
           : registry.profiles.find((p) => p.id === id) === entry;
+      const ownerCurrent = () => {
+        if (!authorization) return true;
+        const setup = setupUnlockAuthorizations.get(authorization);
+        if (setup)
+          return (
+            setup.setup.id === id &&
+            (!setup.signal || !authorizationSignalAborted(setup.signal)) &&
+            setups.get(setup.setupId) === setup.setup &&
+            setup.setup.expires >= Date.now() &&
+            (!setup.source ||
+              (Map.prototype.get.call(opened, setup.sourceId) === setup.source &&
+                Object.getOwnPropertyDescriptor(setup.source, 'closing')?.value === false)) &&
+            (!setup.owner ||
+              vaultSessionUnlockAuthorized(setup.owner, managerApi, 'setup:' + setup.setupId))
+          );
+        return (
+          vaultSessionUnlockAuthorized(authorization, managerApi, 'profile:' + id) ||
+          passkeyUnlockAuthorized(authorization, managerApi, id)
+        );
+      };
       const checkpoint = (phase: 'preparation' | 'vault' | 'publication' = 'preparation') => {
         controller.signal.throwIfAborted();
         if (
@@ -1496,6 +1585,7 @@ export function createEncryptedProfiles({
         )
           throw Error('Encrypted profile preparation changed');
         assertAuthorized?.();
+        if (!ownerCurrent()) throw Error('Encrypted profile authorization changed');
         assertUnlockAuthority(directory, authority);
         unlockCheckpoint?.(phase);
         controller.signal.throwIfAborted();
@@ -1649,8 +1739,35 @@ export function createEncryptedProfiles({
           throw Error('Encrypted profile preparation changed');
       });
       checkpoint('publication');
+      // Caller effects finish before either original physical roster is closed.
+      assertAuthorized?.();
+      if (!ownerCurrent()) throw Error('Encrypted profile authorization changed');
+      prepareManagedDatabaseCallbackBarrier(db);
+      const terminalSql = {
+        data: db.prepare('PRAGMA data_version'),
+        main: db.prepare('PRAGMA main.schema_version'),
+        temp: db.prepare('PRAGMA temp.schema_version'),
+        changes: db.prepare('SELECT CAST(total_changes() AS TEXT) AS n'),
+        head: db.prepare('SELECT head_json FROM __record_state WHERE singleton=1'),
+      };
+      const terminalState = {
+        main: terminalSql.main.get()!.schema_version,
+        temp: terminalSql.temp.get()!.schema_version,
+        changes: terminalSql.changes.get()!.n,
+        methods: managedDatabaseMethodEpoch(db),
+        prepare: db.prepare,
+        exec: db.exec,
+      };
+      if (
+        !terminalState.methods ||
+        terminalSql.data.get()!.data_version !== dataVersion ||
+        JSON.stringify(JSON.parse(String(terminalSql.head.get()?.head_json))) !==
+          JSON.stringify(selected)
+      )
+        throw Error('Encrypted profile preparation changed');
       const physicalEpoch = captureManagedPhysicalEpoch();
       if (!physicalEpoch) throw Error('Encrypted profile physical evidence is being changed');
+      await activation?.terminalVerification?.();
       const checked = await prepareEncryptedUnlock<{ checked: number }>(
         {
           dataDirectory: data,
@@ -1671,36 +1788,45 @@ export function createEncryptedProfiles({
       );
       if (checked.checked !== prepared.physicalWitness.entries)
         throw Error('Encrypted profile physical evidence changed');
-      await activation?.terminalVerification?.();
       await removeRuntime(witnessDirectory, { recursive: true, force: true });
       witnessDirectory = undefined;
-      assertAuthorized?.();
       // No callbacks or await after this closing seal. Opening the prepared DB
       // may change its timestamps, but never its original file identity.
       controller.signal.throwIfAborted();
       if (
         preparing.get(id) !== controller ||
+        !ownerCurrent() ||
         !entryCurrent() ||
         unlockPathIdentity(registryPath) !== registryIdentity ||
         !managedPhysicalEpochCurrent(physicalEpoch)
       )
         throw Error('Encrypted profile preparation changed');
       assertUnlockAuthority(directory, authority);
+      const setupOwner = authorization && setupUnlockAuthorizations.get(authorization);
+      if (setupOwner?.sourceDirectory && setupOwner.sourceAuthority)
+        assertUnlockAuthority(setupOwner.sourceDirectory, setupOwner.sourceAuthority);
       if (
         unlockPathIdentity(root, true) !== prepared.rootIdentity ||
         unlockPathIdentity(dbPath) !== attachedDatabaseIdentity ||
         attachedDatabaseIdentity.split(':').slice(0, 2).join(':') !==
           prepared.databaseIdentity.split(':').slice(0, 2).join(':') ||
         walIdentity() !== attachedWalIdentity ||
-        db.prepare('PRAGMA data_version').get()!.data_version !== dataVersion ||
-        recordStorage.read('head')?.toString('utf8') !== prepared.selectedHead ||
-        JSON.stringify(
-          JSON.parse(
-            String(
-              db.prepare('SELECT head_json FROM __record_state WHERE singleton=1').get()?.head_json,
-            ),
-          ),
-        ) !== JSON.stringify(selected)
+        db.prepare !== terminalState.prepare ||
+        db.exec !== terminalState.exec ||
+        managedDatabaseMethodEpoch(db) !== terminalState.methods ||
+        !withoutManagedDatabaseCallbacks(
+          db,
+          () =>
+            terminalSql.main.get()!.schema_version === terminalState.main &&
+            terminalSql.temp.get()!.schema_version === terminalState.temp &&
+            terminalSql.changes.get()!.n === terminalState.changes &&
+            terminalSql.data.get()!.data_version === dataVersion &&
+            JSON.stringify(JSON.parse(String(terminalSql.head.get()?.head_json))) ===
+              JSON.stringify(selected),
+        ) ||
+        managedDatabaseMethodEpoch(db) !== terminalState.methods ||
+        !managedPhysicalEpochCurrent(physicalEpoch) ||
+        !ownerCurrent()
       )
         throw Error('Encrypted profile preparation changed');
       state.recoveryWork!.physicalCheckedEntries = checked.checked;
@@ -1850,8 +1976,18 @@ export function createEncryptedProfiles({
   }
   async function resumeAsync(
     recovery: unknown,
-    { signal, assertAuthorized }: { signal?: AbortSignal; assertAuthorized?: () => void } = {},
+    {
+      signal,
+      assertAuthorized,
+      authorization,
+    }: {
+      signal?: AbortSignal;
+      assertAuthorized?: () => void;
+      authorization?: object;
+    } = {},
   ) {
+    const ownerCurrent = () =>
+      !authorization || vaultSessionUnlockAuthorized(authorization, managerApi, 'resume');
     const id = (recovery as Partial<RecoveryKit> | null)?.profileId;
     if (!idValid(id))
       throw new HttpError(
@@ -1865,6 +2001,7 @@ export function createEncryptedProfiles({
       key.fill(0);
       signal?.throwIfAborted();
       assertAuthorized?.();
+      if (!ownerCurrent()) throw Error('Setup authorization changed');
       return { profileId: id, active: true, name: entry.name };
     }
     if (preparing.has(id)) {
@@ -1882,6 +2019,7 @@ export function createEncryptedProfiles({
       const check = () => {
         controller.signal.throwIfAborted();
         assertAuthorized?.();
+        if (!ownerCurrent()) throw Error('Setup authorization changed');
         if (preparing.get(id) !== controller || registry.profiles.some((p) => p.id === id))
           throw Error('Setup access changed');
         assertUnlockAuthority(pathFor(id), authority);
@@ -1906,6 +2044,7 @@ export function createEncryptedProfiles({
       )
         throw new HttpError(400, 'SETUP_INVALID', 'This recovery file could not resume setup');
       const setupId = randomBytes(32).toString('base64url');
+      if (!ownerCurrent()) throw Error('Setup authorization changed');
       setups.set(setupId, { id, expires: Date.now() + 30 * 60 * 1000 });
       return { setupId, profileId: id, active: false, name: inspected.details.name };
     } finally {
@@ -1915,7 +2054,7 @@ export function createEncryptedProfiles({
       if (witnessDirectory) await removeRuntime(witnessDirectory, { recursive: true, force: true });
     }
   }
-  return {
+  const api = {
     begin,
     resume,
     resumeAsync,
@@ -1974,4 +2113,6 @@ export function createEncryptedProfiles({
         );
     },
   };
+  managerApi = api;
+  return api;
 }

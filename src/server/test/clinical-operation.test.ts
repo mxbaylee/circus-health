@@ -16,6 +16,44 @@ function gate() {
   });
   return { promise, resolve };
 }
+test('closing clinical ownership never invokes caller cancellation accessors or methods', async () => {
+  const db = new DatabaseSync(':memory:'),
+    controller = new AbortController();
+  let callbacks = 0;
+  try {
+    await assert.rejects(
+      runExclusiveClinicalOperation(
+        db,
+        async (owner) => {
+          Object.defineProperty(controller.signal, 'aborted', {
+            configurable: true,
+            get() {
+              callbacks++;
+              return false;
+            },
+          });
+          Object.defineProperty(controller.signal, 'throwIfAborted', {
+            configurable: true,
+            value() {
+              callbacks++;
+            },
+          });
+          assertClinicalOperation(db, owner);
+          assert.equal(callbacks, 0);
+          controller.abort();
+          assert.throws(() => assertClinicalOperation(db, owner), /no longer active/);
+          assert.equal(callbacks, 0);
+          Reflect.deleteProperty(controller.signal, 'aborted');
+          Reflect.deleteProperty(controller.signal, 'throwIfAborted');
+        },
+        { signal: controller.signal },
+      ),
+      /abort/i,
+    );
+  } finally {
+    db.close();
+  }
+});
 test('clinical operations serialize complete owners and preserve sequential nested ownership', async () => {
   const db = new DatabaseSync(':memory:');
   try {
