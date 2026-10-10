@@ -21,6 +21,7 @@ import {
   clinicalReviewRevision,
   transaction,
   type Database,
+  type TransactionOperation,
 } from './database.ts';
 import { ownershipClinicalHeader as clinicalRecord } from './ownership-clinical-header.ts';
 import { clinicalTables, type ClinicalKind } from './clinical-references.ts';
@@ -986,7 +987,21 @@ export function getRecordOwnershipReceipt(
     replayed: true,
   };
 }
-function commitOwnershipUnit(
+type OwnershipUnitIntent =
+  | { replayed: OwnershipReceipt }
+  | {
+      operation: TransactionOperation;
+      run(): Omit<OwnershipReceipt, 'outcomes'>;
+      finish(committed: Omit<OwnershipReceipt, 'outcomes'>): OwnershipReceipt;
+    };
+
+function commitOwnershipUnit(...args: Parameters<typeof ownershipUnitIntent>): OwnershipReceipt {
+  const intent = ownershipUnitIntent(...args);
+  if ('replayed' in intent) return intent.replayed;
+  return intent.finish(transaction(args[0], intent.run, intent.operation));
+}
+
+function ownershipUnitIntent(
   db: Database,
   root: string,
   profileId: string,
@@ -1007,7 +1022,7 @@ function commitOwnershipUnit(
     decision(recordId: string): NonNullable<OwnershipRequest['decisions']>[number] | undefined;
   },
   identityPlan?: import('./ownership-identity-snapshots.ts').OwnershipIdentitySnapshotPlan,
-): OwnershipReceipt {
+): OwnershipUnitIntent {
   owner(db, profileId);
   if (
     !object(input) ||
@@ -1035,11 +1050,10 @@ function commitOwnershipUnit(
         'OPERATION_CONFLICT',
         'This operation ID belongs to another correction',
       );
-    return getRecordOwnershipReceipt(db, profileId, supplied.operationId);
+    return { replayed: getRecordOwnershipReceipt(db, profileId, supplied.operationId) };
   }
-  const committed = transaction(
-    db,
-    () => {
+  return {
+    run: () => {
       reportPlan?.assertForTransaction();
       namePlan?.assertForTransaction();
       const preview = reportPlan
@@ -1459,14 +1473,17 @@ function commitOwnershipUnit(
       );
       return smallReceipt;
     },
-    {
+    operation: {
       operationId: supplied.operationId,
       fingerprint,
       actor: 'profile-user',
       origin: 'record-ownership',
     },
-  );
-  return { ...committed, outcomes: reportPlan ? [] : receiptOutcomes(db, supplied.operationId) };
+    finish: (committed) => ({
+      ...committed,
+      outcomes: reportPlan ? [] : receiptOutcomes(db, supplied.operationId),
+    }),
+  };
 }
 
 /** Owned native participant; asynchronous preparation must already be complete. */
