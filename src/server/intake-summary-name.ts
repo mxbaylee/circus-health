@@ -34,7 +34,7 @@ export async function prepareIntakeFilenameSummary(
 ): Promise<{ changed: boolean }> {
   options.assertRunning?.();
   const compact = await prepareIntakeCompactMetadata(db, source, options);
-  if (!compact.changed && intakeFilenameSummaryPrepared(db, source)) return compact;
+  if (intakeFilenameSummaryPrepared(db, source)) return compact;
   return runExclusiveClinicalOperation(
     db,
     async (operation) => {

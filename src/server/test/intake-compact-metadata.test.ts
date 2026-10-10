@@ -464,6 +464,7 @@ test(
     restoreInitialDetails();
     for (const mutation of ['sourceABA', 'extraRow'] as const) {
       restoreInitialDetails();
+      const beforeCompactProof = intakeWorkCounters(db).reconstruction;
       let called = false;
       const remove = observeTransactionBeforePublication(db, () => {
         if (called) return;
@@ -486,6 +487,17 @@ test(
         remove();
       }
       assert.equal(called, true);
+      const afterCompactProof = intakeWorkCounters(db).reconstruction;
+      assert.equal(
+        afterCompactProof.schemaCertificationHashedBytes -
+          beforeCompactProof.schemaCertificationHashedBytes,
+        0,
+        'compact-only verification does not hash unchanged native exports',
+      );
+      assert.equal(
+        afterCompactProof.schemaCertificationChunks - beforeCompactProof.schemaCertificationChunks,
+        0,
+      );
       assert.equal(
         db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!.details_json,
         initial.detailsJson,
@@ -555,7 +567,19 @@ test(
       .get(id)!;
     assert.equal(Number(unsafeA.__rowid), Number(unsafeB.__rowid));
     assert.equal(intakeCompactSourceRowsEqual(unsafeA, unsafeB), false);
+    const beforeFinalCompact = intakeWorkCounters(db).reconstruction;
     await prepareIntakeFilenameSummary(db, source);
+    const afterFinalCompact = intakeWorkCounters(db).reconstruction;
+    assert.equal(
+      afterFinalCompact.schemaCertificationHashedBytes -
+        beforeFinalCompact.schemaCertificationHashedBytes,
+      0,
+      'successful compact-only publication does not hash unchanged native exports',
+    );
+    assert.equal(
+      afterFinalCompact.schemaCertificationChunks - beforeFinalCompact.schemaCertificationChunks,
+      0,
+    );
     assert.ok(
       Buffer.byteLength(JSON.stringify(getIntakeEvidenceHeader(db, root, profileId, id))) < 2048,
     );

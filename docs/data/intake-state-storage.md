@@ -305,6 +305,14 @@ Readers obtain checked record handles, point fields, child pages or explicit fra
 
 The lazy compact-metadata projector shares the cold validator's selection rules. It preserves raw known-property occurrences and key spelling, and reads only the selected compact fields under a caller-supplied byte budget. A metadata command must stage its envelope and update the compact source row in one normal transaction; changing only the selected envelope would leave recovery-invalid source metadata.
 
+Compact-only metadata certification requires identical authenticated logical
+descriptors before and after preparation. It does not hash both unchanged exports
+again. Complete graph, JSON, source-projection and publication checks still run;
+actual schema adoption retains both export-equivalence hashes. Successful
+compaction also reuses already-valid filename and locator facts instead of
+publishing an unchanged facts collection. Missing or stale facts retain the
+existing preparation or refusal behavior.
+
 The retained-plan adapter keeps pre-inventory-version-1 expanded units as addressed evidence, with their exact source bindings, ordered attempts, roles and receipt-backed dispositions. It does not substitute the current member-unit recipe. Explicit cold preparation builds complete source/logical-bound first-active and first-retained unit selectors, with separately counted plan headers, units and coverage receipts. Warm point reads and metadata fragments consume those checked selectors. Repeating preparation for the same logical selection after cache loss reuses the completed selected index. Closed proposal/question/link impacts share that checked index through the final auxiliary adoption without rescanning plans. Bounded batch and role impacts additionally verify the appended receipt scope and the corresponding final decision-root publication. Unsupported structural plan changes leave the new selected index explicitly pending; they do not silently run a cold scan on every interactive read. Direct V2 recipe plans have their own checked historical unit pointers; they are never interpreted as empty expanded plans or ZIP evidence. Their cold selector pass reads unit identities without decoding coverage or metadata. A new or structurally replaced plan requires complete selector preparation.
 
 ## Native proposals and report snapshots

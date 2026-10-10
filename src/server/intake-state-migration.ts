@@ -1101,8 +1101,8 @@ function* prepareIntakeSchemaAdoptionProofSteps(
     invalid('compact metadata requires unchanged native logical data');
   const priorHash = createHash('sha256');
   let priorBytes = 0,
-    priorMode: 'raw' | 'normalized';
-  if (schemaBefore) {
+    priorMode: 'raw' | 'normalized' | undefined;
+  if (schemaBefore && !compactSameData) {
     const prior = createIntakeEnvelopeGraphReader(identity, before, beforeRead);
     priorMode = prior.control.mode;
     for (const piece of iterateSchemaEnvelopeText(prior.store, prior.control)) {
@@ -1112,7 +1112,7 @@ function* prepareIntakeSchemaAdoptionProofSteps(
       priorBytes += Buffer.byteLength(piece);
       recordIntakeWork('schemaCertificationHashedBytes', Buffer.byteLength(piece));
     }
-  } else {
+  } else if (!compactSameData) {
     const prior = readIntakeEnvelopeMaterialized(
       db,
       source as unknown as import('./intake-authority.ts').IntakeEnvelopeSource,
@@ -1164,22 +1164,26 @@ function* prepareIntakeSchemaAdoptionProofSteps(
     }
   }
   if (!adopted && !compactSameData) invalid('schema adoption unselected build');
-  const graph = createIntakeEnvelopeGraphReader(identity, after, read),
-    hash = createHash('sha256');
-  let total = 0;
-  for (const chunk of iterateSchemaEnvelopeText(graph.store, graph.control)) {
-    recordIntakeWork('schemaCertificationChunks');
-    if (++work % 64 === 0) yield;
-    hash.update(chunk);
-    total += Buffer.byteLength(chunk);
-    recordIntakeWork('schemaCertificationHashedBytes', Buffer.byteLength(chunk));
+  // The compact-only gate above requires the identical authenticated logical
+  // root. Its export is unchanged, so only actual schema adoption hashes exports.
+  if (!compactSameData) {
+    const graph = createIntakeEnvelopeGraphReader(identity, after, read),
+      hash = createHash('sha256');
+    let total = 0;
+    for (const chunk of iterateSchemaEnvelopeText(graph.store, graph.control)) {
+      recordIntakeWork('schemaCertificationChunks');
+      if (++work % 64 === 0) yield;
+      hash.update(chunk);
+      total += Buffer.byteLength(chunk);
+      recordIntakeWork('schemaCertificationHashedBytes', Buffer.byteLength(chunk));
+    }
+    if (
+      graph.control.mode !== priorMode ||
+      total !== priorBytes ||
+      hash.digest('hex') !== priorHash.digest('hex')
+    )
+      invalid('schema adoption export equivalence');
   }
-  if (
-    graph.control.mode !== priorMode ||
-    total !== priorBytes ||
-    hash.digest('hex') !== priorHash.digest('hex')
-  )
-    invalid('schema adoption export equivalence');
   yield* validateIntakeCollectionEnvelopeRepresentationSteps(
     source.details_json,
     after,
