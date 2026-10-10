@@ -1392,6 +1392,16 @@ export function ImportRecordDetail({
   activeProfile.current = profile?.id;
   const intake = useResource<IntakeRead>(`/intakes/${encodeURIComponent(block.intakeId)}`);
   const review = useSelectedClinicalReview(block.intakeId, block.proposalId, recordId);
+  const identityReviewScope = JSON.stringify([
+    profile?.id || '',
+    block.intakeId,
+    block.proposalId,
+    recordId,
+  ]);
+  const observedIdentityRevision = useRef({
+    scope: identityReviewScope,
+    revision: identityRevision,
+  });
   const authorityUnavailable =
     review.loading ||
     !!review.error ||
@@ -1481,8 +1491,16 @@ export function ImportRecordDetail({
     if (review.data && review.record) drafts.hydrateRecords(review.data, [review.record]);
   }, [review.data, review.record]);
   useEffect(() => {
-    if (identityRevision > 0) review.reload();
-  }, [identityRevision]);
+    const previous = observedIdentityRevision.current;
+    observedIdentityRevision.current = { scope: identityReviewScope, revision: identityRevision };
+    // The selected-review hook already fetches on mount and exact selection changes.
+    if (
+      previous.scope === identityReviewScope &&
+      previous.revision !== identityRevision &&
+      identityRevision > 0
+    )
+      review.reload();
+  }, [identityReviewScope, identityRevision, review.reload]);
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
       if (!metadataPendingRef.current) return;

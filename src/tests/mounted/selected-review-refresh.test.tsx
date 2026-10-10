@@ -98,6 +98,131 @@ it('a second issue remains actionable after saving and refreshing the same exact
 import { MemoryRouter } from 'react-router-dom';
 import { ImportRecordDetail } from '../../app/features/import/ImportDetailReview';
 
+it('fetches a positive-version exact review once and refreshes genuine identity changes across selection switches', async () => {
+  const otherProfile = {
+    id: 'fictional-second-review',
+    name: 'Fictional Second Reader',
+    placebo: true,
+  };
+  replaceProfiles([profile, otherProfile]);
+  const reads: { url: URL; signal: AbortSignal | null | undefined }[] = [];
+  let releaseFirst!: () => void;
+  const firstRead = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = new URL(String(input), 'http://fictional.test');
+      if (url.pathname.endsWith('/review-record')) {
+        reads.push({ url, signal: init?.signal });
+        if (reads.length === 1) await firstRead;
+        const intakeId = decodeURIComponent(url.pathname.split('/').at(-2)!);
+        return json({
+          format: 'health-intake-clinical-record-v2',
+          context: { ...context, intakeId, proposalId: url.searchParams.get('proposalId') },
+          record: {
+            kind: 'reference',
+            reference: {
+              format: 'health-intake-clinical-review-reference-v2',
+              reviewToken: context.reviewToken,
+              section: 'records',
+              ordinal: 0,
+              bytes: 100000,
+            },
+            selection: { ...selection, recordId: url.searchParams.get('recordId') },
+            policy: {
+              canAcceptUnchanged: false,
+              blockingIssueCount: 2,
+              unreviewedPairChoices: false,
+              classification: 'addition',
+              kind: 'document',
+            },
+          },
+        });
+      }
+      const intakeId = decodeURIComponent(url.pathname.split('/').at(-1)!);
+      if (url.pathname.includes('/intakes/'))
+        return json({
+          id: intakeId,
+          version: 7,
+          filename: 'fictional.txt',
+          mimeType: 'text/plain',
+          providerId: 'fictional-provider',
+          provider: 'Fictional',
+          sha256: 'fictional-hash',
+          bytes: 100000,
+          contentUrl: '/api/sources/fictional/content',
+        });
+      throw new Error('Unexpected ' + url);
+    }),
+  );
+  let props = {
+    groupId: 'fictional-group',
+    block: { intakeId: context.intakeId, proposalId: context.proposalId },
+    recordId: selection.recordId,
+    identityPanel: null,
+    identityRevision: 7,
+    sourcePanel: null,
+    commonIdentityIssueIds: new Set<string>(),
+    sourceError: '',
+    onBack: () => {},
+    onChanged: () => {},
+    onUseSource: () => {},
+    guardNavigation: false,
+  };
+  const component = () => (
+    <MemoryRouter>
+      <ImportRecordDetail {...props} />
+    </MemoryRouter>
+  );
+  const view = render(component());
+  await act(async () => {});
+  expect(reads).toHaveLength(1);
+  expect(reads[0]!.signal?.aborted).toBe(false);
+  await act(async () => {
+    view.rerender(component());
+  });
+  expect(reads).toHaveLength(1);
+  expect(reads[0]!.signal?.aborted).toBe(false);
+  await act(async () => {
+    releaseFirst();
+  });
+  await screen.findByRole('button', { name: 'Resolve questions or correct this record' });
+  const refresh = async (next: Partial<typeof props>, count: number) => {
+    props = { ...props, ...next };
+    await act(async () => {
+      view.rerender(component());
+    });
+    await waitFor(() => expect(reads).toHaveLength(count));
+  };
+  await refresh({ identityRevision: 7 }, 1);
+  await refresh({ identityRevision: 8 }, 2);
+  await refresh({ groupId: 'fictional-other-group' }, 2);
+  await refresh({ groupId: 'fictional-third-group', identityRevision: 9 }, 3);
+  await refresh({ recordId: 'fictional-other-record', identityRevision: 11 }, 4);
+  expect(reads.at(-1)!.url.searchParams.get('recordId')).toBe('fictional-other-record');
+  await refresh({ identityRevision: 12 }, 5);
+  await refresh(
+    { block: { ...props.block, intakeId: 'fictional-other-intake' }, identityRevision: 15 },
+    6,
+  );
+  expect(reads.at(-1)!.url.pathname).toContain('/intakes/fictional-other-intake/review-record');
+  await refresh({ identityRevision: 16 }, 7);
+  await refresh(
+    { block: { ...props.block, proposalId: 'fictional-other-proposal' }, identityRevision: 17 },
+    8,
+  );
+  expect(reads.at(-1)!.url.searchParams.get('proposalId')).toBe('fictional-other-proposal');
+  await refresh({ identityRevision: 18 }, 9);
+  await act(async () => {
+    selectProfile(otherProfile);
+  });
+  await waitFor(() => expect(reads).toHaveLength(10));
+  expect(reads.at(-1)!.url.pathname).toContain('/profiles/' + otherProfile.id + '/');
+  await refresh({ identityRevision: 19 }, 11);
+});
+
 it('failed parent authority refresh retains uncertain giant-record choice for exact retry', async () => {
   let refreshFails = false;
   const writes: ClinicalRecordAction[] = [];
