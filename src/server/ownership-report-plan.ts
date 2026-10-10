@@ -132,16 +132,17 @@ const readProofs = new WeakMap<
     stamp: unknown[];
   }
 >();
-const readContinuations = new WeakMap<Function, Database>();
+const readContinuations = new WeakMap<Function, { db: Database; plan?: object }>();
 export function ownershipReportReadContinuationCurrent(work: Function, db: Database): boolean {
-  return readContinuations.get(work) === db && db.isOpen;
+  return readContinuations.get(work)?.db === db && db.isOpen;
 }
 function runReportReadOperation<T>(
   db: Database,
   work: Parameters<typeof runExclusiveClinicalOperation<T>>[1],
   options: Parameters<typeof runExclusiveClinicalOperation<T>>[2],
+  plan?: object,
 ) {
-  readContinuations.set(work, db);
+  readContinuations.set(work, { db, plan });
   return runExclusiveClinicalOperation(db, work, options);
 }
 export function captureOwnershipReportReadOwner(plan: object, db: Database, profileId: string) {
@@ -244,6 +245,24 @@ export function ownershipReportOriginalProofCurrent(
   } catch {
     return false;
   }
+}
+/** Identifies the exact report issuer; the core separately checks the active
+ * child frame and its unchanged caller prerequisites before synchronous T1. */
+export function ownershipReportOriginalProofOwnsContinuation(
+  proof: OwnershipReportOriginalProof,
+  work: Function,
+  db: Database,
+  profileId: string,
+): boolean {
+  const continuation = readContinuations.get(work),
+    original = originalProofs.get(proof);
+  return (
+    !!continuation?.plan &&
+    continuation.db === db &&
+    !!original &&
+    original.owner === originalProofOwners.get(continuation.plan) &&
+    ownershipReportOriginalProofCurrent(proof, db, profileId)
+  );
 }
 export function* verifiedOwnershipReportOriginalArtifacts(
   proof: OwnershipReportOriginalProof,
@@ -570,6 +589,7 @@ export async function prepareOwnershipReportPlan(
             );
           },
           { operation: currentClinicalOperation(db) },
+          returnedPlan,
         );
       let retainedReview:
         | {

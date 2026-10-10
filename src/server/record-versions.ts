@@ -19,10 +19,26 @@ import {
   currentClinicalOperationReadonly,
   assertClinicalOperation,
   clinicalOperationCallerAssertions,
+  clinicalOperationReadContinuations,
+  clinicalOperationImmediateUnassertedContinuation,
   type ClinicalOperation,
 } from './clinical-operation.ts';
 import type { VaultCompactAuthorization } from './vault-app.ts';
 import type { PackageSourceOriginalPhysical } from './intake-package-source-lease.ts';
+import {
+  captureContributorRecordStaging,
+  contributorRecordStagingCurrent,
+  prepareContributorRecordTransactionBacking,
+  assertContributorRecordTransactionPrior,
+  stageContributorRecordObject,
+  prepareContributorRecordStagingHead,
+  prepareContributorRecordBackingAdvance,
+  finishContributorRecordTransactionPreparation,
+  installContributorRecordStagingHead,
+  completeContributorRecordStagingPublication,
+  discardContributorRecordStaging,
+  type ContributorRecordStagingWitness,
+} from './contributor-record-staging.ts';
 import {
   parseRecordJson,
   stringifyRecordJson,
@@ -346,6 +362,7 @@ interface TransactionPreparationData {
   completeBacking?: boolean;
   originals?: RecordPublicationOriginals;
   staging?: VaultRecordStagingWitness;
+  contributorStaging?: ContributorRecordStagingWitness;
   staged?: Pick<IndexedTransaction, 'ref' | 'commit'> & {
     contributor?: ContributorRecordHeadPublication;
   };
@@ -452,6 +469,22 @@ const transactionIndexedPublications = new WeakMap<
     consumed: boolean;
   }
 >();
+const acceptedTransactionBackings = new WeakMap<
+  RecordTransactionBackingPlan,
+  { db: Database; witness: object }
+>();
+/** Retained derivatives are admitted only after the genuine fresh-T2 outcome. */
+export function consumeRecordTransactionBackingPublication(
+  plan: RecordTransactionBackingPlan,
+  db: Database,
+  witness: object,
+): boolean {
+  const found = acceptedTransactionBackings.get(plan);
+  if (!found || found.db !== db || found.witness !== witness)
+    fail('foreign record accepted backing continuation');
+  acceptedTransactionBackings.delete(plan);
+  return true;
+}
 /** Exact payload transport only from this record owner's authenticated frozen
  * plan. A storage helper never receives authority from caller-provided rows. */
 export function* verifiedRecordTransactionBackingVersions(
@@ -466,6 +499,7 @@ export function* verifiedRecordTransactionBackingVersions(
   deleted: boolean;
   previousVersion: string | null;
   contentsJson: string;
+  sourceFields: readonly { name: string; hash: string; bytes: number }[];
 }> {
   const found = transactionBackingPlans.get(plan);
   if (
@@ -497,14 +531,16 @@ export function* verifiedRecordTransactionBackingVersions(
     current();
     const args = row.args;
     if (
-      row.sql !== 'SELECT ?,?,?,?,?,?' ||
-      args.length !== 6 ||
+      row.sql !== 'SELECT ?,?,?,?,?,?,?' ||
+      args.length !== 7 ||
       typeof args[0] !== 'string' ||
       typeof args[1] !== 'string' ||
       typeof args[2] !== 'string' ||
       (args[3] !== 0 && args[3] !== 1) ||
       (args[4] !== null && typeof args[4] !== 'string') ||
-      typeof args[5] !== 'string'
+      typeof args[5] !== 'string' ||
+      typeof args[6] !== 'string' ||
+      args[6].length > 2048
     )
       fail('record transaction backing payload shape differs');
     yield Object.freeze({
@@ -514,6 +550,9 @@ export function* verifiedRecordTransactionBackingVersions(
       deleted: args[3] === 1,
       previousVersion: args[4] as string | null,
       contentsJson: args[5] as string,
+      sourceFields: Object.freeze(
+        parseRecordJson<{ name: string; hash: string; bytes: number }[]>(args[6] as string),
+      ),
     });
     count++;
     current();
@@ -685,6 +724,7 @@ function closeTransactionPreparationResources(proof: TransactionPreparationData)
     () => proof.backingRows?.close(),
     () => proof.readOwner && closeRecordReadOwner(proof.readOwner),
     () => proof.staging && discardVaultRecordStaging(proof.staging),
+    () => proof.contributorStaging && discardContributorRecordStaging(proof.contributorStaging),
     () =>
       proof.staged?.contributor && closeContributorRecordHeadPublication(proof.staged.contributor),
   ])
@@ -713,6 +753,7 @@ const publicationOriginals = new WeakMap<
     >;
     current(additional?: readonly (() => void)[]): void;
     originalSources(additional: readonly (() => void)[]): Iterable<PackageSourceOriginalPhysical>;
+    ownsContinuation(work: Function): boolean;
   }
 >();
 /** Copy the genuine parent's complete signed union before child narrowing.
@@ -829,6 +870,8 @@ export async function captureRecordPublicationOriginals(
       artifacts,
       current,
       originalSources,
+      ownsContinuation: (work) =>
+        report.ownershipReportOriginalProofOwnsContinuation(original, work, db, profileId),
     });
     return capability;
   } catch (error) {
@@ -952,19 +995,32 @@ interface TransactionOriginalBacking {
   methods: object;
   originalState: RecordStateRow;
   readOwner: RecordReadOwner;
-  staging: VaultRecordStagingWitness;
+  staging?: VaultRecordStagingWitness;
+  contributorStaging?: ContributorRecordStagingWitness;
   originals: RecordPublicationOriginals;
   total: bigint;
 }
+declare const transactionOriginalBackingBrand: unique symbol;
+export interface RecordTransactionOriginalBacking {
+  readonly [transactionOriginalBackingBrand]: true;
+}
+const originalTransactionBackings = new WeakMap<
+  RecordTransactionOriginalBacking,
+  {
+    db: Database;
+    backing: TransactionOriginalBacking;
+    consumed: boolean;
+    current(total?: bigint): void;
+    advance(preparation: RecordTransactionPreparation): void;
+  }
+>();
 
 /** Capture the actual vault's complete original namespace BEFORE tentative
  * business reads/writes. The parent union remains its own original proof. */
-export async function prepareRecordTransactionWithOriginals<T>(
+export async function prepareRecordTransactionOriginalBacking(
   db: Database,
-  fn: () => T,
-  operation: TransactionOperation,
   originals: RecordPublicationOriginals,
-): Promise<RecordTransactionPreparation> {
+): Promise<RecordTransactionOriginalBacking> {
   const parent = publicationOriginals.get(originals),
     config = state.get(db),
     owner = currentClinicalOperation(db),
@@ -977,7 +1033,7 @@ export async function prepareRecordTransactionWithOriginals<T>(
     !owner ||
     !methods ||
     db.isTransaction ||
-    !vaultRecordReadOwnerSupported(config.storage)
+    !recordReadOwnerSupported(db, config.profileId)
   )
     fail('record transaction original backing unavailable');
   const admittedParent = parent!,
@@ -988,24 +1044,35 @@ export async function prepareRecordTransactionWithOriginals<T>(
   admittedParent.current(assertions);
   const readOwner = captureRecordReadOwner(db, admittedConfig.profileId);
   let staging: VaultRecordStagingWitness | undefined,
-    prepared: RecordTransactionPreparation | undefined,
+    contributorStaging: ContributorRecordStagingWitness | undefined,
     transferred = false;
   try {
     const originalState = { ...readStatusRow(db) },
-      epoch = captureManagedPhysicalEpoch();
+      retainedRead = recordReadOwners.get(readOwner)!;
     if (
       originalState.head_json !== admittedParent.expectedHead ||
       originalState.sequence !== admittedParent.expectedSequence
     )
       fail('record transaction parent accepted continuation changed');
-    if (!epoch) fail('record transaction original physical interval unavailable');
-    staging = captureVaultRecordStaging(db, admittedConfig.storage, epoch!);
-    if (!staging) fail('record transaction original storage unavailable');
+    if (retainedRead.vault) {
+      const epoch = captureManagedPhysicalEpoch();
+      if (!epoch) fail('record transaction original physical interval unavailable');
+      staging = captureVaultRecordStaging(db, admittedConfig.storage, epoch!);
+      if (!staging) fail('record transaction original storage unavailable');
+    } else if (retainedRead.contributor) {
+      contributorStaging = captureContributorRecordStaging(
+        db,
+        admittedConfig.storage,
+        retainedRead.contributor,
+      );
+      if (!contributorStaging) fail('record transaction original contributor unavailable');
+    } else fail('record transaction original storage unavailable');
     const stamp = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
     stamp.setReadBigInts(true);
     const total = Reflect.apply(readmissionGet, stamp, []).n as bigint;
-    let continuation: TransactionPreparationData | undefined;
-    const check = () => {
+    let expectedTotal = total,
+      advanced = false;
+    const check = (selectedTotal = expectedTotal) => {
       assertClinicalOperation(db, admittedOwner);
       admittedParent.current(assertions);
       if (
@@ -1013,58 +1080,163 @@ export async function prepareRecordTransactionWithOriginals<T>(
         state.get(db) !== config ||
         db.isTransaction ||
         managedDatabaseMethodEpoch(db) !== methods ||
-        Reflect.apply(readmissionGet, stamp, []).n !== (continuation?.total ?? total)
+        Reflect.apply(readmissionGet, stamp, []).n !== selectedTotal
       )
         fail('record transaction original backing changed');
-      if (continuation) {
-        const retained = recordReadOwners.get(readOwner);
-        if (
-          !retained?.vault ||
-          !vaultRecordReadOwnerStagingCurrent(admittedConfig.storage, retained.vault, staging!)
-        )
-          fail('record transaction owned physical continuation changed');
-      } else assertRecordReadOwnerInterval(db, readOwner);
+      if (
+        staging
+          ? !vaultRecordReadOwnerStagingCurrent(
+              admittedConfig.storage,
+              retainedRead.vault!,
+              staging,
+            )
+          : !contributorRecordStagingCurrent(contributorStaging!)
+      )
+        fail('record transaction owned physical continuation changed');
     };
     check();
     const originalHead = recordReadOwners.get(readOwner)?.wire;
     if (typeof originalHead !== 'string')
       fail('record transaction original HEAD bytes unavailable');
-    await prepareVaultRecordTransactionBacking(staging!, originalHead!, check);
+    if (staging) await prepareVaultRecordTransactionBacking(staging, originalHead!, check);
+    else
+      await prepareContributorRecordTransactionBacking(contributorStaging!, originalHead!, check);
     check();
-    const proof = prepareTransaction(db, fn, operation, {
+    const backing: TransactionOriginalBacking = {
       config: admittedConfig,
       operation: admittedOwner,
       methods: admittedMethods,
       originalState,
       readOwner,
-      staging: staging!,
+      staging,
+      contributorStaging,
       originals,
       total,
+    };
+    const capability = Object.freeze({}) as RecordTransactionOriginalBacking;
+    originalTransactionBackings.set(capability, {
+      db,
+      backing,
+      consumed: false,
+      current: check,
+      advance(preparation) {
+        const proof = transactionPreparations.get(preparation);
+        if (
+          advanced ||
+          !proof ||
+          proof.closed ||
+          !proof.released ||
+          !proof.token ||
+          preparedPublicationTokens.get(proof.token) !== proof ||
+          proof.db !== db ||
+          proof.config !== admittedConfig ||
+          proof.clinicalOperation !== admittedOwner ||
+          proof.methods !== admittedMethods ||
+          proof.readOwner !== readOwner ||
+          proof.staging !== staging ||
+          proof.contributorStaging !== contributorStaging ||
+          proof.originals !== originals ||
+          !proof.completeBacking ||
+          proof.tentativeStart !== total ||
+          proof.expectedTentativeWrites !== proof.tentativeWrites ||
+          proof.total === undefined
+        )
+          fail('record preparatory original write continuation differs');
+        // Honest rollback keeps total_changes attempts. Advance only by this
+        // exact released recipe; never adopt a fresh counter or physical base.
+        const recordedTotal = proof!.total!;
+        check(recordedTotal);
+        expectedTotal = recordedTotal;
+        advanced = true;
+      },
     });
-    const captured = transactionPreparations.get(proof);
-    prepared = proof;
-    if (
-      !captured ||
-      captured.tentativeStart !== total ||
-      captured.expectedTentativeWrites !== captured.tentativeWrites
-    )
-      fail('record preparatory original write continuation differs');
-    continuation = captured;
-    check();
     transferred = true;
-    return proof;
+    return capability;
   } finally {
     if (!transferred) {
-      if (prepared) {
-        discardRecordTransactionPreparation(db, prepared);
-      } else {
-        try {
-          closeRecordReadOwner(readOwner);
-        } finally {
-          if (staging) discardVaultRecordStaging(staging);
-        }
+      try {
+        closeRecordReadOwner(readOwner);
+      } finally {
+        if (staging) discardVaultRecordStaging(staging);
+        if (contributorStaging) discardContributorRecordStaging(contributorStaging);
       }
     }
+  }
+}
+export function discardRecordTransactionOriginalBacking(
+  capability: RecordTransactionOriginalBacking,
+): void {
+  const data = originalTransactionBackings.get(capability);
+  originalTransactionBackings.delete(capability);
+  if (!data || data.consumed) return;
+  data.consumed = true;
+  try {
+    closeRecordReadOwner(data.backing.readOwner);
+  } finally {
+    if (data.backing.staging) discardVaultRecordStaging(data.backing.staging);
+    if (data.backing.contributorStaging)
+      discardContributorRecordStaging(data.backing.contributorStaging);
+  }
+}
+/** Consume only inside the original operation or its genuine same-plan report
+ * child. T1 is synchronous; its lifetime remains the original parent owner. */
+export function prepareRecordTransactionFromOriginalBacking<T>(
+  db: Database,
+  capability: RecordTransactionOriginalBacking,
+  fn: () => T,
+  operation: TransactionOperation,
+): RecordTransactionPreparation {
+  const data = originalTransactionBackings.get(capability);
+  if (!data || data.db !== db || data.consumed) fail('record original backing expired');
+  const admitted = data!;
+  // Consumption precedes any supplied business callback, even on refusal.
+  admitted.consumed = true;
+  originalTransactionBackings.delete(capability);
+  let preparation: RecordTransactionPreparation | undefined;
+  try {
+    admitted.current();
+    const currentOwner = currentClinicalOperationReadonly(db),
+      parent = publicationOriginals.get(admitted.backing.originals);
+    if (
+      !currentOwner ||
+      !parent ||
+      (currentOwner !== admitted.backing.operation &&
+        (!clinicalOperationImmediateUnassertedContinuation(
+          db,
+          admitted.backing.operation,
+          currentOwner,
+        ) ||
+          !parent.ownsContinuation(clinicalOperationReadContinuations(db, currentOwner)[0]!)))
+    )
+      fail('record original backing admission owner differs');
+    preparation = prepareTransaction(db, fn, operation, admitted.backing);
+    admitted.advance(preparation);
+    return preparation;
+  } catch (error) {
+    if (preparation) discardRecordTransactionPreparation(db, preparation);
+    else {
+      try {
+        closeRecordReadOwner(admitted.backing.readOwner);
+      } finally {
+        if (admitted.backing.staging) discardVaultRecordStaging(admitted.backing.staging);
+        if (admitted.backing.contributorStaging)
+          discardContributorRecordStaging(admitted.backing.contributorStaging);
+      }
+    }
+    throw error;
+  }
+}
+export async function prepareRecordTransactionWithOriginals<T>(
+  db: Database,
+  fn: () => T,
+  operation: TransactionOperation,
+  originals: RecordPublicationOriginals,
+): Promise<RecordTransactionPreparation> {
+  const backing = await prepareRecordTransactionOriginalBacking(db, originals);
+  try {
+    return prepareRecordTransactionFromOriginalBacking(db, backing, fn, operation);
+  } finally {
+    discardRecordTransactionOriginalBacking(backing);
   }
 }
 
@@ -1088,12 +1260,7 @@ function prepareTransaction<T>(
     operation.intakeMaintenance
   )
     fail('record transaction preparation requires an idle genuine record owner');
-  if (
-    backing &&
-    (backing.config !== config ||
-      backing.operation !== clinicalOperation ||
-      backing.methods !== methods)
-  )
+  if (backing && (backing.config !== config || backing.methods !== methods))
     fail('record transaction original backing owner changed');
   const operationJson = stringifyRecordJson(operation),
     selectedOperation = Object.freeze(parseRecordJson<TransactionOperation>(operationJson)),
@@ -1107,11 +1274,13 @@ function prepareTransaction<T>(
   let recipe: ReturnType<typeof createRecordMutationRecipe>;
   let readOwner: RecordReadOwner | undefined;
   let staging: VaultRecordStagingWitness | undefined;
+  let contributorStaging: ContributorRecordStagingWitness | undefined;
   try {
     recipe = createRecordMutationRecipe(db);
     if (backing) {
       readOwner = backing.readOwner;
       staging = backing.staging;
+      contributorStaging = backing.contributorStaging;
     } else if (recordReadOwnerSupported(db, config!.profileId))
       readOwner = captureRecordReadOwner(db, config!.profileId);
     if (!backing && readOwner && vaultRecordReadOwnerSupported(config!.storage)) {
@@ -1123,13 +1292,14 @@ function prepareTransaction<T>(
     recipe!?.close();
     if (readOwner) closeRecordReadOwner(readOwner);
     if (staging) discardVaultRecordStaging(staging);
+    if (contributorStaging) discardContributorRecordStaging(contributorStaging);
     rows.close();
     throw error;
   }
   const proof: TransactionPreparationData = {
     db,
     config: config!,
-    clinicalOperation: clinicalOperation!,
+    clinicalOperation: backing?.operation ?? clinicalOperation!,
     methods: methods!,
     operation: selectedOperation,
     operationJson,
@@ -1139,6 +1309,7 @@ function prepareTransaction<T>(
     records: 0,
     readOwner,
     staging,
+    contributorStaging,
     completeBacking: !!backing,
     originals: backing?.originals,
     rows,
@@ -1243,19 +1414,32 @@ export async function authenticateRecordTransactionPreparation(
       if ((previous?.version_id ?? null) !== version.previousVersion)
         fail('record publication cached predecessor changed');
       if (selected.completeBacking) {
-        if (!selected.staging) fail('record publication complete backing unavailable');
+        if (!selected.staging && !selected.contributorStaging)
+          fail('record publication complete backing unavailable');
         // Vault certificates use the quoted JSON-string codec. The portable
         // ancestry index below deliberately uses raw document bytes instead.
         const preimage = previous
-          ? await recordStringFieldDigest(previous.contents_json, check)
+          ? selected.staging
+            ? await recordStringFieldDigest(previous.contents_json, check)
+            : await digestRecordPieces(rawRecordPieces(previous.contents_json), check)
           : null;
-        assertVaultRecordTransactionPrior(
-          selected.staging!,
-          version.entity,
-          version.recordId,
-          version.previousVersion,
-          previous ? { deleted: !!previous.deleted, preimage: preimage! } : null,
-        );
+        const prior = previous ? { deleted: !!previous.deleted, preimage: preimage! } : null;
+        if (selected.staging)
+          assertVaultRecordTransactionPrior(
+            selected.staging,
+            version.entity,
+            version.recordId,
+            version.previousVersion,
+            prior,
+          );
+        else
+          assertContributorRecordTransactionPrior(
+            selected.contributorStaging!,
+            version.entity,
+            version.recordId,
+            version.previousVersion,
+            prior,
+          );
         check();
         await yieldHost();
         check();
@@ -1396,7 +1580,12 @@ export async function stageRecordTransactionPreparation(
     staging = proof.staging,
     readOwner = proof.readOwner && recordReadOwners.get(proof.readOwner),
     parent = proof.originals && publicationOriginals.get(proof.originals);
-  if (!staging || !readOwner?.vault || !parent || proof.revision === undefined)
+  if (
+    (!staging && !proof.contributorStaging) ||
+    !readOwner ||
+    !parent ||
+    proof.revision === undefined
+  )
     fail('record publication immutable original owner unavailable');
   const stamp = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
   stamp.setReadBigInts(true);
@@ -1424,7 +1613,10 @@ export async function stageRecordTransactionPreparation(
       !read ||
       !('value' in read) ||
       read.value !== readOwner!.read ||
-      !vaultRecordReadOwnerStagingCurrent(proof.config.storage, readOwner!.vault!, staging!)
+      (staging
+        ? !readOwner!.vault ||
+          !vaultRecordReadOwnerStagingCurrent(proof.config.storage, readOwner!.vault!, staging)
+        : !readOwner!.contributor || !contributorRecordStagingCurrent(proof.contributorStaging!))
     )
       fail('record publication immutable original continuation changed');
   };
@@ -1441,7 +1633,8 @@ export async function stageRecordTransactionPreparation(
   const stage = async (bytes: Buffer) => {
     check();
     const ref = { name: 'objects/' + randomUUID(), sha256: digest(bytes), bytes: bytes.length };
-    stageVaultRecordObject(staging!, ref, bytes);
+    if (staging) stageVaultRecordObject(staging, ref, bytes);
+    else stageContributorRecordObject(proof.contributorStaging!, ref, bytes);
     await yieldHost();
     check();
     return ref;
@@ -1512,6 +1705,7 @@ export async function stageRecordTransactionPreparation(
     records: count,
   };
   const ref = await stage(encode(commit));
+  if (proof.contributorStaging) prepareContributorRecordStagingHead(proof.contributorStaging, ref);
   check();
   const indexRows = createRecordPreparedIndex(db, { assertRunning: check }),
     stateIndex = createRecordPreparedIndex(db, { assertRunning: check }),
@@ -1547,8 +1741,20 @@ export async function stageRecordTransactionPreparation(
         previous = validateVersion(db, proof.config, commit, version, identities),
         { contents, ...metadata } = version,
         contentsJson = await stringifyPreparedRecordContents(contents, check);
+      const sourceFields: { name: string; hash: string; bytes: number }[] = [];
+      if (version.entity === 'source_files' && !version.deleted)
+        for (const name of ['id', 'kind', 'path', 'sha256', 'bytes']) {
+          const value = contents[name];
+          if (name === 'bytes' ? typeof value !== 'number' : typeof value !== 'string')
+            fail('prepared source binding field differs');
+          const field =
+            typeof value === 'string'
+              ? await recordStringFieldDigest(value, check)
+              : recordFieldDigest(JSON.stringify(value));
+          sourceFields.push({ name, ...field });
+        }
       await backingRows.append(
-        'SELECT ?,?,?,?,?,?',
+        'SELECT ?,?,?,?,?,?,?',
         [
           version.entity,
           version.recordId,
@@ -1556,6 +1762,7 @@ export async function stageRecordTransactionPreparation(
           Number(version.deleted),
           version.previousVersion,
           contentsJson,
+          stringifyRecordJson(sourceFields),
         ],
         0,
       );
@@ -1700,6 +1907,21 @@ export async function stageRecordTransactionPreparation(
       1,
       false,
     );
+    for (const source of parent!.originalSources(assertions)) {
+      check();
+      await valueChecks.appendCheck(
+        'SELECT 1 FROM main.source_files WHERE id IS ? AND kind IS ? AND path IS ? AND sha256 IS ? AND bytes IS ?',
+        [
+          source.binding.intakeId,
+          'intake_original',
+          source.acceptedPath,
+          source.binding.sourceHash,
+          source.binding.bytes,
+        ],
+        true,
+      );
+      check();
+    }
     await valueChecks.seal();
     await backingRows.seal();
     check();
@@ -1716,10 +1938,18 @@ export async function stageRecordTransactionPreparation(
   const backingPlan = Object.freeze({}) as RecordTransactionBackingPlan;
   transactionBackingPlans.set(backingPlan, {
     proof,
-    witness: staging!,
+    witness: staging ?? proof.contributorStaging!,
     head: encode(ref).toString('utf8'),
   });
   proof.backingPlan = backingPlan;
+  if (proof.contributorStaging) {
+    await prepareContributorRecordBackingAdvance(
+      proof.contributorStaging,
+      encode(ref).toString('utf8'),
+      backingPlan,
+    );
+    check();
+  }
 }
 /** Actual-vault finalization of one frozen preparatory intent. Ordinary public
  * transactions are unchanged; portable staging is a separate owner variant. */
@@ -1732,7 +1962,7 @@ export async function commitRecordTransactionPreparation<T>(
   if (
     !proof ||
     !parent ||
-    !proof.staging ||
+    (!proof.staging && !proof.contributorStaging) ||
     !proof.staged ||
     !proof.indexRows ||
     !proof.stateIndex ||
@@ -1748,7 +1978,7 @@ export async function commitRecordTransactionPreparation<T>(
     fail('record final publication preparation unavailable');
   const admitted = proof!,
     originals = parent!,
-    staging = admitted.staging!,
+    staging = (admitted.staging ?? admitted.contributorStaging)!,
     plan = admitted.staged!,
     statements = admitted.terminal!,
     rows = admitted.indexRows!,
@@ -1758,6 +1988,8 @@ export async function commitRecordTransactionPreparation<T>(
     replay = prepareRecordReplay(db, admitted.token!),
     capture = prepareIntakeFrontierCaptureClear(db),
     stamp = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
+  if (currentClinicalOperationReadonly(db) !== admitted.clinicalOperation)
+    fail('record final publication requires its original operation');
   stamp.setReadBigInts(true);
   const check = () => {
     assertClinicalOperation(db, admitted.clinicalOperation);
@@ -1771,7 +2003,9 @@ export async function commitRecordTransactionPreparation<T>(
       Reflect.apply(readmissionGet, stamp, []).n !== admitted.total ||
       originals.expectedHead !== admitted.originalState.head_json ||
       originals.expectedSequence !== admitted.originalState.sequence ||
-      !vaultRecordStagingCurrent(staging)
+      (admitted.staging
+        ? !vaultRecordStagingCurrent(admitted.staging)
+        : !contributorRecordStagingCurrent(admitted.contributorStaging!))
     )
       fail('record final publication original continuation changed');
   };
@@ -1810,7 +2044,7 @@ export async function commitRecordTransactionPreparation<T>(
               clearIntakeFrontierRecordCapture(db, capture) !== 0
             )
               fail('record replay began with unowned captured rows');
-            bindVaultRecordStagingTransaction(staging);
+            if (admitted.staging) bindVaultRecordStagingTransaction(admitted.staging);
             replayTerminalRecordMutations(db, admitted.recipe);
             const metaWrite = (key: string, kinds: Array<'insert' | 'update'>, run: () => void) => {
               const expected = expectIntakeFrontierMetaWrite(db, key, kinds);
@@ -1883,22 +2117,48 @@ export async function commitRecordTransactionPreparation<T>(
             if (
               state.get(db) !== admitted.config ||
               currentTransactionToken(db) !== token ||
-              !vaultRecordStagingCurrent(staging)
+              (admitted.staging
+                ? !vaultRecordStagingCurrent(admitted.staging)
+                : !contributorRecordStagingCurrent(admitted.contributorStaging!))
             )
               fail('record replay final owner changed');
-            prepareVaultRecordHead(staging);
-            markSelectionAttempt(db);
-            installVaultRecordHead(staging, encode(plan.ref));
+            if (admitted.staging) {
+              prepareVaultRecordHead(admitted.staging);
+              markSelectionAttempt(db);
+              installVaultRecordHead(admitted.staging, encode(plan.ref));
+            } else {
+              const indexed = Object.freeze({}) as RecordTransactionIndexedPublication;
+              transactionIndexedPublications.set(indexed, {
+                proof: admitted,
+                plan: admitted.backingPlan!,
+                witness: staging,
+                token,
+                head: encode(plan.ref).toString('utf8'),
+                consumed: false,
+              });
+              try {
+                markSelectionAttempt(db);
+                installContributorRecordStagingHead(
+                  admitted.contributorStaging!,
+                  indexed,
+                  admitted.backingPlan!,
+                );
+              } finally {
+                transactionIndexedPublications.delete(indexed);
+              }
+            }
             return preparedResult;
           }),
         );
       },
     });
-    result = (await finishVaultRecordTransactionPreparation(
-      staging,
-      admitted.backingPlan!,
-      execution,
-    )) as T;
+    result = (await (admitted.staging
+      ? finishVaultRecordTransactionPreparation(admitted.staging, admitted.backingPlan!, execution)
+      : finishContributorRecordTransactionPreparation(
+          admitted.contributorStaging!,
+          admitted.backingPlan!,
+          execution,
+        ))) as T;
   } finally {
     transactionTerminalExecutions.delete(execution);
     // The real final outcome is observable only after the finite scope expires.
@@ -1907,6 +2167,17 @@ export async function commitRecordTransactionPreparation<T>(
     if (outcome?.committed && outcome.succeeded) {
       originals.expectedHead = stringifyRecordJson(plan.ref);
       originals.expectedSequence = plan.commit.sequence;
+      if (admitted.contributorStaging) {
+        acceptedTransactionBackings.set(admitted.backingPlan!, {
+          db,
+          witness: admitted.contributorStaging,
+        });
+        completeContributorRecordStagingPublication(
+          db,
+          admitted.contributorStaging,
+          admitted.backingPlan!,
+        );
+      }
       const observers = admitted.observers;
       admitted.observers = undefined;
       preparedPublicationTokens.delete(admitted.token!);
@@ -1917,6 +2188,8 @@ export async function commitRecordTransactionPreparation<T>(
           /* notification only */
         }
       }
+    } else if (admitted.contributorStaging) {
+      discardContributorRecordStaging(admitted.contributorStaging);
     }
   }
   return result as T;
@@ -3326,6 +3599,7 @@ export function attachRecordDurability(
               'SELECT commit_json FROM __record_transactions WHERE sequence=?',
               'SELECT * FROM __record_transactions WHERE operation_id=?',
               'SELECT 1 FROM temp.__record_changed LIMIT 1',
+              'SELECT 1 FROM main.source_files WHERE id IS ? AND kind IS ? AND path IS ? AND sha256 IS ? AND bytes IS ?',
               'SELECT total_changes() AS count',
               ...config.schema.flatMap((table) => [
                 recordPreparedValueCheckSql(table, false),

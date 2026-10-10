@@ -132,6 +132,26 @@ const readOwners = new WeakMap<
     physical: ReturnType<typeof captureRecordHeadPhysical>;
   }
 >();
+const retainedDisposals = new WeakMap<object, Set<() => void>>();
+/** Disposal only. This registration grants no read, publication, or terminal
+ * callback eligibility and expires when the genuine factory closes. */
+export function registerContributorRecordStagingDisposal(
+  storage: object,
+  original: ContributorRecordReadOwner,
+  dispose: () => void,
+): () => void {
+  if (!contributorRecordReadOwnerCurrent(storage, original))
+    fail('retained disposal owner changed');
+  let disposals = retainedDisposals.get(storage);
+  if (!disposals) retainedDisposals.set(storage, (disposals = new Set()));
+  disposals.add(dispose);
+  let live = true;
+  return () => {
+    if (!live) return;
+    live = false;
+    disposals.delete(dispose);
+  };
+}
 declare const writeWitnessBrand: unique symbol;
 export interface ContributorRecordWriteWitness {
   readonly [writeWitnessBrand]: true;
@@ -273,6 +293,23 @@ export function contributorRecordReadOwnerCurrent(
     data.physical.current()
   );
 }
+/** Compare only genuine factory owners and their exact selected incarnation. */
+export function contributorRecordReadOwnersSameSelection(
+  storage: object,
+  left: ContributorRecordReadOwner,
+  right: ContributorRecordReadOwner,
+): boolean {
+  const a = readOwners.get(left),
+    b = readOwners.get(right);
+  return (
+    !!a &&
+    !!b &&
+    a.owner === b.owner &&
+    a.selection === b.selection &&
+    contributorRecordReadOwnerCurrent(storage, left) &&
+    contributorRecordReadOwnerCurrent(storage, right)
+  );
+}
 export function closeContributorRecordReadOwner(capability: ContributorRecordReadOwner): void {
   const data = readOwners.get(capability);
   readOwners.delete(capability);
@@ -357,6 +394,8 @@ const headPublications = new WeakMap<
     original: ContributorRecordReadOwner;
     bytes: Buffer;
     consumed: boolean;
+    installedSelection?: object;
+    installedOwner?: ContributorRecordReadOwner;
   }
 >();
 /** Installation transport only. The record owner must retain this exact handle
@@ -421,6 +460,32 @@ export function installContributorRecordHeadPublication(
   const proof = headPublications.get(capability)!;
   proof.consumed = true;
   proof.owner.install(proof.bytes);
+  proof.installedSelection = proof.owner.selection();
+  proof.installedOwner =
+    captureContributorRecordReadOwner(storage) ?? fail('installed HEAD owner unavailable');
+}
+/** Successor resource capture only for this factory's exact lexical install.
+ * The caller still needs the record core's one-use indexed publication receipt. */
+export function captureContributorRecordInstalledReadOwner(
+  storage: object,
+  capability: ContributorRecordHeadPublication,
+): ContributorRecordReadOwner {
+  const proof = headPublications.get(capability);
+  if (
+    !proof ||
+    !proof.consumed ||
+    !proof.installedSelection ||
+    !proof.installedOwner ||
+    proof.owner.storage !== storage ||
+    proof.owner.selection() !== proof.installedSelection ||
+    !readOwnerMethodsCurrent(proof.owner)
+  )
+    fail('installed HEAD incarnation changed');
+  const installed = proof.installedOwner!;
+  if (!contributorRecordReadOwnerCurrent(storage, installed))
+    fail('installed HEAD incarnation changed');
+  proof.installedOwner = undefined;
+  return installed;
 }
 export function closeContributorRecordHeadPublication(
   capability: ContributorRecordHeadPublication,
@@ -428,6 +493,7 @@ export function closeContributorRecordHeadPublication(
   const proof = headPublications.get(capability);
   headPublications.delete(capability);
   if (proof) closeContributorRecordReadOwner(proof.original);
+  if (proof?.installedOwner) closeContributorRecordReadOwner(proof.installedOwner);
 }
 /** Caller holds this lease for the complete attached database lifetime. Read-only
  * recovery uses a pinned head under that writer's lease and never publishes. */
@@ -546,6 +612,16 @@ export function openContributorRecordStorage(
       close() {
         if (closed) return;
         closed = true;
+        const disposals = retainedDisposals.get(storage);
+        retainedDisposals.delete(storage);
+        let failed: unknown;
+        for (const dispose of disposals ?? []) {
+          try {
+            dispose();
+          } catch (error) {
+            failed ??= error;
+          }
+        }
         if (lease !== undefined) {
           try {
             flockUnlock(lease);
@@ -553,6 +629,7 @@ export function openContributorRecordStorage(
             closeSync(lease);
           }
         }
+        if (failed) throw failed;
       },
     };
     readOwnerFactories.set(storage, {

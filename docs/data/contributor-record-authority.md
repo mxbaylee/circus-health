@@ -26,6 +26,29 @@ Direct attachment also refuses an incompatible history projection, including pro
 
 Portable personal/curation generations remain explicit export/recovery artifacts with real manifests. They omit disposable `__record_*` tables and preserve current selected intake representation. Exporting a snapshot is intentionally work proportional to retained state; it does not make that snapshot the runtime authority or authorize recurring full snapshots during mutations.
 
+### Prepared publication core
+
+The internal prepared-record API supports genuine contributor storage as well
+as vault storage. It executes business decisions once in a rolled-back
+preparation, authenticates changed predecessors against accepted storage, and
+publishes only the frozen changes through a distinct final transaction. The
+original report's complete artifact and source-lease proofs remain live through
+the combined final physical check. A temporary verification frame must belong
+to that exact report and add no expiring caller conditions; an arbitrary child
+operation or a different report cannot supply this continuation.
+
+Within the same live contributor owner, an exact committed publication can
+extend its private accepted-history certificates with its own changes. A second
+prepared write can reuse those certificates without replaying prior versions.
+The complete physical namespace still receives verification; this is not
+constant total work. Closing storage disposes retained verification resources
+without turning an already committed acknowledgement into a failure.
+
+Ordinary public ownership callers do not yet select this prepared path.
+Prerequisite catalog publications and approved multi-group continuations remain
+unqualified under [CRS-231](../todo/CRS-231.md). Helper qualification does not
+establish those public workflows or change the supported recovery procedure.
+
 ## Copy and retry
 
 The contributor copy operation retains its caller-supplied UUID, source/name binding, unpublished staging and final-directory publication contract. Source and backup must match the selected accepted head and substantive recovered state. One-time verification may reconstruct an independent source projection; it must not publish unacknowledged source changes to make a stale cache look coherent.

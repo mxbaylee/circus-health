@@ -16,24 +16,33 @@ import {
 } from '../../record-ownership-native.ts';
 import { freshKey } from '../../vault-crypto.ts';
 import { openVault } from '../../vault-store.ts';
+import { openContributorRecordStorage } from '../../contributor-record-storage.ts';
 
 export async function recordPreparedPublicationFixture(
   t: TestContext,
   initialize?: (db: Database) => void,
+  backend: 'vault' | 'contributor' = 'vault',
 ) {
   t.diagnostic('phase: imported setup');
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'fictional-prepared-publication-'))),
     profileId = 'fictional-prepared-publication',
     paths = ensureProfileDirectories(root, profileId),
     db = openDatabase(paths.database, profileId),
-    key = freshKey(),
-    vault = openVault({ directory: paths.root, profileId, key, initialize: true }),
-    storage = vault.recordStorage();
+    key = backend === 'vault' ? freshKey() : undefined,
+    vault = key
+      ? openVault({ directory: paths.root, profileId, key, initialize: true })
+      : undefined,
+    contributor =
+      backend === 'contributor'
+        ? openContributorRecordStorage(root, profileId, { initialize: true })
+        : undefined,
+    storage = vault?.recordStorage() ?? contributor!;
   t.after(() => {
     clearNativeOwnershipPlans(db);
     db.close();
-    vault.close();
-    key.fill(0);
+    vault?.close();
+    contributor?.close();
+    key?.fill(0);
     rmSync(root, { recursive: true, force: true });
   });
   initialize?.(db);
@@ -74,8 +83,10 @@ export async function recordPreparedPublicationFixture(
   const sourcePath = String(
     db.prepare('SELECT path FROM source_files WHERE id=?').get(source.id)!.path,
   );
-  vault.storeFile(sourcePath, readFileSync(profileOriginal(root, sourcePath, profileId)));
-  vault.publish();
+  if (vault) {
+    vault.storeFile(sourcePath, readFileSync(profileOriginal(root, sourcePath, profileId)));
+    vault.publish();
+  }
   const review = reviewIntake(db, root, profileId, source.id);
   importIntake(db, root, profileId, source.id, {
     version: review.version,
@@ -100,7 +111,8 @@ export async function recordPreparedPublicationFixture(
     ),
     beforeHead = Buffer.from(storage.read('head')!),
     beforePerson = { ...db.prepare('SELECT * FROM people WHERE id=?').get(personId)! },
-    versions = join(paths.root, 'vault', 'versions'),
+    versions =
+      backend === 'vault' ? join(paths.root, 'vault', 'versions') : join(paths.records, 'objects'),
     beforeObjects = readdirSync(versions).length;
   return {
     root,
@@ -117,5 +129,6 @@ export async function recordPreparedPublicationFixture(
     beforePerson,
     versions,
     beforeObjects,
+    closeStorage: () => (contributor ? contributor.close() : vault!.close()),
   };
 }

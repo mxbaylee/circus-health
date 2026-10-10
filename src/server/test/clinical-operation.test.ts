@@ -9,6 +9,7 @@ import {
   currentClinicalOperationReadonly,
   clinicalOperationCallerAssertions,
   clinicalOperationHasCallerAssertions,
+  clinicalOperationImmediateUnassertedContinuation,
   runExclusiveClinicalOperation,
 } from '../clinical-operation.ts';
 
@@ -19,6 +20,68 @@ function gate() {
   });
   return { promise, resolve };
 }
+test('temporary continuation preserves its exact parent and adds no expiring conditions', async () => {
+  const db = new DatabaseSync(':memory:');
+  const foreign = new DatabaseSync(':memory:');
+  try {
+    await runExclusiveClinicalOperation(db, async (parent) => {
+      let expiredChild: typeof parent | undefined;
+      assert.equal(clinicalOperationImmediateUnassertedContinuation(db, parent, parent), false);
+      await runExclusiveClinicalOperation(
+        db,
+        async (child) => {
+          expiredChild = child;
+          assert.equal(clinicalOperationImmediateUnassertedContinuation(db, parent, child), true);
+          assert.equal(
+            clinicalOperationImmediateUnassertedContinuation(foreign, parent, child),
+            false,
+          );
+          await runExclusiveClinicalOperation(
+            db,
+            async (grandchild) => {
+              assert.equal(
+                clinicalOperationImmediateUnassertedContinuation(db, parent, child),
+                false,
+              );
+              assert.equal(
+                clinicalOperationImmediateUnassertedContinuation(db, parent, grandchild),
+                false,
+              );
+              assert.equal(
+                clinicalOperationImmediateUnassertedContinuation(db, child, grandchild),
+                true,
+              );
+            },
+            { operation: child },
+          );
+        },
+        { operation: parent },
+      );
+      assert.equal(
+        clinicalOperationImmediateUnassertedContinuation(db, parent, expiredChild!),
+        false,
+      );
+      for (const conditions of [
+        { signal: new AbortController().signal },
+        { assertRunning: () => undefined },
+        { publicationAssertions: [() => undefined] },
+      ])
+        await runExclusiveClinicalOperation(
+          db,
+          async (child) => {
+            assert.equal(
+              clinicalOperationImmediateUnassertedContinuation(db, parent, child),
+              false,
+            );
+          },
+          { operation: parent, ...conditions },
+        );
+    });
+  } finally {
+    db.close();
+    foreign.close();
+  }
+});
 test('clinical publication provenance retains original ancestor and extra assertions without invoking them', async () => {
   const db = new DatabaseSync(':memory:');
   let calls = 0;

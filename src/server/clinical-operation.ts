@@ -113,6 +113,34 @@ export function clinicalOperationReadContinuations(db: DatabaseSync, operation: 
     work.push(frame.work);
   return Object.freeze(work);
 }
+/** Frame provenance only: a temporary child adds no conditions that would be
+ * lost when later preparation resumes under its still-active parent. */
+export function clinicalOperationImmediateUnassertedContinuation(
+  db: DatabaseSync,
+  parent: ClinicalOperation,
+  child: ClinicalOperation,
+): boolean {
+  const frame = context.getStore(),
+    original = frames.get(parent);
+  if (
+    !frame ||
+    !original ||
+    frame.token !== child ||
+    frame.parent !== original ||
+    frame.controller !== original.controller ||
+    frame.signal ||
+    frame.callerAssertions ||
+    frame.callerAssertion ||
+    frame.publicationAssertions?.length
+  )
+    return false;
+  try {
+    assertClinicalOperation(db, parent);
+    return true;
+  } catch {
+    return false;
+  }
+}
 /** Exact genuine read-owner handoff, not a caller-selected assertion override. */
 export function sealClinicalReadResult<T>(
   db: DatabaseSync,
