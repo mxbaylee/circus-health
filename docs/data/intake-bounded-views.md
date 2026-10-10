@@ -209,6 +209,17 @@ member reads retain their existing unit and occurrence restrictions. Focused
 tests cover concurrent reads, Stop, foreign sessions, changed ancestry/originals
 and parent-domain changes, plus actual manual reading and retained plan history.
 
+Correction support retains its original clinical-review session in a one-use
+opaque preparation until intervening caller checks have finished. It then
+performs one complete cooperative physical sweep before exposing evidence,
+instead of repeating the same sweep in both preparation and consumption.
+Ordinary clinical-review preparation still verifies before returning. Refusal,
+cancellation and abandonment close the retained session; no later filesystem
+state becomes a replacement baseline. A fictional original/proposal fixture
+counts one sweep and both physical identities, with single-use, late caller
+refusal, accepted-state drift and scratch-disposal controls. This removes
+duplicate verification, not required members or subsequent authority checks.
+
 Literal progress totals (retained candidate versions and submitted batches) bind
 to the complete logical workflow index. Source-text or mapping changes leave
 those historical totals intact while classified review and remaining-work

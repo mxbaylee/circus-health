@@ -101,6 +101,11 @@ import {
   type CollectionClinicalReviewResult,
 } from './intake-review-collection-session.ts';
 import {
+  deferCorrectionSupportReview,
+  disposeCorrectionSupportReview,
+  type CorrectionSupportReviewPreparationResult,
+} from './correction-support-review-preparation.ts';
+import {
   captureManagedPhysicalEpoch,
   managedPhysicalEpochCurrent,
 } from './clinical-review-physical-epoch.ts';
@@ -322,6 +327,42 @@ export function prepareCollectionClinicalReview(
 export async function prepareCollectionClinicalReviewAsync(
   ...input: Parameters<typeof prepareCollectionClinicalReviewWork>
 ): Promise<CollectionClinicalReviewResult> {
+  return prepareCollectionClinicalReviewAsyncResult(
+    input,
+    async (result) => {
+      if (result.status === 'ready')
+        await collectionClinicalProjectionContextAsync(
+          result.session,
+          input[5]?.signal,
+          input[5]?.assertRunning,
+        );
+      return result;
+    },
+    (value) => {
+      if (value.status === 'ready') value.session.close();
+    },
+  );
+}
+
+/** Correction support consumes this opaque preparation after its intervening caller checks. */
+export async function prepareCollectionClinicalReviewForCorrectionSupportAsync(
+  ...input: Parameters<typeof prepareCollectionClinicalReviewWork>
+): Promise<CorrectionSupportReviewPreparationResult> {
+  return prepareCollectionClinicalReviewAsyncResult(
+    input,
+    async (result) =>
+      deferCorrectionSupportReview(result, input[5]?.signal, input[5]?.assertRunning),
+    (value) => {
+      if (value.status === 'prepared') disposeCorrectionSupportReview(value.preparation);
+    },
+  );
+}
+
+async function prepareCollectionClinicalReviewAsyncResult<T>(
+  input: Parameters<typeof prepareCollectionClinicalReviewWork>,
+  complete: (result: CollectionClinicalReviewResult) => Promise<T>,
+  discard: (value: T) => void,
+): Promise<T> {
   return runExclusiveClinicalOperation(
     input[0],
     async () => {
@@ -360,13 +401,7 @@ export async function prepareCollectionClinicalReviewAsync(
       );
       try {
         input[5]?.assertRunning?.();
-        if (result.status === 'ready')
-          await collectionClinicalProjectionContextAsync(
-            result.session,
-            input[5]?.signal,
-            input[5]?.assertRunning,
-          );
-        return result;
+        return await complete(result);
       } catch (error) {
         if (result.status === 'ready') result.session.close();
         throw error;
@@ -374,9 +409,7 @@ export async function prepareCollectionClinicalReviewAsync(
     },
     {
       operation: currentClinicalOperation(input[0]),
-      onDiscardResult: (value) => {
-        if (value.status === 'ready') value.session.close();
-      },
+      onDiscardResult: discard,
     },
   );
 }

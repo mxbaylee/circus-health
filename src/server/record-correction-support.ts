@@ -19,9 +19,13 @@ import {
 import { intakeReviewChildren, readIntakeReviewValue } from './intake-review-collection.ts';
 import {
   prepareCollectionClinicalReviewAsync,
+  prepareCollectionClinicalReviewForCorrectionSupportAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
-import { collectionClinicalProjectionContextAsync } from './intake-review-collection-session.ts';
+import {
+  consumeCorrectionSupportReview,
+  disposeCorrectionSupportReview,
+} from './correction-support-review-preparation.ts';
 import { readCollectionReviewMembership } from './intake-review-membership-index.ts';
 import { readRetainedPlanEvidence } from './intake-retained-plan.ts';
 import { createReportSnapshotCatalog } from './intake-report-snapshot-catalog.ts';
@@ -275,7 +279,7 @@ export async function prepareCorrectionSupportingEvidence(
               'CORRECTION_EVIDENCE_CHANGED',
               'Review the current incoming candidate before using its original',
             );
-          const selected = await prepareCollectionClinicalReviewAsync(
+          const pending = await prepareCollectionClinicalReviewForCorrectionSupportAsync(
             db,
             root,
             profileId,
@@ -283,15 +287,21 @@ export async function prepareCorrectionSupportingEvidence(
             ref.proposalId,
             { assertRunning: assertPreparation },
           );
-          if (selected.status !== 'ready')
+          if (pending.status !== 'prepared')
             throw new HttpError(
               409,
               'CORRECTION_EVIDENCE',
               'Prepare the complete selected clinical review before choosing supporting evidence',
             );
+          let selected: Awaited<ReturnType<typeof consumeCorrectionSupportReview>>;
+          try {
+            assertPreparation();
+            selected = await consumeCorrectionSupportReview(pending.preparation);
+          } finally {
+            disposeCorrectionSupportReview(pending.preparation);
+          }
           sessions.push(selected.session);
-          assertPreparation();
-          const selectedContext = await collectionClinicalProjectionContextAsync(selected.session);
+          const selectedContext = selected.context;
           assertPreparation();
           const record = selected.session.record(
             ref.recordId,
