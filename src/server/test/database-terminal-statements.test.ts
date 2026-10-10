@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DatabaseSync, constants } from 'node:sqlite';
+import { DatabaseSync, StatementSync, constants } from 'node:sqlite';
 import {
   installManagedDatabaseAuthorization,
   installManagedDatabaseFunctionRegistration,
@@ -10,8 +10,10 @@ import {
   withTerminalStatements,
   terminalStatement,
   terminalExecution,
+  replayTerminalRecordMutations,
   type PreparedTerminalStatements,
 } from '../database-terminal-statements.ts';
+import { createRecordMutationRecipe, recordMutationStatement } from '../record-mutation-recipe.ts';
 
 function fixture() {
   const db = new DatabaseSync(':memory:');
@@ -20,6 +22,90 @@ function fixture() {
   db.exec('CREATE TABLE fictional_values(n INTEGER); INSERT INTO fictional_values VALUES(7)');
   return db;
 }
+test('terminal recipe resolver admits only genuine exact-connection recipes', async () => {
+  const db = fixture(),
+    foreign = fixture(),
+    recipe = createRecordMutationRecipe(db),
+    other = createRecordMutationRecipe(foreign),
+    sql = 'UPDATE fictional_values SET n=?';
+  try {
+    db.exec('BEGIN');
+    recipe.capture(() => recordMutationStatement(db, sql).run(11));
+    db.exec('ROLLBACK');
+    foreign.exec('BEGIN');
+    other.capture(() => recordMutationStatement(foreign, sql).run(13));
+    foreign.exec('ROLLBACK');
+    const publication = prepareTerminalStatements(db, {
+      statements: [{ sql }],
+      executions: ['BEGIN IMMEDIATE', 'COMMIT'],
+    });
+    await recipe.prepareReplay();
+    let calls = 0;
+    const forged = Object.defineProperty({}, 'replay', {
+      get() {
+        calls++;
+        return recipe.replay;
+      },
+    });
+    withTerminalStatements(db, publication, () => {
+      terminalExecution(db, 'BEGIN IMMEDIATE');
+      assert.throws(() => replayTerminalRecordMutations(db, forged as typeof recipe), /terminal/);
+      assert.throws(() => replayTerminalRecordMutations(db, other), /terminal/);
+      assert.equal(calls, 0);
+      replayTerminalRecordMutations(db, recipe);
+      assert.throws(() => replayTerminalRecordMutations(db, recipe), /recipe/);
+      terminalExecution(db, 'COMMIT');
+    });
+    assert.equal(db.prepare('SELECT n FROM fictional_values').get()!.n, 11);
+    assert.equal(foreign.prepare('SELECT n FROM fictional_values').get()!.n, 7);
+    assert.throws(() => replayTerminalRecordMutations(db, recipe), /terminal/);
+  } finally {
+    recipe.close();
+    other.close();
+    db.close();
+    foreign.close();
+  }
+});
+test('sealed terminal recipe never invokes mutable scratch statement methods', async () => {
+  const db = fixture(),
+    recipe = createRecordMutationRecipe(db),
+    sql = 'UPDATE fictional_values SET n=?',
+    names = ['get', 'all', 'run', 'iterate'] as const,
+    originals = names.map((name) =>
+      Object.getOwnPropertyDescriptor(StatementSync.prototype, name)!,
+    );
+  let calls = 0;
+  try {
+    db.exec('BEGIN');
+    recipe.capture(() => recordMutationStatement(db, sql).run(17));
+    db.exec('ROLLBACK');
+    const publication = prepareTerminalStatements(db, {
+      statements: [{ sql }],
+      executions: ['BEGIN IMMEDIATE', 'COMMIT'],
+    });
+    await recipe.prepareReplay();
+    for (let index = 0; index < names.length; index++)
+      Object.defineProperty(StatementSync.prototype, names[index]!, {
+        configurable: true,
+        get() {
+          calls++;
+          return originals[index]!.value;
+        },
+      });
+    withTerminalStatements(db, publication, () => {
+      terminalExecution(db, 'BEGIN IMMEDIATE');
+      replayTerminalRecordMutations(db, recipe);
+      terminalExecution(db, 'COMMIT');
+    });
+    assert.equal(calls, 0);
+  } finally {
+    for (let index = 0; index < names.length; index++)
+      Object.defineProperty(StatementSync.prototype, names[index]!, originals[index]!);
+    recipe.close();
+    assert.equal(db.prepare('SELECT n FROM fictional_values').get()!.n, 17);
+    db.close();
+  }
+});
 test('terminal transport rejects method accessors without invoking them', () => {
   const db = fixture();
   try {

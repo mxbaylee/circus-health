@@ -1,4 +1,5 @@
 import { ownershipBlockerStoreForPlan } from './ownership-blocker-store.ts';
+import { recordMutationStatement } from './record-mutation-recipe.ts';
 import { ownershipBlockerCount } from './ownership-preview-store.ts';
 import { duplicateRecord, verifyDuplicateOriginals } from './duplicate-review.ts';
 import { prepareOwnershipMatchEvidenceSteps } from './ownership-match-evidence.ts';
@@ -1279,7 +1280,8 @@ function ownershipUnitIntent(
             !split,
           );
           if (item.kind === 'medication')
-            db.prepare(
+            recordMutationStatement(
+              db,
               "INSERT INTO medication_preferences(medication_id,status,version,updated_at,assertion_json) VALUES(?,'not_current',1,?,?) ON CONFLICT(medication_id) DO UPDATE SET status='not_current',version=version+1,updated_at=excluded.updated_at,assertion_json=excluded.assertion_json",
             ).run(
               destinationRecordId,
@@ -1329,11 +1331,13 @@ function ownershipUnitIntent(
         );
         for (const c of moving) {
           // Current person evidence follows the correction; durable row history preserves the prior link.
-          db.prepare(
+          recordMutationStatement(
+            db,
             "UPDATE evidence SET entity_id=? WHERE entity_type='person' AND source_record_id=? AND entity_id=?",
           ).run(destination.personId, c.sourceRecordId, item.owner.personId);
           if (destinationRecordId !== item.recordId)
-            db.prepare(
+            recordMutationStatement(
+              db,
               'UPDATE evidence SET entity_id=? WHERE entity_type=? AND entity_id=? AND source_record_id=?',
             ).run(destinationRecordId, item.kind, item.recordId, c.sourceRecordId);
           // Every occurrence gets its own current authority. Historic attachment decisions remain evidence.
@@ -1374,10 +1378,11 @@ function ownershipUnitIntent(
         }
         if (linked && !split) {
           if (item.kind === 'medication')
-            db.prepare('DELETE FROM medication_preferences WHERE medication_id=?').run(
-              item.recordId,
-            );
-          db.prepare(`DELETE FROM ${record.table} WHERE id=?`).run(item.recordId);
+            recordMutationStatement(
+              db,
+              'DELETE FROM medication_preferences WHERE medication_id=?',
+            ).run(item.recordId);
+          recordMutationStatement(db, `DELETE FROM ${record.table} WHERE id=?`).run(item.recordId);
           appendOwnershipDecision(
             db,
             'ownership-redirect:' + operationId + ':' + item.recordId,

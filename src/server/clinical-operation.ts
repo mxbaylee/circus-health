@@ -2,6 +2,15 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DatabaseSync } from 'node:sqlite';
 import { observeDatabaseClose } from './database.ts';
 import { assertAuthorizationSignalRunning } from './authorization-signal.ts';
+import {
+  assertOwnershipReadOwner,
+  assertOwnershipReadInterval,
+  closeOwnershipReadInterval,
+  ownershipReadOwnerOperation,
+  ownershipReadIntervalSealed,
+  type OwnershipReadOwner,
+  type OwnershipReadInterval,
+} from './ownership-read-owner.ts';
 
 /** Private, active ownership; never a transported or retained review authority. */
 export interface ClinicalOperation {
@@ -19,7 +28,15 @@ type Frame = {
   signal?: AbortSignal;
   child?: Promise<unknown>;
   parent?: Frame;
+  readResult?: ReadResult;
+  work: (operation: ClinicalOperation) => Promise<unknown>;
 };
+interface ReadResult {
+  readonly owner: OwnershipReadOwner;
+  readonly interval: OwnershipReadInterval;
+  readonly value: unknown;
+  readonly frames: Set<Frame>;
+}
 type Pending = { start: () => void; reject: (reason: unknown) => void; dispose: () => void };
 type Lane = { active: boolean; closed: boolean; pending: Pending[]; controller?: AbortController };
 const context = new AsyncLocalStorage<Frame>();
@@ -29,13 +46,10 @@ const unavailable = () => new Error('Clinical operation is no longer active');
 
 function check(frame: Frame, assertions = true) {
   if (!frame.active || !frame.db.isOpen) throw unavailable();
+  assertAuthorizationSignalRunning(frame.controller.signal);
+  if (frame.signal) assertAuthorizationSignalRunning(frame.signal);
   if (assertions) {
-    frame.controller.signal.throwIfAborted();
-    frame.signal?.throwIfAborted();
     frame.assertRunning?.();
-  } else {
-    assertAuthorizationSignalRunning(frame.controller.signal);
-    if (frame.signal) assertAuthorizationSignalRunning(frame.signal);
   }
 }
 /** Trusted nested entry points explicitly pass this token to the coordinator. */
@@ -44,6 +58,15 @@ export function currentClinicalOperation(db: DatabaseSync): ClinicalOperation | 
   if (!frame) return undefined;
   check(frame);
   if (frame.db !== db) throw Error('Nested clinical operations require the same database');
+  return frame.token;
+}
+/** Current frame provenance only. Callers still need genuine readonly issuers
+ * for every assertion before narrowing to callback-free publication. */
+export function currentClinicalOperationReadonly(db: DatabaseSync): ClinicalOperation | undefined {
+  const frame = context.getStore();
+  if (!frame) return undefined;
+  if (frame.db !== db) throw Error('Nested clinical operations require the same database');
+  for (let value: Frame | undefined = frame; value; value = value.parent) check(value, false);
   return frame.token;
 }
 export function assertClinicalOperation(db: DatabaseSync, operation?: ClinicalOperation): void {
@@ -82,6 +105,46 @@ export function clinicalOperationCallerAssertions(
   }
   return Object.freeze(assertions);
 }
+/** Exact work identity for private, source-owned read continuations. */
+export function clinicalOperationReadContinuations(db: DatabaseSync, operation: ClinicalOperation) {
+  assertClinicalOperation(db, operation);
+  const work: Frame['work'][] = [];
+  for (let frame: Frame | undefined = frames.get(operation); frame; frame = frame.parent)
+    work.push(frame.work);
+  return Object.freeze(work);
+}
+/** Exact genuine read-owner handoff, not a caller-selected assertion override. */
+export function sealClinicalReadResult<T>(
+  db: DatabaseSync,
+  operation: ClinicalOperation,
+  owner: OwnershipReadOwner,
+  interval: OwnershipReadInterval,
+  value: T,
+): T {
+  assertClinicalOperation(db, operation);
+  if (
+    context.getStore()?.token !== operation ||
+    ownershipReadOwnerOperation(owner) !== operation ||
+    !ownershipReadIntervalSealed(interval)
+  )
+    throw unavailable();
+  assertOwnershipReadOwner(db, owner);
+  assertOwnershipReadInterval(db, interval);
+  const receipt: ReadResult = { owner, interval, value, frames: new Set() };
+  for (let frame: Frame | undefined = context.getStore(); frame; frame = frame.parent) {
+    if (frame.readResult) throw Error('Clinical read result already awaits its owner handoff');
+    receipt.frames.add(frame);
+  }
+  for (const frame of receipt.frames) frame.readResult = receipt;
+  return value;
+}
+function releaseReadResult(frame: Frame): void {
+  const receipt = frame.readResult;
+  frame.readResult = undefined;
+  if (!receipt) return;
+  receipt.frames.delete(frame);
+  if (!receipt.frames.size) closeOwnershipReadInterval(receipt.interval);
+}
 function pump(lane: Lane) {
   if (lane.active || lane.closed) return;
   const pending = lane.pending.shift();
@@ -104,7 +167,12 @@ async function runFrame<T>(
       const value = await work(frame.token);
       try {
         if (frame.child) throw Error('A nested clinical operation was not awaited');
-        check(frame);
+        const receipt = frame.readResult;
+        if (receipt && Object.is(receipt.value, value)) {
+          check(frame, false);
+          assertOwnershipReadOwner(frame.db, receipt.owner);
+          assertOwnershipReadInterval(frame.db, receipt.interval);
+        } else check(frame);
         return value;
       } catch (error) {
         onDiscardResult?.(value);
@@ -119,6 +187,7 @@ async function runFrame<T>(
     }
     frame.active = false;
     frames.delete(frame.token);
+    releaseReadResult(frame);
   }
 }
 
@@ -136,7 +205,7 @@ export async function runExclusiveClinicalOperation<T>(
 ): Promise<T> {
   if (!db.isOpen) throw unavailable();
   if (db.isTransaction) throw Error('Clinical operation cannot wait inside a transaction');
-  options.signal?.throwIfAborted();
+  if (options.signal) assertAuthorizationSignalRunning(options.signal);
   options.assertRunning?.();
   const parent = context.getStore();
   if (options.operation) {
@@ -144,8 +213,13 @@ export async function runExclusiveClinicalOperation<T>(
     if (parent?.token !== options.operation)
       throw Error('Nested clinical operation requires its immediate owner');
     if (parent!.child) throw Error('Parallel nested clinical operations are not supported');
+    // A subsequent operation performs normal admission again; an earlier read
+    // receipt cannot exempt later work or a different result from caller checks.
+    for (let frame: Frame | undefined = parent; frame; frame = frame.parent)
+      releaseReadResult(frame);
     const child: Frame = {
       db,
+      work,
       token: {} as ClinicalOperation,
       controller: parent!.controller,
       active: true,
@@ -202,6 +276,7 @@ export async function runExclusiveClinicalOperation<T>(
         selected.controller = controller;
         const frame: Frame = {
           db,
+          work,
           token: {} as ClinicalOperation,
           controller,
           active: true,

@@ -125,6 +125,7 @@ const captureClears = new WeakMap<
     mainSchema: unknown;
     tempSchema: unknown;
     statement: StatementSync;
+    base: number;
     phase: number;
     token?: object;
   }
@@ -173,6 +174,9 @@ export function prepareIntakeFrontierCaptureClear(db: DatabaseSync): IntakeFront
     main,
     temp,
     statement,
+    // A genuine preparatory rollback leaves the old observer revoked. Its
+    // cleanup transport retains that count; it never renews observer authority.
+    base: observer.revoked ? observer.captureClearCount : 0,
     mainSchema,
     tempSchema,
     phase: 0,
@@ -685,7 +689,7 @@ export function clearIntakeFrontierRecordCapture(
       (!db.isTransaction && prepared.phase !== 1) ||
       prepared.phase >= 2 ||
       (prepared.token && prepared.token !== token) ||
-      observer!.captureClearCount !== prepared.phase ||
+      observer!.captureClearCount !== prepared.base + prepared.phase ||
       observer!.clearingCapture ||
       observer!.functionReplaced ||
       managedDatabaseMethodEpoch(db) !== prepared.methods ||

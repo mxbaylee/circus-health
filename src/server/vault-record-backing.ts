@@ -5,7 +5,9 @@ import { randomBytes, randomUUID, createHmac } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, relative, dirname } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, StatementSync } from 'node:sqlite';
+import type { VerifiedClinicalArtifact } from './intake-review-collection-session.ts';
+import { captureRecordHeadPhysical } from './record-head-physical.ts';
 import { unlockPhysicalIdentity } from './encrypted-unlock-physical.ts';
 import { recordFieldDigest, recordStringFieldDigest } from './record-prior-fields.ts';
 import {
@@ -15,14 +17,19 @@ import {
 import { intakeTreeRef, type IntakeTreeRoot } from './intake-state-tree.ts';
 import { recordVersionWork } from './record-version-work.ts';
 
-export interface VaultRecordBackingBinding {
+const nativeStatementGet = StatementSync.prototype.get;
+
+interface SelectedSourceBackingBinding {
+  kind?: 'source';
   sourceId: string;
   previousVersion: string;
   preimage: { hash: string; bytes: number };
   fields: readonly { name: string; hash: string; bytes: number }[];
   metadata: readonly { key: string; value: string | undefined }[];
 }
-export interface VaultRecordBackingInput extends VaultRecordBackingBinding {
+export type VaultRecordBackingBinding =
+  SelectedSourceBackingBinding | { kind: 'records'; fields: readonly []; metadata: readonly [] };
+export type VaultRecordBackingInput = VaultRecordBackingBinding & {
   mode: 'prepare' | 'verify';
   directory: string;
   database: string;
@@ -36,8 +43,9 @@ export interface VaultRecordBackingInput extends VaultRecordBackingBinding {
   workspace?: string;
   workspaceNames?: readonly string[];
   originalSources?: number;
+  originalArtifacts?: number;
   checkpointControl: SharedArrayBuffer;
-}
+};
 
 /** Transport owned only by the registered actual vault factory. Not authority. */
 export async function prepareVaultRecordBackingTransport(
@@ -59,9 +67,11 @@ export async function prepareVaultRecordBackingTransport(
   if (
     binding.fields.length > 64 ||
     binding.metadata.length > 4 ||
-    !/^[0-9a-f]{64}$/.test(binding.preimage.hash) ||
-    !Number.isSafeInteger(binding.preimage.bytes) ||
-    binding.preimage.bytes < 0 ||
+    (binding.kind === 'records'
+      ? binding.fields.length !== 0 || binding.metadata.length !== 0
+      : !/^[0-9a-f]{64}$/.test(binding.preimage.hash) ||
+        !Number.isSafeInteger(binding.preimage.bytes) ||
+        binding.preimage.bytes < 0) ||
     Buffer.byteLength(selectedHead) > 4096 ||
     binding.fields.some(
       (field) =>
@@ -99,7 +109,11 @@ export async function prepareVaultRecordBackingTransport(
     checkpointControl: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
   };
   let closed = false;
-  const run = async (mode: VaultRecordBackingInput['mode'], entries?: number) => {
+  const run = async (
+    mode: VaultRecordBackingInput['mode'],
+    entries?: number,
+    final?: () => unknown,
+  ) => {
     assertCurrent();
     if (closed) throw Error('Vault backing transport closed');
     const worker = new Worker(new URL('./vault-record-backing-worker.ts', import.meta.url), {
@@ -115,6 +129,8 @@ export async function prepareVaultRecordBackingTransport(
       | undefined;
     let failed: unknown;
     let stopped = false;
+    let finalResult: unknown;
+    let finalized = false;
     const checkpoint = () => {
       try {
         assertCurrent();
@@ -135,21 +151,42 @@ export async function prepareVaultRecordBackingTransport(
         worker.on('message', (message) => {
           if (message?.checkpoint === true) checkpoint();
           else if (reply) reject(Error('Vault backing worker repeated result'));
-          else reply = message;
+          else {
+            reply = message;
+            if (final) {
+              try {
+                if (stopped || reply?.refused || reply?.entries !== entries)
+                  throw (
+                    failed ??
+                    Error('Vault original backing verification refused: combined roster changed')
+                  );
+                // The synchronous private owner continuation runs in this reply
+                // turn, not after a second worker or the worker-exit event.
+                assertCurrent();
+                finalResult = final();
+                finalized = true;
+                complete();
+              } catch (error) {
+                reject(error);
+              }
+            }
+          }
         });
         worker.once('error', reject);
         worker.once('exit', (code) => {
+          if (finalized) return;
           if (stopped) reject(failed);
           else if (code || reply?.refused || !Number.isSafeInteger(reply?.entries))
             reject(Error('Vault original backing verification refused'));
           else complete();
         });
       });
-      assertCurrent();
+      if (!finalized) assertCurrent();
       recordVersionWork('vaultBackingPhysicalMembersVerified', reply!.entries!);
-      return reply!;
+      return { ...reply!, finalResult };
     } finally {
-      await worker.terminate();
+      if (finalized) await worker.terminate().catch(() => undefined);
+      else await worker.terminate();
     }
   };
   let sql: DatabaseSync | undefined;
@@ -182,13 +219,14 @@ export async function prepareVaultRecordBackingTransport(
       dataVersion = peer.get()!.data_version;
     const sourceInsert = sql.prepare('INSERT OR IGNORE INTO consumed_sources VALUES(?,?,?)'),
       sourceClear = sql.prepare('DELETE FROM consumed_sources');
+    const get = (statement: StatementSync) => Reflect.apply(nativeStatementGet, statement, [])!;
     const scratchCurrent = () => {
       if (
         !sql!.isOpen ||
-        BigInt(String(changes.get()!.n)) !== expectedChanges ||
-        main.get()!.schema_version !== schemas[0] ||
-        temp.get()!.schema_version !== schemas[1] ||
-        peer.get()!.data_version !== dataVersion
+        BigInt(String(get(changes).n)) !== expectedChanges ||
+        get(main).schema_version !== schemas[0] ||
+        get(temp).schema_version !== schemas[1] ||
+        get(peer).data_version !== dataVersion
       )
         throw Error('Vault backing scratch continuity changed');
     };
@@ -209,7 +247,59 @@ export async function prepareVaultRecordBackingTransport(
         expectedChanges += BigInt(count);
       },
     );
+    const retainOriginalSources = async (sources: Iterable<PackageSourceOriginalPhysical>) => {
+      scratchCurrent();
+      expectedChanges += BigInt(sourceClear.run().changes);
+      let count = 0,
+        visited = 0;
+      for (const original of sources) {
+        assertCurrent();
+        scratchCurrent();
+        const accepted = certificates.get(
+          certificateRoot,
+          'source_files',
+          JSON.stringify([original.binding.intakeId]),
+        );
+        if (!accepted || accepted.deleted || original.binding.profileId !== profileId)
+          throw Error('Vault original leased source certificate missing');
+        const binding = {
+          id: original.binding.intakeId,
+          kind: 'intake_original',
+          path: original.acceptedPath,
+          sha256: original.binding.sourceHash,
+          bytes: original.binding.bytes,
+        };
+        for (const [name, value] of Object.entries(binding)) {
+          const field = accepted.fields.find((candidate) => candidate.name === name),
+            digest =
+              typeof value === 'string'
+                ? await recordStringFieldDigest(value, assertCurrent)
+                : recordFieldDigest(JSON.stringify(value));
+          if (!field || field.hash !== digest.hash || field.bytes !== digest.bytes)
+            throw Error('Vault original leased source certificate differs');
+          scratchCurrent();
+        }
+        const source = JSON.stringify(original),
+          signature = sign('consumed-source:' + count, 'source', source);
+        const inserted = sourceInsert.run(count, source, signature).changes;
+        expectedChanges += BigInt(inserted);
+        count += Number(inserted);
+        if (++visited % 64 === 0) {
+          await yieldHost();
+          assertCurrent();
+        }
+      }
+      input.originalSources = count;
+      scratchCurrent();
+    };
     const assertBinding = (next: VaultRecordBackingBinding) => {
+      // Whole-record admission authenticates the full namespace/root only.
+      // The private consumer must check each changed predecessor explicitly.
+      if (next.kind === 'records') {
+        if (next.fields.length || next.metadata.length)
+          throw Error('Vault record-only binding has selected source fields');
+        return;
+      }
       const source = certificates.get(
         certificateRoot,
         'source_files',
@@ -253,8 +343,15 @@ export async function prepareVaultRecordBackingTransport(
     let capturedParent: { path: string; identity: string } | undefined;
     let capturedHeadParent: string | undefined;
     return {
+      supportsRecordPriors: input.kind === 'records',
       acquire(nextHead: string, nextBinding: VaultRecordBackingBinding, check: () => void) {
-        if (closed || activeCurrent || pending || nextHead !== input.selectedHead)
+        if (
+          closed ||
+          activeCurrent ||
+          pending ||
+          nextHead !== input.selectedHead ||
+          (nextBinding.kind === 'records' && input.kind !== 'records')
+        )
           throw Error('Vault retained backing frontier unavailable');
         activeCurrent = check;
         assertBinding(nextBinding);
@@ -266,6 +363,33 @@ export async function prepareVaultRecordBackingTransport(
         scratchCurrent();
         input.originalSources = undefined;
         activeCurrent = undefined;
+      },
+      assertRecordPrior(
+        entity: string,
+        recordId: string,
+        previousVersion: string | null,
+        prior: { deleted: boolean; preimage: { hash: string; bytes: number } } | null,
+      ) {
+        // Match the existing certificate codec: preimage is the exact
+        // JSON.stringify string digest of retained contents_json, not a
+        // structural reserialization or an unquoted JSON document digest.
+        assertCurrent();
+        scratchCurrent();
+        if (input.kind !== 'records') throw Error('Vault record predecessor keyspace unavailable');
+        const accepted = certificates.get(certificateRoot, entity, recordId);
+        if (
+          previousVersion === null
+            ? accepted !== undefined || prior !== null
+            : !accepted ||
+              !prior ||
+              accepted.versionId !== previousVersion ||
+              !!accepted.deleted !== prior.deleted ||
+              accepted.preimage.hash !== prior.preimage.hash ||
+              accepted.preimage.bytes !== prior.preimage.bytes
+        )
+          throw Error('Vault accepted record predecessor differs');
+        assertCurrent();
+        scratchCurrent();
       },
       async prepareAdvance(
         head: string,
@@ -466,55 +590,72 @@ export async function prepareVaultRecordBackingTransport(
         // No new physical baseline or certificate is captured here.
         assertCurrent();
         activeCurrent = current;
-        scratchCurrent();
-        expectedChanges += BigInt(sourceClear.run().changes);
-        let count = 0,
-          visited = 0;
-        for (const original of sources) {
-          assertCurrent();
-          scratchCurrent();
-          const accepted = certificates.get(
-            certificateRoot,
-            'source_files',
-            JSON.stringify([original.binding.intakeId]),
-          );
-          if (!accepted || accepted.deleted || original.binding.profileId !== profileId)
-            throw Error('Vault original leased source certificate missing');
-          const binding = {
-            id: original.binding.intakeId,
-            kind: 'intake_original',
-            path: original.acceptedPath,
-            sha256: original.binding.sourceHash,
-            bytes: original.binding.bytes,
-          };
-          for (const [name, value] of Object.entries(binding)) {
-            const field = accepted.fields.find((candidate) => candidate.name === name),
-              digest =
-                typeof value === 'string'
-                  ? await recordStringFieldDigest(value, assertCurrent)
-                  : recordFieldDigest(JSON.stringify(value));
-            if (!field || field.hash !== digest.hash || field.bytes !== digest.bytes)
-              throw Error('Vault original leased source certificate differs');
-            scratchCurrent();
-          }
-          const source = JSON.stringify(original),
-            signature = sign('consumed-source:' + count, 'source', source);
-          const inserted = sourceInsert.run(count, source, signature).changes;
-          expectedChanges += BigInt(inserted);
-          count += Number(inserted);
-          if (++visited % 64 === 0) {
-            await yieldHost();
-            assertCurrent();
-          }
-        }
-        input.originalSources = count;
-        scratchCurrent();
+        await retainOriginalSources(sources);
         if (capturedParent) throw Error('Vault owned record transition unfinished');
         if ((await run('verify', entries)).entries !== entries)
           throw Error('Vault backing member count changed');
         scratchCurrent();
         assertCurrent();
         scratchCurrent();
+      },
+      async verifyTransaction(
+        current: () => void,
+        artifacts: Iterable<VerifiedClinicalArtifact>,
+        sources: Iterable<PackageSourceOriginalPhysical>,
+        complete: () => unknown,
+      ): Promise<unknown> {
+        assertCurrent();
+        activeCurrent = current;
+        await retainOriginalSources(sources);
+        scratchCurrent();
+        const clear = sql!.prepare('DELETE FROM original_artifacts'),
+          insert = sql!.prepare('INSERT INTO original_artifacts VALUES(?,?,?,?,?)');
+        expectedChanges += BigInt(clear.run().changes);
+        let count = 0;
+        for (const original of artifacts) {
+          assertCurrent();
+          scratchCurrent();
+          if (
+            typeof original.id !== 'string' ||
+            !original.id ||
+            typeof original.path !== 'string' ||
+            !original.path ||
+            typeof original.identity !== 'string' ||
+            !original.identity
+          )
+            throw Error('Vault original artifact descriptor invalid');
+          const serialized = JSON.stringify([original.id, original.path, original.identity]);
+          if (
+            insert.run(
+              count,
+              original.id,
+              original.path,
+              original.identity,
+              sign('parent-artifact:' + count, 'artifact', serialized),
+            ).changes !== 1
+          )
+            throw Error('Vault original artifact membership changed');
+          expectedChanges++;
+          count++;
+          if (count % 64 === 0) {
+            await yieldHost();
+            assertCurrent();
+          }
+        }
+        input.originalArtifacts = count;
+        scratchCurrent();
+        if (capturedParent) throw Error('Vault owned record transition unfinished');
+        const sealed = captureRecordHeadPhysical([physical], [scratch]);
+        try {
+          const reply = await run('verify', entries, () => {
+            scratchCurrent();
+            if (!sealed.current()) throw Error('Vault original artifact scratch changed');
+            return complete();
+          });
+          return reply.finalResult;
+        } finally {
+          sealed.close();
+        }
       },
       close() {
         if (closed) return;

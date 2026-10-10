@@ -21,6 +21,7 @@ import type { VaultRecordBackingInput } from './vault-record-backing.ts';
 import type { PackageSourceOriginalPhysical } from './intake-package-source-lease.ts';
 import { VAULT_CERTIFICATE_SCHEMA, vaultRecordCertificates } from './vault-record-certificates.ts';
 import type { IntakeTreeRoot } from './intake-state-tree.ts';
+import { regularFileIdentity } from './regular-file-identity.ts';
 
 const input = workerData as VaultRecordBackingInput;
 const key = Buffer.from(input.key),
@@ -31,9 +32,11 @@ const sign = (path: string, kind: string, identity: string) =>
     .update(JSON.stringify([input.nonce, path, kind, identity]))
     .digest('hex');
 let work = 0;
+let closing = false;
 let certificateRoot: IntakeTreeRoot = null;
 const replayWork = createRecordVersionWorkCounters();
-const checkpoint = (phase?: 'leased-source') => {
+const checkpoint = (phase?: 'leased-source' | 'original-artifact') => {
+  if (closing) return;
   if (++work % 64 === 0 || phase) {
     const control = new Int32Array(input.checkpointControl);
     Atomics.store(control, 0, 1);
@@ -177,6 +180,38 @@ function verifyPhysical(expected: number): void {
       }
       if (count !== input.originalSources) throw Error('Vault original source membership changed');
     }
+    if (input.originalArtifacts !== undefined) {
+      if (!Number.isSafeInteger(input.originalArtifacts) || input.originalArtifacts < 0)
+        throw Error('Vault original artifact count invalid');
+      const artifacts = table.prepare(
+        'SELECT sequence,id,path,identity,signature FROM original_artifacts ORDER BY sequence',
+      );
+      let count = 0;
+      checkpoint('original-artifact');
+      for (const row of artifacts.iterate()) {
+        checkpoint();
+        if (
+          row.sequence !== count ||
+          typeof row.id !== 'string' ||
+          !row.id ||
+          typeof row.path !== 'string' ||
+          !row.path ||
+          typeof row.identity !== 'string' ||
+          !row.identity ||
+          row.signature !==
+            sign(
+              'parent-artifact:' + count,
+              'artifact',
+              JSON.stringify([row.id, row.path, row.identity]),
+            ) ||
+          regularFileIdentity(row.path) !== row.identity
+        )
+          throw Error('Vault original parent artifact changed');
+        count++;
+      }
+      if (count !== input.originalArtifacts)
+        throw Error('Vault original parent artifact membership changed');
+    }
   } finally {
     table.close();
   }
@@ -187,7 +222,7 @@ async function prepare(): Promise<number> {
   let entries = 0;
   try {
     physical.exec(
-      'CREATE TABLE physical(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE workspace(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE verified_originals(path TEXT NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(path,bytes,sha256)); CREATE TABLE consumed_sources(sequence INTEGER PRIMARY KEY,source TEXT NOT NULL,signature TEXT NOT NULL,UNIQUE(source)); ' +
+      'CREATE TABLE physical(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE workspace(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE verified_originals(path TEXT NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(path,bytes,sha256)); CREATE TABLE consumed_sources(sequence INTEGER PRIMARY KEY,source TEXT NOT NULL,signature TEXT NOT NULL,UNIQUE(source)); CREATE TABLE original_artifacts(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,path TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); ' +
         VAULT_CERTIFICATE_SCHEMA +
         ' BEGIN',
     );
@@ -271,42 +306,44 @@ async function prepare(): Promise<number> {
         }),
       ),
     );
-    const current = db
-      .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
-      .get('source_files', JSON.stringify([input.sourceId]));
-    if (current?.version_id !== input.previousVersion)
-      throw Error('Vault accepted source version differs');
-    const acceptedPreimage = db
-        .prepare('SELECT contents_json FROM __record_versions WHERE version_id=?')
-        .get(input.previousVersion)?.contents_json,
-      preimage =
-        typeof acceptedPreimage === 'string'
-          ? await recordStringFieldDigest(acceptedPreimage, checkpoint)
-          : undefined;
-    if (
-      !preimage ||
-      preimage.hash !== input.preimage.hash ||
-      preimage.bytes !== input.preimage.bytes
-    )
-      throw Error('Vault accepted source preimage differs');
-    const source = db.prepare('SELECT * FROM source_files WHERE id=?').get(input.sourceId);
-    if (!source || Object.keys(source).length !== input.fields.length)
-      throw Error('Vault accepted source shape differs');
-    for (const field of input.fields) {
-      const value = source[field.name],
-        digest =
-          typeof value === 'string'
-            ? await recordStringFieldDigest(value, checkpoint)
-            : recordFieldDigest(JSON.stringify(value));
-      if (digest.hash !== field.hash || digest.bytes !== field.bytes)
-        throw Error('Vault accepted source column differs');
-    }
-    for (const metadata of input.metadata) {
+    if (input.kind !== 'records') {
+      const current = db
+        .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
+        .get('source_files', JSON.stringify([input.sourceId]));
+      if (current?.version_id !== input.previousVersion)
+        throw Error('Vault accepted source version differs');
+      const acceptedPreimage = db
+          .prepare('SELECT contents_json FROM __record_versions WHERE version_id=?')
+          .get(input.previousVersion)?.contents_json,
+        preimage =
+          typeof acceptedPreimage === 'string'
+            ? await recordStringFieldDigest(acceptedPreimage, checkpoint)
+            : undefined;
       if (
-        db.prepare('SELECT value FROM app_meta WHERE key=?').get(metadata.key)?.value !==
-        metadata.value
+        !preimage ||
+        preimage.hash !== input.preimage.hash ||
+        preimage.bytes !== input.preimage.bytes
       )
-        throw Error('Vault selected native binding differs');
+        throw Error('Vault accepted source preimage differs');
+      const source = db.prepare('SELECT * FROM source_files WHERE id=?').get(input.sourceId);
+      if (!source || Object.keys(source).length !== input.fields.length)
+        throw Error('Vault accepted source shape differs');
+      for (const field of input.fields) {
+        const value = source[field.name],
+          digest =
+            typeof value === 'string'
+              ? await recordStringFieldDigest(value, checkpoint)
+              : recordFieldDigest(JSON.stringify(value));
+        if (digest.hash !== field.hash || digest.bytes !== field.bytes)
+          throw Error('Vault accepted source column differs');
+      }
+      for (const metadata of input.metadata) {
+        if (
+          db.prepare('SELECT value FROM app_meta WHERE key=?').get(metadata.key)?.value !==
+          metadata.value
+        )
+          throw Error('Vault selected native binding differs');
+      }
     }
     const readMetadata = db.prepare('SELECT * FROM app_meta WHERE key=?');
     const certificates = vaultRecordCertificates(
@@ -318,11 +355,12 @@ async function prepare(): Promise<number> {
     const readSource = db.prepare('SELECT * FROM source_files WHERE id=?');
     for (const row of db
       .prepare(
-        "SELECT c.entity,c.record_id,c.version_id,v.contents_json,v.deleted FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity IN ('source_files','app_meta')",
+        'SELECT c.entity,c.record_id,c.version_id,v.contents_json,v.deleted FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id' +
+          (input.kind === 'records' ? '' : " WHERE c.entity IN ('source_files','app_meta')"),
       )
       .iterate()) {
       checkpoint();
-      const entity = row.entity as 'source_files' | 'app_meta',
+      const entity = String(row.entity),
         recordId = String(row.record_id),
         deleted = Number(row.deleted),
         preimage = await recordStringFieldDigest(String(row.contents_json), checkpoint),
@@ -330,9 +368,12 @@ async function prepare(): Promise<number> {
           ? undefined
           : entity === 'source_files'
             ? readSource.get(JSON.parse(recordId)[0])
-            : readMetadata.get(JSON.parse(recordId)[0]);
+            : entity === 'app_meta'
+              ? readMetadata.get(JSON.parse(recordId)[0])
+              : undefined;
       const fields: { name: string; hash: string; bytes: number }[] = [];
-      if (!deleted && !contents) throw Error('Vault accepted current certificate row missing');
+      if (!deleted && ['source_files', 'app_meta'].includes(entity) && !contents)
+        throw Error('Vault accepted current certificate row missing');
       for (const [name, value] of Object.entries(contents ?? {})) {
         const digest =
           typeof value === 'string'
@@ -353,6 +394,8 @@ async function prepare(): Promise<number> {
       throw Error('Vault accepted HEAD changed during backing verification');
     originals.exec('COMMIT');
     verifyPhysical(entries);
+    closing = true;
+    verifyPhysical(entries);
     return entries;
   } finally {
     db?.close();
@@ -369,6 +412,9 @@ try {
       decodedVersions: replayWork.reconstruction.decodedVersions,
     });
   else {
+    verifyPhysical(input.entries!);
+    // No supported host callback follows this complete original roster pass.
+    closing = true;
     verifyPhysical(input.entries!);
     parentPort!.postMessage({ entries: input.entries });
   }

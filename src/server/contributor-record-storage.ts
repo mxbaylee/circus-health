@@ -15,25 +15,34 @@ import {
   readdirSync,
 } from 'node:fs';
 import { resolve, dirname } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { flockExclusiveNonblocking, flockUnlock } from '../shared/flock.ts';
 import { profilePaths, profileOriginal } from './profile-storage.ts';
-import type { RecordStorage, DurableRecordVersion } from './record-versions.ts';
+import type {
+  RecordStorage,
+  DurableRecordVersion,
+  RecordObjectReference,
+} from './record-versions.ts';
 import { hashFile } from './vault-store.ts';
 import { captureRecordHeadPhysical } from './record-head-physical.ts';
+import { unlockPhysicalIdentity } from './encrypted-unlock-physical.ts';
 import {
   captureManagedPhysicalScope,
   managedPhysicalScopeCurrent,
 } from './clinical-review-physical-epoch.ts';
 
 const FORMAT = 'health-contributor-record-authority-v1';
+const canonicalPath = realpathSync.native;
 function fail(message: string): never {
   throw Error('Contributor authority: ' + message);
 }
 // Keep each physical-path proof fresh; the native resolver avoids repeating
 // Node's JavaScript component walk without caching or skipping symlink checks.
 function directory(path: string): void {
-  if (!lstatSync(path).isDirectory() || realpathSync.native(path) !== resolve(path))
+  if (
+    (lstatSync(path).mode & constants.S_IFMT) !== constants.S_IFDIR ||
+    canonicalPath(path) !== resolve(path)
+  )
     fail('directory must be physical and profile scoped');
 }
 function sync(path: string): void {
@@ -55,7 +64,10 @@ function readFile(path: string): Buffer | null {
     }
     return null;
   }
-  if (!lstatSync(path).isFile() || realpathSync.native(path) !== path)
+  if (
+    (lstatSync(path).mode & constants.S_IFMT) !== constants.S_IFREG ||
+    canonicalPath(path) !== path
+  )
     fail('authority must be a regular physical file');
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
@@ -102,6 +114,8 @@ interface ContributorReadOwner {
   live(): boolean;
   writable(): boolean;
   selection(): object;
+  install(bytes: Uint8Array): void;
+  stage(name: string, bytes: Uint8Array): void;
   immutableSequence(): bigint;
 }
 const readOwnerFactories = new WeakMap<object, ContributorReadOwner>();
@@ -166,8 +180,51 @@ export function contributorRecordWriteWitnessSequence(
   const data = writeWitnesses.get(witness)!;
   return data.owner.immutableSequence() - data.sequence;
 }
+export function stageContributorRecordFactoryObject(
+  storage: object,
+  witness: ContributorRecordWriteWitness,
+  reference: RecordObjectReference,
+  input: Uint8Array,
+): { identity: string; sha256: string; bytes: number } {
+  if (!contributorRecordWriteWitnessCurrent(storage, witness))
+    fail('record object staging writer changed');
+  const owner = writeWitnesses.get(witness)!.owner,
+    bytes = Buffer.from(input);
+  if (
+    !/^objects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+      reference.name,
+    ) ||
+    bytes.length !== reference.bytes ||
+    createHash('sha256').update(bytes).digest('hex') !== reference.sha256 ||
+    existsSync(resolve(owner.base, reference.name))
+  )
+    fail('record object staging reference changed');
+  owner.stage(reference.name, bytes);
+  const physical = unlockPhysicalIdentity(resolve(owner.base, reference.name));
+  if (physical.kind !== 'file' || Number(physical.value.split(':')[2]) !== reference.bytes)
+    fail('record object staging writer did not add exact immutable object');
+  const sha256 = hashFile(resolve(owner.base, reference.name));
+  if (sha256 !== reference.sha256) fail('record object staging readback differs');
+  return { identity: physical.value, sha256, bytes: reference.bytes };
+}
 export function closeContributorRecordWriteWitness(witness: ContributorRecordWriteWitness): void {
   writeWitnesses.delete(witness);
+}
+/** Location is released only for an exact live read owner from this factory. */
+export function contributorRecordBackingLocation(
+  storage: object,
+  original: ContributorRecordReadOwner,
+): { root: string; profileId: string; base: string; marker: string } | undefined {
+  const data = readOwners.get(original),
+    owner = readOwnerFactories.get(storage);
+  if (
+    !owner ||
+    !data ||
+    data.owner !== owner ||
+    !contributorRecordReadOwnerCurrent(storage, original)
+  )
+    return undefined;
+  return { root: owner.root, profileId: owner.profileId, base: owner.base, marker: owner.marker };
 }
 function readOwnerMethodsCurrent(owner: ContributorReadOwner): boolean {
   for (const [name, expected] of [
@@ -289,6 +346,89 @@ export function contributorLegacyBridgeBackingScopeCurrent(
   );
 }
 
+declare const headPublicationBrand: unique symbol;
+export interface ContributorRecordHeadPublication {
+  readonly [headPublicationBrand]: true;
+}
+const headPublications = new WeakMap<
+  ContributorRecordHeadPublication,
+  {
+    owner: ContributorReadOwner;
+    original: ContributorRecordReadOwner;
+    bytes: Buffer;
+    consumed: boolean;
+  }
+>();
+/** Installation transport only. The record owner must retain this exact handle
+ * privately and separately prove its transaction, indexed rows and originals. */
+export function prepareContributorRecordHeadPublication(
+  storage: object,
+  reference: RecordObjectReference,
+): ContributorRecordHeadPublication | undefined {
+  const owner = readOwnerFactories.get(storage);
+  if (!owner) return undefined;
+  if (!readOwnerMethodsCurrent(owner)) fail('head publication owner unavailable');
+  const { name, sha256, bytes } = reference;
+  if (
+    !/^objects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(name) ||
+    !/^[0-9a-f]{64}$/.test(sha256) ||
+    !Number.isSafeInteger(bytes) ||
+    bytes <= 0
+  )
+    fail('head publication reference is invalid');
+  const original = captureContributorRecordReadOwner(storage)!;
+  try {
+    const commit = readFile(resolve(owner.base, name));
+    if (
+      !commit ||
+      commit.length !== bytes ||
+      createHash('sha256').update(commit).digest('hex') !== sha256 ||
+      !contributorRecordReadOwnerCurrent(storage, original)
+    )
+      fail('head publication immutable object differs');
+    const capability = Object.freeze({}) as ContributorRecordHeadPublication;
+    headPublications.set(capability, {
+      owner,
+      original,
+      bytes: Buffer.from(JSON.stringify({ name, sha256, bytes }) + '\n'),
+      consumed: false,
+    });
+    return capability;
+  } catch (error) {
+    closeContributorRecordReadOwner(original);
+    throw error;
+  }
+}
+export function contributorRecordHeadPublicationCurrent(
+  storage: object,
+  capability: ContributorRecordHeadPublication,
+): boolean {
+  const proof = headPublications.get(capability);
+  return (
+    !!proof &&
+    !proof.consumed &&
+    proof.owner.storage === storage &&
+    contributorRecordReadOwnerCurrent(storage, proof.original)
+  );
+}
+/** No public adapter property/callback is read or invoked at installation. */
+export function installContributorRecordHeadPublication(
+  storage: object,
+  capability: ContributorRecordHeadPublication,
+): void {
+  if (!contributorRecordHeadPublicationCurrent(storage, capability))
+    fail('head publication changed or expired');
+  const proof = headPublications.get(capability)!;
+  proof.consumed = true;
+  proof.owner.install(proof.bytes);
+}
+export function closeContributorRecordHeadPublication(
+  capability: ContributorRecordHeadPublication,
+): void {
+  const proof = headPublications.get(capability);
+  headPublications.delete(capability);
+  if (proof) closeContributorRecordReadOwner(proof.original);
+}
 /** Caller holds this lease for the complete attached database lifetime. Read-only
  * recovery uses a pinned head under that writer's lease and never publishes. */
 export function openContributorRecordStorage(
@@ -318,7 +458,7 @@ export function openContributorRecordStorage(
     directory(profile.root);
     directory(base);
   };
-  const write = (name: string, bytes: Uint8Array, immutable: boolean) => {
+  const write = (name: string, bytes: Uint8Array, immutable: boolean): boolean => {
     check();
     if (readOnly) fail('read-only backend');
     const target =
@@ -330,7 +470,7 @@ export function openContributorRecordStorage(
     const old = readFile(target);
     if (immutable && old) {
       if (!old.equals(Buffer.from(bytes))) fail('immutable collision');
-      return;
+      return false;
     }
     const pending = resolve(parent, '.pending-' + randomUUID());
     const fd = openSync(
@@ -351,6 +491,7 @@ export function openContributorRecordStorage(
       } else renameSync(pending, target);
       sync(parent);
       if (!readFile(target)?.equals(Buffer.from(bytes))) fail('write verification failed');
+      return true;
     } finally {
       if (existsSync(pending)) unlinkSync(pending);
     }
@@ -429,6 +570,16 @@ export function openContributorRecordStorage(
       writable: () => !readOnly,
       selection: () => selection,
       immutableSequence: () => immutableSequence,
+      install: (bytes) => {
+        name('head');
+        write('head', bytes, false);
+        selection = Object.freeze({});
+      },
+      stage: (value, bytes) => {
+        name(value);
+        immutableSequence++;
+        if (!write(value, bytes, true)) fail('staged object was not newly created');
+      },
     });
     return storage;
   } catch (error) {

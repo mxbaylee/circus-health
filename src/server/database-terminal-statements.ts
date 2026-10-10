@@ -4,8 +4,17 @@ import {
   managedDatabaseDataMethod,
   prepareManagedDatabaseCallbackBarrier,
   withoutManagedDatabaseCallbacks,
+  currentTransactionToken,
 } from './database.ts';
 import { withIntakeStateTerminalCleanup } from './intake-state-storage.ts';
+import {
+  recordMutationRecipeBoundTo,
+  type createRecordMutationRecipe,
+} from './record-mutation-recipe.ts';
+import {
+  recordPreparedIndexBoundTo,
+  type createRecordPreparedIndex,
+} from './record-prepared-index.ts';
 
 declare const statementsBrand: unique symbol;
 export interface PreparedTerminalStatements {
@@ -112,7 +121,30 @@ export function prepareTerminalStatements(
     readonly executions?: readonly string[];
   },
 ): PreparedTerminalStatements {
-  if (db.isTransaction || active.has(db)) fail();
+  return prepareStatements(db, inventory);
+}
+
+/** Compile in the genuine tentative transaction, not an empty surrogate.
+ * The caller must separately bind its rollback receipt to a fresh final token. */
+export function prepareTerminalStatementsInTransaction(
+  db: DatabaseSync,
+  token: object,
+  inventory: Parameters<typeof prepareTerminalStatements>[1],
+): PreparedTerminalStatements {
+  if (!token || !db.isTransaction || currentTransactionToken(db) !== token) fail();
+  return prepareStatements(db, inventory, token);
+}
+
+function prepareStatements(
+  db: DatabaseSync,
+  inventory: Parameters<typeof prepareTerminalStatements>[1],
+  token?: object,
+): PreparedTerminalStatements {
+  const originalTransaction = () =>
+    token
+      ? db.isTransaction && currentTransactionToken(db) === token
+      : !db.isTransaction && currentTransactionToken(db) === undefined;
+  if (!originalTransaction() || active.has(db)) fail();
   prepareManagedDatabaseCallbackBarrier(db);
   const methods = managedDatabaseMethodEpoch(db);
   if (!methods) fail();
@@ -143,10 +175,12 @@ export function prepareTerminalStatements(
     used: false,
   };
   const compile = (sql: string, bigInts: boolean): Entry => {
+    if (!originalTransaction()) fail();
     const statement = nativePrepare.call(db, sql);
     // SQLite prepare can ignore trailing statements; never certify such a batch.
     if (statement.sourceSQL.trim() !== sql.trim()) fail();
     Reflect.apply(nativeReadBigInts, statement, [bigInts]);
+    if (!originalTransaction()) fail();
     return { statement, facade: facade(item, statement, bigInts), bigInts };
   };
   for (const spec of inventory.statements) {
@@ -159,6 +193,7 @@ export function prepareTerminalStatements(
     item.executions.set(sql, compile(sql, false));
   }
   if (
+    !originalTransaction() ||
     managedDatabaseMethodEpoch(db) !== methods ||
     managedDatabaseDataMethod(db, 'prepare') !== prepare ||
     managedDatabaseDataMethod(db, 'exec') !== exec ||
@@ -212,6 +247,48 @@ export function withTerminalStatements<T>(
       active.delete(db);
     }
   });
+}
+
+/** Only a genuine frozen exact-connection recipe reaches native handles; the
+ * resolver stays inside these two issuers and cannot escape to caller code. */
+export function replayTerminalRecordMutations(
+  db: DatabaseSync,
+  recipe: ReturnType<typeof createRecordMutationRecipe>,
+): void {
+  const item = active.get(db);
+  if (!item || !recordMutationRecipeBoundTo(db, recipe)) fail();
+  current(item!);
+  recipe.replay((sql) => {
+    current(item!);
+    const entry = item!.entries.get(entryKey(sql, false));
+    if (!entry) return fail();
+    return entry.statement;
+  });
+  current(item!);
+}
+/** Only a genuine exact-DB typed index can resolve the owner's private native
+ * inventory. No caller-selected resolver or native statement escapes. */
+export function replayTerminalPreparedRecordIndex(
+  db: DatabaseSync,
+  index: ReturnType<typeof createRecordPreparedIndex>,
+): void {
+  const item = active.get(db);
+  if (!item || !recordPreparedIndexBoundTo(db, index)) fail();
+  current(item!);
+  for (const row of index.consume()) {
+    current(item!);
+    const entry = item!.entries.get(entryKey(row.sql, false));
+    if (!entry) fail();
+    if (row.mode === 'check') {
+      if (
+        Number(Reflect.apply(nativeGet, entry!.statement, row.args) !== undefined) !== row.expected
+      )
+        fail();
+    } else if (Reflect.apply(nativeRun, entry!.statement, row.args).changes !== row.expected)
+      fail();
+    current(item!);
+  }
+  current(item!);
 }
 
 /** Ordinary callers keep native preparation; only the active private owner

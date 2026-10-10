@@ -27,6 +27,60 @@ import type { OwnershipScopeIndex } from './ownership-scope-index.ts';
 import { ownershipIntakeScopes } from './ownership-intake-scopes.ts';
 import { ownershipHash, appendOwnershipDecision } from './ownership-journal.ts';
 import { currentTransactionToken, rejectCurrentTransaction } from './database.ts';
+import { DatabaseSync, StatementSync } from 'node:sqlite';
+
+const nativeReadPrepare = DatabaseSync.prototype.prepare,
+  nativeReadGet = StatementSync.prototype.get;
+const readOwners = new WeakMap<
+  object,
+  {
+    db: Database;
+    profileId: string;
+    current(): boolean;
+    sql: DatabaseSync;
+  }
+>();
+declare const readOwnerBrand: unique symbol;
+export interface OwnershipNameReadOwner {
+  readonly [readOwnerBrand]: true;
+}
+const readProofs = new WeakMap<
+  OwnershipNameReadOwner,
+  {
+    owner: NonNullable<ReturnType<typeof readOwners.get>>;
+    statements: StatementSync[];
+    stamp: unknown[];
+  }
+>();
+/** Private name scratch continuity, never a public assertion callback. */
+export function captureOwnershipNameReadOwner(plan: object, db: Database, profileId: string) {
+  const owner = readOwners.get(plan);
+  if (!owner || owner.db !== db || owner.profileId !== profileId || !owner.current())
+    throw Error('Ownership name read owner unavailable');
+  const statements = [
+    'SELECT total_changes() AS value',
+    'PRAGMA main.schema_version',
+    'PRAGMA temp.schema_version',
+    'PRAGMA main.data_version',
+  ].map((sql) => Reflect.apply(nativeReadPrepare, owner.sql, [sql]));
+  const stamp = statements.map(
+    (statement) => Object.values(Reflect.apply(nativeReadGet, statement, [])!)[0],
+  );
+  const proof = Object.freeze({}) as OwnershipNameReadOwner;
+  readProofs.set(proof, { owner, statements, stamp });
+  assertOwnershipNameReadOwner(db, proof);
+  return proof;
+}
+export function assertOwnershipNameReadOwner(db: Database, proof: OwnershipNameReadOwner): void {
+  const data = readProofs.get(proof);
+  if (!data || data.owner.db !== db || !data.owner.current())
+    throw Error('Ownership name read owner changed');
+  const stamp = data.statements.map(
+    (statement) => Object.values(Reflect.apply(nativeReadGet, statement, [])!)[0],
+  );
+  if (stamp.some((value, index) => value !== data.stamp[index]) || !data.owner.current())
+    throw Error('Ownership name read owner changed');
+}
 
 export async function prepareOwnershipNamePlan(
   db: Database,
@@ -47,6 +101,7 @@ export async function prepareOwnershipNamePlan(
     owners = new Set(owners);
   }
   request = structuredClone(request);
+  const originalAssertRunning = options.assertRunning;
   const scratch = disposableSqlite('fictional-ownership-name-plan-');
   const sql = scratch.db;
   const selectedRevision = clinicalReviewRevision(db),
@@ -63,7 +118,7 @@ export async function prepareOwnershipNamePlan(
   };
   const assertStable = () => {
     try {
-      options.assertRunning?.();
+      originalAssertRunning?.();
       if (
         closed ||
         !db.isOpen ||
@@ -499,7 +554,7 @@ export async function prepareOwnershipNamePlan(
       after: items.length && after !== null ? next(items.at(-1)!) : null,
     });
     let stageToken: ReturnType<typeof currentTransactionToken>;
-    return {
+    const prepared = {
       reference,
       work,
       sources,
@@ -783,6 +838,13 @@ export async function prepareOwnershipNamePlan(
         }
       },
     };
+    readOwners.set(prepared, {
+      db,
+      profileId,
+      sql,
+      current: () => !closed && db.isOpen && sql.isOpen,
+    });
+    return prepared;
   } catch (error) {
     closed = true;
     scratch.close();

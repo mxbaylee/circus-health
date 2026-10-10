@@ -11,7 +11,9 @@ import {
   observeTransactionOutcome,
   observeTransactionBeforePublication,
   type Database,
+  type TransactionOutcome,
 } from './database.ts';
+import { tryObservePreparedRecordPublication } from './record-versions.ts';
 import { canonicalLiteral, cloneLiteral } from './intake-format.ts';
 import {
   intakeWorkflowQuestionValue,
@@ -1098,6 +1100,50 @@ function captureAcceptanceFootprint(db: Database) {
     },
   };
 }
+function observeAcceptancePublication(
+  db: Database,
+  token: object,
+  footprint: ReturnType<typeof captureAcceptanceFootprint>,
+  complete: (outcome: TransactionOutcome) => void,
+): () => void {
+  let active = true,
+    stopPrepared = () => {};
+  const close = () => {
+    if (!active) return;
+    active = false;
+    stop();
+    stopPrepared();
+    footprint.close();
+  };
+  const finish = (outcome: TransactionOutcome) => {
+    if (!active) return;
+    close();
+    complete(outcome);
+  };
+  const stop = observeTransactionOutcome(db, (outcome) => {
+    if (outcome.token !== token || !active) return;
+    stop();
+    const exact = footprint.eligible();
+    footprint.close();
+    if (!exact) {
+      close();
+      return;
+    }
+    if (outcome.prepared && !outcome.committed && !outcome.succeeded) {
+      // Only the record owner's private released preparation can carry this
+      // footprint across rollback to its distinct final publication token.
+      const retained = tryObservePreparedRecordPublication(db, token, {
+        published: finish,
+        discarded: close,
+      });
+      if (retained) stopPrepared = retained;
+      else close();
+      return;
+    }
+    finish(outcome);
+  });
+  return close;
+}
 function observeOwnedAcceptanceTransition(
   db: Database,
   input: CertifiedTransition,
@@ -1110,13 +1156,8 @@ function observeOwnedAcceptanceTransition(
     source: { id: input.source.id, sha256: input.source.sha256 },
     receipt: structuredClone(input.receipt),
   };
-  const stop = observeTransactionOutcome(db, (outcome) => {
-    if (outcome.token !== token) return;
-    stop();
-    const exact = footprint.eligible();
-    footprint.close();
+  observeAcceptancePublication(db, token, footprint, (outcome) => {
     if (
-      !exact ||
       !outcome.committed ||
       !outcome.succeeded ||
       outcome.intakeMaintenance ||
@@ -1189,12 +1230,9 @@ export function beginOwnedGroupedAcceptanceTransition(db: Database) {
         source: { id: item.source.id, sha256: item.source.sha256 },
       }));
       footprint.seal();
-      stop = observeTransactionOutcome(db, (outcome) => {
-        if (outcome.token !== token) return;
-        const exact = footprint.eligible();
+      stop = observeAcceptancePublication(db, token, footprint, (outcome) => {
         close();
         if (
-          !exact ||
           !outcome.committed ||
           !outcome.succeeded ||
           outcome.intakeMaintenance ||

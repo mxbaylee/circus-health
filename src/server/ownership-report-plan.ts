@@ -2,8 +2,14 @@ import {
   assertClinicalOperation,
   currentClinicalOperation,
   runExclusiveClinicalOperation,
+  sealClinicalReadResult,
+  type ClinicalOperation,
 } from './clinical-operation.ts';
-import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import {
+  createClinicalReviewArtifactProof,
+  captureClinicalArtifactReadTerminal,
+  type ClinicalArtifactReadTerminal,
+} from './clinical-review-artifact-proof.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { identityGroundingGeneration } from './intake-identity-grounding.ts';
 import { ownershipPlanGroups } from './ownership-plan-groups.ts';
@@ -12,6 +18,7 @@ import { prepareOwnershipRecordsSelection } from './ownership-records-selection.
 import { prepareOwnershipIdentitySnapshots } from './ownership-identity-snapshots.ts';
 /** Owned complete report preview. Its scratch rows are views, never durable authority. */
 import { createOwnershipScopeIndex } from './ownership-scope-index.ts';
+import { ClinicalPhysicalEvidenceChanged } from './clinical-review-physical-worker.ts';
 import {
   iterateOwnershipStreamContributions,
   OwnershipContributionSequence,
@@ -25,6 +32,7 @@ import {
 import {
   collectionClinicalProjectionContext,
   collectionClinicalProjectionContextAsync,
+  type VerifiedClinicalArtifact,
 } from './intake-review-collection-session.ts';
 import type { IntakeReview } from '../shared/intake.ts';
 import type { SelectedOwnershipReviewScope } from './record-ownership-authority.ts';
@@ -43,7 +51,29 @@ import {
   type OwnershipCommitView,
 } from './ownership-preview-store.ts';
 import { previewRecordOwnership, previewRecordOwnershipPrepared } from './record-ownership.ts';
-import { prepareOwnershipNamePlan } from './ownership-name-plan.ts';
+import { prepareOwnershipNamePlan, captureOwnershipNameReadOwner } from './ownership-name-plan.ts';
+import { DatabaseSync, StatementSync } from 'node:sqlite';
+import {
+  prepareTerminalStatements,
+  withTerminalStatements,
+} from './database-terminal-statements.ts';
+import {
+  captureRecordReadOwner,
+  recordReadOwnerSupported,
+  assertRecordReadOwnerBeforeVerification,
+  assertRecordReadOwnerTerminal,
+  closeRecordReadOwner,
+  type RecordReadOwner,
+} from './record-versions.ts';
+import {
+  captureOwnershipReadInterval,
+  bindOwnershipReadInterval,
+  assertOwnershipReadInterval,
+  closeOwnershipReadInterval,
+  prepareOwnershipReadOwner,
+  assertOwnershipReadOwner,
+  sealOwnershipReadInterval,
+} from './ownership-read-owner.ts';
 import { prepareCollectionWorkflowReadiness } from './intake-workflow-readiness.ts';
 import { prepareCollectionReviewMembership } from './intake-review-membership-index.ts';
 import { activeMappingRules } from './clinical-import.ts';
@@ -65,6 +95,173 @@ import type {
   OwnershipReportPreviewReference,
   OwnershipReportEvidenceReference,
 } from '../shared/ownership-report-reference.ts';
+
+declare const originalProofBrand: unique symbol;
+export interface OwnershipReportOriginalProof {
+  readonly [originalProofBrand]: true;
+}
+interface OriginalProofOwner {
+  db: Database;
+  profileId: string;
+  current(): boolean;
+  capture(): () => Generator<VerifiedClinicalArtifact>;
+}
+const originalProofOwners = new WeakMap<object, OriginalProofOwner>();
+const nativeReadPrepare = DatabaseSync.prototype.prepare,
+  nativeReadGet = StatementSync.prototype.get;
+declare const readOwnerBrand: unique symbol;
+export interface OwnershipReportReadOwner {
+  readonly [readOwnerBrand]: true;
+}
+const readOwners = new WeakMap<
+  object,
+  {
+    db: Database;
+    profileId: string;
+    sql: DatabaseSync;
+    record: RecordReadOwner;
+    current(): boolean;
+    ownsTerminal(proof: ClinicalArtifactReadTerminal): boolean;
+  }
+>();
+const readProofs = new WeakMap<
+  OwnershipReportReadOwner,
+  {
+    owner: NonNullable<ReturnType<typeof readOwners.get>>;
+    statements: StatementSync[];
+    stamp: unknown[];
+  }
+>();
+const readContinuations = new WeakMap<Function, Database>();
+export function ownershipReportReadContinuationCurrent(work: Function, db: Database): boolean {
+  return readContinuations.get(work) === db && db.isOpen;
+}
+function runReportReadOperation<T>(
+  db: Database,
+  work: Parameters<typeof runExclusiveClinicalOperation<T>>[1],
+  options: Parameters<typeof runExclusiveClinicalOperation<T>>[2],
+) {
+  readContinuations.set(work, db);
+  return runExclusiveClinicalOperation(db, work, options);
+}
+export function captureOwnershipReportReadOwner(plan: object, db: Database, profileId: string) {
+  const owner = readOwners.get(plan);
+  if (!owner || owner.db !== db || owner.profileId !== profileId || !owner.current())
+    throw Error('Original ownership report read owner unavailable');
+  const statements = [
+    'SELECT total_changes() AS value',
+    'PRAGMA main.schema_version',
+    'PRAGMA temp.schema_version',
+    'PRAGMA main.data_version',
+  ].map((sql) => Reflect.apply(nativeReadPrepare, owner.sql, [sql]));
+  const stamp = statements.map(
+    (statement) => Object.values(Reflect.apply(nativeReadGet, statement, [])!)[0],
+  );
+  const proof = Object.freeze({}) as OwnershipReportReadOwner;
+  readProofs.set(proof, { owner, statements, stamp });
+  assertOwnershipReportReadOwner(db, proof);
+  return proof;
+}
+export function assertOwnershipReportReadOwner(
+  db: Database,
+  proof: OwnershipReportReadOwner,
+): void {
+  const data = readProofs.get(proof);
+  if (!data || data.owner.db !== db || !data.owner.current())
+    throw Error('Original ownership report read owner changed');
+  const stamp = data.statements.map(
+    (statement) => Object.values(Reflect.apply(nativeReadGet, statement, [])!)[0],
+  );
+  if (stamp.some((value, index) => value !== data.stamp[index]) || !data.owner.current())
+    throw Error('Original ownership report read owner changed');
+}
+export function ownershipReportReadRecordOwner(
+  db: Database,
+  proof: OwnershipReportReadOwner,
+): RecordReadOwner {
+  assertOwnershipReportReadOwner(db, proof);
+  return readProofs.get(proof)!.owner.record;
+}
+export function ownershipReportReadTerminalCurrent(
+  db: Database,
+  proof: OwnershipReportReadOwner,
+  terminal: ClinicalArtifactReadTerminal,
+): boolean {
+  assertOwnershipReportReadOwner(db, proof);
+  return readProofs.get(proof)!.owner.ownsTerminal(terminal);
+}
+const originalProofs = new WeakMap<
+  OwnershipReportOriginalProof,
+  {
+    owner: OriginalProofOwner;
+    operation: ClinicalOperation;
+    rows: () => Generator<VerifiedClinicalArtifact>;
+  }
+>();
+function originalProofUnavailable(): never {
+  throw new HttpError(
+    409,
+    'OWNERSHIP_CHANGED',
+    'Original ownership evidence is no longer available',
+  );
+}
+/** Only an actual prepared report can transport its original complete proof. */
+export function captureOwnershipReportOriginalProof(
+  plan: PreparedOwnershipReportPlan,
+  db: Database,
+  profileId: string,
+): OwnershipReportOriginalProof {
+  const owner = originalProofOwners.get(plan),
+    operation = currentClinicalOperation(db);
+  if (
+    !owner ||
+    owner.db !== db ||
+    owner.profileId !== profileId ||
+    !owner.current() ||
+    !operation ||
+    db.isTransaction
+  )
+    originalProofUnavailable();
+  const rows = owner!.capture();
+  assertClinicalOperation(db, operation);
+  if (!owner!.current()) originalProofUnavailable();
+  const proof = Object.freeze({}) as OwnershipReportOriginalProof;
+  originalProofs.set(proof, { owner: owner!, operation: operation!, rows });
+  return proof;
+}
+/** Authentication and membership transport only, never current physical authority. */
+export function ownershipReportOriginalProofCurrent(
+  proof: OwnershipReportOriginalProof,
+  db: Database,
+  profileId: string,
+): boolean {
+  const data = originalProofs.get(proof);
+  if (!data || data.owner.db !== db || data.owner.profileId !== profileId || !data.owner.current())
+    return false;
+  try {
+    assertClinicalOperation(db, data.operation);
+    return true;
+  } catch {
+    return false;
+  }
+}
+export function* verifiedOwnershipReportOriginalArtifacts(
+  proof: OwnershipReportOriginalProof,
+  db: Database,
+  profileId: string,
+): Generator<VerifiedClinicalArtifact> {
+  const data = originalProofs.get(proof);
+  const current = () => {
+    if (!ownershipReportOriginalProofCurrent(proof, db, profileId)) originalProofUnavailable();
+  };
+  current();
+  for (const artifact of data!.rows()) {
+    current();
+    yield artifact;
+    current();
+  }
+  current();
+}
 export async function prepareOwnershipReportPlan(
   db: Database,
   root: string,
@@ -78,6 +275,7 @@ export async function prepareOwnershipReportPlan(
     >;
   } = {},
 ) {
+  const originalAssertRunning = options.assertRunning;
   return runExclusiveClinicalOperation(
     db,
     async () => {
@@ -115,7 +313,7 @@ export async function prepareOwnershipReportPlan(
         const ready = await prepareCollectionWorkflowReadiness(db, root, profileId, intakeId, {
           mappingVersion: mappingVersion(),
           currentMappingVersion: mappingVersion,
-          assertRunning: options.assertRunning,
+          assertRunning: originalAssertRunning,
         });
         if (ready.state !== 'ready')
           throw new HttpError(
@@ -171,7 +369,7 @@ export async function prepareOwnershipReportPlan(
           )) {
             await prepareDependency(contribution.intakeId, contribution.sourceRecordId);
             if (++preparedSources % 32 === 0) await setImmediate();
-            options.assertRunning?.();
+            originalAssertRunning?.();
             if (clinicalReviewRevision(db) !== selectedClinical)
               throw new HttpError(
                 409,
@@ -245,6 +443,9 @@ export async function prepareOwnershipReportPlan(
       // separate private scratch whose witness stays unchanged through publication.
       const artifactScratch = disposableSqlite('ownership-artifact-proof-'),
         artifacts = createClinicalReviewArtifactProof(artifactScratch.db, 'clinical_artifacts');
+      let closed = false;
+      let returnedPlan: object | undefined;
+      let recordReadOwner: RecordReadOwner | undefined;
       let terminalPhysicalCurrent: (() => void) | undefined,
         stopTerminalGuard: (() => void) | undefined;
       const assertPreparedCurrent = () => {
@@ -264,7 +465,7 @@ export async function prepareOwnershipReportPlan(
         complete: () => T,
         mode: 'read-only' | 'publication',
       ): Promise<T> =>
-        runExclusiveClinicalOperation(
+        runReportReadOperation(
           db,
           async (operation) => {
             if (terminalPhysicalCurrent || db.isTransaction || currentTransactionToken(db))
@@ -281,6 +482,77 @@ export async function prepareOwnershipReportPlan(
                   'Ownership preview changed during verification',
                 );
             };
+            if (mode === 'read-only' && recordReadOwner) {
+              const interval = captureOwnershipReadInterval(db);
+              let handedOff = false;
+              try {
+                const owner = await prepareOwnershipReadOwner(
+                    db,
+                    profileId,
+                    operation,
+                    originalAssertRunning ? [originalAssertRunning] : [],
+                  ),
+                  reportOwner = captureOwnershipReportReadOwner(returnedPlan!, db, profileId),
+                  nameOwner = captureOwnershipNameReadOwner(plan!, db, profileId);
+                bindOwnershipReadInterval(db, interval, reportOwner, nameOwner);
+                const current = () => {
+                  assertOwnershipReadOwner(db, owner);
+                  assertOwnershipReadInterval(db, interval);
+                };
+                assertPreflightCurrent();
+                current();
+                // All caller rendering and getter evaluation precedes the final
+                // original-member sweep. Only a detached result can escape it.
+                terminalPhysicalCurrent = current;
+                let value: T;
+                try {
+                  const rendered = complete();
+                  if (
+                    rendered !== null &&
+                    (typeof rendered === 'object' || typeof rendered === 'function') &&
+                    ('then' in rendered || 'next' in rendered)
+                  )
+                    throw Error('Ownership read requires a synchronous detached result');
+                  value = structuredClone(rendered);
+                } finally {
+                  terminalPhysicalCurrent = undefined;
+                }
+                assertPreflightCurrent();
+                const statements = prepareTerminalStatements(db, { statements: [] });
+                assertRecordReadOwnerBeforeVerification(db, recordReadOwner);
+                current();
+                return await artifacts.withVerifiedTerminal(
+                  { assertCurrent: current },
+                  (physicalCurrent) =>
+                    withTerminalStatements(db, statements, () => {
+                      current();
+                      assertRecordReadOwnerTerminal(db, recordReadOwner!);
+                      sealOwnershipReadInterval(
+                        db,
+                        interval,
+                        captureClinicalArtifactReadTerminal(physicalCurrent),
+                      );
+                      const result = sealClinicalReadResult(db, operation, owner, interval, value);
+                      handedOff = true;
+                      return result;
+                    }),
+                  'read-only',
+                );
+              } catch (error) {
+                if (error instanceof ClinicalPhysicalEvidenceChanged) {
+                  assertClinicalOperation(db, operation);
+                  throw new HttpError(
+                    409,
+                    'SOURCE_CHANGED',
+                    'Retained physical evidence changed; prepare a fresh review',
+                  );
+                }
+                throw error;
+              } finally {
+                terminalPhysicalCurrent = undefined;
+                if (!handedOff) closeOwnershipReadInterval(interval);
+              }
+            }
             return artifacts.withVerifiedTerminal(
               { assertCurrent: assertPreflightCurrent },
               (physicalCurrent) => {
@@ -470,7 +742,7 @@ export async function prepareOwnershipReportPlan(
           store.sink.sources,
           store.sink.owners,
           request,
-          { ...options, ownedReportScopes: true, scopes },
+          { ...options, assertRunning: originalAssertRunning, ownedReportScopes: true, scopes },
         );
         options.onCheckpoint?.('names-complete');
         const prepareHolds = () =>
@@ -538,7 +810,7 @@ export async function prepareOwnershipReportPlan(
           reference.reportHoldTotal = holds.length;
           return header;
         };
-        return {
+        const prepared = {
           plan,
           scopes,
           decision,
@@ -1177,13 +1449,37 @@ export async function prepareOwnershipReportPlan(
             };
           },
           close() {
+            if (closed) return;
+            closed = true;
+            if (recordReadOwner) closeRecordReadOwner(recordReadOwner);
             retainedReview?.close();
             plan!.close();
             selection.close();
             artifactScratch.close();
           },
         };
+        originalProofOwners.set(prepared, {
+          db,
+          profileId,
+          current: () => !closed && db.isOpen && artifactScratch.db.isOpen,
+          capture: () => artifacts.captureVerifiedArtifacts(),
+        });
+        returnedPlan = prepared;
+        if (recordReadOwnerSupported(db, profileId)) {
+          recordReadOwner = captureRecordReadOwner(db, profileId);
+          readOwners.set(prepared, {
+            db,
+            profileId,
+            sql: selection.sql,
+            record: recordReadOwner,
+            current: () => !closed && db.isOpen && selection.sql.isOpen,
+            ownsTerminal: (proof) => artifacts.ownsReadTerminal(proof),
+          });
+        }
+        return prepared;
       } catch (error) {
+        closed = true;
+        if (recordReadOwner) closeRecordReadOwner(recordReadOwner);
         retainedReview?.close();
         plan?.close();
         selection.close();

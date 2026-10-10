@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { createIntakeTree, type IntakeTreeRoot } from './intake-state-tree.ts';
 
 export interface VaultRecordCertificate {
-  entity: 'source_files' | 'app_meta';
+  entity: string;
   recordId: string;
   versionId: string;
   deleted: number;

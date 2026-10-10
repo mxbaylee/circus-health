@@ -43,6 +43,12 @@ import {
   recordCompactTerminalOriginalSources,
   type RecordIndexedPublication,
   type RecordCompactTerminalOwner,
+  recordTransactionTerminalExecutionCurrent,
+  runRecordTransactionTerminalExecution,
+  verifiedRecordTransactionOriginalArtifacts,
+  verifiedRecordTransactionOriginalSources,
+  type RecordTransactionBackingPlan,
+  type RecordTransactionTerminalExecution,
 } from './record-versions.ts';
 
 const mkdirSync: typeof rawMkdirSync = (...args) =>
@@ -61,6 +67,7 @@ import { openVaultIndexSteps, safeVaultName, type VaultIndexLimits } from './vau
 import { setImmediate as yieldHost } from 'node:timers/promises';
 import { openDiagnosticChunkStore, type DiagnosticChunkStore } from './diagnostic-chunk-store.ts';
 import { captureRecordHeadPhysical } from './record-head-physical.ts';
+import { recordVersionWork } from './record-version-work.ts';
 
 export type VaultDiagnosticWriter = (sequence: number, bytes: Uint8Array) => void;
 const diagnosticWriters = new WeakMap<
@@ -367,20 +374,36 @@ export async function prepareVaultRecordStagingBacking(
     if (!data.owner.workspace) data.owner.prepareHead();
     check();
     const retained = data.owner.backingFrontier;
-    if (retained) {
+    if (retained && binding.kind === 'records' && !retained.backing.supportsRecordPriors) {
+      recordVersionWork('vaultBackingRejectedScope');
       data.owner.backingFrontier = undefined;
-      if (
-        retained.db === data.db &&
-        retained.methods === managedDatabaseMethodEpoch(data.db) &&
-        retained.head === selectedHead &&
-        managedPhysicalEpochCurrent(retained.epoch) &&
-        retained.sequence === data.sequence &&
-        retained.workspaceEpoch === data.workspaceEpoch &&
-        recordParentsCurrent(retained.parents)
-      ) {
+      retained.backing.close();
+    }
+    if (retained && data.owner.backingFrontier === retained) {
+      data.owner.backingFrontier = undefined;
+      const rejection =
+        retained.db !== data.db
+          ? 'vaultBackingRejectedOwner'
+          : retained.methods !== managedDatabaseMethodEpoch(data.db)
+            ? 'vaultBackingRejectedMethods'
+            : retained.head !== selectedHead
+              ? 'vaultBackingRejectedHead'
+              : !managedPhysicalEpochCurrent(retained.epoch)
+                ? 'vaultBackingRejectedPhysical'
+                : retained.sequence !== data.sequence
+                  ? 'vaultBackingRejectedSequence'
+                  : retained.workspaceEpoch !== data.workspaceEpoch
+                    ? 'vaultBackingRejectedWorkspace'
+                    : !recordParentsCurrent(retained.parents)
+                      ? 'vaultBackingRejectedParents'
+                      : undefined;
+      if (!rejection) {
         data.backing = retained.backing;
         data.backing.acquire(selectedHead, binding, check);
-      } else retained.backing.close();
+      } else {
+        recordVersionWork(rejection);
+        retained.backing.close();
+      }
     }
     data.backing ??= await prepareVaultRecordBackingTransport(
       data.owner.directory,
@@ -396,6 +419,38 @@ export async function prepareVaultRecordStagingBacking(
   } catch (error) {
     data.revoked = true;
     data.backing?.close();
+    throw error;
+  }
+}
+/** Namespace-only transport for the private ordinary record consumer. It does
+ * not certify arbitrary SQLite priors; every changed key must match below. */
+export async function prepareVaultRecordTransactionBacking(
+  witness: VaultRecordStagingWitness,
+  selectedHead: string,
+  assertCurrent: () => void,
+): Promise<void> {
+  await prepareVaultRecordStagingBacking(
+    witness,
+    selectedHead,
+    { kind: 'records', fields: [], metadata: [] },
+    assertCurrent,
+  );
+}
+export function assertVaultRecordTransactionPrior(
+  witness: VaultRecordStagingWitness,
+  entity: string,
+  recordId: string,
+  previousVersion: string | null,
+  prior: { deleted: boolean; preimage: { hash: string; bytes: number } } | null,
+): void {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data?.backing || !vaultRecordStagingCurrent(witness))
+    throw Error('Vault record predecessor proof unavailable');
+  try {
+    data.backing.assertRecordPrior(entity, recordId, previousVersion, prior);
+    if (!vaultRecordStagingCurrent(witness)) throw Error('Vault record predecessor seal changed');
+  } catch (error) {
+    data.revoked = true;
     throw error;
   }
 }
@@ -437,6 +492,35 @@ export async function finishVaultRecordStagingPreparation(
   } else await data.backing.verify();
   if (!vaultRecordStagingCurrent(witness)) throw Error('Vault compact backing seal changed');
   data.preparationComplete = true;
+}
+/** Only a genuine record preparation can select HEAD from the final combined
+ * worker reply. No caller-selected completion callback is accepted here. */
+export async function finishVaultRecordTransactionPreparation(
+  witness: VaultRecordStagingWitness,
+  plan: RecordTransactionBackingPlan,
+  execution: RecordTransactionTerminalExecution,
+): Promise<unknown> {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data?.backing || data.preparationComplete)
+    throw Error('Vault record transaction completion expired');
+  const current = () => {
+    if (
+      !vaultRecordStagingCurrent(witness) ||
+      !recordTransactionTerminalExecutionCurrent(execution, data.db, witness, plan)
+    )
+      throw Error('Vault record transaction terminal issuer changed');
+  };
+  current();
+  return data.backing.verifyTransaction(
+    current,
+    verifiedRecordTransactionOriginalArtifacts(plan, data.db, witness),
+    verifiedRecordTransactionOriginalSources(plan, data.db, witness),
+    () => {
+      current();
+      data.preparationComplete = true;
+      return runRecordTransactionTerminalExecution(execution, data.db, witness, plan);
+    },
+  );
 }
 export async function assertVaultRecordMetadataPrior(
   witness: VaultRecordStagingWitness,

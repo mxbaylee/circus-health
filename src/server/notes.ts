@@ -769,12 +769,12 @@ function createInner(
     requireDistinctPerson(db, name, v.person.icon);
   }
   if (personId)
-    db.prepare('INSERT INTO people(id,display_name,relationship) VALUES(?,?,?)').run(
-      personId,
-      v.person.name || v.title,
-      v.person.relationship || null,
-    );
-  db.prepare(
+    recordMutationStatement(
+      db,
+      'INSERT INTO people(id,display_name,relationship) VALUES(?,?,?)',
+    ).run(personId, v.person.name || v.title, v.person.relationship || null);
+  recordMutationStatement(
+    db,
     'INSERT INTO notes(id,kind,status,title,content,note_type,event_date,topics,raw_thoughts,person_id,profile_json,text_formats_json,pinned,archived,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
   ).run(
     id,
@@ -929,7 +929,8 @@ function saveInner(db: Database, row: NoteRow, input: NoteValues, manualNames = 
   }
   v.archived = row.archived;
   replaceLinks(db, row.id, input.links);
-  db.prepare(
+  recordMutationStatement(
+    db,
     'UPDATE notes SET title=?,content=?,note_type=?,event_date=?,topics=?,raw_thoughts=?,profile_json=?,text_formats_json=?,pinned=?,archived=?,updated_at=?,version=version+1 WHERE id=?',
   ).run(
     v.title,
@@ -946,7 +947,7 @@ function saveInner(db: Database, row: NoteRow, input: NoteValues, manualNames = 
     row.id,
   );
   if (row.person_id)
-    db.prepare('UPDATE people SET display_name=?,relationship=? WHERE id=?').run(
+    recordMutationStatement(db, 'UPDATE people SET display_name=?,relationship=? WHERE id=?').run(
       v.person.name || v.title,
       v.person.relationship || null,
       row.person_id,
@@ -1015,7 +1016,7 @@ export function rememberSourceNameInTransaction(
   const next = already ? names : [...names, evidence.name];
   // Install the authority inside the caller's existing journal transaction,
   // then use ordinary save validation/versioning for the mirrored name list.
-  db.prepare('UPDATE notes SET profile_json=? WHERE id=?').run(
+  recordMutationStatement(db, 'UPDATE notes SET profile_json=? WHERE id=?').run(
     JSON.stringify({ ...current.person, sourceKnownNames: [...sources, evidence] }),
     row.id,
   );
@@ -1360,3 +1361,4 @@ function validatePerson(person: Record<string, unknown>, previous: Record<string
       throw new HttpError(400, 'INVALID_INPUT', `${key} is not a valid calendar date`);
   }
 }
+import { recordMutationStatement } from './record-mutation-recipe.ts';

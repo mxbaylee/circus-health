@@ -1423,7 +1423,8 @@ function insert(
   value: Record<string, SqlValue | undefined>,
 ): void {
   const keys = Object.keys(value);
-  db.prepare(
+  recordMutationStatement(
+    db,
     `INSERT INTO ${table}(${keys.join(',')}) VALUES(${keys.map(() => '?').join(',')})`,
   ).run(...keys.map((k) => value[k] ?? null));
 }
@@ -2834,14 +2835,15 @@ export function insertClinicalProjection(
   const write = (table: string, values: Record<string, SqlValue | undefined>) => {
     if (!update) return insert(db, table, values);
     const keys = Object.keys(values).filter((k) => k !== 'id');
-    db.prepare(`UPDATE ${table} SET ${keys.map((k) => k + '=?').join(',')} WHERE id=?`).run(
-      ...keys.map((k) => values[k] ?? null),
-      id,
-    );
+    recordMutationStatement(
+      db,
+      `UPDATE ${table} SET ${keys.map((k) => k + '=?').join(',')} WHERE id=?`,
+    ).run(...keys.map((k) => values[k] ?? null), id);
   };
   if (mapping.kind === 'observation') {
     const testId = conceptId(db, mapping);
-    db.prepare(
+    recordMutationStatement(
+      db,
       'INSERT OR IGNORE INTO test_types(id,label,category,unit,codes_json,extra_json) VALUES(?,?,?,?,?,?)',
     ).run(
       testId,
@@ -2916,3 +2918,4 @@ export function insertClinicalProjection(
       extra_json: JSON.stringify(extra),
     });
 }
+import { recordMutationStatement } from './record-mutation-recipe.ts';

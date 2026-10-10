@@ -33,6 +33,29 @@ const selectedPlans = new WeakMap<
 const preparingPlans = new WeakSet<Database>();
 const committingPlans = new WeakSet<Database>();
 const planEpochs = new WeakMap<Database, number>();
+const planAssertions = new WeakMap<() => void, { db: Database; epoch: number }>();
+const readContinuations = new WeakMap<Function, Database>();
+export function ownershipReadContinuationCurrent(work: Function, db: Database): boolean {
+  return readContinuations.get(work) === db && db.isOpen;
+}
+function runNativeOwnershipOperation<T>(
+  db: Database,
+  work: Parameters<typeof runExclusiveClinicalOperation<T>>[1],
+  options: Parameters<typeof runExclusiveClinicalOperation<T>>[2],
+) {
+  readContinuations.set(work, db);
+  return runExclusiveClinicalOperation(db, work, options);
+}
+export function ownershipPlanAssertionKnown(assertion: () => void, db: Database): boolean {
+  return planAssertions.get(assertion)?.db === db;
+}
+/** Only the exact retained-plan issuer qualifies; this is liveness, not evidence. */
+export function ownershipPlanAssertionCurrent(assertion: () => void, db: Database): boolean {
+  const original = planAssertions.get(assertion);
+  return (
+    !!original && original.db === db && db.isOpen && (planEpochs.get(db) ?? 0) === original.epoch
+  );
+}
 export function clearNativeOwnershipPlans(db: Database) {
   planEpochs.set(db, (planEpochs.get(db) ?? 0) + 1);
   const selected = selectedPlans.get(db);
@@ -86,16 +109,18 @@ async function prepare(
 ) {
   const epoch = planEpochs.get(db) ?? 0;
   const selectedRequest = ownershipRequest(input);
+  const assertRunning = () => {
+    if ((planEpochs.get(db) ?? 0) !== epoch)
+      throw new HttpError(
+        401,
+        'PROFILE_LOCKED',
+        'Unlock this profile and prepare the current ownership evidence',
+      );
+  };
+  planAssertions.set(assertRunning, { db, epoch });
   const report = await prepareOwnershipReportPlan(db, root, profileId, selectedRequest, {
     ...options,
-    assertRunning() {
-      if ((planEpochs.get(db) ?? 0) !== epoch)
-        throw new HttpError(
-          401,
-          'PROFILE_LOCKED',
-          'Unlock this profile and prepare the current ownership evidence',
-        );
-    },
+    assertRunning,
   });
   try {
     return {
@@ -116,7 +141,7 @@ export async function previewNativeRecordOwnership(
   input: unknown,
   options: { onCheckpoint?: (stage: string) => void } = {},
 ) {
-  return runExclusiveClinicalOperation(
+  return runNativeOwnershipOperation(
     db,
     async () => {
       if (preparingPlans.has(db) || committingPlans.has(db))
@@ -190,7 +215,7 @@ export async function chooseNativeOwnershipName(
   key: string,
   outcome: import('../shared/record-ownership.ts').OwnershipNameEffect['decision'],
 ) {
-  return runExclusiveClinicalOperation(
+  return runNativeOwnershipOperation(
     db,
     async () => {
       const plan = nativeOwnershipNamePlan(db, profileId, token),
@@ -223,7 +248,7 @@ export async function chooseNativeOwnershipName(
     { operation: currentClinicalOperation(db) },
   );
 }
-export function nativeOwnershipNamePlan(db: Database, profileId: string, token: string) {
+function selectedOwnershipNamePlan(db: Database, profileId: string, token: string) {
   if (committingPlans.has(db) || preparingPlans.has(db))
     throw new HttpError(409, 'OWNERSHIP_COMMITTING', 'The approved correction is being saved');
   const selected = selectedPlans.get(db);
@@ -233,23 +258,28 @@ export function nativeOwnershipNamePlan(db: Database, profileId: string, token: 
       'OWNERSHIP_CHANGED',
       'Prepare the current ownership evidence before viewing it',
     );
-  selected.plan.assertCurrent();
   return selected.plan;
+}
+export function nativeOwnershipNamePlan(db: Database, profileId: string, token: string) {
+  const plan = selectedOwnershipNamePlan(db, profileId, token);
+  plan.assertCurrent();
+  return plan;
 }
 export async function withNativeOwnershipNamePlan<T>(
   db: Database,
   profileId: string,
   token: string,
   complete: (plan: PreparedOwnershipNamePlan) => T,
+  options: { signal?: AbortSignal } = {},
 ) {
-  return runExclusiveClinicalOperation(
+  return runNativeOwnershipOperation(
     db,
     async () => {
-      const plan = nativeOwnershipNamePlan(db, profileId, token),
+      const plan = selectedOwnershipNamePlan(db, profileId, token),
         report = selectedPlans.get(db)?.report;
       return report ? report.withVerifiedRead(() => complete(plan)) : complete(plan);
     },
-    { operation: currentClinicalOperation(db) },
+    { operation: currentClinicalOperation(db), signal: options.signal },
   );
 }
 export async function commitNativeRecordOwnership(
@@ -258,7 +288,7 @@ export async function commitNativeRecordOwnership(
   profileId: string,
   input: unknown,
 ) {
-  return runExclusiveClinicalOperation(
+  return runNativeOwnershipOperation(
     db,
     async () => {
       if (committingPlans.has(db) || preparingPlans.has(db))
@@ -423,14 +453,15 @@ export async function withNativeOwnershipReportPlan<T>(
   profileId: string,
   token: string,
   complete: (plan: PreparedOwnershipReportPlan) => T,
+  options: { signal?: AbortSignal } = {},
 ) {
-  return runExclusiveClinicalOperation(
+  return runNativeOwnershipOperation(
     db,
     async () => {
       const report = selectedOwnershipReportPlan(db, profileId, token);
       return report.withVerifiedRead(() => complete(report));
     },
-    { operation: currentClinicalOperation(db) },
+    { operation: currentClinicalOperation(db), signal: options.signal },
   );
 }
 export async function chooseNativeOwnershipReport(
@@ -439,7 +470,7 @@ export async function chooseNativeOwnershipReport(
   token: string,
   input: unknown,
 ) {
-  return runExclusiveClinicalOperation(
+  return runNativeOwnershipOperation(
     db,
     async () => {
       const report = selectedOwnershipReportPlan(db, profileId, token),
@@ -480,7 +511,7 @@ export async function withNativeOwnershipBlockerStore<T>(
   token: string,
   complete: (store: OwnershipBlockerStore) => T,
 ) {
-  return runExclusiveClinicalOperation(
+  return runNativeOwnershipOperation(
     db,
     async () => {
       const store = nativeOwnershipBlockerStore(db, profileId, token),

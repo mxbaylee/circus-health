@@ -6,9 +6,72 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import crypto from 'node:crypto';
 import { syncBuiltinESMExports } from 'node:module';
-import { createClinicalReviewArtifactProof } from '../clinical-review-artifact-proof.ts';
+import {
+  createClinicalReviewArtifactProof,
+  captureClinicalArtifactReadTerminal,
+  assertClinicalArtifactReadTerminal,
+} from '../clinical-review-artifact-proof.ts';
 import { intakeFileIdentity } from '../intake-files.ts';
 import { beginManagedPhysicalMutation } from '../clinical-review-physical-epoch.ts';
+
+test('readonly artifact terminal provenance is issued only after the actual worker acknowledgement', async (t) => {
+  const sql = new DatabaseSync(':memory:');
+  t.after(() => sql.close());
+  const proof = createClinicalReviewArtifactProof(sql, 'proof');
+  assert.throws(() => captureClinicalArtifactReadTerminal(() => {}));
+  assert.throws(() => assertClinicalArtifactReadTerminal({} as never));
+  let original: (() => void) | undefined;
+  const receipt = await proof.withVerifiedTerminal({ assertCurrent() {} }, (current) => {
+    original = current;
+    return captureClinicalArtifactReadTerminal(current);
+  });
+  assertClinicalArtifactReadTerminal(receipt);
+  assert.throws(() => captureClinicalArtifactReadTerminal(original!));
+  sql.exec('CREATE TEMP TABLE changed(value TEXT)');
+  assert.throws(() => assertClinicalArtifactReadTerminal(receipt), { code: 'SOURCE_CHANGED' });
+  await proof.withVerifiedTerminal(
+    { assertCurrent() {} },
+    (current) => {
+      assert.throws(() => captureClinicalArtifactReadTerminal(current));
+    },
+    'publication',
+  );
+});
+
+test('captured artifact unions preserve original identities and refuse changed or closed scratch', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'fictional-artifact-union-')),
+    sql = new DatabaseSync(':memory:');
+  t.after(() => {
+    if (sql.isOpen) sql.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const path = join(directory, 'source');
+  writeFileSync(path, 'Fictional original union');
+  const original = { id: 'a', path, identity: intakeFileIdentity(path) },
+    proof = createClinicalReviewArtifactProof(sql, 'proof');
+  proof.retain([original]);
+  const retained = proof.captureVerifiedArtifacts();
+  writeFileSync(path, 'Changed fictional original union');
+  assert.deepEqual([...retained()], [original], 'transport never adopts current physical identity');
+  assert.throws(() => proof.assertCurrent(), { code: 'SOURCE_CHANGED' });
+  const paused = retained();
+  assert.deepEqual(paused.next().value, original);
+  sql.exec('SAVEPOINT attempted');
+  sql.prepare('UPDATE proof SET path=path').run();
+  sql.exec('ROLLBACK TO attempted; RELEASE attempted');
+  assert.throws(() => paused.next(), { code: 'SOURCE_CHANGED' });
+  assert.throws(() => [...retained()], { code: 'SOURCE_CHANGED' });
+  const beforeGrowth = proof.captureVerifiedArtifacts();
+  proof.retain([{ ...original, id: 'b' }]);
+  assert.throws(() => [...beforeGrowth()], { code: 'SOURCE_CHANGED' });
+  const beforeSchema = proof.captureVerifiedArtifacts();
+  sql.exec('CREATE TEMP TABLE fictional_shadow(value TEXT)');
+  assert.throws(() => [...beforeSchema()], { code: 'SOURCE_CHANGED' });
+  const beforeClose = proof.captureVerifiedArtifacts()();
+  assert.deepEqual(beforeClose.next().value, original);
+  sql.close();
+  assert.throws(() => beforeClose.next());
+});
 
 test('artifact proof prepares one private HMAC key per owner without skipping verification', (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'fictional-artifact-key-')),

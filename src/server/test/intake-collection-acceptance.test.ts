@@ -9,7 +9,14 @@ import {
   transaction,
   HttpError,
   observeTransactionBeforePublication,
+  observeTransactionOutcome,
 } from '../database.ts';
+import { runExclusiveClinicalOperation } from '../clinical-operation.ts';
+import {
+  prepareRecordTransaction,
+  discardRecordTransactionPreparation,
+  tryObservePreparedRecordPublication,
+} from '../record-versions.ts';
 import { withManagedPhysicalMutation } from '../clinical-review-physical-epoch.ts';
 import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
 import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state-storage.ts';
@@ -305,7 +312,14 @@ test('native acceptance preserves saved-answer and identity/source blockers', ()
   );
 });
 
-for (const extra of ['none', 'write', 'restored', 'changed-source', 'late-physical'] as const) {
+for (const extra of [
+  'none',
+  'write',
+  'restored',
+  'changed-source',
+  'late-physical',
+  'prepared-discard',
+] as const) {
   test(`native acceptance composes actual clinical SQL and certifies only its owned writes: ${extra}`, async (t) => {
     const { ensureProfileDirectories } = await import('../profile-storage.ts'),
       { attachPersonalDurability } = await import('../portable.ts'),
@@ -472,6 +486,65 @@ for (const extra of ['none', 'write', 'restored', 'changed-source', 'late-physic
     }
     prepared = await prepareNativeIntakeAcceptance(db, root, profileId, input);
     if (!prepared.prepared) throw Error('Unexpected replay after rollback');
+    if (extra === 'prepared-discard') {
+      const beforeHead = db.prepare('SELECT head_json FROM __record_state WHERE singleton=1').get();
+      let rolledBack = false,
+        discarded = false,
+        published = false;
+      const stop = observeTransactionOutcome(db, (outcome) => {
+        if (!outcome.prepared) return;
+        assert.equal(outcome.committed, false);
+        assert.equal(outcome.succeeded, false);
+        rolledBack = true;
+        assert.ok(
+          tryObservePreparedRecordPublication(db, outcome.token, {
+            published() {
+              published = true;
+            },
+            discarded() {
+              discarded = true;
+            },
+          }),
+        );
+      });
+      try {
+        await runExclusiveClinicalOperation(db, async () => {
+          const tentative = prepareRecordTransaction(
+            db,
+            () => {
+              prepared.apply!();
+              return prepared.reportReceipt;
+            },
+            { operationId: input.operationId, fingerprint: input.fingerprint },
+          );
+          assert.equal(rolledBack, true);
+          assert.equal(discarded, false);
+          assert.equal(published, false);
+          assert.equal(db.prepare('SELECT count(*) AS n FROM documents').get()!.n, 0);
+          assert.deepEqual(
+            db.prepare('SELECT head_json FROM __record_state WHERE singleton=1').get(),
+            beforeHead,
+          );
+          assert.equal(
+            db
+              .prepare('SELECT 1 FROM __record_transactions WHERE operation_id=?')
+              .get(input.operationId),
+            undefined,
+          );
+          assert.equal(
+            proveNativeAcceptanceOnlyTransition(db, basis, { entries: [] }),
+            undefined,
+            'a genuinely prepared rollback cannot certify accepted work',
+          );
+          discardRecordTransactionPreparation(db, tentative);
+          assert.equal(discarded, true);
+          assert.equal(published, false);
+        });
+      } finally {
+        stop();
+      }
+      return;
+    }
     if (extra === 'late-physical') {
       const stop = observeTransactionBeforePublication(db, () =>
         withManagedPhysicalMutation(() =>

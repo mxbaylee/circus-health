@@ -3,7 +3,10 @@ import {
   terminalExecution,
   terminalStatementsActive,
   prepareTerminalStatements,
+  prepareTerminalStatementsInTransaction,
   withTerminalStatements,
+  replayTerminalRecordMutations,
+  replayTerminalPreparedRecordIndex,
   type PreparedTerminalStatements,
 } from './database-terminal-statements.ts';
 import {
@@ -13,6 +16,7 @@ import {
 } from './intake-compact-terminal-sql.ts';
 import {
   currentClinicalOperation,
+  currentClinicalOperationReadonly,
   assertClinicalOperation,
   clinicalOperationCallerAssertions,
   type ClinicalOperation,
@@ -31,7 +35,12 @@ import {
 import { resolveClinicalReference } from './clinical-references.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { readRecordJsonLines, readRecordJsonLinesSteps } from './record-json-lines.ts';
+import { parseRecordJsonPiecesSteps } from './record-json-pieces.ts';
 import { recordSourceFieldChanges } from './record-source-field-changes.ts';
+import { createRecordPreparedRows } from './record-prepared-rows.ts';
+import { createRecordPreparedIndex } from './record-prepared-index.ts';
+import { createRecordMutationRecipe } from './record-mutation-recipe.ts';
+import { createRecordPreparedPriors } from './record-prepared-priors.ts';
 import {
   prepareRecordPriorFields,
   recordFieldDigest,
@@ -51,13 +60,17 @@ import {
   installVaultRecordHead,
   discardVaultRecordStaging,
   prepareVaultRecordStagingBacking,
+  prepareVaultRecordTransactionBacking,
+  assertVaultRecordTransactionPrior,
   prepareVaultRecordBackingAdvance,
   finishVaultRecordStagingPreparation,
+  finishVaultRecordTransactionPreparation,
   assertVaultRecordMetadataPrior,
   bindVaultRecordStagingTransaction,
   type VaultRecordStagingWitness,
   captureVaultRecordReadOwner,
   vaultRecordReadOwnerCurrent,
+  vaultRecordReadOwnerStagingCurrent,
   closeVaultRecordReadOwner,
   type VaultRecordReadOwner,
   vaultRecordReadOwnerSupported,
@@ -72,6 +85,8 @@ import {
   bindContributorLegacyBridgeBackingScope,
   contributorLegacyBridgeBackingScopeCurrent,
   type ContributorLegacyBridgeBackingScope,
+  closeContributorRecordHeadPublication,
+  type ContributorRecordHeadPublication,
 } from './contributor-record-storage.ts';
 import {
   captureManagedPhysicalEpoch,
@@ -95,10 +110,17 @@ import {
   type Database,
   type SqliteRow,
   type TransactionOperation,
+  type TransactionOutcome,
   type TransactionDurabilityHooks,
   prepareTerminalTransactionCallbacks,
+  prepareRecordReplay,
+  recordReplayCurrent,
+  executeRecordReplay,
+  notifyRecordReplay,
   terminalTransactionCallbacksCurrent,
   type TerminalTransactionCallbacks,
+  transaction,
+  transactionDurabilityParticipantCurrent,
 } from './database.ts';
 import { DatabaseSync, StatementSync, type SQLInputValue, type SQLOutputValue } from 'node:sqlite';
 import {
@@ -303,6 +325,1602 @@ interface RecordCapture {
   bookkeeping?: RecordBookkeeping;
 }
 const recordParticipants = new WeakMap<Database, TransactionDurabilityHooks<RecordCapture>>();
+declare const transactionPreparationBrand: unique symbol;
+export interface RecordTransactionPreparation {
+  readonly [transactionPreparationBrand]: true;
+}
+interface TransactionPreparationData {
+  db: Database;
+  config: RecordConfig;
+  operation: TransactionOperation;
+  operationJson: string;
+  clinicalOperation: ClinicalOperation;
+  methods: object;
+  originalState: RecordStateRow;
+  recordedAt: string;
+  operationId: string;
+  revision?: number;
+  records: number;
+  readOwner?: RecordReadOwner;
+  authenticated?: boolean;
+  completeBacking?: boolean;
+  originals?: RecordPublicationOriginals;
+  staging?: VaultRecordStagingWitness;
+  staged?: Pick<IndexedTransaction, 'ref' | 'commit'> & {
+    contributor?: ContributorRecordHeadPublication;
+  };
+  stagingStarted?: boolean;
+  indexRows?: ReturnType<typeof createRecordPreparedIndex>;
+  stateIndex?: ReturnType<typeof createRecordPreparedIndex>;
+  valueChecks?: ReturnType<typeof createRecordPreparedIndex>;
+  backingRows?: ReturnType<typeof createRecordPreparedIndex>;
+  backingPlan?: RecordTransactionBackingPlan;
+  indexBookkeeping?: RecordBookkeeping;
+  indexWrites?: bigint;
+  terminal?: PreparedTerminalStatements;
+  rows: ReturnType<typeof createRecordPreparedRows>;
+  recipe: ReturnType<typeof createRecordMutationRecipe>;
+  token?: object;
+  resultJson?: string;
+  total?: bigint;
+  tentativeStart?: bigint;
+  tentativeWrites?: bigint;
+  expectedTentativeWrites?: bigint;
+  captureRows?: number | bigint;
+  released?: boolean;
+  closed: boolean;
+  observers?: Set<PreparedPublicationObserver>;
+}
+interface PreparedPublicationObserver {
+  published(outcome: TransactionOutcome): void;
+  discarded(): void;
+}
+const transactionPreparations = new WeakMap<
+  RecordTransactionPreparation,
+  TransactionPreparationData
+>();
+const preparingTransactions = new WeakMap<TransactionOperation, TransactionPreparationData>();
+const preparingTokens = new WeakMap<object, TransactionPreparationData>();
+const preparedPublicationTokens = new WeakMap<object, TransactionPreparationData>();
+declare const transactionBackingPlanBrand: unique symbol;
+export interface RecordTransactionBackingPlan {
+  readonly [transactionBackingPlanBrand]: true;
+}
+declare const transactionIndexedBrand: unique symbol;
+export interface RecordTransactionIndexedPublication {
+  readonly [transactionIndexedBrand]: true;
+}
+declare const transactionTerminalBrand: unique symbol;
+export interface RecordTransactionTerminalExecution {
+  readonly [transactionTerminalBrand]: true;
+}
+const transactionTerminalExecutions = new WeakMap<
+  RecordTransactionTerminalExecution,
+  {
+    db: Database;
+    witness: object;
+    plan: RecordTransactionBackingPlan;
+    used: boolean;
+    complete(): unknown;
+  }
+>();
+export function recordTransactionTerminalExecutionCurrent(
+  execution: RecordTransactionTerminalExecution,
+  db: Database,
+  witness: object,
+  plan: RecordTransactionBackingPlan,
+): boolean {
+  const owner = transactionTerminalExecutions.get(execution);
+  return (
+    !!owner &&
+    !owner.used &&
+    owner.db === db &&
+    owner.witness === witness &&
+    owner.plan === plan &&
+    recordTransactionBackingPlanCurrent(plan, db, witness)
+  );
+}
+/** Only the private consumer registered below supplies the finite T2 body. */
+export function runRecordTransactionTerminalExecution(
+  execution: RecordTransactionTerminalExecution,
+  db: Database,
+  witness: object,
+  plan: RecordTransactionBackingPlan,
+): unknown {
+  if (!recordTransactionTerminalExecutionCurrent(execution, db, witness, plan))
+    fail('record transaction terminal execution expired');
+  const owner = transactionTerminalExecutions.get(execution)!;
+  owner.used = true;
+  return owner.complete();
+}
+const transactionBackingPlans = new WeakMap<
+  RecordTransactionBackingPlan,
+  {
+    proof: TransactionPreparationData;
+    witness: object;
+    head: string;
+  }
+>();
+const transactionIndexedPublications = new WeakMap<
+  RecordTransactionIndexedPublication,
+  {
+    proof: TransactionPreparationData;
+    plan: RecordTransactionBackingPlan;
+    witness: object;
+    token: object;
+    head: string;
+    consumed: boolean;
+  }
+>();
+/** Exact payload transport only from this record owner's authenticated frozen
+ * plan. A storage helper never receives authority from caller-provided rows. */
+export function* verifiedRecordTransactionBackingVersions(
+  plan: RecordTransactionBackingPlan,
+  db: Database,
+  witness: object,
+  head: string,
+): Generator<{
+  entity: string;
+  recordId: string;
+  versionId: string;
+  deleted: boolean;
+  previousVersion: string | null;
+  contentsJson: string;
+}> {
+  const found = transactionBackingPlans.get(plan);
+  if (
+    !found ||
+    found.proof.db !== db ||
+    found.witness !== witness ||
+    found.head !== head ||
+    found.proof.backingPlan !== plan ||
+    !found.proof.authenticated ||
+    found.proof.closed ||
+    db.isTransaction
+  )
+    fail('foreign record transaction backing payload');
+  const data = found!;
+  const current = () => {
+    assertClinicalOperation(db, data.proof.clinicalOperation);
+    if (
+      transactionBackingPlans.get(plan) !== data ||
+      data.proof.closed ||
+      state.get(db) !== data.proof.config ||
+      managedDatabaseMethodEpoch(db) !== data.proof.methods
+    )
+      fail('record transaction backing payload changed');
+  };
+  let count = 0;
+  current();
+  if (!data.proof.backingRows) fail('record transaction backing payload is not sealed');
+  for (const row of data.proof.backingRows!.inspect()) {
+    current();
+    const args = row.args;
+    if (
+      row.sql !== 'SELECT ?,?,?,?,?,?' ||
+      args.length !== 6 ||
+      typeof args[0] !== 'string' ||
+      typeof args[1] !== 'string' ||
+      typeof args[2] !== 'string' ||
+      (args[3] !== 0 && args[3] !== 1) ||
+      (args[4] !== null && typeof args[4] !== 'string') ||
+      typeof args[5] !== 'string'
+    )
+      fail('record transaction backing payload shape differs');
+    yield Object.freeze({
+      entity: args[0] as string,
+      recordId: args[1] as string,
+      versionId: args[2] as string,
+      deleted: args[3] === 1,
+      previousVersion: args[4] as string | null,
+      contentsJson: args[5] as string,
+    });
+    count++;
+    current();
+  }
+  if (count !== data.proof.records) fail('record transaction backing payload membership differs');
+  current();
+}
+/** One-shot private indexed receipt. Matching IDs or HEAD without the exact
+ * original frozen payload plan cannot promote any reusable certificate root. */
+export function consumeRecordTransactionBackingAdvance(
+  db: Database,
+  indexed: RecordTransactionIndexedPublication,
+  witness: object,
+  head: string,
+  plan: RecordTransactionBackingPlan,
+): boolean {
+  const found = transactionIndexedPublications.get(indexed);
+  if (
+    !found ||
+    found.consumed ||
+    found.proof.db !== db ||
+    found.witness !== witness ||
+    found.head !== head ||
+    found.plan !== plan ||
+    found.proof.backingPlan !== plan ||
+    transactionBackingPlans.get(plan)?.proof !== found.proof ||
+    found.proof.closed ||
+    !db.isTransaction ||
+    currentTransactionToken(db) !== found.token ||
+    state.get(db) !== found.proof.config ||
+    managedDatabaseMethodEpoch(db) !== found.proof.methods
+  )
+    fail('foreign record indexed backing transition');
+  found!.consumed = true;
+  return true;
+}
+/** Readonly issuer checks for the genuine staged plan, not a caller callback. */
+export function recordTransactionBackingPlanCurrent(
+  plan: RecordTransactionBackingPlan,
+  db: Database,
+  witness: object,
+): boolean {
+  const data = transactionBackingPlans.get(plan),
+    parent = data?.proof.originals && publicationOriginals.get(data.proof.originals),
+    operation = currentClinicalOperationReadonly(db);
+  if (
+    !data ||
+    !parent ||
+    !operation ||
+    data.witness !== witness ||
+    data.proof.db !== db ||
+    data.proof.closed ||
+    data.proof.backingPlan !== plan ||
+    !data.proof.authenticated ||
+    state.get(db) !== data.proof.config ||
+    managedDatabaseMethodEpoch(db) !== data.proof.methods
+  )
+    return false;
+  try {
+    assertClinicalOperation(db, data.proof.clinicalOperation);
+    parent.current(clinicalOperationCallerAssertions(db, operation));
+    return true;
+  } catch {
+    return false;
+  }
+}
+/** Only the complete original parent union bound to this exact staged plan. */
+export function* verifiedRecordTransactionOriginalArtifacts(
+  plan: RecordTransactionBackingPlan,
+  db: Database,
+  witness: object,
+): Generator<import('./intake-review-collection-session.ts').VerifiedClinicalArtifact> {
+  const data = transactionBackingPlans.get(plan),
+    parent = data?.proof.originals && publicationOriginals.get(data.proof.originals);
+  if (!data || !parent || !recordTransactionBackingPlanCurrent(plan, db, witness))
+    fail('record transaction original artifact owner unavailable');
+  const artifacts = parent!.artifacts.captureVerifiedArtifacts();
+  for (const row of artifacts()) {
+    if (!recordTransactionBackingPlanCurrent(plan, db, witness))
+      fail('record transaction original artifact owner changed');
+    yield row;
+  }
+  if (!recordTransactionBackingPlanCurrent(plan, db, witness))
+    fail('record transaction original artifact owner changed');
+}
+/** Open-time lease descriptors from the same genuine original assertion tree.
+ * These are original evidence, never a new filesystem or SQL baseline. */
+export function* verifiedRecordTransactionOriginalSources(
+  plan: RecordTransactionBackingPlan,
+  db: Database,
+  witness: object,
+): Generator<PackageSourceOriginalPhysical> {
+  const data = transactionBackingPlans.get(plan),
+    parent = data?.proof.originals && publicationOriginals.get(data.proof.originals),
+    operation = currentClinicalOperationReadonly(db);
+  if (!data || !parent || !operation || !recordTransactionBackingPlanCurrent(plan, db, witness))
+    fail('record transaction original lease owner unavailable');
+  for (const source of parent!.originalSources(clinicalOperationCallerAssertions(db, operation!))) {
+    if (!recordTransactionBackingPlanCurrent(plan, db, witness))
+      fail('record transaction original lease owner changed');
+    yield source;
+  }
+  if (!recordTransactionBackingPlanCurrent(plan, db, witness))
+    fail('record transaction original lease owner changed');
+}
+/** Private released-T1 provenance for the database replay transport. */
+export function recordPreparedReplayCurrent(db: Database, token: object): boolean {
+  const proof = preparedPublicationTokens.get(token);
+  return (
+    !!proof &&
+    proof.db === db &&
+    proof.token === token &&
+    !proof.closed &&
+    !!proof.resultJson &&
+    !!proof.released &&
+    state.get(db) === proof.config &&
+    managedDatabaseMethodEpoch(db) === proof.methods &&
+    transactionDurabilityParticipantCurrent(db, recordParticipants.get(db))
+  );
+}
+function discardPreparedPublicationObservers(proof: TransactionPreparationData): void {
+  if (proof.token) preparedPublicationTokens.delete(proof.token);
+  const observers = proof.observers;
+  proof.observers = undefined;
+  for (const observer of observers ?? []) {
+    try {
+      observer.discarded();
+    } catch {
+      // Notification failure cannot make a discarded preparation publishable.
+    }
+  }
+}
+/** A genuine rollback receipt may retain a sealed consumer footprint for its
+ * eventual fresh-token publication. This observer grants no write authority. */
+export function tryObservePreparedRecordPublication(
+  db: Database,
+  token: object,
+  observer: PreparedPublicationObserver,
+): (() => void) | undefined {
+  const proof = preparedPublicationTokens.get(token);
+  if (!proof) return undefined;
+  if (
+    proof.db !== db ||
+    proof.token !== token ||
+    proof.closed ||
+    !proof.released ||
+    !proof.resultJson ||
+    db.isTransaction ||
+    state.get(db) !== proof.config
+  )
+    fail('foreign prepared publication observation');
+  const captured = Object.freeze({ published: observer.published, discarded: observer.discarded });
+  if (typeof captured.published !== 'function' || typeof captured.discarded !== 'function')
+    fail('invalid prepared publication observation');
+  const observers = (proof.observers ??= new Set());
+  observers.add(captured);
+  return () => observers.delete(captured);
+}
+function closeTransactionPreparationResources(proof: TransactionPreparationData): void {
+  if (proof.backingPlan) transactionBackingPlans.delete(proof.backingPlan);
+  discardPreparedPublicationObservers(proof);
+  let failure: unknown;
+  for (const close of [
+    () => proof.recipe.close(),
+    () => proof.rows.close(),
+    () => proof.indexRows?.close(),
+    () => proof.stateIndex?.close(),
+    () => proof.valueChecks?.close(),
+    () => proof.backingRows?.close(),
+    () => proof.readOwner && closeRecordReadOwner(proof.readOwner),
+    () => proof.staging && discardVaultRecordStaging(proof.staging),
+    () =>
+      proof.staged?.contributor && closeContributorRecordHeadPublication(proof.staged.contributor),
+  ])
+    try {
+      close();
+    } catch (error) {
+      failure ??= error;
+    }
+  if (failure) throw failure;
+}
+declare const publicationOriginalsBrand: unique symbol;
+export interface RecordPublicationOriginals {
+  readonly [publicationOriginalsBrand]: true;
+}
+const publicationOriginals = new WeakMap<
+  RecordPublicationOriginals,
+  {
+    db: Database;
+    config: RecordConfig;
+    operation: ClinicalOperation;
+    expectedHead: string;
+    expectedSequence: number;
+    scratch: ReturnType<typeof disposableSqlite>;
+    artifacts: ReturnType<
+      typeof import('./clinical-review-artifact-proof.ts').createClinicalReviewArtifactProof
+    >;
+    current(additional?: readonly (() => void)[]): void;
+    originalSources(additional: readonly (() => void)[]): Iterable<PackageSourceOriginalPhysical>;
+  }
+>();
+/** Copy the genuine parent's complete signed union before child narrowing.
+ * This transports original identities, never stats a newer child baseline. */
+export async function captureRecordPublicationOriginals(
+  db: Database,
+  profileId: string,
+  original: import('./ownership-report-plan.ts').OwnershipReportOriginalProof,
+): Promise<RecordPublicationOriginals> {
+  const config = state.get(db),
+    operation = currentClinicalOperation(db);
+  if (!config || config.profileId !== profileId || !operation || db.isTransaction)
+    fail('record publication original parent unavailable');
+  const originalState = readStatusRow(db);
+  const report = await import('./ownership-report-plan.ts'),
+    artifact = await import('./clinical-review-artifact-proof.ts'),
+    native = await import('./record-ownership-native.ts'),
+    request = await import('./index.ts'),
+    assistant = await import('./assistant.ts'),
+    session = await import('./intake-package-session.ts'),
+    vault = await import('./vault-app.ts');
+  assertClinicalOperation(db, operation);
+  const assertions = clinicalOperationCallerAssertions(db, operation!),
+    authorization = vault.currentVaultCompactAuthorization(db, profileId),
+    scratch = disposableSqlite('circus-record-publication-originals-');
+  try {
+    const artifacts = artifact.createClinicalReviewArtifactProof(scratch.db, 'originals');
+    const stamp = Reflect.apply(readmissionPrepare, scratch.db, ['SELECT total_changes() AS n']),
+      schema = Reflect.apply(readmissionPrepare, scratch.db, ['PRAGMA main.schema_version']),
+      temp = Reflect.apply(readmissionPrepare, scratch.db, ['PRAGMA temp.schema_version']),
+      peer = Reflect.apply(readmissionPrepare, scratch.db, ['PRAGMA main.data_version']);
+    stamp.setReadBigInts(true);
+    const originalSchema = Reflect.apply(readmissionGet, schema, [])!.schema_version,
+      originalTemp = Reflect.apply(readmissionGet, temp, [])!.schema_version,
+      originalPeer = Reflect.apply(readmissionGet, peer, [])!.data_version;
+    let copied = 0;
+    const current = (additional: readonly (() => void)[] = []) => {
+      assertClinicalOperation(db, operation!);
+      if (
+        state.get(db) !== config ||
+        !db.isOpen ||
+        !scratch.db.isOpen ||
+        !report.ownershipReportOriginalProofCurrent(original, db, profileId) ||
+        Reflect.apply(readmissionGet, stamp, [])!.n !== BigInt(copied) ||
+        Reflect.apply(readmissionGet, schema, [])!.schema_version !== originalSchema ||
+        Reflect.apply(readmissionGet, temp, [])!.schema_version !== originalTemp ||
+        Reflect.apply(readmissionGet, peer, [])!.data_version !== originalPeer ||
+        (authorization && !vault.vaultCompactAuthorizationCurrent(authorization, db, profileId))
+      )
+        fail('record publication original owner changed');
+      const visiting = new Set<() => void>();
+      const known = (assertion: () => void): boolean => {
+        if (visiting.has(assertion)) return false;
+        if (native.ownershipPlanAssertionKnown(assertion, db))
+          return native.ownershipPlanAssertionCurrent(assertion, db);
+        if (request.requestFilenameAssertionCurrent(assertion, db)) return true;
+        const inputs =
+          assistant.assistantCompactAssertionPrerequisites(assertion, db) ??
+          session.packageSessionAssertionPrerequisites(assertion, db);
+        if (!inputs) return false;
+        visiting.add(assertion);
+        try {
+          return inputs.every(known);
+        } finally {
+          visiting.delete(assertion);
+        }
+      };
+      if (!assertions.every(known) || !additional.every(known))
+        fail('record publication requires genuine owner assertions');
+    };
+    const originalSources = function* (
+      additional: readonly (() => void)[],
+    ): Generator<PackageSourceOriginalPhysical> {
+      current(additional);
+      const visited = new Set<() => void>();
+      function* visit(assertion: () => void): Generator<PackageSourceOriginalPhysical> {
+        if (visited.has(assertion)) return;
+        visited.add(assertion);
+        current(additional);
+        const source = session.packageSessionOriginalPhysicalSource(assertion, db);
+        if (source) {
+          if (source.binding.profileId !== profileId)
+            fail('record publication original lease profile differs');
+          yield source;
+        }
+        const inputs =
+          assistant.assistantCompactAssertionPrerequisites(assertion, db) ??
+          session.packageSessionAssertionPrerequisites(assertion, db);
+        if (inputs)
+          for (let index = 0; index < inputs.length; index++) yield* visit(inputs[index]!);
+      }
+      for (const assertion of assertions) yield* visit(assertion);
+      for (const assertion of additional) yield* visit(assertion);
+      current(additional);
+    };
+    current();
+    for (const row of report.verifiedOwnershipReportOriginalArtifacts(original, db, profileId)) {
+      current();
+      artifacts.retain([row]);
+      if (++copied % 64 === 0) {
+        await yieldHost();
+        current();
+      }
+    }
+    current();
+    const capability = Object.freeze({}) as RecordPublicationOriginals;
+    publicationOriginals.set(capability, {
+      db,
+      config: config!,
+      operation: operation!,
+      expectedHead: originalState.head_json,
+      expectedSequence: originalState.sequence,
+      scratch,
+      artifacts,
+      current,
+      originalSources,
+    });
+    return capability;
+  } catch (error) {
+    scratch.close();
+    throw error;
+  }
+}
+/** Last physical worker on the SAME complete parent union. The record owner
+ * still has to close original SQL/HEAD and exact own additions before selection. */
+export async function withRecordPublicationOriginals<T>(
+  db: Database,
+  capability: RecordPublicationOriginals,
+  complete: (physicalCurrent: () => void) => T,
+): Promise<T> {
+  const proof = publicationOriginals.get(capability);
+  if (!proof || proof.db !== db || state.get(db) !== proof.config || db.isTransaction)
+    fail('foreign record publication originals');
+  const operation = currentClinicalOperationReadonly(db);
+  if (!operation) fail('record publication original child unavailable');
+  const assertions = clinicalOperationCallerAssertions(db, operation!),
+    current = () => {
+      if (publicationOriginals.get(capability) !== proof)
+        fail('record publication original child expired');
+      assertClinicalOperation(db, operation);
+      proof!.current(assertions);
+    };
+  current();
+  return proof!.artifacts.withVerifiedTerminal({ assertCurrent: current }, complete, 'publication');
+}
+export function closeRecordPublicationOriginals(capability: RecordPublicationOriginals): void {
+  const proof = publicationOriginals.get(capability);
+  publicationOriginals.delete(capability);
+  proof?.scratch.close();
+}
+/** Dispatch identity only. An arbitrary transaction operation cannot enroll
+ * itself, and this branch can only roll back, never select accepted history. */
+export function recordTransactionPreparationRequested(
+  db: Database,
+  operation: TransactionOperation,
+): boolean {
+  const proof = preparingTransactions.get(operation);
+  if (!proof) return false;
+  if (
+    proof.db !== db ||
+    state.get(db) !== proof.config ||
+    proof.closed ||
+    managedDatabaseMethodEpoch(db) !== proof.methods ||
+    !transactionDurabilityParticipantCurrent(db, recordParticipants.get(db))
+  )
+    fail('record transaction preparation owner changed');
+  return true;
+}
+export function recordTransactionPreparationCaptured(
+  db: Database,
+  operation: TransactionOperation,
+  token: object,
+): boolean {
+  const proof = preparingTransactions.get(operation);
+  if (!proof) return false;
+  if (
+    !recordTransactionPreparationRequested(db, operation) ||
+    proof.token !== token ||
+    !proof.resultJson
+  )
+    fail('record transaction preparation did not capture its actual token');
+  return true;
+}
+
+/** Only the literal recipe and fixed application bookkeeping may advance the
+ * original SQL counter. No post-callback counter is adopted as a baseline. */
+export function recordPreparationBeforeBookkeeping(
+  db: Database,
+  operation: TransactionOperation,
+): void {
+  const proof = preparingTransactions.get(operation);
+  if (!proof) return;
+  if (!recordTransactionPreparationRequested(db, operation) || proof.tentativeStart === undefined)
+    fail('record preparatory bookkeeping owner unavailable');
+  const total = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
+  total.setReadBigInts(true);
+  const business = proof.recipe.writes();
+  if (Reflect.apply(readmissionGet, total, []).n !== proof.tentativeStart! + business)
+    fail('record preparatory unowned prepublication write');
+  const read = Reflect.apply(readmissionPrepare, db, ['SELECT 1 FROM main.app_meta WHERE key=?']),
+    captured = Reflect.apply(readmissionPrepare, db, [
+      "SELECT 1 FROM temp.__record_changed WHERE entity='app_meta' AND record_id=?",
+    ]);
+  if (!Reflect.apply(readmissionGet, read, ['revision']))
+    fail('record preparatory revision absent');
+  const clinicalInsert = !Reflect.apply(readmissionGet, read, ['clinical_review_revision']),
+    keys = ['revision', 'curation_revision'];
+  if (clinicalInsert || operation.actor !== 'source-text') keys.push('clinical_review_revision');
+  let captureWrites = 0n;
+  for (const key of keys)
+    if (!Reflect.apply(readmissionGet, captured, [stringifyRecordJson([key])])) captureWrites++;
+  proof.expectedTentativeWrites =
+    business +
+    captureWrites +
+    2n +
+    BigInt(clinicalInsert) +
+    BigInt(operation.actor !== 'source-text');
+  if (Reflect.apply(readmissionGet, total, []).n !== proof.tentativeStart! + business)
+    fail('record preparatory bookkeeping compilation wrote SQL');
+}
+
+/** Actual tentative-row execution, including normal observers and bookkeeping.
+ * This preparatory receipt is NOT acceptance authority or an operation result;
+ * the publication owner still has to authenticate/replay its exact retained
+ * rows against original physical evidence using a distinct final token. */
+export function prepareRecordTransaction<T>(
+  db: Database,
+  fn: () => T,
+  operation: TransactionOperation,
+): RecordTransactionPreparation {
+  return prepareTransaction(db, fn, operation);
+}
+
+interface TransactionOriginalBacking {
+  config: RecordConfig;
+  operation: ClinicalOperation;
+  methods: object;
+  originalState: RecordStateRow;
+  readOwner: RecordReadOwner;
+  staging: VaultRecordStagingWitness;
+  originals: RecordPublicationOriginals;
+  total: bigint;
+}
+
+/** Capture the actual vault's complete original namespace BEFORE tentative
+ * business reads/writes. The parent union remains its own original proof. */
+export async function prepareRecordTransactionWithOriginals<T>(
+  db: Database,
+  fn: () => T,
+  operation: TransactionOperation,
+  originals: RecordPublicationOriginals,
+): Promise<RecordTransactionPreparation> {
+  const parent = publicationOriginals.get(originals),
+    config = state.get(db),
+    owner = currentClinicalOperation(db),
+    methods = managedDatabaseMethodEpoch(db);
+  if (
+    !parent ||
+    parent.db !== db ||
+    parent.config !== config ||
+    !config ||
+    !owner ||
+    !methods ||
+    db.isTransaction ||
+    !vaultRecordReadOwnerSupported(config.storage)
+  )
+    fail('record transaction original backing unavailable');
+  const admittedParent = parent!,
+    admittedConfig = config!,
+    admittedOwner = owner!,
+    admittedMethods = methods!,
+    assertions = clinicalOperationCallerAssertions(db, admittedOwner);
+  admittedParent.current(assertions);
+  const readOwner = captureRecordReadOwner(db, admittedConfig.profileId);
+  let staging: VaultRecordStagingWitness | undefined,
+    prepared: RecordTransactionPreparation | undefined,
+    transferred = false;
+  try {
+    const originalState = { ...readStatusRow(db) },
+      epoch = captureManagedPhysicalEpoch();
+    if (
+      originalState.head_json !== admittedParent.expectedHead ||
+      originalState.sequence !== admittedParent.expectedSequence
+    )
+      fail('record transaction parent accepted continuation changed');
+    if (!epoch) fail('record transaction original physical interval unavailable');
+    staging = captureVaultRecordStaging(db, admittedConfig.storage, epoch!);
+    if (!staging) fail('record transaction original storage unavailable');
+    const stamp = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
+    stamp.setReadBigInts(true);
+    const total = Reflect.apply(readmissionGet, stamp, []).n as bigint;
+    let continuation: TransactionPreparationData | undefined;
+    const check = () => {
+      assertClinicalOperation(db, admittedOwner);
+      admittedParent.current(assertions);
+      if (
+        publicationOriginals.get(originals) !== parent ||
+        state.get(db) !== config ||
+        db.isTransaction ||
+        managedDatabaseMethodEpoch(db) !== methods ||
+        Reflect.apply(readmissionGet, stamp, []).n !== (continuation?.total ?? total)
+      )
+        fail('record transaction original backing changed');
+      if (continuation) {
+        const retained = recordReadOwners.get(readOwner);
+        if (
+          !retained?.vault ||
+          !vaultRecordReadOwnerStagingCurrent(admittedConfig.storage, retained.vault, staging!)
+        )
+          fail('record transaction owned physical continuation changed');
+      } else assertRecordReadOwnerInterval(db, readOwner);
+    };
+    check();
+    const originalHead = recordReadOwners.get(readOwner)?.wire;
+    if (typeof originalHead !== 'string')
+      fail('record transaction original HEAD bytes unavailable');
+    await prepareVaultRecordTransactionBacking(staging!, originalHead!, check);
+    check();
+    const proof = prepareTransaction(db, fn, operation, {
+      config: admittedConfig,
+      operation: admittedOwner,
+      methods: admittedMethods,
+      originalState,
+      readOwner,
+      staging: staging!,
+      originals,
+      total,
+    });
+    const captured = transactionPreparations.get(proof);
+    prepared = proof;
+    if (
+      !captured ||
+      captured.tentativeStart !== total ||
+      captured.expectedTentativeWrites !== captured.tentativeWrites
+    )
+      fail('record preparatory original write continuation differs');
+    continuation = captured;
+    check();
+    transferred = true;
+    return proof;
+  } finally {
+    if (!transferred) {
+      if (prepared) {
+        discardRecordTransactionPreparation(db, prepared);
+      } else {
+        try {
+          closeRecordReadOwner(readOwner);
+        } finally {
+          if (staging) discardVaultRecordStaging(staging);
+        }
+      }
+    }
+  }
+}
+
+function prepareTransaction<T>(
+  db: Database,
+  fn: () => T,
+  operation: TransactionOperation,
+  backing?: TransactionOriginalBacking,
+): RecordTransactionPreparation {
+  const config = state.get(db),
+    clinicalOperation = currentClinicalOperation(db),
+    methods = managedDatabaseMethodEpoch(db),
+    participant = recordParticipants.get(db);
+  if (
+    !config ||
+    !clinicalOperation ||
+    !methods ||
+    !participant ||
+    !transactionDurabilityParticipantCurrent(db, participant) ||
+    db.isTransaction ||
+    operation.intakeMaintenance
+  )
+    fail('record transaction preparation requires an idle genuine record owner');
+  if (
+    backing &&
+    (backing.config !== config ||
+      backing.operation !== clinicalOperation ||
+      backing.methods !== methods)
+  )
+    fail('record transaction original backing owner changed');
+  const operationJson = stringifyRecordJson(operation),
+    selectedOperation = Object.freeze(parseRecordJson<TransactionOperation>(operationJson)),
+    operationId = selectedOperation.operationId ?? randomUUID(),
+    originalState = backing?.originalState ?? readStatusRow(db),
+    rows = createRecordPreparedRows();
+  if (typeof operationId !== 'string') {
+    rows.close();
+    fail('record transaction preparation operation identity');
+  }
+  let recipe: ReturnType<typeof createRecordMutationRecipe>;
+  let readOwner: RecordReadOwner | undefined;
+  let staging: VaultRecordStagingWitness | undefined;
+  try {
+    recipe = createRecordMutationRecipe(db);
+    if (backing) {
+      readOwner = backing.readOwner;
+      staging = backing.staging;
+    } else if (recordReadOwnerSupported(db, config!.profileId))
+      readOwner = captureRecordReadOwner(db, config!.profileId);
+    if (!backing && readOwner && vaultRecordReadOwnerSupported(config!.storage)) {
+      const epoch = captureManagedPhysicalEpoch();
+      if (!epoch) fail('record transaction preparation physical owner unavailable');
+      staging = captureVaultRecordStaging(db, config!.storage, epoch!);
+    }
+  } catch (error) {
+    recipe!?.close();
+    if (readOwner) closeRecordReadOwner(readOwner);
+    if (staging) discardVaultRecordStaging(staging);
+    rows.close();
+    throw error;
+  }
+  const proof: TransactionPreparationData = {
+    db,
+    config: config!,
+    clinicalOperation: clinicalOperation!,
+    methods: methods!,
+    operation: selectedOperation,
+    operationJson,
+    originalState: { ...originalState },
+    recordedAt: new Date().toISOString(),
+    operationId: operationId as string,
+    records: 0,
+    readOwner,
+    staging,
+    completeBacking: !!backing,
+    originals: backing?.originals,
+    rows,
+    recipe,
+    closed: false,
+  };
+  preparingTransactions.set(selectedOperation, proof);
+  try {
+    const start = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
+    start.setReadBigInts(true);
+    transaction(
+      db,
+      () => {
+        proof.tentativeStart = Reflect.apply(readmissionGet, start, []).n as bigint;
+        return recipe.capture(fn);
+      },
+      selectedOperation,
+    );
+    assertClinicalOperation(db, clinicalOperation!);
+    const statement = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
+    statement.setReadBigInts(true);
+    if (
+      !proof.released ||
+      !proof.token ||
+      !proof.resultJson ||
+      db.isTransaction ||
+      state.get(db) !== config ||
+      managedDatabaseMethodEpoch(db) !== methods ||
+      !transactionDurabilityParticipantCurrent(db, participant) ||
+      stringifyRecordJson(selectedOperation) !== proof.operationJson ||
+      Reflect.apply(readmissionGet, statement, []).n !== proof.total
+    )
+      fail('record transaction preparation changed during rollback cleanup');
+    const capability = Object.freeze({}) as RecordTransactionPreparation;
+    transactionPreparations.set(capability, proof);
+    return capability;
+  } catch (error) {
+    proof.closed = true;
+    try {
+      closeTransactionPreparationResources(proof);
+    } catch {
+      // Preserve the preparation refusal after trying every owned resource.
+    }
+    throw error;
+  } finally {
+    preparingTransactions.delete(selectedOperation);
+  }
+}
+export function discardRecordTransactionPreparation(
+  db: Database,
+  capability: RecordTransactionPreparation,
+): void {
+  const proof = transactionPreparations.get(capability);
+  if (!proof || proof.db !== db) fail('foreign record transaction preparation');
+  transactionPreparations.delete(capability);
+  proof!.closed = true;
+  closeTransactionPreparationResources(proof!);
+}
+/** Authenticate changed keys in one newest-first accepted-history walk. The
+ * private result remains bound to the original preparatory receipt; matching
+ * disposable version rows never supply their own predecessor authority. */
+export async function authenticateRecordTransactionPreparation(
+  db: Database,
+  capability: RecordTransactionPreparation,
+): Promise<void> {
+  const proof = transactionPreparations.get(capability);
+  if (!proof || proof.db !== db || !proof.readOwner || proof.authenticated)
+    fail('record publication predecessor owner unavailable');
+  const selected = proof!,
+    priors = createRecordPreparedPriors(),
+    total = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
+  total.setReadBigInts(true);
+  const check = () => {
+    assertClinicalOperation(db, selected.clinicalOperation);
+    if (
+      transactionPreparations.get(capability) !== selected ||
+      selected.closed ||
+      !selected.released ||
+      !selected.token ||
+      !selected.resultJson ||
+      db.isTransaction ||
+      state.get(db) !== selected.config ||
+      managedDatabaseMethodEpoch(db) !== selected.methods ||
+      !transactionDurabilityParticipantCurrent(db, recordParticipants.get(db)) ||
+      stringifyRecordJson(selected.operation) !== selected.operationJson ||
+      Reflect.apply(readmissionGet, total, []).n !== selected.total
+    )
+      fail('record publication predecessor preparation changed');
+    assertRecordReadOwnerInterval(db, selected.readOwner!);
+  };
+  let pending = 0,
+    absence = false;
+  try {
+    check();
+    assertRecordReadOwnerBeforeVerification(db, selected.readOwner!);
+    check();
+    for (const raw of selected.rows.values()) {
+      check();
+      const version = await parsePreparedRecordVersion(raw, check),
+        previous = current(db, version.entity, version.recordId);
+      check();
+      if ((previous?.version_id ?? null) !== version.previousVersion)
+        fail('record publication cached predecessor changed');
+      if (selected.completeBacking) {
+        if (!selected.staging) fail('record publication complete backing unavailable');
+        // Vault certificates use the quoted JSON-string codec. The portable
+        // ancestry index below deliberately uses raw document bytes instead.
+        const preimage = previous
+          ? await recordStringFieldDigest(previous.contents_json, check)
+          : null;
+        assertVaultRecordTransactionPrior(
+          selected.staging!,
+          version.entity,
+          version.recordId,
+          version.previousVersion,
+          previous ? { deleted: !!previous.deleted, preimage: preimage! } : null,
+        );
+        check();
+        await yieldHost();
+        check();
+        continue;
+      }
+      const preimage = previous
+        ? await digestRecordPieces(rawRecordPieces(previous.contents_json), check)
+        : null;
+      priors.append({
+        entity: version.entity,
+        recordId: version.recordId,
+        previousVersion: version.previousVersion,
+        deleted: !!previous?.deleted,
+        preimage,
+      });
+      if (previous) pending++;
+      else absence = true;
+    }
+    if (selected.completeBacking) {
+      check();
+      selected.authenticated = true;
+      return;
+    }
+    priors.seal();
+    let reference = parseRecordJson<RecordObjectReference>(selected.originalState.head_json),
+      sequence = selected.originalState.sequence;
+    while (reference) {
+      check();
+      const commit = readCommit(
+        selected.config.storage,
+        reference,
+        selected.config.profileId,
+        selected.config.schemaVersion,
+      );
+      check();
+      if (commit.sequence !== sequence--)
+        fail('record publication accepted predecessor sequence changed');
+      const segments = function* () {
+        for (const ref of iterateRecordCommitSegments(selected.config.storage, commit)) {
+          check();
+          const bytes = readObject(selected.config.storage, ref);
+          check();
+          yield bytes;
+        }
+      };
+      const identities = versionIdentityIndex(),
+        steps = readRecordJsonLinesSteps(segments(), { parseSmall: parseRecordJson });
+      let count = 0;
+      try {
+        for (;;) {
+          check();
+          const next = steps.next();
+          check();
+          if (next.done) break;
+          if (next.value) {
+            const version = next.value.record as DurableRecordVersion,
+              shape = selected.config.schema.find((table) => table.name === version?.entity);
+            if (
+              !shape ||
+              version.format !== FORMAT ||
+              version.profileId !== selected.config.profileId ||
+              version.schemaVersion !== selected.config.schemaVersion ||
+              version.sequence !== commit.sequence ||
+              version.operationId !== commit.operationId ||
+              version.recordedAt !== commit.recordedAt ||
+              !/^[0-9a-f-]{36}$/.test(version.versionId) ||
+              typeof version.deleted !== 'boolean' ||
+              !version.contents ||
+              typeof version.contents !== 'object' ||
+              Array.isArray(version.contents) ||
+              !eq(Object.keys(version.contents).sort(), [...shape.columns].sort()) ||
+              identity(shape, version.contents) !== version.recordId ||
+              (shape.name === 'app_meta' && internalKey(version.contents.key as string))
+            )
+              fail('invalid complete accepted publication predecessor record');
+            const key = stringifyRecordJson([version.entity, version.recordId]);
+            if (identities.has(key)) fail('duplicate accepted publication predecessor record');
+            identities.add(key);
+            count++;
+            const expected = priors.find(version.entity, version.recordId);
+            if (expected && !expected.matched) {
+              const preimage = await digestRecordPieces(
+                sourcePreimagePieces(version.contents),
+                check,
+              );
+              priors.match(version.entity, version.recordId, {
+                versionId: version.versionId,
+                deleted: version.deleted,
+                preimage,
+              });
+              pending--;
+            }
+          }
+          await yieldHost();
+          check();
+        }
+      } finally {
+        try {
+          steps.return(undefined);
+        } finally {
+          identities.close();
+        }
+      }
+      if (count !== commit.records) fail('partial accepted publication predecessor transaction');
+      reference = commit.previous!;
+      if (!pending && !absence) break;
+      await yieldHost();
+      check();
+    }
+    if (!reference && sequence !== 0) fail('record publication predecessor root sequence changed');
+    priors.finish({ reachedRoot: !reference });
+    check();
+    selected.authenticated = true;
+  } finally {
+    priors.close();
+  }
+}
+/** Stage the immutable intent without a main SQL transaction or accepted HEAD.
+ * Only the final private replay may consume this plan after original workers. */
+function recordPreparedValueCheckSql(table: TableSchema, deleted: boolean): string {
+  const columns = deleted ? table.pk : table.columns;
+  return `SELECT 1 FROM main.${q(table.name)} WHERE ${columns.map((column) => q(column) + ' IS ?').join(' AND ')}`;
+}
+export async function stageRecordTransactionPreparation(
+  db: Database,
+  capability: RecordTransactionPreparation,
+): Promise<void> {
+  const found = transactionPreparations.get(capability);
+  if (
+    !found ||
+    found.db !== db ||
+    !found.authenticated ||
+    !found.completeBacking ||
+    found.stagingStarted
+  )
+    fail('record publication immutable preparation unavailable');
+  const proof = found!,
+    staging = proof.staging,
+    readOwner = proof.readOwner && recordReadOwners.get(proof.readOwner),
+    parent = proof.originals && publicationOriginals.get(proof.originals);
+  if (!staging || !readOwner?.vault || !parent || proof.revision === undefined)
+    fail('record publication immutable original owner unavailable');
+  const stamp = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
+  stamp.setReadBigInts(true);
+  const assertions = clinicalOperationCallerAssertions(db, proof.clinicalOperation);
+  const check = () => {
+    assertClinicalOperation(db, proof.clinicalOperation);
+    parent!.current(assertions);
+    const read = ownDescriptor(proof.config.storage, 'read');
+    if (
+      transactionPreparations.get(capability) !== proof ||
+      publicationOriginals.get(proof.originals!) !== parent ||
+      proof.closed ||
+      !proof.released ||
+      !proof.authenticated ||
+      !proof.token ||
+      !proof.resultJson ||
+      db.isTransaction ||
+      state.get(db) !== proof.config ||
+      managedDatabaseMethodEpoch(db) !== proof.methods ||
+      !transactionDurabilityParticipantCurrent(db, recordParticipants.get(db)) ||
+      stringifyRecordJson(proof.operation) !== proof.operationJson ||
+      Reflect.apply(readmissionGet, stamp, []).n !== proof.total ||
+      parent!.expectedHead !== proof.originalState.head_json ||
+      parent!.expectedSequence !== proof.originalState.sequence ||
+      !read ||
+      !('value' in read) ||
+      read.value !== readOwner!.read ||
+      !vaultRecordReadOwnerStagingCurrent(proof.config.storage, readOwner!.vault!, staging!)
+    )
+      fail('record publication immutable original continuation changed');
+  };
+  check();
+  proof.stagingStarted = true;
+  const sequence = proof.originalState.sequence + 1,
+    operationId = proof.operationId;
+  let segmentHead: RecordObjectReference | null = null,
+    segmentCount = 0,
+    count = 0,
+    page: RecordObjectReference[] = [],
+    chunks: Buffer[] = [],
+    size = 0;
+  const stage = async (bytes: Buffer) => {
+    check();
+    const ref = { name: 'objects/' + randomUUID(), sha256: digest(bytes), bytes: bytes.length };
+    stageVaultRecordObject(staging!, ref, bytes);
+    await yieldHost();
+    check();
+    return ref;
+  };
+  const flushPage = async () => {
+    if (!page.length) return;
+    const value: RecordSegmentPage = {
+      format: 'health-record-segment-page-v1',
+      profileId: proof.config.profileId,
+      schemaVersion: proof.config.schemaVersion,
+      sequence,
+      operationId,
+      previous: segmentHead,
+      firstSegment: segmentCount - page.length,
+      segments: page,
+    };
+    const bytes = encode(value);
+    if (bytes.length > SEGMENT_PAGE_BYTES) fail('prepared segment page exceeds controlled format');
+    segmentHead = await stage(bytes);
+    page = [];
+    recordVersionWork('segmentIndexPagesWritten');
+  };
+  const flush = async () => {
+    if (!size) return;
+    page.push(await stage(Buffer.concat(chunks, size)));
+    chunks = [];
+    size = 0;
+    segmentCount++;
+    recordVersionWorkMaximum('maxSegmentReferencesBuffered', page.length);
+    if (page.length === SEGMENT_REFERENCE_WINDOW) await flushPage();
+  };
+  for (const raw of proof.rows.values()) {
+    check();
+    // The signed row already contains the frozen version ID and metadata.
+    // Encode bounded UTF-8 pieces rather than another complete version buffer.
+    for (const piece of (function* () {
+      yield* rawRecordPieces(raw);
+      yield '\n';
+    })()) {
+      const bytes = Buffer.from(piece);
+      for (let offset = 0; offset < bytes.length;) {
+        const take = Math.min(proof.config.segmentBytes - size, bytes.length - offset);
+        chunks.push(bytes.subarray(offset, offset + take));
+        size += take;
+        offset += take;
+        if (size === proof.config.segmentBytes) await flush();
+      }
+      await yieldHost();
+      check();
+    }
+    count++;
+  }
+  if (count !== proof.records) fail('prepared immutable version count changed');
+  await flush();
+  await flushPage();
+  const commit: RecordCommitV2 = {
+    format: COMMIT_FORMAT,
+    profileId: proof.config.profileId,
+    schemaVersion: proof.config.schemaVersion,
+    sequence,
+    revision: proof.revision!,
+    previous: parseRecordJson<RecordObjectReference>(proof.originalState.head_json),
+    operationId,
+    fingerprint: proof.operation.fingerprint ?? null,
+    result: parseRecordJson(proof.resultJson!),
+    recordedAt: proof.recordedAt,
+    segments: { format: 'health-record-segment-index-v1', head: segmentHead, count: segmentCount },
+    records: count,
+  };
+  const ref = await stage(encode(commit));
+  check();
+  const indexRows = createRecordPreparedIndex(db, { assertRunning: check }),
+    stateIndex = createRecordPreparedIndex(db, { assertRunning: check }),
+    valueChecks = createRecordPreparedIndex(db, { assertRunning: check }),
+    backingRows = createRecordPreparedIndex(db, { assertRunning: check }),
+    identities = versionIdentityIndex(),
+    bookkeeping: RecordBookkeeping = {
+      writes: 0n,
+      metadataKeys: new Set(),
+      metadataOnly: true,
+    };
+  proof.indexRows = indexRows;
+  proof.stateIndex = stateIndex;
+  proof.valueChecks = valueChecks;
+  proof.backingRows = backingRows;
+  let indexWrites = 0n;
+  const retainIndex = async (
+    sql: string,
+    args: SQLInputValue[],
+    changes: number,
+    bookkeep = true,
+  ) => {
+    check();
+    await (bookkeep ? indexRows : stateIndex).append(sql, args, changes);
+    check();
+    indexWrites += BigInt(changes);
+    if (bookkeep) bookkeeping.writes += BigInt(changes);
+  };
+  try {
+    for (const raw of proof.rows.values()) {
+      check();
+      const version = await parsePreparedRecordVersion(raw, check),
+        previous = validateVersion(db, proof.config, commit, version, identities),
+        { contents, ...metadata } = version,
+        contentsJson = await stringifyPreparedRecordContents(contents, check);
+      await backingRows.append(
+        'SELECT ?,?,?,?,?,?',
+        [
+          version.entity,
+          version.recordId,
+          version.versionId,
+          Number(version.deleted),
+          version.previousVersion,
+          contentsJson,
+        ],
+        0,
+      );
+      check();
+      const table = proof.config.schema.find((item) => item.name === version.entity);
+      if (!table) fail('prepared changed-row entity unavailable');
+      const columns = version.deleted ? table!.pk : table!.columns,
+        args = version.deleted
+          ? parseRecordJson<SQLInputValue[]>(version.recordId)
+          : columns.map((column) => contents[column] as SQLInputValue);
+      await valueChecks.appendCheck(
+        recordPreparedValueCheckSql(table!, version.deleted),
+        args,
+        !version.deleted,
+      );
+      check();
+      await retainIndex(
+        'INSERT INTO __record_versions VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        [
+          version.versionId,
+          proof.config.profileId,
+          version.entity,
+          version.recordId,
+          version.sequence,
+          version.recordedAt,
+          version.previousVersion,
+          version.operationId,
+          Number(version.deleted),
+          contentsJson,
+          stringifyRecordJson(metadata),
+        ],
+        1,
+      );
+      await retainIndex(
+        'INSERT INTO __record_current VALUES(?,?,?) ON CONFLICT(entity,record_id) DO UPDATE SET version_id=excluded.version_id',
+        [version.entity, version.recordId, version.versionId],
+        1,
+      );
+      if (version.entity === 'app_meta' && bookkeeping.metadataKeys.size < 4100)
+        bookkeeping.metadataKeys.add(contents.key as string);
+      else bookkeeping.metadataOnly = false;
+      if (!implicitInitialMetadataFields(version)) {
+        const fields: SQLInputValue[] = [];
+        const flushFields = async () => {
+          if (!fields.length) return;
+          const count = fields.length / 9;
+          await retainIndex(
+            'INSERT INTO __record_fields VALUES' +
+              Array(count).fill('(?,?,?,?,?,?,?,?,?)').join(','),
+            [...fields],
+            count,
+          );
+          fields.length = 0;
+        };
+        const retainField = async (field: string, before: boolean, after: boolean) => {
+          fields.push(
+            version.versionId,
+            proof.config.profileId,
+            version.entity,
+            version.recordId,
+            field,
+            version.sequence,
+            previous?.version_id ?? null,
+            Number(before),
+            Number(after),
+          );
+          if (fields.length === 32 * 9) await flushFields();
+        };
+        if (
+          version.entity === 'source_files' &&
+          (contentsJson.length > 65536 || (previous?.contents_json.length ?? 0) > 65536)
+        ) {
+          const before = await prepareRecordPriorFields(
+            [previous && !previous.deleted ? previous.contents_json : '{}'],
+            check,
+          );
+          let after: PreparedRecordPriorFields | undefined;
+          try {
+            after = await prepareRecordPriorFields([version.deleted ? '{}' : contentsJson], check);
+            const retain = async (field: string) => {
+              check();
+              const old = before.get(field),
+                next = after!.get(field);
+              if (old?.hash !== next?.hash || old?.bytes !== next?.bytes)
+                await retainField(field, old !== undefined, next !== undefined);
+            };
+            for (const field of before.fields()) {
+              await retain(field);
+              await yieldHost();
+            }
+            for (const field of after.fields()) {
+              if (before.get(field) === undefined) await retain(field);
+              await yieldHost();
+            }
+          } finally {
+            try {
+              before.close();
+            } finally {
+              after?.close();
+            }
+          }
+        } else {
+          const before = values(
+              previous && !previous.deleted ? parseRecordJson(previous.contents_json) : null,
+            ),
+            after = values(version.deleted ? null : contents);
+          for (const field of (function* () {
+            yield* before.keys();
+            for (const field of after.keys()) if (!before.has(field)) yield field;
+          })()) {
+            if (before.get(field) !== after.get(field))
+              await retainField(field, before.has(field), after.has(field));
+            await yieldHost();
+            check();
+          }
+        }
+        await flushFields();
+      }
+      await yieldHost();
+      check();
+    }
+    await retainIndex(
+      'INSERT INTO __record_transactions VALUES(?,?,?,?,?)',
+      [
+        commit.operationId,
+        commit.sequence,
+        commit.fingerprint as SQLInputValue,
+        stringifyRecordJson(commit.result),
+        stringifyRecordJson(commit),
+      ],
+      1,
+    );
+    await retainIndex(
+      'INSERT OR REPLACE INTO __record_state VALUES(1,?,?,?,?,?)',
+      [
+        proof.config.profileId,
+        PROJECTION,
+        proof.config.schemaVersion,
+        commit.sequence,
+        stringifyRecordJson(ref),
+      ],
+      1,
+      false,
+    );
+    await valueChecks.seal();
+    await backingRows.seal();
+    check();
+    await indexRows.seal();
+    check();
+    await stateIndex.seal();
+    check();
+  } finally {
+    identities.close();
+  }
+  proof.indexBookkeeping = bookkeeping;
+  proof.indexWrites = indexWrites;
+  proof.staged = { ref, commit };
+  const backingPlan = Object.freeze({}) as RecordTransactionBackingPlan;
+  transactionBackingPlans.set(backingPlan, {
+    proof,
+    witness: staging!,
+    head: encode(ref).toString('utf8'),
+  });
+  proof.backingPlan = backingPlan;
+}
+/** Actual-vault finalization of one frozen preparatory intent. Ordinary public
+ * transactions are unchanged; portable staging is a separate owner variant. */
+export async function commitRecordTransactionPreparation<T>(
+  db: Database,
+  capability: RecordTransactionPreparation,
+): Promise<T> {
+  const proof = transactionPreparations.get(capability),
+    parent = proof?.originals && publicationOriginals.get(proof.originals);
+  if (
+    !proof ||
+    !parent ||
+    !proof.staging ||
+    !proof.staged ||
+    !proof.indexRows ||
+    !proof.stateIndex ||
+    !proof.valueChecks ||
+    !proof.terminal ||
+    proof.tentativeWrites === undefined ||
+    proof.captureRows === undefined ||
+    !proof.authenticated ||
+    proof.closed ||
+    !proof.token ||
+    !proof.resultJson
+  )
+    fail('record final publication preparation unavailable');
+  const admitted = proof!,
+    originals = parent!,
+    staging = admitted.staging!,
+    plan = admitted.staged!,
+    statements = admitted.terminal!,
+    rows = admitted.indexRows!,
+    valueChecks = admitted.valueChecks!,
+    stateIndex = admitted.stateIndex!,
+    assertions = clinicalOperationCallerAssertions(db, admitted.clinicalOperation),
+    replay = prepareRecordReplay(db, admitted.token!),
+    capture = prepareIntakeFrontierCaptureClear(db),
+    stamp = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
+  stamp.setReadBigInts(true);
+  const check = () => {
+    assertClinicalOperation(db, admitted.clinicalOperation);
+    originals.current(assertions);
+    if (
+      transactionPreparations.get(capability) !== admitted ||
+      admitted.closed ||
+      publicationOriginals.get(admitted.originals!) !== originals ||
+      state.get(db) !== admitted.config ||
+      !recordReplayCurrent(db, replay) ||
+      Reflect.apply(readmissionGet, stamp, []).n !== admitted.total ||
+      originals.expectedHead !== admitted.originalState.head_json ||
+      originals.expectedSequence !== admitted.originalState.sequence ||
+      !vaultRecordStagingCurrent(staging)
+    )
+      fail('record final publication original continuation changed');
+  };
+  check();
+  const preparedResult = parseRecordJson<T>(admitted.resultJson!);
+  check();
+  await admitted.recipe.prepareReplay();
+  check();
+  // Every caller/policy compilation effect has completed. Both workers retain
+  // their ORIGINAL rosters, including exact owned immutable additions.
+  // This preliminary source pass retains the existing original proof; the
+  // combined final worker below closes sources AND immutable objects together.
+  await withRecordPublicationOriginals(db, admitted.originals!, (physicalCurrent) => {
+    physicalCurrent();
+    check();
+  });
+  check();
+  let result: T | undefined;
+  const execution = Object.freeze({}) as RecordTransactionTerminalExecution;
+  try {
+    transactionTerminalExecutions.set(execution, {
+      db,
+      witness: staging,
+      plan: admitted.backingPlan!,
+      used: false,
+      complete: () => {
+        check();
+        return withTerminalStatements(db, statements, () =>
+          executeRecordReplay(db, replay, (token) => {
+            const total = () =>
+              terminalStatement(db, 'SELECT total_changes() AS n', undefined, true).get()!
+                .n as bigint;
+            const start = total();
+            if (
+              terminalStatement(db, 'SELECT 1 FROM temp.__record_changed LIMIT 1').get() ||
+              clearIntakeFrontierRecordCapture(db, capture) !== 0
+            )
+              fail('record replay began with unowned captured rows');
+            bindVaultRecordStagingTransaction(staging);
+            replayTerminalRecordMutations(db, admitted.recipe);
+            const metaWrite = (key: string, kinds: Array<'insert' | 'update'>, run: () => void) => {
+              const expected = expectIntakeFrontierMetaWrite(db, key, kinds);
+              let succeeded = false;
+              try {
+                run();
+                succeeded = true;
+              } finally {
+                finishIntakeFrontierMetaWrite(db, expected, succeeded);
+              }
+            };
+            const clinical = expectIntakeFrontierMetaWrite(db, 'clinical_review_revision', [
+              'insert',
+            ]);
+            let inserted = false;
+            try {
+              inserted =
+                terminalStatement(
+                  db,
+                  "INSERT OR IGNORE INTO app_meta(key,value) VALUES('clinical_review_revision',(SELECT value FROM app_meta WHERE key='revision'))",
+                ).run().changes === 1;
+            } finally {
+              finishIntakeFrontierMetaWrite(db, clinical, inserted);
+            }
+            if (admitted.operation.actor !== 'source-text')
+              metaWrite('clinical_review_revision', ['update'], () =>
+                terminalExecution(
+                  db,
+                  "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='clinical_review_revision'",
+                ),
+              );
+            metaWrite('revision', ['update'], () =>
+              terminalExecution(
+                db,
+                "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'",
+              ),
+            );
+            metaWrite('curation_revision', ['insert', 'update'], () => {
+              if (
+                terminalStatement(
+                  db,
+                  "INSERT INTO app_meta(key,value) VALUES('curation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ).run(String(admitted.revision)).changes !== 1
+              )
+                fail('record replay curation write differs');
+            });
+            if (total() - start !== admitted.tentativeWrites)
+              fail('record replay tentative writes differ');
+            // The same literal trigger recipe must recreate every frozen changed
+            // value; no business function or UUID generator is called a second time.
+            replayTerminalPreparedRecordIndex(db, valueChecks);
+            replayTerminalPreparedRecordIndex(db, rows);
+            const stateWrite = expectIntakeFrontierStateWrite(db);
+            let wroteState = false;
+            try {
+              replayTerminalPreparedRecordIndex(db, stateIndex);
+              wroteState = true;
+            } finally {
+              finishIntakeFrontierMetaWrite(db, stateWrite, wroteState);
+            }
+            if (total() - start !== admitted.tentativeWrites! + admitted.indexWrites!)
+              fail('record replay indexed interval differs');
+            if (
+              BigInt(clearIntakeFrontierRecordCapture(db, capture)) !==
+              BigInt(admitted.captureRows!)
+            )
+              fail('record replay captured membership differs');
+            assertClinicalOperation(db, admitted.clinicalOperation);
+            originals.current(assertions);
+            if (
+              state.get(db) !== admitted.config ||
+              currentTransactionToken(db) !== token ||
+              !vaultRecordStagingCurrent(staging)
+            )
+              fail('record replay final owner changed');
+            prepareVaultRecordHead(staging);
+            markSelectionAttempt(db);
+            installVaultRecordHead(staging, encode(plan.ref));
+            return preparedResult;
+          }),
+        );
+      },
+    });
+    result = (await finishVaultRecordTransactionPreparation(
+      staging,
+      admitted.backingPlan!,
+      execution,
+    )) as T;
+  } finally {
+    transactionTerminalExecutions.delete(execution);
+    // The real final outcome is observable only after the finite scope expires.
+    // A failed selection retains existing uncertain-durability semantics.
+    const outcome = notifyRecordReplay(db, replay);
+    if (outcome?.committed && outcome.succeeded) {
+      originals.expectedHead = stringifyRecordJson(plan.ref);
+      originals.expectedSequence = plan.commit.sequence;
+      const observers = admitted.observers;
+      admitted.observers = undefined;
+      preparedPublicationTokens.delete(admitted.token!);
+      for (const observer of observers ?? []) {
+        try {
+          observer.published(outcome);
+        } catch {
+          /* notification only */
+        }
+      }
+    }
+  }
+  return result as T;
+}
 const selectionAttempts = new WeakSet<object>();
 /** Cleanup disposition only: an attempted selection cannot be called a
  * prepublication refusal, even when a later SQL COMMIT or participant fails. */
@@ -1633,6 +3251,138 @@ export function attachRecordDurability(
     },
     markDirty: markPersisted,
     prepare(captured, { operation, result }) {
+      const preparation = preparingTransactions.get(operation);
+      if (preparation) {
+        const token = currentTransactionToken(db),
+          stamp = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
+        stamp.setReadBigInts(true);
+        const before = Reflect.apply(readmissionGet, stamp, []).n as bigint;
+        assertClinicalOperation(db, preparation.clinicalOperation);
+        if (
+          !captured ||
+          !captured.empty ||
+          captured.token !== token ||
+          preparation.token ||
+          !recordTransactionPreparationRequested(db, operation) ||
+          stringifyRecordJson(operation) !== preparation.operationJson ||
+          managedDatabaseMethodEpoch(db) !== preparation.methods
+        )
+          fail('record tentative-row preparation changed');
+        const names = new Set([
+          ...config.schema.map((table) => table.name.toLowerCase()),
+          '__record_changed',
+          '__record_state',
+          '__record_current',
+          '__record_versions',
+          '__record_fields',
+          '__record_transactions',
+        ]);
+        for (const shadow of Reflect.apply(readmissionPrepare, db, [
+          "SELECT name FROM sqlite_temp_schema WHERE type IN ('table','view')",
+        ]).all())
+          if (names.has(String(shadow.name).toLowerCase()) && shadow.name !== '__record_changed')
+            fail('record tentative-row preparation has a TEMP shadow');
+        for (const record of collect(db, config)) {
+          const version: DurableRecordVersion = {
+            format: FORMAT,
+            profileId: config.profileId,
+            schemaVersion: config.schemaVersion,
+            sequence: preparation.originalState.sequence + 1,
+            operationId: preparation.operationId,
+            recordedAt: preparation.recordedAt,
+            versionId: randomUUID(),
+            actor: operation.actor ?? null,
+            origin: operation.origin ?? null,
+            references: operation.references ?? null,
+            ...record,
+          };
+          // Reference observers see the genuine tentative rows, just as in an
+          // ordinary publish. They do not run again in the sealed replay.
+          config.verifyReferences?.([version]);
+          preparation.rows.append(stringifyRecordJson(version));
+          preparation.records++;
+        }
+        preparation.rows.seal();
+        // Rollback removes these TEMP rows before participant.release runs.
+        // Retain tentative membership separately from the cleanup delete count.
+        preparation.captureRows = Reflect.apply(
+          readmissionGet,
+          Reflect.apply(readmissionPrepare, db, [
+            'SELECT count(*) AS count FROM temp.__record_changed',
+          ]),
+          [],
+        ).count as number | bigint;
+        preparation.revision = revision(db);
+        const resultJson = stringifyRecordJson(result ?? null);
+        // Genuine policy decisions see the actual tentative rows and token.
+        // The retained bytecode is transport only; acceptance still requires
+        // authenticated predecessors, original physical proofs and a new token.
+        preparation.terminal = prepareTerminalStatementsInTransaction(db, token!, {
+          statements: [
+            ...new Set([
+              ...preparation.recipe.sql(),
+              'SELECT total_changes() AS n',
+              'SELECT * FROM __record_state WHERE singleton=1',
+              'SELECT commit_json FROM __record_transactions WHERE sequence=?',
+              'SELECT * FROM __record_transactions WHERE operation_id=?',
+              'SELECT 1 FROM temp.__record_changed LIMIT 1',
+              'SELECT total_changes() AS count',
+              ...config.schema.flatMap((table) => [
+                recordPreparedValueCheckSql(table, false),
+                recordPreparedValueCheckSql(table, true),
+              ]),
+              ...config.schema.map(
+                (table) =>
+                  `SELECT * FROM ${q(table.name)} WHERE ${table.pk.map((key) => q(key) + '=?').join(' AND ')}`,
+              ),
+              "INSERT OR IGNORE INTO app_meta(key,value) VALUES('clinical_review_revision',(SELECT value FROM app_meta WHERE key='revision'))",
+              "INSERT INTO app_meta(key,value) VALUES('curation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+              'SELECT v.* FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?',
+              'INSERT INTO __record_versions VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+              'INSERT INTO __record_current VALUES(?,?,?) ON CONFLICT(entity,record_id) DO UPDATE SET version_id=excluded.version_id',
+              'INSERT INTO __record_transactions VALUES(?,?,?,?,?)',
+              'INSERT OR REPLACE INTO __record_state VALUES(1,?,?,?,?,?)',
+              "SELECT value FROM app_meta WHERE key='revision'",
+              ...Array.from(
+                { length: 32 },
+                (_, index) =>
+                  'INSERT INTO __record_fields VALUES' +
+                  Array(index + 1)
+                    .fill('(?,?,?,?,?,?,?,?,?)')
+                    .join(','),
+              ),
+            ]),
+          ].map((sql) => ({
+            sql,
+            bigInts: ['SELECT total_changes() AS n', 'SELECT total_changes() AS count'].includes(
+              sql,
+            ),
+          })),
+          executions: [
+            'BEGIN IMMEDIATE',
+            'COMMIT',
+            'ROLLBACK',
+            "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'",
+            "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='clinical_review_revision'",
+          ],
+        });
+        if (
+          Reflect.apply(readmissionGet, stamp, []).n !== before ||
+          preparation.expectedTentativeWrites === undefined ||
+          before !== preparation.tentativeStart! + preparation.expectedTentativeWrites ||
+          stringifyRecordJson(operation) !== preparation.operationJson ||
+          managedDatabaseMethodEpoch(db) !== preparation.methods
+        )
+          fail('record tentative-row capture invoked an unowned SQL write');
+        preparation.resultJson = resultJson;
+        if (preparation.tentativeStart === undefined)
+          fail('record preparatory write interval absent');
+        preparation.tentativeWrites = before - preparation.tentativeStart!;
+        preparation.total = before;
+        preparation.token = token;
+        preparingTokens.set(token!, preparation);
+        return;
+      }
       const prior = operation.intakeMaintenance
         ? consumeIntakeMaintenancePriorFields(db, operation.intakeMaintenance)
         : undefined;
@@ -1684,6 +3434,15 @@ export function attachRecordDurability(
           [...indexed].every((key) => bookkeeping!.metadataKeys.has(key));
       }
       const cleared = clearIntakeFrontierRecordCapture(db, activeCompactTerminal.get(db)?.capture);
+      const preparation = preparingTokens.get(captured.token);
+      if (preparation) {
+        preparingTokens.delete(captured.token);
+        if (db.isTransaction || preparation.total === undefined || preparation.released)
+          fail('record preparation released before its rollback');
+        preparation.total = preparation.total! + BigInt(cleared);
+        preparation.released = true;
+        preparedPublicationTokens.set(captured.token, preparation);
+      }
       if (exact && BigInt(cleared) === BigInt(keys!.size))
         maintenanceBookkeeping.set(db, {
           token: captured.token,
@@ -2420,6 +4179,50 @@ export async function prepareRecordCompactPublication(
     deferredTerminal,
   };
 }
+async function parsePreparedRecordVersion(
+  raw: string,
+  check: () => void,
+): Promise<DurableRecordVersion> {
+  if (raw.length <= 16 * 1024) return parseRecordJson<DurableRecordVersion>(raw);
+  recordVersionWork('parseCalls');
+  const pieces = function* () {
+    for (const piece of rawRecordPieces(raw)) {
+      recordVersionWork('parsedBytes', Buffer.byteLength(piece));
+      yield piece;
+    }
+  };
+  const steps = parseRecordJsonPiecesSteps(pieces(), { assertRunning: check });
+  try {
+    for (;;) {
+      check();
+      const next = steps.next();
+      check();
+      if (next.done) return next.value as DurableRecordVersion;
+      await yieldHost();
+    }
+  } finally {
+    steps.return(undefined as never);
+  }
+}
+async function stringifyPreparedRecordContents(
+  contents: Record<string, unknown>,
+  check: () => void,
+): Promise<string> {
+  // The final SQLite scalar still materializes once, but escaping a large
+  // source string does not monopolize the host before that bind.
+  const pieces: string[] = [];
+  recordVersionWork('serializationCalls');
+  for (const piece of sourcePreimagePieces(contents)) {
+    check();
+    pieces.push(piece);
+    recordVersionWork('serializedBytes', Buffer.byteLength(piece));
+    await yieldHost();
+  }
+  check();
+  const result = pieces.join('');
+  check();
+  return result;
+}
 function* sourcePreimagePieces(contents: Record<string, unknown>): Generator<string> {
   yield '{';
   let first = true;
@@ -2461,6 +4264,21 @@ async function digestRecordPieces(pieces: Iterable<string>, check: () => void) {
     check();
   }
   return { hash: hash.digest('hex'), bytes };
+}
+function* rawRecordPieces(raw: string): Generator<string> {
+  for (let offset = 0; offset < raw.length;) {
+    let end = Math.min(offset + 4096, raw.length);
+    if (
+      end < raw.length &&
+      raw.charCodeAt(end - 1) >= 0xd800 &&
+      raw.charCodeAt(end - 1) <= 0xdbff &&
+      raw.charCodeAt(end) >= 0xdc00 &&
+      raw.charCodeAt(end) <= 0xdfff
+    )
+      end++;
+    yield raw.slice(offset, end);
+    offset = end;
+  }
 }
 
 /** SQL version rows are locators only. On an uncertified contributor adapter,

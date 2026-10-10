@@ -6,6 +6,7 @@ import { reviewPreparationStamp } from '../clinical-review-maintenance.ts';
 import {
   assertClinicalOperation,
   currentClinicalOperation,
+  currentClinicalOperationReadonly,
   clinicalOperationCallerAssertions,
   clinicalOperationHasCallerAssertions,
   runExclusiveClinicalOperation,
@@ -38,6 +39,7 @@ test('clinical publication provenance retains original ancestor and extra assert
           db,
           async (child) => {
             const before = calls;
+            assert.equal(currentClinicalOperationReadonly(db), child);
             const assertions = clinicalOperationCallerAssertions(db, child);
             assert.deepEqual(assertions, [childAssertion, publicationAssertion, parentAssertion]);
             assert.equal(Object.isFrozen(assertions), true);

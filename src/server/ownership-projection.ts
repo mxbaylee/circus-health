@@ -79,7 +79,8 @@ export function reconcileOwnershipAttachments(
   operationId: string,
 ) {
   if (oldId === newId) {
-    db.prepare(
+    recordMutationStatement(
+      db,
       'UPDATE attachments SET person_id=? WHERE owner_type=? AND owner_id=? AND person_id IS NOT NULL',
     ).run(mapping.personId || 'patient', kind, oldId);
     return;
@@ -102,7 +103,8 @@ export function reconcileOwnershipAttachments(
         .prepare('SELECT 1 FROM attachments WHERE owner_type=? AND owner_id=? AND asset_id=?')
         .get(kind, newId, row.asset_id)
     )
-      db.prepare(
+      recordMutationStatement(
+        db,
         'INSERT INTO attachments(id,asset_id,owner_type,owner_id,caption,created_at,body_location,event_date,person_id) VALUES(?,?,?,?,?,?,?,?,?)',
       ).run(
         'ownership-attachment:' + ownershipHash([operationId, newId, row.asset_id]),
@@ -116,11 +118,13 @@ export function reconcileOwnershipAttachments(
         row.person_id === null ? null : mapping.personId || 'patient',
       );
     if (!hasFile(remaining, left, String(row.source_file_id)))
-      db.prepare('DELETE FROM attachments WHERE id=?').run(row.id);
+      recordMutationStatement(db, 'DELETE FROM attachments WHERE id=?').run(row.id);
   }
   // A whole-record link leaves no orphan attachment owner, including personal attachments.
   if (!remaining.length)
-    db.prepare(
+    recordMutationStatement(
+      db,
       'UPDATE attachments SET owner_id=?,person_id=CASE WHEN person_id IS NULL THEN NULL ELSE ? END WHERE owner_type=? AND owner_id=?',
     ).run(newId, mapping.personId || 'patient', kind, oldId);
 }
+import { recordMutationStatement } from './record-mutation-recipe.ts';

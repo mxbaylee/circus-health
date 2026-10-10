@@ -1,10 +1,17 @@
 import { createHmac, randomBytes } from 'node:crypto';
 import { DatabaseSync, StatementSync, type SQLInputValue } from 'node:sqlite';
 import { disposableSqlite } from './disposable-sqlite.ts';
+import { captureRecordHeadPhysical } from './record-head-physical.ts';
+import { dirname } from 'node:path';
+import { setImmediate as yieldHost } from 'node:timers/promises';
 
 const prepare = DatabaseSync.prototype.prepare,
   run = StatementSync.prototype.run,
   get = StatementSync.prototype.get,
+  all = StatementSync.prototype.all,
+  iterate = StatementSync.prototype.iterate,
+  location = DatabaseSync.prototype.location,
+  readBigInts = StatementSync.prototype.setReadBigInts,
   descriptor = Object.getOwnPropertyDescriptor;
 type Argument = { kind: string; value: string | Uint8Array | null };
 export type RecordMutationOutput = 'none' | 'changes' | 'rowid';
@@ -21,6 +28,11 @@ interface Capture {
   statement(sql: string, output: RecordMutationOutput): StatementSync;
 }
 const active = new WeakMap<DatabaseSync, Capture>();
+const recipes = new WeakMap<object, DatabaseSync>();
+/** Provenance only; the consuming owner still proves its operation/evidence. */
+export function recordMutationRecipeBoundTo(db: DatabaseSync, recipe: object): boolean {
+  return recipes.get(recipe) === db;
+}
 const fail = (): never => {
   throw Error('Record mutation recipe changed, escaped or was already consumed');
 };
@@ -83,21 +95,24 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
     executing = false,
     count = 0,
     expectedWrites = 0n;
+  let replayPhysical: ReturnType<typeof captureRecordHeadPhysical> | undefined;
+  let replayVerified = false;
   try {
     scratch.db.exec(
       'CREATE TABLE recipe(sequence INTEGER PRIMARY KEY,sql TEXT NOT NULL,arguments INTEGER NOT NULL,changes TEXT NOT NULL,rowid TEXT,delta TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE arguments(sequence INTEGER NOT NULL,position INTEGER NOT NULL,kind TEXT NOT NULL,value,PRIMARY KEY(sequence,position));',
     );
     const stamp = scratch.db.prepare('SELECT total_changes() AS n'),
       peer = scratch.db.prepare('PRAGMA data_version'),
-      schema = scratch.db.prepare('PRAGMA schema_version'),
-      sourceStamp = Reflect.apply(prepare, db, ['SELECT total_changes() AS n']);
+      schema = scratch.db.prepare('PRAGMA schema_version');
+    let sourceStamp = Reflect.apply(prepare, db, ['SELECT total_changes() AS n']);
     const sourceSql = descriptor(sourceStamp, 'sourceSQL'),
       nativeSourceSql = sourceSql?.get;
     if (typeof nativeSourceSql !== 'function' || sourceSql?.configurable) return fail();
-    stamp.setReadBigInts(true);
-    sourceStamp.setReadBigInts(true);
-    const originalPeer = peer.get()!.data_version,
-      originalSchema = schema.get()!.schema_version,
+    Reflect.apply(readBigInts, stamp, [true]);
+    Reflect.apply(readBigInts, sourceStamp, [true]);
+    const read = (statement: StatementSync) => Reflect.apply(get, statement, []);
+    const originalPeer = read(peer)!.data_version,
+      originalSchema = read(schema)!.schema_version,
       insert = scratch.db.prepare('INSERT INTO recipe VALUES(?,?,?,?,?,?,?)'),
       insertArgument = scratch.db.prepare('INSERT INTO arguments VALUES(?,?,?,?)'),
       rows = scratch.db.prepare('SELECT * FROM recipe ORDER BY sequence'),
@@ -109,9 +124,10 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
         closed ||
         failed ||
         !db.isOpen ||
-        peer.get()!.data_version !== originalPeer ||
-        schema.get()!.schema_version !== originalSchema ||
-        stamp.get()!.n !== expectedWrites
+        read(peer)!.data_version !== originalPeer ||
+        read(schema)!.schema_version !== originalSchema ||
+        read(stamp)!.n !== expectedWrites ||
+        (replayPhysical && !replayPhysical.current())
       )
         fail();
     };
@@ -166,11 +182,15 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
               current();
               for (let position = 0; position < args.length; position++) {
                 const arg = args[position]!;
-                if (insertArgument.run(count, position, arg.kind, arg.value).changes !== 1) fail();
+                if (
+                  Reflect.apply(run, insertArgument, [count, position, arg.kind, arg.value])
+                    .changes !== 1
+                )
+                  fail();
                 expectedWrites++;
               }
               if (
-                insert.run(
+                Reflect.apply(run, insert, [
                   count,
                   row.sql,
                   args.length,
@@ -178,7 +198,7 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
                   row.rowid,
                   row.delta,
                   sign(row, args),
-                ).changes !== 1
+                ]).changes !== 1
               )
                 fail();
               expectedWrites++;
@@ -216,27 +236,42 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
         }) as unknown as StatementSync;
       },
     };
-    const checked = function* (): Generator<{ row: RecipeRow; args: SQLInputValue[] }> {
+    const probe = Reflect.apply(iterate, rows, []),
+      next = descriptor(Object.getPrototypeOf(probe), 'next')?.value,
+      finish = descriptor(Object.getPrototypeOf(probe), 'return')?.value;
+    if (typeof next !== 'function' || typeof finish !== 'function') fail();
+    Reflect.apply(finish, probe, []);
+    const checked = function* (
+      authenticate = true,
+    ): Generator<{ row: RecipeRow; args: SQLInputValue[] }> {
       current();
       let visited = 0;
-      for (const raw of rows.iterate()) {
-        current();
-        const row = raw as unknown as RecipeRow,
-          args = argumentsFor.all(row.sequence) as unknown as Argument[];
-        const { signature, ...header } = row;
-        if (
-          row.sequence !== visited++ ||
-          args.length !== row.arguments ||
-          sign(header, args) !== signature
-        )
-          fail();
-        yield { row, args: args.map(value) };
-        current();
+      const iterator = Reflect.apply(iterate, rows, []);
+      try {
+        while (true) {
+          const item = Reflect.apply(next, iterator, []) as IteratorResult<Record<string, unknown>>;
+          if (item.done) break;
+          const raw = item.value;
+          current();
+          const row = raw as unknown as RecipeRow,
+            args = Reflect.apply(all, argumentsFor, [row.sequence]) as unknown as Argument[];
+          const { signature, ...header } = row;
+          if (
+            row.sequence !== visited++ ||
+            args.length !== row.arguments ||
+            (authenticate && sign(header, args) !== signature)
+          )
+            fail();
+          yield { row, args: args.map(value) };
+          current();
+        }
+      } finally {
+        Reflect.apply(finish, iterator, []);
       }
       if (visited !== count) fail();
       current();
     };
-    return Object.freeze({
+    const recipe = Object.freeze({
       capture<T>(fn: () => T): T {
         current();
         if (capturing || sealed || active.has(db) || !db.isTransaction) fail();
@@ -265,10 +300,69 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
         if (!sealed || used) fail();
         for (const { row } of checked()) yield row.sql;
       },
+      writes(): bigint {
+        if (!sealed || used) fail();
+        let writes = 0n;
+        for (const { row } of checked()) {
+          if (!/^(0|[1-9][0-9]*)$/.test(row.delta)) fail();
+          writes += BigInt(row.delta);
+        }
+        return writes;
+      },
+      async prepareReplay(): Promise<void> {
+        current();
+        if (!sealed || used || replayPhysical) fail();
+        // Barrier preparation rearms authorization and expires older bytecode.
+        // Recompile before the final physical proof, never during replay.
+        sourceStamp = Reflect.apply(prepare, db, ['SELECT total_changes() AS n']);
+        Reflect.apply(readBigInts, sourceStamp, [true]);
+        Reflect.apply(get, sourceStamp, []);
+        current();
+        const path = Reflect.apply(location, scratch.db, []) as string;
+        if (!path) fail();
+        replayPhysical = captureRecordHeadPhysical([path], [dirname(path)]);
+        try {
+          for (const { row, args: input } of checked(false)) {
+            const { signature, ...header } = row,
+              args = input.map(argument),
+              digest = createHmac('sha256', key).update(JSON.stringify(header));
+            for (const arg of args) {
+              digest.update(
+                JSON.stringify([arg.kind, arg.value === null ? null : arg.value.length]),
+              );
+              if (arg.value === null) continue;
+              for (let offset = 0; offset < arg.value.length;) {
+                current();
+                let end = Math.min(offset + 4096, arg.value.length);
+                if (
+                  typeof arg.value === 'string' &&
+                  end < arg.value.length &&
+                  /[\uD800-\uDBFF]/.test(arg.value[end - 1]!)
+                )
+                  end--;
+                digest.update(
+                  typeof arg.value === 'string'
+                    ? arg.value.slice(offset, end)
+                    : arg.value.subarray(offset, end),
+                );
+                offset = end;
+                await yieldHost();
+                current();
+              }
+            }
+            if (digest.digest('hex') !== signature) fail();
+          }
+          current();
+          replayVerified = true;
+        } catch (error) {
+          failed = true;
+          throw error;
+        }
+      },
       replay(resolve: (sql: string) => StatementSync): void {
-        if (!sealed || used || !db.isTransaction) fail();
+        if (!sealed || used || !db.isTransaction || (replayPhysical && !replayVerified)) fail();
         used = true;
-        for (const { row, args } of checked()) {
+        for (const { row, args } of checked(!replayPhysical)) {
           const before = Reflect.apply(get, sourceStamp, []).n as bigint,
             statement = resolve(row.sql);
           // This native accessor also rejects non-native resolver facades.
@@ -288,11 +382,18 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
         if (closed) return;
         if (capturing || executing) fail();
         closed = true;
+        recipes.delete(recipe);
         if (active.get(db) === capture) active.delete(db);
         key.fill(0);
-        scratch.close();
+        try {
+          replayPhysical?.close();
+        } finally {
+          scratch.close();
+        }
       },
     });
+    recipes.set(recipe, db);
+    return recipe;
   } catch (error) {
     key.fill(0);
     scratch.close();

@@ -28,7 +28,13 @@ import { intakeLookupTerminalOutcome } from './intake-lookup-projection.ts';
 import { intakeDiscoveryTerminalOutcome } from './intake-discovery-admission.ts';
 import { intakeSourceContextTerminalOutcome } from './intake-source-context-classification.ts';
 import { intakeStateTerminalOutcome } from './intake-state-storage.ts';
-import { recordTerminalDurabilityParticipant } from './record-versions.ts';
+import {
+  recordTerminalDurabilityParticipant,
+  recordPreparedReplayCurrent,
+  recordPreparationBeforeBookkeeping,
+  recordTransactionPreparationRequested,
+  recordTransactionPreparationCaptured,
+} from './record-versions.ts';
 import {
   terminalStatement,
   terminalExecution,
@@ -543,11 +549,21 @@ export function registerTransactionDurability<Capture, Result>(
 export function hasTransactionDurability(db: DatabaseSync): boolean {
   return durabilityHooks.has(db);
 }
+/** Read-only identity; this neither registers nor certifies a participant. */
+export function transactionDurabilityParticipantCurrent(
+  db: DatabaseSync,
+  participant: unknown,
+): boolean {
+  return durabilityHooks.get(db) === participant;
+}
 /** Memory-only observers; accepted-record durability hooks retain their ordering. */
 export type TransactionOutcome = {
   token: object;
   committed: boolean;
   succeeded: boolean;
+  /** A genuine record-owner planning transaction rolled back after retaining
+   * its tentative write set. This is never an accepted or replayed operation. */
+  prepared?: true;
   /** Set only by the transaction owner after exact maintenance verification,
    * successful commit, durable flush and participant cleanup. */
   intakeMaintenance?: true;
@@ -631,6 +647,114 @@ const startObservers = new WeakMap<DatabaseSync, Set<(token: object) => void>>()
 const transactionObserverSerials = new WeakMap<DatabaseSync, bigint>();
 const rotateTransactionObserverSerial = (db: DatabaseSync) =>
   transactionObserverSerials.set(db, (transactionObserverSerials.get(db) ?? 0n) + 1n);
+declare const recordReplayBrand: unique symbol;
+export interface PreparedRecordReplay {
+  readonly [recordReplayBrand]: true;
+}
+const recordReplays = new WeakMap<
+  PreparedRecordReplay,
+  {
+    db: DatabaseSync;
+    original: object;
+    serial: bigint;
+    hooks: TransactionDurabilityHooks | undefined;
+    used: boolean;
+    outcome?: TransactionOutcome;
+  }
+>();
+/** Transaction transport only. The record owner must separately close its
+ * original backing, frozen write recipe and durable intent before using it. */
+export function prepareRecordReplay(db: DatabaseSync, original: object): PreparedRecordReplay {
+  if (
+    db.isTransaction ||
+    !recordPreparedReplayCurrent(db, original) ||
+    !recordTerminalDurabilityParticipant(db, durabilityHooks.get(db)) ||
+    [...(startObservers.get(db) ?? [])].some(
+      (callback) => !intakeFrontierTerminalStart(db, callback),
+    )
+  )
+    throw Error('Record replay requires its genuine released preparation');
+  const capability = Object.freeze({}) as PreparedRecordReplay;
+  recordReplays.set(capability, {
+    db,
+    original,
+    serial: transactionObserverSerials.get(db) ?? 0n,
+    hooks: durabilityHooks.get(db),
+    used: false,
+  });
+  return capability;
+}
+export function recordReplayCurrent(db: DatabaseSync, capability: PreparedRecordReplay): boolean {
+  const item = recordReplays.get(capability);
+  return (
+    !!item &&
+    item.db === db &&
+    !item.used &&
+    !db.isTransaction &&
+    recordPreparedReplayCurrent(db, item.original) &&
+    item.serial === (transactionObserverSerials.get(db) ?? 0n) &&
+    durabilityHooks.get(db) === item.hooks &&
+    recordTerminalDurabilityParticipant(db, item.hooks)
+  );
+}
+/** The finite native scope owns BEGIN/COMMIT/ROLLBACK. No preparatory callbacks
+ * or business logic are rerun; ordinary observers already saw the honest T1. */
+export function executeRecordReplay<T>(
+  db: DatabaseSync,
+  capability: PreparedRecordReplay,
+  body: (token: object) => T,
+): T {
+  if (!terminalStatementsActive(db) || !recordReplayCurrent(db, capability))
+    throw Error('Foreign or expired record replay');
+  const item = recordReplays.get(capability)!;
+  item.used = true;
+  const token = Object.freeze({});
+  let committed = false;
+  terminalExecution(db, 'BEGIN IMMEDIATE');
+  transactionTokens.set(db, token);
+  try {
+    for (const observer of startObservers.get(db) ?? []) observer(token);
+    const result = body(token);
+    if (
+      result &&
+      (typeof result === 'object' || typeof result === 'function') &&
+      ('then' in result || Symbol.iterator in result || Symbol.asyncIterator in result)
+    )
+      throw Error('Record replay requires synchronous nonescaping work');
+    terminalExecution(db, 'COMMIT');
+    committed = true;
+    return result;
+  } finally {
+    try {
+      if (!committed && db.isTransaction) terminalExecution(db, 'ROLLBACK');
+    } finally {
+      transactionFailures.delete(db);
+      terminalTransactionGuards.delete(db);
+      transactionTokens.delete(db);
+      item.outcome = Object.freeze({ token, committed, succeeded: committed });
+    }
+  }
+}
+/** Notifications are not publication authority. They run only after the finite
+ * scope expires; mutation by one cannot certify a later child's originals. */
+export function notifyRecordReplay(
+  db: DatabaseSync,
+  capability: PreparedRecordReplay,
+): TransactionOutcome | undefined {
+  const item = recordReplays.get(capability);
+  if (!item || item.db !== db || db.isTransaction || terminalStatementsActive(db))
+    throw Error('Record replay outcome is not closed');
+  recordReplays.delete(capability);
+  if (!item.outcome) return undefined;
+  for (const observer of outcomeObservers.get(db) ?? []) {
+    try {
+      observer(item.outcome);
+    } catch {
+      /* notifications cannot change acknowledgement */
+    }
+  }
+  return item.outcome;
+}
 declare const terminalCallbacksBrand: unique symbol;
 export interface TerminalTransactionCallbacks {
   readonly [terminalCallbacksBrand]: true;
@@ -739,6 +863,8 @@ export function transaction<T>(
 ): T {
   terminalExecution(db, 'BEGIN IMMEDIATE');
   let committed = false;
+  let rolledBack = false;
+  let prepared = false;
   let succeeded = false;
   let verifiedIntakeMaintenance = false;
   const token = {};
@@ -751,14 +877,25 @@ export function transaction<T>(
     }
   }
   const hooks = durabilityHooks.get(db);
+  let hooksAdmitted = true;
   let captured;
   try {
+    // A planning owner must reject start-observer hook substitution BEFORE
+    // dispatching any begin/capture/prepare callback from that replacement.
+    try {
+      recordTransactionPreparationRequested(db, operation);
+    } catch (error) {
+      hooksAdmitted = false;
+      throw error;
+    }
     if (operation.intakeMaintenance) {
       if (!hooks?.capture) throw Error('Intake maintenance requires accepted-row capture');
       beginIntakeMaintenancePublication(db, operation.intakeMaintenance, token, operation);
     }
     const retry = hooks?.begin?.(operation);
     if (retry?.replayed) {
+      if (recordTransactionPreparationRequested(db, operation))
+        throw Error('Record preparation cannot reuse an accepted transaction');
       if (operation.intakeMaintenance)
         throw Error('Intake maintenance replay must be resolved before preparation');
       terminalExecution(db, 'COMMIT');
@@ -786,6 +923,7 @@ export function transaction<T>(
       if (terminalGuard.token !== token) throw Error('Foreign terminal transaction guard');
       terminalGuard.check();
     }
+    recordPreparationBeforeBookkeeping(db, operation);
     const clinicalInsert = expectIntakeFrontierMetaWrite(db, 'clinical_review_revision', [
       'insert',
     ]);
@@ -825,6 +963,12 @@ export function transaction<T>(
     // The recoverable intent must reach durable profile storage before an
     // ephemeral SQLite COMMIT can be acknowledged.
     hooks?.prepare(captured, { operation, result });
+    if (recordTransactionPreparationCaptured(db, operation, token)) {
+      terminalExecution(db, 'ROLLBACK');
+      rolledBack = true;
+      prepared = true;
+      return result;
+    }
     terminalExecution(db, 'COMMIT');
     committed = true;
     // Publication may be retried from the durable intent, even after losing
@@ -833,7 +977,7 @@ export function transaction<T>(
     succeeded = true;
     return result;
   } catch (error) {
-    if (!committed) terminalExecution(db, 'ROLLBACK');
+    if (!committed && !rolledBack) terminalExecution(db, 'ROLLBACK');
     throw error;
   } finally {
     if (operation.intakeMaintenance)
@@ -842,7 +986,7 @@ export function transaction<T>(
     terminalTransactionGuards.delete(db);
     // Read at completion: observers can register while fn stages its first value.
     try {
-      hooks?.release?.(captured);
+      if (hooksAdmitted) hooks?.release?.(captured);
     } catch (error) {
       succeeded = false;
       throw error;
@@ -856,6 +1000,7 @@ export function transaction<T>(
             token,
             committed,
             succeeded,
+            ...(prepared ? { prepared: true as const } : {}),
             ...(verifiedIntakeMaintenance && committed && succeeded
               ? { intakeMaintenance: true as const }
               : {}),

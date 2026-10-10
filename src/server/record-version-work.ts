@@ -36,9 +36,19 @@ const empty = () => ({
   vaultBackingColdReplays: 0,
   vaultBackingColdDecodedVersions: 0,
   vaultBackingReuses: 0,
+  vaultBackingRejectedOwner: 0,
+  vaultBackingRejectedMethods: 0,
+  vaultBackingRejectedHead: 0,
+  vaultBackingRejectedPhysical: 0,
+  vaultBackingRejectedSequence: 0,
+  vaultBackingRejectedWorkspace: 0,
+  vaultBackingRejectedParents: 0,
+  vaultBackingRejectedScope: 0,
   vaultBackingCertificateWrites: 0,
   vaultBackingChangedVersions: 0,
   vaultBackingPhysicalMembersVerified: 0,
+  contributorBackingPhysicalMemberVisits: 0,
+  contributorBackingColdDecodedVersions: 0,
 });
 type Metrics = ReturnType<typeof empty>;
 type Phase = 'operation' | 'reconstruction';
