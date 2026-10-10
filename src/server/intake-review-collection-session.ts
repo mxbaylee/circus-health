@@ -102,6 +102,99 @@ const projectionContexts = new WeakMap<
   CollectionClinicalReviewSession,
   CollectionClinicalProjectionContext
 >();
+declare const ownershipHandoff: unique symbol;
+export interface CollectionClinicalOwnershipPreparation {
+  readonly [ownershipHandoff]: 'verified-review';
+}
+type OwnershipHandoffState = {
+  session: CollectionClinicalReviewSession;
+  context: CollectionClinicalProjectionContext;
+  methodEpoch: NonNullable<ReturnType<typeof managedDatabaseMethodEpoch>>;
+  stamp: string;
+  signal?: AbortSignal;
+  assertRunning?: () => void;
+};
+const ownershipHandoffs = new WeakMap<
+  CollectionClinicalOwnershipPreparation,
+  OwnershipHandoffState
+>();
+export type CollectionClinicalOwnershipPreparationResult =
+  | Exclude<CollectionClinicalReviewResult, { status: 'ready' }>
+  | { status: 'prepared'; preparation: CollectionClinicalOwnershipPreparation };
+/** Retain only the exact context returned by the host's first physical closure.
+ * Ownership construction must still verify its complete original union before escape. */
+export async function prepareCollectionClinicalOwnershipReview(
+  result: Extract<CollectionClinicalReviewResult, { status: 'ready' }>,
+  signal?: AbortSignal,
+  assertRunning?: () => void,
+): Promise<CollectionClinicalOwnershipPreparationResult> {
+  const context = projectionContexts.get(result.session);
+  if (!context) throw Error('Foreign selected clinical review session');
+  signal?.throwIfAborted();
+  context.assertAuthorityCurrent();
+  signal?.throwIfAborted();
+  const methodEpoch = managedDatabaseMethodEpoch(context.db),
+    stamp = reviewReadStamp(context.db);
+  if (!methodEpoch || !stamp) throw Error('Ownership review handoff unavailable');
+  await collectionClinicalProjectionContextAsync(result.session, signal, assertRunning);
+  signal?.throwIfAborted();
+  if (
+    managedDatabaseMethodEpoch(context.db) !== methodEpoch ||
+    reviewReadStamp(context.db) !== stamp
+  )
+    throw new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
+  const preparation = Object.freeze({}) as CollectionClinicalOwnershipPreparation;
+  ownershipHandoffs.set(preparation, {
+    session: result.session,
+    context,
+    methodEpoch,
+    stamp,
+    signal,
+    assertRunning,
+  });
+  return { status: 'prepared', preparation };
+}
+export function disposeCollectionClinicalOwnershipReview(
+  preparation: CollectionClinicalOwnershipPreparation,
+) {
+  const value = ownershipHandoffs.get(preparation);
+  ownershipHandoffs.delete(preparation);
+  value?.session.close();
+}
+export function consumeCollectionClinicalOwnershipReview(
+  preparation: CollectionClinicalOwnershipPreparation,
+  db: DatabaseSync,
+  profileId: string,
+) {
+  const value = ownershipHandoffs.get(preparation);
+  ownershipHandoffs.delete(preparation);
+  if (!value) throw Error('Ownership review handoff unavailable');
+  const assertPins = () => {
+    if (
+      managedDatabaseMethodEpoch(value.context.db) !== value.methodEpoch ||
+      reviewReadStamp(value.context.db) !== value.stamp
+    )
+      throw new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
+  };
+  const assertCurrent = () => {
+    value.signal?.throwIfAborted();
+    assertPins();
+    value.context.assertAuthorityCurrent();
+    value.signal?.throwIfAborted();
+    assertPins();
+  };
+  try {
+    if (value.context.db !== db || value.context.profileId !== profileId)
+      throw Error('Foreign ownership review handoff');
+    assertCurrent();
+    value.assertRunning?.();
+    assertCurrent();
+    return { session: value.session, context: value.context };
+  } catch (error) {
+    value.session.close();
+    throw error;
+  }
+}
 declare const acceptanceHandoff: unique symbol;
 export interface CollectionClinicalAcceptancePreparation {
   readonly [acceptanceHandoff]: 'review';

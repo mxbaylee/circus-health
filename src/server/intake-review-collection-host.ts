@@ -98,6 +98,9 @@ import {
 import {
   createCollectionClinicalReviewSessionWork,
   collectionClinicalProjectionContextAsync,
+  prepareCollectionClinicalOwnershipReview,
+  disposeCollectionClinicalOwnershipReview,
+  type CollectionClinicalOwnershipPreparationResult,
   deferCollectionClinicalAcceptanceReview,
   disposeCollectionClinicalAcceptanceReview,
   type CollectionClinicalAcceptancePreparationResult,
@@ -349,6 +352,28 @@ export async function prepareCollectionClinicalReviewAsync(
     },
     (value) => {
       if (value.status === 'ready') value.session.close();
+    },
+  );
+}
+
+/** Private ownership construction forwards this already-verified context once;
+ * its complete artifact union still closes before a preview becomes visible. */
+export async function prepareCollectionClinicalReviewForOwnershipAsync(
+  ...input: Parameters<typeof prepareCollectionClinicalReviewWork>
+): Promise<CollectionClinicalOwnershipPreparationResult> {
+  return prepareCollectionClinicalReviewAsyncResult(
+    input,
+    async (result) => {
+      if (result.status !== 'ready') return result;
+      return prepareCollectionClinicalOwnershipReview(
+        result,
+        input[5]?.signal,
+        input[5]?.assertRunning,
+      );
+    },
+    (result) => {
+      if (result.status === 'prepared')
+        disposeCollectionClinicalOwnershipReview(result.preparation);
     },
   );
 }

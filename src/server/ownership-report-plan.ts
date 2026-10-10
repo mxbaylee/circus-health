@@ -27,11 +27,14 @@ import {
 } from './ownership-contribution-stream.ts';
 import {
   prepareCollectionClinicalReviewAsync,
+  prepareCollectionClinicalReviewForOwnershipAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
 import {
   collectionClinicalProjectionContext,
   collectionClinicalProjectionContextAsync,
+  consumeCollectionClinicalOwnershipReview,
+  disposeCollectionClinicalOwnershipReview,
   type VerifiedClinicalArtifact,
 } from './intake-review-collection-session.ts';
 import type { IntakeReview } from '../shared/intake.ts';
@@ -609,7 +612,12 @@ export async function prepareOwnershipReportPlan(
         if (retainedReview?.key !== key) {
           retainedReview?.close();
           retainedReview = undefined;
-          const ready = await prepareCollectionClinicalReviewAsync(
+          // Only construction has no prerequisite-publication consumers. The
+          // existing complete union closes before its first outward preview.
+          const prepare = returnedPlan
+            ? prepareCollectionClinicalReviewAsync
+            : prepareCollectionClinicalReviewForOwnershipAsync;
+          const ready = await prepare(
             db,
             root,
             profileId,
@@ -617,7 +625,7 @@ export async function prepareOwnershipReportPlan(
             proposal === intakeId ? null : proposal,
             { assertRunning: assertCurrent },
           );
-          if (ready.status !== 'ready')
+          if (ready.status === 'fragment_required')
             throw new HttpError(
               409,
               'OWNERSHIP_REVIEW_FRAGMENT',
@@ -626,20 +634,35 @@ export async function prepareOwnershipReportPlan(
           // Copy the host's already-verified identities before this one retained
           // session is replaced. SQL holds the complete fan-in without live sessions.
           let context: ReturnType<typeof collectionClinicalProjectionContext>;
+          let session:
+            | import('./intake-review-collection-session.ts').CollectionClinicalReviewSession
+            | undefined;
           try {
-            context = await collectionClinicalProjectionContextAsync(ready.session);
+            if (ready.status === 'prepared') {
+              ({ session, context } = consumeCollectionClinicalOwnershipReview(
+                ready.preparation,
+                db,
+                profileId,
+              ));
+            } else {
+              session = ready.session;
+              context = await collectionClinicalProjectionContextAsync(session);
+            }
             artifacts.retain(context.verifiedArtifacts());
           } catch (error) {
-            ready.session.close();
+            session?.close();
+            if (ready.status === 'ready') ready.session.close();
+            else disposeCollectionClinicalOwnershipReview(ready.preparation);
             throw error;
           }
+          const selectedSession = session;
           retainedReview = {
             key,
-            review: ready.session.review,
-            ownership: ready.session.ownership,
-            record: (id: string) => ready.session.record(id),
+            review: selectedSession.review,
+            ownership: selectedSession.ownership,
+            record: (id: string) => selectedSession.record(id),
             assertCurrent: () => context.assertAuthorityCurrent(),
-            close: () => ready.session.close(),
+            close: () => selectedSession.close(),
           };
         }
         retainedReview!.assertCurrent();

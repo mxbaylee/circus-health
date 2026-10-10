@@ -94,6 +94,14 @@ set, retain their authenticated snapshot preparation paths. The accepted receipt
 retains the exact empty issue evidence; this avoids unused snapshot writes, not
 source evidence verification or final physical checks.
 
+Initial ownership preview construction forwards each host-verified clinical review
+context through a private one-use handoff, bound to its original session, database,
+profile, method epoch and SQL read interval. It avoids only the immediate duplicate
+per-session physical pass. Construction still copies the original artifact identities
+and verifies their complete union before the preview escapes. Later snapshot
+preparation retains its existing per-session checks and prerequisite-publication
+closures; cancellation or changed authority cannot recapture a newer proof.
+
 Ownership name-evidence hashing preserves the complete canonical order and
 membership while yielding at bounded piece and byte intervals. Individual hash
 updates retain surrogate pairs and consume at most 4,097 UTF-16 units; each digest
