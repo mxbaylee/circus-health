@@ -1,4 +1,4 @@
-import { fixtureApi, fixtureReport } from './native-intake-fixture.ts';
+import { fixtureApi, fixtureReport, fixtureNativeReportReady } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
@@ -189,7 +189,13 @@ test(
     await page.goto(
       `${url}/#/import?intake=${encodeURIComponent(intake.id)}&group=${encodeURIComponent(groupId)}`,
     );
-    await page.reload();
+    const displayed = await fixtureNativeReportReady(
+      page,
+      prefix,
+      { intakeId: intake.id, groupId },
+      () => page.reload(),
+    );
+    assert.equal(displayed.people.counts.pending, 2);
     const people = page.getByRole('region', { name: 'People from this report' });
     await people.getByRole('tab', { name: /To review\s+2/ }).waitFor();
     await people.getByRole('button', { name: /Mira Finch/ }).click();
@@ -269,7 +275,13 @@ test(
     const juniperRow = people.getByRole('article').filter({ hasText: 'Juniper Vale' });
     await juniperRow.getByRole('button', { name: 'Review later', exact: true }).click();
     await people.getByRole('tab', { name: /Review later\s+1/ }).waitFor();
-    await page.reload();
+    const deferred = await fixtureNativeReportReady(
+      page,
+      prefix,
+      { intakeId: intake.id, groupId },
+      () => page.reload(),
+    );
+    assert.equal(deferred.people.counts.later, 1);
     const deferredPeople = page.getByRole('region', { name: 'People from this report' });
     await deferredPeople.getByRole('tab', { name: /Review later\s+1/ }).click();
     await deferredPeople.getByRole('button', { name: /Juniper Vale/ }).click();
