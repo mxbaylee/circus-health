@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, parse } from 'node:path';
 import test from 'node:test';
 import {
   beginManagedPhysicalMutation,
   captureManagedPhysicalEpoch,
+  captureManagedPhysicalScope,
   managedPhysicalEpochCurrent,
+  managedPhysicalScopeCurrent,
   withManagedPhysicalMutation,
 } from '../clinical-review-physical-epoch.ts';
 import {
@@ -150,6 +152,71 @@ test('managed physical epoch refuses in-flight, completed and failed attempts', 
   );
   assert.equal(managedPhysicalEpochCurrent(third), false);
   assert.ok(captureManagedPhysicalEpoch());
+});
+
+test('scoped physical witnesses ignore disjoint paths and refuse aliases, ancestors and unknown writes', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'fictional-physical-scope-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const selected = join(base, 'selected');
+  const other = join(base, 'other');
+  mkdirSync(selected);
+  mkdirSync(other);
+  symlinkSync(selected, join(base, 'alias'));
+  const first = captureManagedPhysicalScope(selected);
+  assert.ok(first);
+  const active = beginManagedPhysicalMutation([join(other, 'source')]);
+  assert.equal(managedPhysicalScopeCurrent(first), false);
+  active();
+  assert.equal(managedPhysicalScopeCurrent(first), true);
+  withManagedPhysicalMutation(() => {}, [join(base, 'alias', 'source')]);
+  assert.equal(managedPhysicalScopeCurrent(first), false);
+  const second = captureManagedPhysicalScope(selected);
+  assert.ok(second);
+  withManagedPhysicalMutation(() => {}, [base]);
+  assert.equal(managedPhysicalScopeCurrent(second), false);
+  const third = captureManagedPhysicalScope(selected);
+  assert.ok(third);
+  withManagedPhysicalMutation(() => {});
+  assert.equal(managedPhysicalScopeCurrent(third), false);
+  const sameByte = join(selected, 'source');
+  writeFileSync(sameByte, 'fictional');
+  const fourth = captureManagedPhysicalScope(selected);
+  assert.ok(fourth);
+  withManagedPhysicalMutation(() => writeFileSync(sameByte, 'fictional'), [sameByte]);
+  assert.equal(managedPhysicalScopeCurrent(fourth), false);
+  const fifth = captureManagedPhysicalScope(selected);
+  assert.ok(fifth);
+  withManagedPhysicalMutation(
+    () => {},
+    Array.from({ length: 5 }, (_, index) => join(other, String(index))),
+  );
+  assert.equal(managedPhysicalScopeCurrent(fifth), false);
+  const sixth = captureManagedPhysicalScope(selected);
+  assert.ok(sixth);
+  withManagedPhysicalMutation(() => {}, [parse(selected).root]);
+  assert.equal(managedPhysicalScopeCurrent(sixth), false);
+  const seventh = captureManagedPhysicalScope(selected);
+  assert.ok(seventh);
+  withManagedPhysicalMutation(() => {}, [join(other, 'x'.repeat(4096))]);
+  assert.equal(managedPhysicalScopeCurrent(seventh), false);
+  assert.equal(managedPhysicalScopeCurrent({}), false);
+});
+
+test('scoped physical witness refuses stale event history without retaining every write', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'fictional-physical-overflow-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const selected = join(base, 'selected');
+  const other = join(base, 'other');
+  mkdirSync(selected);
+  mkdirSync(other);
+  const witness = captureManagedPhysicalScope(selected);
+  assert.ok(witness);
+  for (let index = 0; index < 1025; index++)
+    withManagedPhysicalMutation(() => {}, [join(other, String(index))]);
+  assert.equal(managedPhysicalScopeCurrent(witness), false);
+  const fresh = captureManagedPhysicalScope(selected);
+  assert.ok(fresh);
+  assert.equal(managedPhysicalScopeCurrent(fresh), true);
 });
 
 test('physical worker preserves its caller abort reason and drains', async () => {

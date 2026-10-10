@@ -24,9 +24,12 @@ runtime. Arbitrary older acquisition and other metadata remain outside this
 two-field contraction; CRS-231's integrated release qualification is still open.
 The candidate's encrypted compatibility publication also verifies the actual
 accepted backing and stages only changed immutable objects before its fixed
-transaction. This does not qualify bounded cold source-history reconstruction
-or repeated-source proof reuse; those remain release gates, with no extra
-operator setting or permitted authority downgrade.
+transaction. Its private retained certificate frontier advances only through
+exact owned source publications; an unknown mutation or changed owner discards
+it and requires a new authenticated cold proof. The frontier is disposable and
+does not change accepted formats or require an operator setting. Complete
+physical namespace sweeps, metadata-only integration and repeated-source release
+qualification remain gates, not a permitted authority downgrade.
 Contributor and portable compatibility writes also check their source preimage
 against immutable accepted history, not mutually matching cache rows. A refused
 altered cache must be reconstructed from its unchanged accepted record storage;

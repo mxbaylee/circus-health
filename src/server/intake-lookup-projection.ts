@@ -929,8 +929,12 @@ interface NativeReceiptAppend {
   before: string;
   after: string;
   rows: readonly { operation: string; address: string }[];
+  maximumAddress: string | null;
 }
-interface NativeReceiptAppendBasis extends Omit<NativeReceiptAppend, 'after' | 'rows'> {
+interface NativeReceiptAppendBasis extends Omit<
+  NativeReceiptAppend,
+  'after' | 'rows' | 'maximumAddress'
+> {
   db: DatabaseSync;
 }
 const receiptAppendBases = new WeakMap<object, NativeReceiptAppendBasis>();
@@ -1099,7 +1103,7 @@ export function retainNativeIntakeReceiptAppendBatch(
       members.has(item.source.id)
     )
       return;
-    const rows = consumeWorkflowReceiptAppendProof(
+    const contribution = consumeWorkflowReceiptAppendProof(
       item.proof,
       db,
       item.source,
@@ -1107,13 +1111,14 @@ export function retainNativeIntakeReceiptAppendBatch(
       item.before,
       item.after,
     );
-    if (!rows || rows.length > 64) return;
-    const detached = rows.map(({ operation, address }) => ({ operation, address }));
+    if (!contribution || contribution.rows.length > 64) return;
+    const detached = contribution.rows.map(({ operation, address }) => ({ operation, address }));
     bytes +=
       Buffer.byteLength(item.source.id) +
       Buffer.byteLength(prior.sourceHash) +
       Buffer.byteLength(item.before) +
-      Buffer.byteLength(item.after);
+      Buffer.byteLength(item.after) +
+      Buffer.byteLength(contribution.maximumAddress ?? '');
     for (const row of detached)
       bytes += Buffer.byteLength(row.operation) + Buffer.byteLength(row.address);
     if (bytes > 1024 * 1024) return;
@@ -1126,6 +1131,7 @@ export function retainNativeIntakeReceiptAppendBatch(
       before: prior.before,
       after: item.after,
       rows: detached,
+      maximumAddress: contribution.maximumAddress,
     });
   }
   if (
@@ -1148,7 +1154,10 @@ export async function advanceNativeIntakeLookupCatalog(
   changedHeads: readonly string[],
   ordinaryToken: object | undefined,
   current: () => boolean,
-  options: { assertRunning?: () => void },
+  options: {
+    assertRunning?: () => void;
+    onCheckpoint?: (progress: { sourceId: string; visited: number }) => void | Promise<void>;
+  },
 ): Promise<readonly AdvancedNativeLookupSource[] | undefined> {
   const connection = connections.get(db);
   const catalog = connection?.nativeCatalog;
@@ -1226,9 +1235,8 @@ export async function advanceNativeIntakeLookupCatalog(
         'lookup-discovery-maximum',
         [],
       );
-      const oldMaximum = scratch
-        .prepare('SELECT source_id,value FROM maximum WHERE singleton=1')
-        .get();
+      if ((maximum ? view.address(maximum) : null) !== member.maximumAddress)
+        fail('native catalog discovery index differs from accepted contribution');
       let nextMaximum: bigint | null = null;
       let maximumAddress: string | undefined;
       if (maximum) {
@@ -1242,11 +1250,6 @@ export async function advanceNativeIntakeLookupCatalog(
           return;
         maximumAddress = view.address(maximum);
       }
-      if (
-        oldMaximum?.source_id === member.sourceId &&
-        (nextMaximum === null || nextMaximum < BigInt(oldMaximum.value as number | bigint))
-      )
-        return;
       for (const item of member.rows) {
         if (checkpoint()) await cooperate();
         const selected = readNativeIntakeLookupTarget(
@@ -1272,14 +1275,10 @@ export async function advanceNativeIntakeLookupCatalog(
       if (nextMaximum !== null && maximumAddress !== undefined)
         scratch
           .prepare(
-            `INSERT INTO maximum VALUES(1,?,?,?,?,?,?)
-            ON CONFLICT(singleton) DO UPDATE SET source_id=excluded.source_id,
+            `INSERT INTO source_maxima VALUES(?,?,?,?,?,?)
+            ON CONFLICT(source_id) DO UPDATE SET
             source_order=excluded.source_order,source_hash=excluded.source_hash,
-            authority_head=excluded.authority_head,address=excluded.address,value=excluded.value
-            WHERE excluded.value>maximum.value OR
-              (excluded.value=maximum.value AND
-                (excluded.source_order<maximum.source_order OR
-                  excluded.source_id=maximum.source_id))`,
+            authority_head=excluded.authority_head,address=excluded.address,value=excluded.value`,
           )
           .run(
             member.sourceId,
@@ -1289,7 +1288,7 @@ export async function advanceNativeIntakeLookupCatalog(
             maximumAddress,
             nextMaximum,
           );
-      else if (oldMaximum?.source_id === member.sourceId) return;
+      else scratch.prepare('DELETE FROM source_maxima WHERE source_id=?').run(member.sourceId);
       changed.push({
         sourceId: member.sourceId,
         sourceOrder: member.sourceOrder,
@@ -1297,7 +1296,20 @@ export async function advanceNativeIntakeLookupCatalog(
         authorityKey: binding.key,
         logicalHead: member.after,
       });
+      if (options.onCheckpoint) {
+        options.assertRunning?.();
+        if (!current()) return;
+        await options.onCheckpoint({ sourceId: member.sourceId, visited: member.rows.length });
+        options.assertRunning?.();
+        if (!current()) return;
+      }
     }
+    if (!current()) return;
+    // The original complete catalog covers every unchanged contributor. The
+    // ordered private index can select a runner-up without rereading originals.
+    scratch.exec(`DELETE FROM maximum;
+      INSERT INTO maximum SELECT 1,source_id,source_order,source_hash,authority_head,address,value
+      FROM source_maxima ORDER BY value DESC,source_order ASC LIMIT 1;`);
     if (!current()) return;
     catalog.token = nextToken;
     return changed;
@@ -1345,6 +1357,9 @@ export async function buildNativeIntakeLookupCatalog(
       CREATE INDEX IF NOT EXISTS acceptance_source ON acceptances(source_id);
       CREATE TABLE IF NOT EXISTS maximum(singleton INTEGER PRIMARY KEY,source_id TEXT,source_order INTEGER,
         source_hash TEXT,authority_head TEXT,address TEXT,value INTEGER);
+      CREATE TABLE IF NOT EXISTS source_maxima(source_id TEXT PRIMARY KEY,source_order INTEGER,
+        source_hash TEXT,authority_head TEXT,address TEXT,value INTEGER) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS source_maxima_order ON source_maxima(value DESC,source_order ASC);
       DELETE FROM maximum;
     `);
     const put = scratch.db.prepare(`INSERT INTO acceptances VALUES(?,?,?,?)
@@ -1356,6 +1371,10 @@ export async function buildNativeIntakeLookupCatalog(
       source_order=excluded.source_order,source_hash=excluded.source_hash,
       authority_head=excluded.authority_head,address=excluded.address,value=excluded.value
       WHERE excluded.value>maximum.value`);
+    const putSourceMaximum = scratch.db.prepare(`INSERT INTO source_maxima VALUES(?,?,?,?,?,?)
+      ON CONFLICT(source_id) DO UPDATE SET source_order=excluded.source_order,
+      source_hash=excluded.source_hash,authority_head=excluded.authority_head,
+      address=excluded.address,value=excluded.value`);
     const cast = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n");
     cast.setReadBigInts(true);
     const checkpoint = async (sourceId: string, visited: number) => {
@@ -1408,6 +1427,21 @@ export async function buildNativeIntakeLookupCatalog(
         append.after === source.authority_head &&
         prior?.source_order === source.source_order &&
         prior.source_hash === source.sha256;
+      let expectedMaximum: string | null = null;
+      if (reuse) {
+        expectedMaximum =
+          (scratch.db.prepare('SELECT address FROM source_maxima WHERE source_id=?').get(source.id)
+            ?.address as string | undefined) ?? null;
+      } else if (reuseAppend && append) expectedMaximum = append.maximumAddress;
+      else {
+        for (const contribution of intakeLookupContributions(db, view, 'discovery')) {
+          if ('checkpoint' in contribution) {
+            if (!(await checkpoint(source.id, 0))) return undefined;
+          } else expectedMaximum = contribution.target ? view.address(contribution.target) : null;
+        }
+      }
+      if ((group ? view.address(group) : null) !== expectedMaximum)
+        fail('native catalog discovery index is incomplete or changed');
       if (reuseAppend && append) {
         for (const item of append.rows) {
           const selected = readNativeIntakeLookupTarget(
@@ -1426,6 +1460,7 @@ export async function buildNativeIntakeLookupCatalog(
           }
         }
       }
+      scratch.db.prepare('DELETE FROM source_maxima WHERE source_id=?').run(source.id);
       if (group) {
         const text = boundedIntakeLookupText(view.fieldChunks(group, 'discoveryOrder'));
         const value = cast.get(text)!.n as bigint | null;
@@ -1435,6 +1470,14 @@ export async function buildNativeIntakeLookupCatalog(
           unsafeMaximum ||=
             value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER);
           putMaximum.run(
+            source.id,
+            source.source_order,
+            source.sha256,
+            source.authority_head,
+            view.address(group),
+            value,
+          );
+          putSourceMaximum.run(
             source.id,
             source.source_order,
             source.sha256,
@@ -1504,6 +1547,7 @@ export async function buildNativeIntakeLookupCatalog(
       for (const row of batch) {
         if (row.seen_epoch === seenEpoch) continue;
         if (!(await removeReceipts(String(row.source_id)))) return undefined;
+        scratch.db.prepare('DELETE FROM source_maxima WHERE source_id=?').run(row.source_id!);
         scratch.db.prepare('DELETE FROM sources WHERE source_id=?').run(row.source_id!);
       }
       cursor = String(batch[batch.length - 1]!.source_id);
@@ -1616,7 +1660,14 @@ export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
     }
     const view = nativeReader(db, source);
     const group = readNativeIntakeLookupTarget(db, source, view, 'lookup-discovery-maximum', []);
-    if (!group) continue;
+    if (!group) {
+      // The synchronous compatibility path has no complete private catalog.
+      // An index miss must agree with source evidence before answering empty.
+      for (const contribution of intakeLookupContributions(db, view, 'discovery'))
+        if (!('checkpoint' in contribution) && contribution.target)
+          fail('native catalog discovery index is incomplete or changed');
+      continue;
+    }
     const text = boundedIntakeLookupText(view.fieldChunks(group, 'discoveryOrder'));
     const value = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n").get(text)!.n;
     if (value !== null && (nativeMaximum === null || Number(value) > nativeMaximum))
@@ -1636,12 +1687,25 @@ export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
   assertProjectionAnswerWitness(db, answerWitness);
   return Number(maximum || 0);
 }
+const receiptSelectionGuards = new WeakMap<IntakeLookupReceiptReference, () => void>();
+function guardedReceiptReference(
+  reference: IntakeLookupReceiptReference,
+  assertCurrent: () => void,
+): IntakeLookupReceiptReference {
+  receiptSelectionGuards.set(reference, assertCurrent);
+  return reference;
+}
 export function retainedIntakeAcceptance(db: DatabaseSync, operationId: string): unknown {
   const reference = retainedIntakeAcceptanceReference(db, operationId);
   if (!reference) return null;
-  return reference.mode === 'legacy'
-    ? reference.value
-    : JSON.parse(boundedIntakeLookupText(reference.view.recordChunks(reference.record)));
+  const value =
+    reference.mode === 'legacy'
+      ? reference.value
+      : JSON.parse(boundedIntakeLookupText(reference.view.recordChunks(reference.record)));
+  // The selected source may stay current while another original becomes first.
+  // Keep the original global selection proof through callback-capable hydration.
+  receiptSelectionGuards.get(reference)!();
+  return value;
 }
 /** Point-selected receipt capability for consumers that cannot hydrate its targets. */
 export function retainedIntakeAcceptanceReference(
@@ -1672,7 +1736,10 @@ export function retainedIntakeAcceptanceReference(
       [nativeOperation],
     );
     assertNativeCatalogCurrent(db, catalog);
-    return { mode: 'native', sourceId: String(pointer.source_id), view, record };
+    return guardedReceiptReference(
+      { mode: 'native', sourceId: String(pointer.source_id), view, record },
+      () => assertNativeCatalogCurrent(db, catalog),
+    );
   }
   refreshLegacyProjection(db, connection);
   const answerWitness = projectionAnswerWitness(db);
@@ -1700,7 +1767,10 @@ export function retainedIntakeAcceptanceReference(
   }
   if (allOriginalsNative) {
     assertProjectionAnswerWitness(db, answerWitness);
-    return native;
+    return (
+      native &&
+      guardedReceiptReference(native, () => assertProjectionAnswerWitness(db, answerWitness))
+    );
   }
   const row = db
     .prepare(
@@ -1712,7 +1782,10 @@ export function retainedIntakeAcceptanceReference(
     : null;
   if (native && nativeOrder < (row ? Number(row.source_order) : Infinity)) selected = native;
   assertProjectionAnswerWitness(db, answerWitness);
-  return selected;
+  return (
+    selected &&
+    guardedReceiptReference(selected, () => assertProjectionAnswerWitness(db, answerWitness))
+  );
 }
 type NativeSource = IntakeEnvelopeSource & {
   source_order: number;

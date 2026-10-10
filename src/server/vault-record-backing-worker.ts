@@ -6,7 +6,11 @@ import { opendirSync } from 'node:fs';
 import { openVault } from './vault-store.ts';
 import { openDatabase } from './database.ts';
 import { attachRecordDurability } from './record-versions.ts';
-import { withRecordReplayCheckpoints } from './record-version-work.ts';
+import {
+  withRecordReplayCheckpoints,
+  createRecordVersionWorkCounters,
+  withRecordVersionWork,
+} from './record-version-work.ts';
 import { recordFieldDigest, recordStringFieldDigest } from './record-prior-fields.ts';
 import {
   unlockPhysicalEntries,
@@ -14,6 +18,8 @@ import {
   unlockPhysicalIdentity,
 } from './encrypted-unlock-physical.ts';
 import type { VaultRecordBackingInput } from './vault-record-backing.ts';
+import { VAULT_CERTIFICATE_SCHEMA, vaultRecordCertificates } from './vault-record-certificates.ts';
+import type { IntakeTreeRoot } from './intake-state-tree.ts';
 
 const input = workerData as VaultRecordBackingInput;
 const key = Buffer.from(input.key),
@@ -24,6 +30,8 @@ const sign = (path: string, kind: string, identity: string) =>
     .update(JSON.stringify([input.nonce, path, kind, identity]))
     .digest('hex');
 let work = 0;
+let certificateRoot: IntakeTreeRoot = null;
+const replayWork = createRecordVersionWorkCounters();
 const checkpoint = () => {
   if (++work % 64 === 0) parentPort!.postMessage({ checkpoint: true });
 };
@@ -133,7 +141,9 @@ async function prepare(): Promise<number> {
   let entries = 0;
   try {
     physical.exec(
-      'CREATE TABLE physical(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE workspace(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE verified_originals(path TEXT NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(path,bytes,sha256)); CREATE TABLE accepted_metadata(record_id TEXT PRIMARY KEY,version_id TEXT NOT NULL,hash TEXT,bytes INTEGER,preimage_hash TEXT NOT NULL,preimage_bytes INTEGER NOT NULL,deleted INTEGER NOT NULL,signature TEXT NOT NULL); BEGIN',
+      'CREATE TABLE physical(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE workspace(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE verified_originals(path TEXT NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(path,bytes,sha256)); ' +
+        VAULT_CERTIFICATE_SCHEMA +
+        ' BEGIN',
     );
     const insert = physical.prepare('INSERT INTO physical VALUES(?,?,?,?)');
     for (const item of unlockPhysicalEntries(root)) {
@@ -153,6 +163,9 @@ async function prepare(): Promise<number> {
     retainOriginal = originals.prepare('INSERT INTO verified_originals VALUES(?,?,?)');
   let db: ReturnType<typeof openDatabase> | undefined;
   try {
+    // This derivative index becomes readable only after its complete original
+    // replay. Avoid a durable SQLite commit for every certificate/tree node.
+    originals.exec('BEGIN');
     const storage = vault.recordStorage(),
       read = storage.read;
     storage.read = (name) => {
@@ -180,35 +193,37 @@ async function prepare(): Promise<number> {
       );
     }
     db = openDatabase(input.database, input.profileId);
-    withRecordReplayCheckpoints(checkpoint, () =>
-      attachRecordDurability(db!, {
-        profileId: input.profileId,
-        storage,
-        verifyReferences(versions) {
-          for (const version of versions) {
-            checkpoint();
-            if (version.deleted) continue;
-            const row = version.contents,
-              path =
-                version.entity === 'source_files'
-                  ? row.path
-                  : version.entity === 'assets'
-                    ? row.stored_path
-                    : null;
-            if (typeof path !== 'string') continue;
-            const prefix = `data/profiles/${input.profileId}/`;
-            if (path.startsWith('data/profiles/') && !path.startsWith(prefix))
-              throw Error('Vault original escaped its profile');
-            const name = path.startsWith(prefix) ? path.slice(prefix.length) : path;
-            const bytes = Number(row.bytes),
-              hash = String(row.sha256);
-            if (original.get(path, bytes, hash)) continue;
-            if (!vault.verifyFile(name, bytes, hash) && !vault.verifyFile(path, bytes, hash))
-              throw Error('Vault accepted original changed');
-            retainOriginal.run(path, bytes, hash);
-          }
-        },
-      }),
+    withRecordVersionWork(replayWork, () =>
+      withRecordReplayCheckpoints(checkpoint, () =>
+        attachRecordDurability(db!, {
+          profileId: input.profileId,
+          storage,
+          verifyReferences(versions) {
+            for (const version of versions) {
+              checkpoint();
+              if (version.deleted) continue;
+              const row = version.contents,
+                path =
+                  version.entity === 'source_files'
+                    ? row.path
+                    : version.entity === 'assets'
+                      ? row.stored_path
+                      : null;
+              if (typeof path !== 'string') continue;
+              const prefix = `data/profiles/${input.profileId}/`;
+              if (path.startsWith('data/profiles/') && !path.startsWith(prefix))
+                throw Error('Vault original escaped its profile');
+              const name = path.startsWith(prefix) ? path.slice(prefix.length) : path;
+              const bytes = Number(row.bytes),
+                hash = String(row.sha256);
+              if (original.get(path, bytes, hash)) continue;
+              if (!vault.verifyFile(name, bytes, hash) && !vault.verifyFile(path, bytes, hash))
+                throw Error('Vault accepted original changed');
+              retainOriginal.run(path, bytes, hash);
+            }
+          },
+        }),
+      ),
     );
     const current = db
       .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
@@ -247,45 +262,50 @@ async function prepare(): Promise<number> {
       )
         throw Error('Vault selected native binding differs');
     }
-    const metadata = originals.prepare('INSERT INTO accepted_metadata VALUES(?,?,?,?,?,?,?,?)'),
-      readMetadata = db.prepare('SELECT value FROM app_meta WHERE key=?');
+    const readMetadata = db.prepare('SELECT * FROM app_meta WHERE key=?');
+    const certificates = vaultRecordCertificates(
+      originals,
+      input.profileId,
+      input.nonce,
+      checkpoint,
+    );
+    const readSource = db.prepare('SELECT * FROM source_files WHERE id=?');
     for (const row of db
       .prepare(
-        "SELECT c.record_id,c.version_id,v.contents_json,v.deleted FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity='app_meta'",
+        "SELECT c.entity,c.record_id,c.version_id,v.contents_json,v.deleted FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity IN ('source_files','app_meta')",
       )
       .iterate()) {
       checkpoint();
-      const recordId = String(row.record_id),
-        versionId = String(row.version_id),
-        value = readMetadata.get(JSON.parse(recordId)[0])?.value,
+      const entity = row.entity as 'source_files' | 'app_meta',
+        recordId = String(row.record_id),
+        deleted = Number(row.deleted),
         preimage = await recordStringFieldDigest(String(row.contents_json), checkpoint),
-        digest =
-          value === undefined
-            ? undefined
-            : await recordStringFieldDigest(String(value), checkpoint);
-      metadata.run(
+        contents = deleted
+          ? undefined
+          : entity === 'source_files'
+            ? readSource.get(JSON.parse(recordId)[0])
+            : readMetadata.get(JSON.parse(recordId)[0]);
+      const fields: { name: string; hash: string; bytes: number }[] = [];
+      if (!deleted && !contents) throw Error('Vault accepted current certificate row missing');
+      for (const [name, value] of Object.entries(contents ?? {})) {
+        const digest =
+          typeof value === 'string'
+            ? await recordStringFieldDigest(value, checkpoint)
+            : recordFieldDigest(JSON.stringify(value));
+        fields.push({ name, ...digest });
+      }
+      certificateRoot = certificates.put(certificateRoot, {
+        entity,
         recordId,
-        versionId,
-        digest?.hash ?? null,
-        digest?.bytes ?? null,
-        preimage.hash,
-        preimage.bytes,
-        row.deleted,
-        sign(
-          'metadata:' + recordId,
-          versionId,
-          JSON.stringify([
-            digest?.hash ?? null,
-            digest?.bytes ?? null,
-            preimage.hash,
-            preimage.bytes,
-            row.deleted,
-          ]),
-        ),
-      );
+        versionId: String(row.version_id),
+        deleted,
+        preimage,
+        fields,
+      }).root;
     }
     if (storage.read('head')?.toString('utf8') !== input.selectedHead)
       throw Error('Vault accepted HEAD changed during backing verification');
+    originals.exec('COMMIT');
     verifyPhysical(entries);
     return entries;
   } finally {
@@ -296,7 +316,12 @@ async function prepare(): Promise<number> {
 }
 
 try {
-  if (input.mode === 'prepare') parentPort!.postMessage({ entries: await prepare() });
+  if (input.mode === 'prepare')
+    parentPort!.postMessage({
+      entries: await prepare(),
+      certificateRoot,
+      decodedVersions: replayWork.reconstruction.decodedVersions,
+    });
   else {
     verifyPhysical(input.entries!);
     parentPort!.postMessage({ entries: input.entries });

@@ -27,7 +27,7 @@ import {
   managedPhysicalMutationSequence,
 } from './clinical-review-physical-epoch.ts';
 import type { DatabaseSync } from 'node:sqlite';
-import { currentTransactionToken } from './database.ts';
+import { currentTransactionToken, managedDatabaseMethodEpoch } from './database.ts';
 import {
   currentClinicalOperation,
   assertClinicalOperation,
@@ -37,6 +37,7 @@ import {
   prepareVaultRecordBackingTransport,
   type VaultRecordBackingBinding,
 } from './vault-record-backing.ts';
+import { consumeRecordBackingAdvance, type RecordIndexedPublication } from './record-versions.ts';
 
 const mkdirSync: typeof rawMkdirSync = (...args) =>
   withManagedPhysicalMutation(() => rawMkdirSync(...args));
@@ -116,6 +117,16 @@ interface RecordStagingOwner {
   workspaceEpoch(): object;
   workspaceNames(): readonly string[];
   compactReady(): boolean;
+  backingFrontier?: {
+    backing: Awaited<ReturnType<typeof prepareVaultRecordBackingTransport>>;
+    db: DatabaseSync;
+    head: string;
+    epoch: object;
+    sequence: bigint;
+    workspaceEpoch: object;
+    parents: RecordParent[];
+    methods: object;
+  };
 }
 interface RecordStagingData {
   owner: RecordStagingOwner;
@@ -246,7 +257,23 @@ export async function prepareVaultRecordStagingBacking(
       throw Error('Vault compact preparation has unpublished changes');
     if (!data.owner.workspace) data.owner.prepareHead();
     check();
-    data.backing = await prepareVaultRecordBackingTransport(
+    const retained = data.owner.backingFrontier;
+    if (retained) {
+      data.owner.backingFrontier = undefined;
+      if (
+        retained.db === data.db &&
+        retained.methods === managedDatabaseMethodEpoch(data.db) &&
+        retained.head === selectedHead &&
+        managedPhysicalEpochCurrent(retained.epoch) &&
+        retained.sequence === data.sequence &&
+        retained.workspaceEpoch === data.workspaceEpoch &&
+        recordParentsCurrent(retained.parents)
+      ) {
+        data.backing = retained.backing;
+        data.backing.acquire(selectedHead, binding, check);
+      } else retained.backing.close();
+    }
+    data.backing ??= await prepareVaultRecordBackingTransport(
       data.owner.directory,
       data.owner.profileId,
       data.owner.key,
@@ -262,6 +289,19 @@ export async function prepareVaultRecordStagingBacking(
     data.backing?.close();
     throw error;
   }
+}
+export async function prepareVaultRecordBackingAdvance(
+  witness: VaultRecordStagingWitness,
+  head: string,
+  versions: Parameters<
+    Awaited<ReturnType<typeof prepareVaultRecordBackingTransport>>['prepareAdvance']
+  >[1],
+): Promise<void> {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data?.backing || !vaultRecordStagingCurrent(witness))
+    throw Error('Vault backing advance owner expired');
+  await data.backing.prepareAdvance(head, versions);
+  if (!vaultRecordStagingCurrent(witness)) throw Error('Vault backing advance seal changed');
 }
 export async function finishVaultRecordStagingPreparation(
   witness: VaultRecordStagingWitness,
@@ -318,12 +358,63 @@ export function prepareVaultRecordHead(witness: VaultRecordStagingWitness): void
 export function installVaultRecordHead(
   witness: VaultRecordStagingWitness,
   bytes: Uint8Array,
+  indexed?: RecordIndexedPublication,
 ): void {
   const data = recordStagingWitnesses.get(witness);
   if (!data || !data.headPrepared || !vaultRecordStagingCurrent(witness))
     throw Error('Immutable record head publication expired');
+  const head = Buffer.from(bytes).toString('utf8'),
+    sequence = data.sequence;
+  // Only the private indexed compact plan can promote reusable certificates.
+  // Ordinary writes retain their existing publication contract and revoke them.
+  const versions = indexed && consumeRecordBackingAdvance(data.db, indexed, witness, head);
+  if (!vaultRecordStagingCurrent(witness)) throw Error('Vault backing install seal expired');
+  if (versions) data.backing!.beforeHead();
   data.revoked = true;
   data.owner.installHead(Buffer.from(bytes));
+  const manifest = JSON.parse(
+    decryptObject(
+      resolve(data.owner.directory, 'vault/manifest.enc'),
+      data.owner.key,
+      data.owner.profileId,
+      'manifest',
+    ).toString('utf8'),
+  );
+  if (
+    manifest.format !== 'circus-health-vault-head-v2' ||
+    manifest.profileId !== data.owner.profileId ||
+    manifest.recordsHead !== Buffer.from(bytes).toString('base64')
+  )
+    throw Error('Immutable record HEAD readback differs');
+  if (versions) {
+    const epoch = captureManagedPhysicalEpoch();
+    const methods = managedDatabaseMethodEpoch(data.db);
+    if (
+      epoch &&
+      methods &&
+      managedPhysicalEpochCurrent(epoch) &&
+      managedPhysicalMutationSequence() === sequence + 2n &&
+      recordStagingMethodsCurrent(data.owner) &&
+      data.owner.compactReady() &&
+      data.owner.workspaceEpoch() === data.workspaceEpoch &&
+      recordParentsCurrent(data.parents)
+    ) {
+      data.backing!.afterHead();
+      data.backing!.promote(head, versions);
+      data.backing!.release();
+      data.owner.backingFrontier = {
+        backing: data.backing!,
+        db: data.db,
+        head,
+        epoch,
+        sequence: sequence + 2n,
+        workspaceEpoch: data.workspaceEpoch,
+        parents: data.parents,
+        methods,
+      };
+      data.backing = undefined;
+    }
+  }
 }
 function hashRecordCiphertext(fd: number): string {
   const hash = createHash('sha256');
@@ -746,9 +837,12 @@ function* openVaultSteps({
   } finally {
     if (!indexed) index.close();
   }
+  const backingOwners = new Set<RecordStagingOwner>();
   function discard(): void {
     if (closed) return;
     closed = true;
+    for (const owner of backingOwners) owner.backingFrontier?.backing.close();
+    backingOwners.clear();
     diagnosticChunks?.close();
     diagnosticChunks = undefined;
     fingerprints.clear();
@@ -1010,7 +1104,7 @@ function* openVaultSteps({
         }
       },
     };
-    recordStagingOwners.set(storage, {
+    const stagingOwner: RecordStagingOwner = {
       storage,
       read: storage.read,
       write: storage.writeImmutable,
@@ -1041,7 +1135,9 @@ function* openVaultSteps({
           throw error;
         }
       },
-    });
+    };
+    backingOwners.add(stagingOwner);
+    recordStagingOwners.set(storage, stagingOwner);
     return storage;
   }
   if (initialize && !existsSync(manifestPath)) publish();

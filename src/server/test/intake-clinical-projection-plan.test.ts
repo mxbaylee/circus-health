@@ -274,6 +274,19 @@ test('projection copied group proof survives review cleanup and refuses replaced
   });
   const laterContext = collectionClinicalProjectionContext(members[1]!.session);
   const consumed = laterContext.consumedArtifactIds.bind(laterContext);
+  const restore = laterContext.beginProjectionConsumption();
+  assert.throws(() => laterContext.beginProjectionConsumption(), { code: 'SOURCE_CHANGED' });
+  restore();
+  const nextRestore = laterContext.beginProjectionConsumption();
+  restore();
+  assert.throws(() => laterContext.beginProjectionConsumption(), { code: 'SOURCE_CHANGED' });
+  const paused = laterContext.consumedArtifactIds()[Symbol.iterator]();
+  assert.equal(paused.next().done, false);
+  nextRestore();
+  const latestRestore = laterContext.beginProjectionConsumption();
+  assert.throws(() => paused.next(), { code: 'SOURCE_CHANGED' });
+  latestRestore();
+  assert.deepEqual([...laterContext.consumedArtifactIds()], [...consumed()]);
   laterContext.consumedArtifactIds = function* () {
     yield* consumed();
     yield 'fictional-unprepared-group-dependency';

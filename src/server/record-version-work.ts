@@ -33,6 +33,12 @@ const empty = () => ({
   fieldVisits: 0,
   replayDeleteAttempts: 0,
   replayInsertAttempts: 0,
+  vaultBackingColdReplays: 0,
+  vaultBackingColdDecodedVersions: 0,
+  vaultBackingReuses: 0,
+  vaultBackingCertificateWrites: 0,
+  vaultBackingChangedVersions: 0,
+  vaultBackingPhysicalMembersVerified: 0,
 });
 type Metrics = ReturnType<typeof empty>;
 type Phase = 'operation' | 'reconstruction';

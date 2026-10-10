@@ -366,10 +366,19 @@ The compact workspace path instead compares the workspace against the accepted
 manifest in its worker; it does not invoke the ordinary workspace callback again
 or authorize arbitrary publication callbacks.
 
-The current compatibility verifier reconstructs accepted profile history for
-each cold proof. Repeated-source proof reuse and bounded oversized-source replay
-remain unfinished qualification requirements, not a global recovery bound or a
-completed scaling claim.
+The actual vault's first compatibility proof reconstructs accepted profile
+history and retains a private disk-backed certificate index for all current
+source and metadata predecessors. Authenticated point paths prove both membership
+and absence; a missing disposable SQL row is not an absence certificate. Only the
+matching private indexed plan, create-only immutable receipts and exact lexical
+HEAD install can promote changed certificates. A changed storage owner, database,
+method policy, workspace, unknown physical mutation or accepted HEAD discards the
+frontier rather than refreshing its original proof. A legacy install that also
+creates an index generation does not promote this manifest-only continuation.
+The worker still checks complete physical namespace membership for each prepared
+publication. That total-work bound, the ordinary metadata-only publication bridge,
+and integrated repeated-source/recovery qualification remain open; retaining
+accepted-history certificates is not a global bounded-recovery claim.
 
 Cold journal framing retains at most 64 KiB for its small-record path. Larger
 records are privately spooled and decoded through 8 KiB reads and the existing
@@ -789,6 +798,15 @@ write attempt and the final unchanged logical binding are accounted for. Unknown
 SQL, rollback, failed outcomes, protected TEMP/schema changes, peer/profile/registry
 drift and mixed or legacy originals require complete derivation. Neither an old
 raw stamp nor an old token is simply refreshed.
+The private catalog also retains each original's verified discovery maximum in
+an ordered index. Cold derivation checks the selected maximum against the actual
+SQL-first report-group scope; a missing entry under a claimed complete index
+does not prove an empty scope. Accepted transitions carry the compiler's exact
+maximum address in the same one-use proof as their receipt contributions.
+Preparation checks that address before extending the catalog, and validates the
+original interval again after any caller checkpoint. The ordered private index
+selects the global winner without inspecting unrelated originals; it is
+disposable derived state, not recovery authority.
 Maintenance bookkeeping is credited from literal accepted-record index writes
 and exact captured metadata identities, bound to the successful transaction.
 The original protected-write observer supplies those identities; neither an
@@ -823,6 +841,10 @@ Uncertified native and mixed lookups finish any legacy projection preparation
 before selecting an answer, then keep that original answer witness through the
 final return. Foreign projection mutation refuses the read; explicit cache
 rebuild must restore exact answers from retained authority before retrying.
+Receipt payload hydration retains the original global selection proof as well
+as the selected source proof. A different original becoming the first matching
+receipt during hydration invalidates the answer, even when the selected source
+itself is unchanged.
 
 Connection proofs assume trusted in-process application code uses the managed
 connection and native fixed-query methods. They are not a sandbox against code

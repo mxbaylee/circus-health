@@ -17,6 +17,7 @@ import { prepareIntakeLookupIndices } from '../intake-lookup-state.ts';
 import {
   INTAKE_LOOKUP_INDEX_COLLECTION,
   INTAKE_LOOKUP_INDEX_POLICY,
+  readNativeIntakeLookupTarget,
 } from '../intake-lookup-state.ts';
 import { retainedIntakeAcceptance } from '../intake-lookup-projection.ts';
 import {
@@ -155,16 +156,26 @@ for (const failure of ['rollback', 'release'] as const)
     DatabaseSync.prototype.prepare = function (sql: string) {
       if (this === f.db && sql.startsWith("UPDATE manual_batches SET status='verified'"))
         armed = true;
-      return originalPrepare.call(this, sql);
+      const statement = originalPrepare.call(this, sql);
+      if (this === f.db && sql === 'DELETE FROM temp.__record_changed') {
+        const run = statement.run;
+        statement.run = function (...parameters) {
+          if (armed && !failed && failure === 'release' && !f.db.isTransaction) {
+            failed = true;
+            throw Error('fictional release failure');
+          }
+          return Reflect.apply(run, this, parameters);
+        };
+      }
+      return statement;
     };
     DatabaseSync.prototype.exec = function (sql: string) {
       if (
         this === f.db &&
         armed &&
         !failed &&
-        (failure === 'rollback'
-          ? sql === "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'"
-          : sql === 'DELETE FROM __record_changed' && !this.isTransaction)
+        failure === 'rollback' &&
+        sql === "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'"
       ) {
         failed = true;
         throw Error('fictional ' + failure + ' failure');
@@ -226,16 +237,26 @@ for (const failure of ['rollback', 'release'] as const)
     DatabaseSync.prototype.prepare = function (sql: string) {
       if (this === f.db && sql.startsWith("UPDATE manual_batches SET status='verified'"))
         armed = true;
-      return originalPrepare.call(this, sql);
+      const statement = originalPrepare.call(this, sql);
+      if (this === f.db && sql === 'DELETE FROM temp.__record_changed') {
+        const run = statement.run;
+        statement.run = function (...parameters) {
+          if (armed && !failed && failure === 'release' && !f.db.isTransaction) {
+            failed = true;
+            throw Error('fictional grouped release failure');
+          }
+          return Reflect.apply(run, this, parameters);
+        };
+      }
+      return statement;
     };
     DatabaseSync.prototype.exec = function (sql: string) {
       if (
         this === f.db &&
         armed &&
         !failed &&
-        (failure === 'rollback'
-          ? sql === "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'"
-          : sql === 'DELETE FROM __record_changed' && !this.isTransaction)
+        failure === 'rollback' &&
+        sql === "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'"
       ) {
         failed = true;
         throw Error('fictional grouped ' + failure + ' failure');
@@ -300,6 +321,13 @@ for (const mismatch of [false, true])
       const workflow = view.child(intake, 'workflow')!;
       const prior = view.childAt(workflow, 'reportAcceptances', 0)!;
       const latest = view.childAt(workflow, 'reportAcceptances', 1)!;
+      const maximum = readNativeIntakeLookupTarget(
+        f.db,
+        source,
+        view,
+        'lookup-discovery-maximum',
+        [],
+      );
       const selected = selectedEnvelopeStore(f.db, source).collections;
       const operationId = randomUUID();
       selected.commitMaintenance(
@@ -322,6 +350,17 @@ for (const mismatch of [false, true])
               key: 'policy',
               value: INTAKE_LOOKUP_INDEX_POLICY,
             },
+            ...(maximum
+              ? [
+                  {
+                    area: 'builds' as const,
+                    collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+                    op: 'put' as const,
+                    key: schemaKey('lookup-discovery-maximum'),
+                    value: view.address(maximum),
+                  },
+                ]
+              : []),
             ...[
               { operation: 'fictional-retained', record: prior },
               { operation: f.input.operationId, record: mismatched ? prior : latest },

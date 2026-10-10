@@ -100,6 +100,7 @@ interface ReceiptAppendProof {
   before: string;
   after: string;
   rows: readonly { operation: string; address: string }[];
+  maximumAddress: string | null;
 }
 const receiptAppendProofs = new WeakMap<object, ReceiptAppendProof>();
 export function consumeWorkflowReceiptAppendProof(
@@ -109,7 +110,7 @@ export function consumeWorkflowReceiptAppendProof(
   reader: IntakeCollectionEnvelopeReader,
   before: string,
   after: string,
-): readonly { operation: string; address: string }[] | undefined {
+): Pick<ReceiptAppendProof, 'rows' | 'maximumAddress'> | undefined {
   const retained = receiptAppendProofs.get(proof);
   if (
     retained?.db === db &&
@@ -120,7 +121,7 @@ export function consumeWorkflowReceiptAppendProof(
     retained.after === after
   ) {
     receiptAppendProofs.delete(proof);
-    return retained.rows;
+    return { rows: retained.rows, maximumAddress: retained.maximumAddress };
   }
   return undefined;
 }
@@ -187,6 +188,7 @@ export async function prepareWorkflowAcceptanceDerived(
   const receiptRows = new Map<string, string>();
   let boundedReceiptRows = true,
     completeReceiptScope = false;
+  let maximumAddress: string | null | undefined;
   const candidates = new Map(
     input.affected.candidateChanges.map((item) => [item.versionAddress, item]),
   );
@@ -209,6 +211,10 @@ export async function prepareWorkflowAcceptanceDerived(
       input.onFacts?.(facts);
     },
     onAcceptanceLookupContribution(contribution, reader) {
+      if (contribution.index === 'lookup-discovery-maximum') {
+        maximumAddress = contribution.target ? reader.address(contribution.target) : null;
+        return;
+      }
       if (
         contribution.index !== 'lookup-acceptance-operation-first' ||
         !contribution.target ||
@@ -227,7 +233,8 @@ export async function prepareWorkflowAcceptanceDerived(
   });
   if (needsReview === undefined)
     throw Error('Acceptance requires a checked complete workflow summary');
-  const receiptAppend = boundedReceiptRows && completeReceiptScope ? {} : undefined;
+  const receiptAppend =
+    boundedReceiptRows && completeReceiptScope && maximumAddress !== undefined ? {} : undefined;
   if (receiptAppend) {
     const before = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
     receiptAppendProofs.set(receiptAppend, {
@@ -238,6 +245,7 @@ export async function prepareWorkflowAcceptanceDerived(
       before: JSON.stringify(before.logical),
       after: JSON.stringify(input.logical),
       rows: [...receiptRows].map(([operation, address]) => ({ operation, address })),
+      maximumAddress: maximumAddress!,
     });
   }
   return { changes, needsReview, receiptAppend };

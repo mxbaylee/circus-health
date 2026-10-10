@@ -279,17 +279,16 @@ for (const coupled of [false, true])
         ),
         undefined,
       );
-      assert.deepEqual(
-        consumeWorkflowReceiptAppendProof(
-          appendProof,
-          db,
-          source,
-          appendReader,
-          oldLogical,
-          appendLogical,
-        ),
-        [],
+      const consumedAppend = consumeWorkflowReceiptAppendProof(
+        appendProof,
+        db,
+        source,
+        appendReader,
+        oldLogical,
+        appendLogical,
       );
+      assert.deepEqual(consumedAppend?.rows, []);
+      assert.equal(consumedAppend?.maximumAddress, null);
       assert.equal(
         consumeWorkflowReceiptAppendProof(
           appendProof,

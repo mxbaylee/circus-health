@@ -22,6 +22,7 @@ import {
 import {
   openCollectionReportQueue,
   collectionReportGroupSummary,
+  type PreparedCollectionQueueGuard,
 } from './intake-report-group-collection.ts';
 import type { CollectionReportGroupReference } from './intake-queue-page-collection.ts';
 import { readCollectionQueueActivity } from './intake-queue-activity-collection.ts';
@@ -187,6 +188,7 @@ async function feedWindow(
     peopleAfter: string;
     cursor: (section: string, order: string) => string;
     assertRunning(): void;
+    preparedGuard: PreparedCollectionQueueGuard;
   },
 ) {
   const preparationStamp = reviewPreparationStamp(db);
@@ -232,6 +234,7 @@ async function feedWindow(
         cached.member,
         input.assertRunning,
         feed.artifacts.retain,
+        input.preparedGuard,
       );
       record.intakeVersion = fresh.version;
       record.reviewToken = fresh.reviewToken;
@@ -258,6 +261,7 @@ async function feedWindow(
         cached.member,
         input.assertRunning,
         feed.artifacts.retain,
+        input.preparedGuard,
       );
       record.detail = {
         kind: 'reference',
@@ -323,7 +327,15 @@ async function feedWindow(
     group.binding = queue.binding;
     const pointer = queue.findGroup(group.groupId, group.intakeId, group.ordinal);
     if (!pointer) throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report summary');
-    const summary = await collectionReportGroupSummary(db, root, profileId, queue, pointer);
+    const summary = await collectionReportGroupSummary(
+      db,
+      root,
+      profileId,
+      queue,
+      pointer,
+      undefined,
+      input.preparedGuard,
+    );
     group.bytes = Buffer.byteLength(canonicalLiteral(summary));
     groups.set(JSON.stringify([group.intakeId, group.ordinal]), group);
   }
@@ -340,7 +352,15 @@ async function feedWindow(
     } as CollectionReportGroupReference;
     const pointer = queue.findGroup(group.groupId, group.intakeId, group.ordinal);
     if (!pointer) throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report summary');
-    const summary = await collectionReportGroupSummary(db, root, profileId, queue, pointer);
+    const summary = await collectionReportGroupSummary(
+      db,
+      root,
+      profileId,
+      queue,
+      pointer,
+      undefined,
+      input.preparedGuard,
+    );
     group.bytes = Buffer.byteLength(canonicalLiteral(summary));
     peopleGroups.push(group);
     peopleLast = String(row.ordering);
@@ -356,7 +376,7 @@ async function feedWindow(
     {
       assertCurrent: () => {
         input.assertRunning();
-        queue.assertCurrent();
+        queue.assertPreparedGuard(input.preparedGuard);
         terminalActivity.assertCurrent();
       },
     },
@@ -432,6 +452,8 @@ export async function readCollectionImportFeed(
         queue = await openCollectionReportQueue(db, root, profileId),
         grounding = identityGroundingGeneration(db),
         epoch = feedEpochs.get(db) || 0;
+      const preparedGuard = queue.capturePreparedGuard(),
+        assertPreparedQueue = () => queue.assertPreparedGuard(preparedGuard);
       let scratch = disposableSqlite('circus-import-feed-');
       let signingKey: Buffer = randomBytes(32),
         artifacts = createClinicalReviewArtifactProof(scratch.db, 'clinical_artifacts');
@@ -535,6 +557,7 @@ export async function readCollectionImportFeed(
             peopleAfter,
             cursor,
             assertRunning,
+            preparedGuard,
           });
           successfulRead = true;
           return result;
@@ -651,6 +674,7 @@ export async function readCollectionImportFeed(
                 member,
                 assertRunning,
                 artifacts.retain,
+                preparedGuard,
               ),
               kind = feedKind(raw);
             if (
@@ -879,6 +903,8 @@ export async function readCollectionImportFeed(
                   profileId,
                   queue,
                   pointer,
+                  undefined,
+                  preparedGuard,
                 ),
                 order =
                   pointer.order +
@@ -959,6 +985,8 @@ export async function readCollectionImportFeed(
                     profileId,
                     queue,
                     pointer,
+                    undefined,
+                    preparedGuard,
                   ),
                   groupOrder =
                     pointer.order +
@@ -1013,7 +1041,15 @@ export async function readCollectionImportFeed(
               (input.intakeId && input.intakeId !== pointer.intakeId)
             )
               continue;
-            const summary = await collectionReportGroupSummary(db, root, profileId, queue, pointer),
+            const summary = await collectionReportGroupSummary(
+                db,
+                root,
+                profileId,
+                queue,
+                pointer,
+                undefined,
+                preparedGuard,
+              ),
               groupOrder =
                 pointer.order +
                 ':' +
@@ -1082,7 +1118,7 @@ export async function readCollectionImportFeed(
           totalRecords += Number(row.totalRecords);
           totalPeopleGroups += Number(row.totalPeopleGroups);
         }
-        queue.assertCurrent();
+        assertPreparedQueue();
         if (identityGroundingGeneration(db) !== grounding)
           throw new HttpError(
             409,
@@ -1142,6 +1178,7 @@ export async function readCollectionImportFeed(
           peopleAfter,
           cursor,
           assertRunning,
+          preparedGuard,
         });
         successfulRead = true;
         return result;

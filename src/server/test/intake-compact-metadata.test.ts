@@ -599,10 +599,25 @@ test(
     let mutateIndexedPhysical = false,
       indexedPhysicalMutation = false,
       consumedRecordPath = '';
+    let mutateIndexedRawPhysical = false,
+      indexedRawPhysicalMutation = false;
     let cancelHead = false,
       ownerClosed = false;
     const installAuthorizer = () =>
       db.setAuthorizer((action, table) => {
+        if (
+          mutateIndexedRawPhysical &&
+          action === constants.SQLITE_INSERT &&
+          table === '__record_transactions'
+        ) {
+          mutateIndexedRawPhysical = false;
+          indexedRawPhysicalMutation = true;
+          const original = readFileSync(consumedRecordPath),
+            changed = Buffer.from(original);
+          changed[0] = changed[0]! ^ 1;
+          writeFileSync(consumedRecordPath, changed);
+          writeFileSync(consumedRecordPath, original);
+        }
         if (
           mutateIndexedPhysical &&
           action === constants.SQLITE_INSERT &&
@@ -824,6 +839,18 @@ test(
       initial.detailsJson,
     );
     assert.equal(vault.verifyFile(path, original.length, sourceHash), true);
+    restoreAcceptedProjection();
+    mutateIndexedRawPhysical = true;
+    await assert.rejects(
+      prepareIntakeCompactMetadata(db, source),
+      /physical|authority|publication|callback/i,
+    );
+    assert.equal(
+      indexedRawPhysicalMutation,
+      true,
+      'raw mutation occurred inside a supported installed policy callback, not an external process',
+    );
+    assert.equal(storage.read('head')!.toString('utf8'), beforeRefusal);
     restoreAcceptedProjection();
     mutateIndexedPhysical = true;
     await assert.rejects(

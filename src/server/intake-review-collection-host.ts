@@ -795,6 +795,7 @@ function* prepareCollectionClinicalReviewWork(
     const originalPhysicalCount = Number(
       issueScratch.db.prepare('SELECT count(*) count FROM main.consumed_source_files').get()!.count,
     );
+    let projectionConsumptionScope: object | undefined;
     const assertPhysicalEvidenceCurrent = () => {
       let seen = 0;
       for (const row of issueScratch.db
@@ -1274,24 +1275,50 @@ function* prepareCollectionClinicalReviewWork(
       verifyProjectionEvidenceCooperatively: cooperativePhysical
         ? verifyPhysicalEvidenceCooperatively
         : undefined,
+      // The group owns the signed original union before speculative cross-member reads.
       beginProjectionConsumption() {
+        if (projectionConsumptionScope)
+          throw new HttpError(409, 'SOURCE_CHANGED', 'Clinical projection consumption is active');
         const last = issueScratch.db
           .prepare('SELECT COALESCE(max(rowid),0) AS ordinal FROM main.consumed_source_files')
           .get()!.ordinal;
+        const scope = {};
+        projectionConsumptionScope = scope;
+        let restored = false;
         return () => {
-          issueScratch.db.prepare('DELETE FROM main.consumed_source_files WHERE rowid>?').run(last);
+          if (restored) return;
+          if (projectionConsumptionScope !== scope)
+            throw new HttpError(409, 'SOURCE_CHANGED', 'Clinical projection consumption changed');
+          try {
+            issueScratch.db
+              .prepare('DELETE FROM main.consumed_source_files WHERE rowid>?')
+              .run(last);
+          } finally {
+            projectionConsumptionScope = undefined;
+            restored = true;
+          }
         };
       },
       *consumedArtifactIds() {
-        let seen = 0;
+        const scope = projectionConsumptionScope;
+        const assertScope = () => {
+          if (projectionConsumptionScope !== scope)
+            throw new HttpError(409, 'SOURCE_CHANGED', 'Clinical projection consumption changed');
+        };
+        let sealed = 0;
         for (const row of issueScratch.db
-          .prepare('SELECT id FROM main.consumed_source_files ORDER BY id')
+          .prepare('SELECT id,path,identity,seal FROM main.consumed_source_files ORDER BY id')
           .iterate()) {
+          assertScope();
           if (typeof row.id !== 'string') throw Error('Incomplete clinical consumed source');
-          seen++;
+          if (physicallySealed(row)) sealed++;
+          else if (!scope || row.path !== null || row.identity !== null || row.seal !== null)
+            throw Error('Incomplete clinical consumed source');
           yield row.id;
+          assertScope();
         }
-        if (seen !== originalPhysicalCount) throw Error('Incomplete clinical consumed source');
+        assertScope();
+        if (sealed !== originalPhysicalCount) throw Error('Incomplete clinical consumed source');
       },
       *verifiedArtifacts() {
         let seen = 0;

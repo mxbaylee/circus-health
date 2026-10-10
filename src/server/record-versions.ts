@@ -30,6 +30,7 @@ import {
   installVaultRecordHead,
   discardVaultRecordStaging,
   prepareVaultRecordStagingBacking,
+  prepareVaultRecordBackingAdvance,
   finishVaultRecordStagingPreparation,
   assertVaultRecordMetadataPrior,
   bindVaultRecordStagingTransaction,
@@ -1080,9 +1081,9 @@ function publish(
     );
     prepareVaultRecordHead(staging!);
     renewIntakeMaintenanceAfterIndex(db, operation.intakeMaintenance!, prior.indexed!);
-    installVaultRecordHead(staging!, encode(plan.ref));
-    if (!eq(readHead(config.storage), plan.ref))
-      fail('compact HEAD publication failed verification');
+    installVaultRecordHead(staging!, encode(plan.ref), prior.indexed!);
+    // The actual lexical installer authenticates HEAD readback itself. Do not
+    // re-enter a storage callback after the final publication/continuation seal.
     return {
       sequence: plan.commit.sequence,
       operationId: plan.commit.operationId,
@@ -1609,8 +1610,39 @@ const indexedPublications = new WeakMap<
     ref: RecordObjectReference;
     commit: RecordCommit;
     token: object;
+    backingConsumed?: boolean;
   }
 >();
+/** Read-only consumption of the private, exactly indexed preparation. No SQL,
+ * storage or policy callback may run after the publication's closing seal. */
+export function consumeRecordBackingAdvance(
+  db: Database,
+  proof: RecordIndexedPublication,
+  staging: VaultRecordStagingWitness,
+  head: string,
+): readonly string[] {
+  const data = indexedPublications.get(proof),
+    plan = data?.prior.plan,
+    authority = data && authorityWitnesses.get(data.prior.authority);
+  if (
+    !data ||
+    !plan ||
+    !authority ||
+    data.backingConsumed ||
+    data.db !== db ||
+    state.get(db) !== data.config ||
+    authority.staging !== staging ||
+    data.prior.indexed !== proof ||
+    !plan.consumed ||
+    data.token !== currentTransactionToken(db) ||
+    head !== stringifyRecordJson(plan.ref) + '\n' ||
+    data.ref !== plan.ref ||
+    data.commit !== plan.commit
+  )
+    fail('foreign installed backing transition');
+  data!.backingConsumed = true;
+  return plan!.versions.map((version) => version.versionId);
+}
 /** A count derived only from actual fixed index writes, never observed drift. */
 export function recordIndexedPublicationWrites(
   db: Database,
@@ -1707,6 +1739,7 @@ interface SourcePriorData {
   indexed?: RecordIndexedPublication;
   plan?: {
     pending: readonly PendingRecordVersion[];
+    versions: readonly DurableRecordVersion[];
     ref: RecordObjectReference;
     commit: RecordCommitV2;
     operation: { operationId: string; fingerprint: string; result: unknown };
@@ -1857,6 +1890,7 @@ export async function prepareRecordCompactPublication(
     recordVersionWorkMaximum('maxSegmentReferencesBuffered', page.length);
     if (page.length === SEGMENT_REFERENCE_WINDOW) await flushPage();
   };
+  const versions: DurableRecordVersion[] = [];
   for (const record of pending) {
     check();
     const version: DurableRecordVersion = {
@@ -1872,6 +1906,7 @@ export async function prepareRecordCompactPublication(
       references: null,
       ...record,
     };
+    versions.push(version);
     // The worker verified original references from authenticated history. This
     // derivative changes only metadata, not any original path/hash/byte column.
     const bytes = encode(version);
@@ -1900,10 +1935,12 @@ export async function prepareRecordCompactPublication(
     records: pending.length,
   };
   const ref = await stage(encode(commit));
+  await prepareVaultRecordBackingAdvance(staging, encode(ref).toString('utf8'), versions);
   await finishVaultRecordStagingPreparation(staging);
   check();
   prior.plan = {
     pending,
+    versions,
     ref,
     commit,
     operation: {

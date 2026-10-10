@@ -28,7 +28,7 @@ export function boundedIntakeLookupText(pieces: Iterable<string>): string {
 export function* intakeLookupContributions(
   db: DatabaseSync,
   view: IntakeCollectionEnvelopeReader,
-  scope: 'all' | 'acceptances' = 'all',
+  scope: 'all' | 'acceptances' | 'discovery' = 'all',
 ): Generator<WorkflowIndexContribution | WorkflowIndexProgress> {
   const intake = view.child(view.root(), 'intake');
   const workflow = intake && view.child(intake, 'workflow');
@@ -57,7 +57,7 @@ export function* intakeLookupContributions(
   const cast = db.prepare("SELECT CAST(json_extract(?,'$') AS INTEGER) n");
   cast.setReadBigInts(true);
   for (
-    let ordinal = 0, total = scope === 'all' ? count('reportGroups') : 0;
+    let ordinal = 0, total = scope !== 'acceptances' ? count('reportGroups') : 0;
     ordinal < total;
     ordinal++
   ) {
@@ -79,7 +79,9 @@ export function* intakeLookupContributions(
     }
     if (++visited % 64 === 0) yield { checkpoint: true };
   }
-  if (scope === 'all') yield { index: 'lookup-discovery-maximum', key: [], target: maximumGroup };
+  if (scope !== 'acceptances')
+    yield { index: 'lookup-discovery-maximum', key: [], target: maximumGroup };
+  if (scope === 'discovery') return;
   for (let ordinal = count('reportAcceptances') - 1; ordinal >= 0; ordinal--) {
     const acceptance = view.childAt(workflow, 'reportAcceptances', ordinal);
     if (!acceptance) throw Error('Intake lookup acceptance occurrence is unavailable');

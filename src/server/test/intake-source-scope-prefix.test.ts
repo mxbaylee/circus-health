@@ -1,9 +1,11 @@
 import nodeFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
+import { Worker } from 'node:worker_threads';
 import { attachPersonalDurability } from '../portable.ts';
 import { ensureProfileDirectories, profileOriginal } from '../profile-storage.ts';
 import { uploadIntake, proposeConversionRead } from '../intake.ts';
 import {
+  prepareCollectionClinicalReview,
   prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from '../intake-review-collection-host.ts';
@@ -437,83 +439,82 @@ for (const column of ['header', 'version', 'mac', 'ordinal'])
     },
   );
 
-for (const mutation of ['local-ABA', 'TEMP-schema', 'peer-ABA'] as const)
-  test(
-    'actual host prefix proof catches ' + mutation + ' after its last physical stat',
-    async (t) => {
-      const root = mkdtempSync(join(tmpdir(), 'fictional-source-prefix-host-')),
-        profile = 'fictional-prefix-host',
-        paths = ensureProfileDirectories(root, profile),
-        db = openDatabase(paths.database, profile);
-      attachPersonalDurability(db, { root, profileId: profile });
-      t.after(() => {
-        clearIntakeStateCache(db);
-        if (db.isOpen) db.close();
-        rmSync(root, { recursive: true, force: true });
-      });
-      const original = uploadIntake(db, root, profile, {
-        filename: 'fictional.txt',
-        bytes: Buffer.from('Fictional source report and patient'),
-        newProviderName: 'Fictional clinic',
-      });
-      await buildIntakeCollectionEnvelope(db, { id: original.id });
-      await proposeConversionRead(db, root, profile, original.id, {
-        version: original.version,
-        summary: 'Fictional scope evidence',
-        jsonlText: JSON.stringify({
-          format: 'health-record-v1',
-          id: 'fictional-host-record',
-          kind: 'record',
-          payload: 'Fictional result body',
-          clinical: { kind: 'document', title: 'Fictional evidence', subject: 'unknown' },
-          report: {
-            key: 'fictional-report',
-            title: 'Fictional report',
-            anchor: { locator: 'page1', text: 'Fictional report' },
-            subject: { locator: 'page1', text: 'Fictional patient' },
-          },
-          provenance: {
-            sourceSystem: 'Fictional issuer',
-            sourceRecordId: 'fictional-host-record',
-            capturedVia: null,
-            evidenceClass: 'provider_export',
-            locator: 'page1',
-          },
-          coverage: { status: 'complete_response', notes: [] },
-        }),
-      });
-      const proposalId = String(
-        db
-          .prepare(
-            "SELECT id FROM source_files WHERE kind='intake_proposal' ORDER BY rowid DESC LIMIT 1",
-          )
-          .get()!.id,
-      );
-      await prepareCollectionClinicalReviewDependencies(db, root, profile, original.id, proposalId);
-      db.exec('CREATE TABLE fictional_prefix_race(value TEXT)');
-      const file = db
-        .prepare('SELECT path FROM source_files WHERE id IN (?,?) ORDER BY id DESC LIMIT 1')
-        .get(original.id, proposalId)!;
-      const target = profileOriginal(root, String(file.path), profile);
-      using peer = new DatabaseSync(paths.database);
-      const before = {
-        raw: reviewReadStamp(db),
-        peer: db.prepare('PRAGMA data_version').get()!.data_version,
-        temp: db.prepare('PRAGMA temp.schema_version').get()!.schema_version,
-      };
-      const old = nodeFs.statSync,
-        oldStack = Error.stackTraceLimit;
-      let visits = 0,
-        injected = false,
-        after: { raw: string | undefined; peer: unknown; temp: unknown } | undefined;
-      Error.stackTraceLimit = 64;
-      Reflect.set(nodeFs, 'statSync', ((path, ...args) => {
-        const result = old(path, ...args);
-        if (
-          String(path) === target &&
-          new Error().stack?.includes('sourceScopePrefixProof') &&
-          ++visits === 2
-        ) {
+for (const mode of ['synchronous', 'cooperative'] as const)
+  for (const mutation of ['local-ABA', 'TEMP-schema', 'peer-ABA'] as const)
+    test(
+      mode + ' host prefix proof catches ' + mutation + ' after its last physical check',
+      async (t) => {
+        const root = mkdtempSync(join(tmpdir(), 'fictional-source-prefix-host-')),
+          profile = 'fictional-prefix-host',
+          paths = ensureProfileDirectories(root, profile),
+          db = openDatabase(paths.database, profile);
+        attachPersonalDurability(db, { root, profileId: profile });
+        t.after(() => {
+          clearIntakeStateCache(db);
+          if (db.isOpen) db.close();
+          rmSync(root, { recursive: true, force: true });
+        });
+        const original = uploadIntake(db, root, profile, {
+          filename: 'fictional.txt',
+          bytes: Buffer.from('Fictional source report and patient'),
+          newProviderName: 'Fictional clinic',
+        });
+        await buildIntakeCollectionEnvelope(db, { id: original.id });
+        await proposeConversionRead(db, root, profile, original.id, {
+          version: original.version,
+          summary: 'Fictional scope evidence',
+          jsonlText: JSON.stringify({
+            format: 'health-record-v1',
+            id: 'fictional-host-record',
+            kind: 'record',
+            payload: 'Fictional result body',
+            clinical: { kind: 'document', title: 'Fictional evidence', subject: 'unknown' },
+            report: {
+              key: 'fictional-report',
+              title: 'Fictional report',
+              anchor: { locator: 'page1', text: 'Fictional report' },
+              subject: { locator: 'page1', text: 'Fictional patient' },
+            },
+            provenance: {
+              sourceSystem: 'Fictional issuer',
+              sourceRecordId: 'fictional-host-record',
+              capturedVia: null,
+              evidenceClass: 'provider_export',
+              locator: 'page1',
+            },
+            coverage: { status: 'complete_response', notes: [] },
+          }),
+        });
+        const proposalId = String(
+          db
+            .prepare(
+              "SELECT id FROM source_files WHERE kind='intake_proposal' ORDER BY rowid DESC LIMIT 1",
+            )
+            .get()!.id,
+        );
+        await prepareCollectionClinicalReviewDependencies(
+          db,
+          root,
+          profile,
+          original.id,
+          proposalId,
+        );
+        db.exec('CREATE TABLE fictional_prefix_race(value TEXT)');
+        using peer = new DatabaseSync(paths.database);
+        const file = db
+          .prepare('SELECT path FROM source_files WHERE id IN (?,?) ORDER BY id DESC LIMIT 1')
+          .get(original.id, proposalId)!;
+        const target = profileOriginal(root, String(file.path), profile);
+        const before = {
+          raw: reviewReadStamp(db),
+          peer: db.prepare('PRAGMA data_version').get()!.data_version,
+          temp: db.prepare('PRAGMA temp.schema_version').get()!.schema_version,
+        };
+        let visits = 0,
+          pageReplies = 0,
+          injected = false,
+          after: { raw: string | undefined; peer: unknown; temp: unknown } | undefined;
+        const mutate = () => {
           if (mutation === 'local-ABA')
             db.exec(
               "INSERT INTO fictional_prefix_race VALUES('fictional');DELETE FROM fictional_prefix_race",
@@ -532,29 +533,76 @@ for (const mutation of ['local-ABA', 'TEMP-schema', 'peer-ABA'] as const)
             temp: db.prepare('PRAGMA temp.schema_version').get()!.schema_version,
           };
           injected = true;
+        };
+        if (mode === 'synchronous') {
+          const old = nodeFs.statSync,
+            oldStack = Error.stackTraceLimit;
+          Error.stackTraceLimit = 64;
+          Reflect.set(nodeFs, 'statSync', ((path, ...args) => {
+            const result = old(path, ...args);
+            if (
+              String(path) === target &&
+              new Error().stack?.includes('sourceScopePrefixProof') &&
+              ++visits === 2
+            )
+              mutate();
+            return result;
+          }) as typeof nodeFs.statSync);
+          syncBuiltinESMExports();
+          try {
+            assert.throws(
+              () => prepareCollectionClinicalReview(db, root, profile, original.id, proposalId),
+              /Clinical source scope authority changed during verification/,
+            );
+          } finally {
+            Reflect.set(nodeFs, 'statSync', old);
+            syncBuiltinESMExports();
+            Error.stackTraceLimit = oldStack;
+          }
+        } else {
+          const workerEvents = Worker.prototype as unknown as {
+            emit(event: string | symbol, ...args: unknown[]): boolean;
+          };
+          const originalEmit = workerEvents.emit;
+          workerEvents.emit = function (event, ...args) {
+            const message = args[0];
+            if (
+              event === 'message' &&
+              message !== null &&
+              typeof message === 'object' &&
+              typeof (message as { count?: unknown }).count === 'number'
+            )
+              pageReplies++;
+            return originalEmit.call(this, event, ...args);
+          };
+          try {
+            await assert.rejects(
+              prepareCollectionClinicalReviewAsync(db, root, profile, original.id, proposalId, {
+                assertRunning() {
+                  if (
+                    pageReplies > 0 &&
+                    !injected &&
+                    new Error().stack?.includes('verifyPhysicalEvidenceCooperatively')
+                  )
+                    mutate();
+                },
+              }),
+              { code: 'SOURCE_CHANGED' },
+            );
+          } finally {
+            workerEvents.emit = originalEmit;
+          }
+          assert.ok(pageReplies > 0);
         }
-        return result;
-      }) as typeof nodeFs.statSync);
-      syncBuiltinESMExports();
-      try {
-        await assert.rejects(
-          prepareCollectionClinicalReviewAsync(db, root, profile, original.id, proposalId),
-          /Clinical source scope authority changed during verification/,
-        );
-      } finally {
-        Reflect.set(nodeFs, 'statSync', old);
-        syncBuiltinESMExports();
-        Error.stackTraceLimit = oldStack;
-      }
-      assert.equal(injected, true);
-      assert.ok(after);
-      assert.notEqual(after.raw, before.raw);
-      if (mutation === 'peer-ABA') assert.notEqual(after.peer, before.peer);
-      if (mutation === 'TEMP-schema') assert.notEqual(after.temp, before.temp);
-      assert.equal(db.prepare('SELECT count(*) n FROM fictional_prefix_race').get()!.n, 0);
-      assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
-    },
-  );
+        assert.equal(injected, true);
+        assert.ok(after);
+        assert.notEqual(after.raw, before.raw);
+        if (mutation === 'peer-ABA') assert.notEqual(after.peer, before.peer);
+        if (mutation === 'TEMP-schema') assert.notEqual(after.temp, before.temp);
+        assert.equal(db.prepare('SELECT count(*) n FROM fictional_prefix_race').get()!.n, 0);
+        assert.deepEqual(reviewIssueScratchCounts(db), { databases: 0, scopes: 0, rows: 0 });
+      },
+    );
 
 test('native prefix preserves raw numeric boundary tokens and missing member distinct from null', async (t) => {
   const f = await fixture(t, 4, 256 * 1024, false, 'raw-number');

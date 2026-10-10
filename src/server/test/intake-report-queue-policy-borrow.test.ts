@@ -34,6 +34,10 @@ import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { reviewReadStamp } from '../intake-clinical-review-read-cache.ts';
 import { reviewIssueScratchCounts } from '../intake-review-issue-state.ts';
 import { canonicalReviewValueChunks } from '../intake-review-question-state.ts';
+import {
+  execClinicalReviewMaintenance,
+  runClinicalReviewMaintenance,
+} from '../clinical-review-maintenance.ts';
 
 function fixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-queue-policy-borrow-')),
@@ -271,6 +275,58 @@ for (const count of [4, 16] as const)
       });
     },
   );
+
+test('queued review continuation credits only certified disposable maintenance', async (t) => {
+  const f = fixture(t);
+  execClinicalReviewMaintenance(
+    f.db,
+    'attention',
+    'CREATE TEMP TABLE IF NOT EXISTS source_attention_counts_v1(source_id TEXT PRIMARY KEY,sections INTEGER NOT NULL)',
+  );
+  const neutral = await openCollectionReportQueue(f.db, f.root, f.profileId);
+  const assertNeutralPrepared = neutral.capturePreparedGuard();
+  runClinicalReviewMaintenance(
+    f.db,
+    'attention',
+    'INSERT OR REPLACE INTO source_attention_counts_v1 VALUES(?,?)',
+    'fictional-certified-attention',
+    0,
+  );
+  neutral.assertPreparedGuard(assertNeutralPrepared);
+  assert.throws(() => neutral.assertCurrent(), { code: 'REPORT_QUEUE_CURSOR' });
+  neutral.close({ discard: true });
+  assert.throws(() => neutral.assertPreparedGuard(assertNeutralPrepared), {
+    code: 'REPORT_QUEUE_CURSOR',
+  });
+
+  const foreign = await openCollectionReportQueue(f.db, f.root, f.profileId);
+  const assertForeignPrepared = foreign.capturePreparedGuard();
+  f.db.exec('CREATE TEMP TABLE fictional_foreign_queue_cache(n INTEGER)');
+  assert.throws(() => foreign.assertPreparedGuard(assertForeignPrepared), {
+    code: 'REPORT_QUEUE_CURSOR',
+  });
+  foreign.close({ discard: true });
+
+  const methods = await openCollectionReportQueue(f.db, f.root, f.profileId);
+  const assertMethodsPrepared = methods.capturePreparedGuard();
+  assert.throws(() => methods.assertPreparedGuard(assertForeignPrepared), {
+    code: 'REPORT_QUEUE_CURSOR',
+  });
+  const beforeTransaction = methods.capturePreparedGuard();
+  f.db.exec('BEGIN');
+  try {
+    assert.throws(() => methods.assertPreparedGuard(beforeTransaction), {
+      code: 'REPORT_QUEUE_CURSOR',
+    });
+  } finally {
+    f.db.exec('ROLLBACK');
+  }
+  f.db.setAuthorizer(null);
+  assert.throws(() => methods.assertPreparedGuard(assertMethodsPrepared), {
+    code: 'REPORT_QUEUE_CURSOR',
+  });
+  methods.close({ discard: true });
+});
 
 test(
   'actual users pin protects retained policy across fifth database LRU churn and releases only its lease',

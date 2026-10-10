@@ -51,9 +51,150 @@ import {
   assertIntakeDiscoveryRevision,
   preparedIntakeLookupReadToken,
   preparedIntakeDiscoveryRevision,
+  INTAKE_LOOKUP_INDEX_COLLECTION,
+  INTAKE_LOOKUP_INDEX_POLICY,
 } from '../intake-lookup-state.ts';
 
 const summaryOptions = { mappingVersion: 'fictional-v1', isSourceContextVersion: () => false };
+
+for (const mode of ['warm', 'cold', 'unprepared'] as const)
+  test(`a claimed complete ${mode} native index cannot erase a genuine discovery maximum`, async (t) => {
+    const f = await fixture(
+      t,
+      JSON.stringify({
+        intake: {
+          version: 0,
+          workflow: {
+            format: 'health-intake-workflow-v1',
+            reportGroups: [{ id: 'fictional-discovery-group', discoveryOrder: 7, versions: [] }],
+          },
+        },
+      }),
+    );
+    await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+    await prepareIntakeLookupIndices(f.db);
+    assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
+    const view = openIntakeCollectionEnvelope(f.db, f.source),
+      collections = selectedEnvelopeStore(f.db, f.source).collections,
+      operationId = randomUUID();
+    collections.commitMaintenance(
+      collections.prepare(collections.openView(), {
+        operationId,
+        requestDigest: createHash('sha256').update(operationId).digest('hex'),
+        domainVersion: 0,
+        changes: [
+          {
+            area: 'builds',
+            collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+            op: 'put',
+            key: 'complete',
+            value: JSON.stringify(view.logical),
+          },
+          {
+            area: 'builds',
+            collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+            op: 'put',
+            key: 'policy',
+            value: INTAKE_LOOKUP_INDEX_POLICY,
+          },
+          {
+            area: 'builds',
+            collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+            op: 'delete',
+            key: schemaKey('lookup-discovery-maximum'),
+          },
+        ],
+      }),
+    );
+    const current = openIntakeCollectionEnvelope(f.db, f.source),
+      intake = current.child(current.root(), 'intake')!,
+      workflow = current.child(intake, 'workflow')!,
+      group = current.childAt(workflow, 'reportGroups', 0)!;
+    assert.equal(current.field(group, 'discoveryOrder').kind, 'value');
+    assert.equal(JSON.parse([...current.fieldChunks(group, 'discoveryOrder')].join('')), 7);
+    if (mode !== 'warm') clearIntakeLookupCache(f.db);
+    let answer: number | null;
+    try {
+      if (mode !== 'unprepared') await prepareIntakeLookupIndices(f.db);
+      answer = maximumIntakeDiscoveryOrder(f.db);
+    } catch (error) {
+      assert.match(
+        String(error),
+        /lookup.*(?:incomplete|unavailable|changed)|native catalog.*changed|semantic indexes/i,
+      );
+      return;
+    }
+    assert.equal(answer, 7, 'A disposable completeness claim cannot supply a false negative');
+  });
+
+for (const mode of ['direct', 'fallback'] as const)
+  test(`native receipt hydration keeps its original ${mode} earliest-source selection`, async (t) => {
+    const receipt = (marker: string) =>
+      JSON.stringify({
+        intake: {
+          version: 0,
+          workflow: {
+            format: 'health-intake-workflow-v1',
+            reportAcceptances: [{ receipt: { operationId: 'fictional-target' }, marker }],
+          },
+        },
+      });
+    const f = await fixture(t, receipt('first'));
+    registerRawIntakeFixture(f.db, 'fictional-competing-original', receipt('second'));
+    await buildIntakeCollectionEnvelope(f.db, { id: 'fictional-competing-original' });
+    await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+    await buildVerifiedWorkflowSummary(
+      f.db,
+      { id: 'fictional-competing-original' },
+      summaryOptions,
+    );
+    if (mode === 'direct') await prepareIntakeLookupIndices(f.db);
+    assert.equal(!!preparedIntakeLookupReadToken(f.db), mode === 'direct');
+    assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-target'), {
+      receipt: { operationId: 'fictional-target' },
+      marker: 'first',
+    });
+    assert.equal(retainedIntakeAcceptance(f.db, 'fictional-missing'), null);
+    const original = StatementSync.prototype.get;
+    let changed = false;
+    StatementSync.prototype.get = function (
+      this: StatementSync,
+      ...parameters: Parameters<StatementSync['get']>
+    ) {
+      const row = Reflect.apply(original, this, parameters);
+      if (
+        !changed &&
+        this.sourceSQL ===
+          (mode === 'direct'
+            ? 'SELECT total_changes() AS count'
+            : 'SELECT id,kind,sha256,details_json FROM source_files WHERE id=?') &&
+        new Error().stack?.includes('recordChunks')
+      ) {
+        changed = true;
+        transaction(f.db, () =>
+          f.db
+            .prepare('UPDATE source_files SET rowid=0 WHERE id=?')
+            .run('fictional-competing-original'),
+        );
+      }
+      return row;
+    } as typeof StatementSync.prototype.get;
+    try {
+      assert.throws(
+        () => retainedIntakeAcceptance(f.db, 'fictional-target'),
+        /native catalog frontier changed|projection answer witness changed/,
+      );
+    } finally {
+      StatementSync.prototype.get = original;
+    }
+    assert.equal(changed, true, 'The competing original must change during payload hydration');
+    await prepareIntakeLookupIndices(f.db);
+    assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-target'), {
+      receipt: { operationId: 'fictional-target' },
+      marker: 'second',
+    });
+    assert.equal(retainedIntakeAcceptance(f.db, 'fictional-missing'), null);
+  });
 
 for (const mode of ['native-only', 'mixed'] as const)
   test(`native fallback maximum refuses a late selected-head change in ${mode} lookup`, async (t) => {
