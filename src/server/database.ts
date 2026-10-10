@@ -32,6 +32,7 @@ import { intakeStateTerminalOutcome } from './intake-state-storage.ts';
 import {
   recordTerminalDurabilityParticipant,
   recordPreparedReplayCurrent,
+  recordPreparedMaintenanceReplayVerified,
   recordPreparationBeforeBookkeeping,
   recordTransactionPreparationRequested,
   recordTransactionPreparationCaptured,
@@ -1169,31 +1170,50 @@ export function executeRecordReplay<T>(
   const item = recordReplays.get(capability)!;
   item.used = true;
   const token = Object.freeze({});
-  let committed = false;
+  let committed = false,
+    maintenance = false,
+    failed = false,
+    firstFailure: unknown,
+    result: T | undefined;
   terminalExecution(db, 'BEGIN IMMEDIATE');
   transactionTokens.set(db, token);
   try {
     for (const observer of startObservers.get(db) ?? []) observer(token);
-    const result = body(token);
+    result = body(token);
     if (
       result &&
       (typeof result === 'object' || typeof result === 'function') &&
       ('then' in result || Symbol.iterator in result || Symbol.asyncIterator in result)
     )
       throw Error('Record replay requires synchronous nonescaping work');
+    maintenance = recordPreparedMaintenanceReplayVerified(db, item.original, token);
     terminalExecution(db, 'COMMIT');
     committed = true;
-    return result;
+  } catch (error) {
+    failed = true;
+    firstFailure = error;
   } finally {
     try {
       if (!committed && db.isTransaction) terminalExecution(db, 'ROLLBACK');
+    } catch (error) {
+      if (!failed) {
+        failed = true;
+        firstFailure = error;
+      }
     } finally {
       transactionFailures.delete(db);
       terminalTransactionGuards.delete(db);
       transactionTokens.delete(db);
-      item.outcome = Object.freeze({ token, committed, succeeded: committed });
+      item.outcome = Object.freeze({
+        token,
+        committed,
+        succeeded: committed,
+        ...(committed && maintenance ? { intakeMaintenance: true as const } : {}),
+      });
     }
   }
+  if (failed) throw firstFailure;
+  return result as T;
 }
 /** Notifications are not publication authority. They run only after the finite
  * scope expires; mutation by one cannot certify a later child's originals. */

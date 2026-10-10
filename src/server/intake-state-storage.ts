@@ -140,7 +140,11 @@ function remember(cache: Cache, target: Map<string, CachedBasis>, key: string, v
 export function clearIntakeStateCache(db: Database): void {
   clearIntakeCaches(db, true);
 }
-function clearIntakeCaches(db: Database, releaseReviewScratch: boolean): void {
+function clearIntakeCaches(
+  db: Database,
+  releaseReviewScratch: boolean,
+  preparedToken?: object,
+): void {
   const terminal = terminalCleanups.get(db);
   if (terminal) {
     terminal.pending = true;
@@ -161,7 +165,7 @@ function clearIntakeCaches(db: Database, releaseReviewScratch: boolean): void {
   clearCollectionQueueReviews(db);
   if (releaseReviewScratch) clearReviewIssueScratch(db);
   clearIntakeCollectionCache(db);
-  clearIntakeMaintenancePublications(db);
+  clearIntakeMaintenancePublications(db, preparedToken);
   clearIntakeLegacyBridgeProofs(db);
   const cache = caches.get(db);
   if (!cache) return;
@@ -207,7 +211,11 @@ function cacheFor(db: Database): Cache {
           // A rollback invalidates cached/prepared state, but does not own
           // caller-held review sessions. Their original physical proofs must
           // survive for a retry; their normal authority guards still run.
-          clearIntakeCaches(db, false);
+          clearIntakeCaches(
+            db,
+            false,
+            outcome.prepared && !outcome.committed ? outcome.token : undefined,
+          );
           return;
         }
         if (outcome.token !== owned.token) return;

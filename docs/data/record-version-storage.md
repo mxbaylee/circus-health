@@ -59,6 +59,15 @@ authorization observers run during preparation, and changes to their membership
 refuse replay; their mutable closure behavior is not freshly reevaluated during
 changeset preflight or final replay.
 
+The same private path supports verified plain intake-maintenance publications.
+It retains the exact preparatory capability across only its genuine rollback,
+then requires a distinct issuer-bound final token, unchanged source bindings and
+the frozen write roster. General revision advances while clinical-review
+revision stays unchanged. Explicit invalidation, lock and unrelated rollback
+still revoke retained preparations. Compact-metadata and legacy representation
+bridges retain their specialized paths; this support does not activate public
+ownership checkpoints by itself.
+
 ## Current data and searchable history
 
 SQLite is a disposable, indexed projection containing both current records and retained version history. The current view selects the latest accepted version in committed order. Record history is a normal query, not an offline backup-restoration workflow. Index by profile, entity/record, version/sequence and time, with a field-change index or equivalent for queries such as **When did I change my birthday?**

@@ -67,6 +67,13 @@ import {
   consumeIntakeMaintenancePriorFields,
   sealIntakeMaintenancePriorFields,
   renewIntakeMaintenanceAfterIndex,
+  captureIntakeMaintenancePreparation,
+  assertIntakeMaintenancePreparation,
+  beginIntakeMaintenanceReplay,
+  verifyIntakeMaintenanceReplay,
+  discardIntakeMaintenancePreparation,
+  intakeMaintenanceReplayStatements,
+  type IntakeMaintenancePreparation,
 } from './intake-state-maintenance.ts';
 import {
   captureVaultRecordStaging,
@@ -382,9 +389,13 @@ interface TransactionPreparationData {
   recipe: ReturnType<typeof createRecordMutationRecipe>;
   token?: object;
   resultJson?: string;
+  maintenance?: IntakeMaintenancePreparation;
+  replayToken?: object;
+  replayMaintenanceVerified?: boolean;
   total?: bigint;
   tentativeStart?: bigint;
   tentativeWrites?: bigint;
+  businessWrites?: bigint;
   expectedTentativeWrites?: bigint;
   captureRows?: number | bigint;
   released?: boolean;
@@ -676,6 +687,32 @@ export function recordPreparedReplayCurrent(db: Database, token: object): boolea
     transactionDurabilityParticipantCurrent(db, recordParticipants.get(db))
   );
 }
+/** Only the core's exact released T1 may enter its own fresh T2. */
+export function recordPreparedMaintenanceReplayCurrent(
+  db: Database,
+  original: object,
+  token: object,
+): boolean {
+  const proof = preparedPublicationTokens.get(original);
+  return (
+    recordPreparedReplayCurrent(db, original) &&
+    !!proof?.maintenance &&
+    proof.replayToken === token &&
+    token !== original &&
+    db.isTransaction &&
+    currentTransactionToken(db) === token
+  );
+}
+export function recordPreparedMaintenanceReplayVerified(
+  db: Database,
+  original: object,
+  token: object,
+): boolean {
+  return (
+    recordPreparedMaintenanceReplayCurrent(db, original, token) &&
+    preparedPublicationTokens.get(original)?.replayMaintenanceVerified === true
+  );
+}
 function discardPreparedPublicationObservers(proof: TransactionPreparationData): void {
   if (proof.token) preparedPublicationTokens.delete(proof.token);
   const observers = proof.observers;
@@ -719,6 +756,7 @@ function closeTransactionPreparationResources(proof: TransactionPreparationData)
   discardPreparedPublicationObservers(proof);
   let failure: unknown;
   for (const close of [
+    () => proof.maintenance && discardIntakeMaintenancePreparation(proof.maintenance),
     () => proof.recipe.close(),
     () => proof.rows.close(),
     () => proof.indexRows?.close(),
@@ -956,6 +994,7 @@ export function recordPreparationBeforeBookkeeping(
   const total = Reflect.apply(readmissionPrepare, db, ['SELECT total_changes() AS n']);
   total.setReadBigInts(true);
   const business = proof.recipe.writes();
+  proof.businessWrites = business;
   if (Reflect.apply(readmissionGet, total, []).n !== proof.tentativeStart! + business)
     fail('record preparatory unowned prepublication write');
   const read = Reflect.apply(readmissionPrepare, db, ['SELECT 1 FROM main.app_meta WHERE key=?']),
@@ -966,16 +1005,13 @@ export function recordPreparationBeforeBookkeeping(
     fail('record preparatory revision absent');
   const clinicalInsert = !Reflect.apply(readmissionGet, read, ['clinical_review_revision']),
     keys = ['revision', 'curation_revision'];
-  if (clinicalInsert || operation.actor !== 'source-text') keys.push('clinical_review_revision');
+  const clinicalUpdate = operation.actor !== 'source-text' && !operation.intakeMaintenance;
+  if (clinicalInsert || clinicalUpdate) keys.push('clinical_review_revision');
   let captureWrites = 0n;
   for (const key of keys)
     if (!Reflect.apply(readmissionGet, captured, [stringifyRecordJson([key])])) captureWrites++;
   proof.expectedTentativeWrites =
-    business +
-    captureWrites +
-    2n +
-    BigInt(clinicalInsert) +
-    BigInt(operation.actor !== 'source-text');
+    business + captureWrites + 2n + BigInt(clinicalInsert) + BigInt(clinicalUpdate);
   if (Reflect.apply(readmissionGet, total, []).n !== proof.tentativeStart! + business)
     fail('record preparatory bookkeeping compilation wrote SQL');
 }
@@ -1260,13 +1296,16 @@ function prepareTransaction<T>(
     !participant ||
     !transactionDurabilityParticipantCurrent(db, participant) ||
     db.isTransaction ||
-    operation.intakeMaintenance
+    (operation.intakeMaintenance && !backing)
   )
     fail('record transaction preparation requires an idle genuine record owner');
   if (backing && (backing.config !== config || backing.methods !== methods))
     fail('record transaction original backing owner changed');
   const operationJson = stringifyRecordJson(operation),
-    selectedOperation = Object.freeze(parseRecordJson<TransactionOperation>(operationJson)),
+    selectedOperation = Object.freeze({
+      ...parseRecordJson<TransactionOperation>(operationJson),
+      ...(operation.intakeMaintenance ? { intakeMaintenance: operation.intakeMaintenance } : {}),
+    }),
     operationId = selectedOperation.operationId ?? randomUUID(),
     originalState = backing?.originalState ?? readStatusRow(db),
     rows = createRecordPreparedRows();
@@ -2022,6 +2061,8 @@ export async function commitRecordTransactionPreparation<T>(
   check();
   const preparedResult = parseRecordJson<T>(admitted.resultJson!);
   check();
+  if (admitted.maintenance) assertIntakeMaintenancePreparation(db, admitted.maintenance);
+  check();
   await admitted.recipe.prepareReplay();
   check();
   // Every caller/policy compilation effect has completed. Both workers retain
@@ -2045,6 +2086,7 @@ export async function commitRecordTransactionPreparation<T>(
         check();
         return withTerminalStatements(db, statements, () =>
           executeRecordReplay(db, replay, (token) => {
+            admitted.replayToken = token;
             const total = () =>
               terminalStatement(db, 'SELECT total_changes() AS n', undefined, true).get()!
                 .n as bigint;
@@ -2055,7 +2097,18 @@ export async function commitRecordTransactionPreparation<T>(
             )
               fail('record replay began with unowned captured rows');
             if (admitted.staging) bindVaultRecordStagingTransaction(admitted.staging);
+            if (admitted.maintenance) beginIntakeMaintenanceReplay(db, admitted.maintenance, token);
             replayTerminalRecordMutations(db, admitted.recipe);
+            if (admitted.maintenance) {
+              verifyIntakeMaintenanceReplay(
+                db,
+                admitted.maintenance,
+                token,
+                admitted.resultJson!,
+                start + admitted.businessWrites!,
+              );
+              admitted.replayMaintenanceVerified = true;
+            }
             const metaWrite = (key: string, kinds: Array<'insert' | 'update'>, run: () => void) => {
               const expected = expectIntakeFrontierMetaWrite(db, key, kinds);
               let succeeded = false;
@@ -2079,7 +2132,7 @@ export async function commitRecordTransactionPreparation<T>(
             } finally {
               finishIntakeFrontierMetaWrite(db, clinical, inserted);
             }
-            if (admitted.operation.actor !== 'source-text')
+            if (admitted.operation.actor !== 'source-text' && !admitted.maintenance)
               metaWrite('clinical_review_revision', ['update'], () =>
                 terminalExecution(
                   db,
@@ -2117,11 +2170,37 @@ export async function commitRecordTransactionPreparation<T>(
             }
             if (total() - start !== admitted.tentativeWrites! + admitted.indexWrites!)
               fail('record replay indexed interval differs');
+            let maintenanceWrites: bigint | undefined;
+            if (admitted.maintenance) {
+              const keys = intakeFrontierOwnedMetadataKeys(db, token),
+                bookkeeping = admitted.indexBookkeeping;
+              if (keys && bookkeeping?.metadataOnly) {
+                const capturedKeys = new Set([...keys].map((key) => stringifyRecordJson([key])));
+                let exact = true;
+                for (const row of terminalStatement(
+                  db,
+                  'SELECT entity,record_id FROM __record_changed',
+                ).iterate())
+                  if (row.entity !== 'app_meta' || !capturedKeys.delete(row.record_id as string))
+                    exact = false;
+                const indexedKeys = new Set([...keys].filter((key) => !internalKey(key)));
+                if (
+                  exact &&
+                  capturedKeys.size === 0 &&
+                  BigInt(keys.size) === BigInt(admitted.captureRows!) &&
+                  indexedKeys.size === bookkeeping.metadataKeys.size &&
+                  [...indexedKeys].every((key) => bookkeeping.metadataKeys.has(key))
+                )
+                  maintenanceWrites = bookkeeping.writes + 2n * BigInt(keys.size);
+              }
+            }
             if (
               BigInt(clearIntakeFrontierRecordCapture(db, capture)) !==
               BigInt(admitted.captureRows!)
             )
               fail('record replay captured membership differs');
+            if (maintenanceWrites !== undefined)
+              maintenanceBookkeeping.set(db, { token, writes: maintenanceWrites });
             assertClinicalOperation(db, admitted.clinicalOperation);
             originals.current(assertions);
             if (
@@ -3610,6 +3689,9 @@ export function attachRecordDurability(
           statements: [
             ...new Set([
               ...preparation.recipe.sql(),
+              ...(operation.intakeMaintenance
+                ? intakeMaintenanceReplayStatements().map((statement) => statement.sql)
+                : []),
               'SELECT total_changes() AS n',
               'SELECT * FROM __record_state WHERE singleton=1',
               'SELECT commit_json FROM __record_transactions WHERE sequence=?',
@@ -3672,6 +3754,13 @@ export function attachRecordDurability(
         preparation.total = before;
         preparation.token = token;
         preparingTokens.set(token!, preparation);
+        if (operation.intakeMaintenance)
+          preparation.maintenance = captureIntakeMaintenancePreparation(
+            db,
+            operation.intakeMaintenance,
+            token!,
+            operation,
+          );
         return;
       }
       const prior = operation.intakeMaintenance

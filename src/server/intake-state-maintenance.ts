@@ -4,6 +4,7 @@ import {
   currentTransactionToken,
   installTransactionTerminalGuard,
   managedDatabaseMethodEpoch,
+  type TransactionOperation,
 } from './database.ts';
 import {
   recordDurabilityStatus,
@@ -17,6 +18,9 @@ import {
   withRecordCompactTerminal,
   prepareRecordCompactReadmission,
   type RecordCompactReadmission,
+  recordTransactionPreparationCaptured,
+  recordPreparedReplayCurrent,
+  recordPreparedMaintenanceReplayCurrent,
 } from './record-versions.ts';
 import { currentClinicalOperation, assertClinicalOperation } from './clinical-operation.ts';
 import {
@@ -51,6 +55,29 @@ export interface IntakeMaintenancePublication {
 export interface IntakeMaintenanceWrite {
   readonly key: string;
   readonly value: string;
+}
+declare const maintenancePreparationBrand: unique symbol;
+/** Frozen auxiliary publication retained from a genuine record T1 rollback. */
+export interface IntakeMaintenancePreparation {
+  readonly [maintenancePreparationBrand]: true;
+}
+interface PreparedPublication {
+  db: DatabaseSync;
+  originalToken: object;
+  methods: object;
+  identity: IntakeStateIdentity;
+  headKey: string;
+  beforeHead: string;
+  afterHead: string;
+  source: string;
+  sourcePin: string | undefined;
+  writes: ReadonlyMap<string, string>;
+  result: string;
+  mainSchema: number;
+  tempSchema: number;
+  bytes: number;
+  token?: object;
+  verified?: boolean;
 }
 interface Candidate {
   identity: IntakeStateIdentity;
@@ -114,6 +141,11 @@ interface Retained {
 }
 const publications = new WeakMap<IntakeMaintenancePublication, Publication>();
 const retained = new WeakMap<DatabaseSync, Retained>();
+const preparedPublications = new WeakMap<IntakeMaintenancePreparation, PreparedPublication>();
+const preparedRetained = new WeakMap<
+  DatabaseSync,
+  { entries: Map<IntakeMaintenancePreparation, PreparedPublication>; bytes: number }
+>();
 /** Capture before the terminal transaction disposes its original preparation. */
 export function prepareIntakeCompactReadmission(
   db: DatabaseSync,
@@ -223,8 +255,23 @@ function remove(capability: IntakeMaintenancePublication): void {
   const state = retained.get(publication.db);
   if (state?.entries.delete(capability)) state.bytes -= publication.bytes;
 }
+/** Expire an issued handle even when preparation failed before entering T1. */
+export function discardIntakeMaintenancePublication(
+  capability: IntakeMaintenancePublication,
+): void {
+  remove(capability);
+}
 /** Also called on storage invalidation/lock; expired handles can never regain authority. */
-export function clearIntakeMaintenancePublications(db: DatabaseSync): void {
+export function clearIntakeMaintenancePublications(db: DatabaseSync, preparedToken?: object): void {
+  const preparations = preparedRetained.get(db);
+  for (const [capability, proof] of preparations?.entries ?? [])
+    if (
+      !preparedToken ||
+      proof.originalToken !== preparedToken ||
+      !recordPreparedReplayCurrent(db, preparedToken)
+    )
+      discardIntakeMaintenancePreparation(capability);
+  if (!preparations?.entries.size) preparedRetained.delete(db);
   const state = retained.get(db);
   if (!state) return;
   for (const capability of state.entries.keys()) remove(capability);
@@ -372,6 +419,218 @@ function selected(db: DatabaseSync, capability: IntakeMaintenancePublication): P
   if (!publication || publication.db !== db) fail('foreign, expired or consumed capability');
   return publication;
 }
+
+/** Capture only after the record issuer has frozen this actual T1 token/result.
+ * The ordinary maintenance handle still expires at T1 finish. This derivative
+ * grants no publication authority without the record issuer's fresh T2 token. */
+export function captureIntakeMaintenancePreparation(
+  db: DatabaseSync,
+  capability: IntakeMaintenancePublication,
+  token: object,
+  operation: TransactionOperation,
+): IntakeMaintenancePreparation {
+  const publication = selected(db, capability),
+    methods = managedDatabaseMethodEpoch(db);
+  if (
+    !methods ||
+    !db.isTransaction ||
+    currentTransactionToken(db) !== token ||
+    publication.token !== token ||
+    !publication.verified ||
+    operation.intakeMaintenance !== capability ||
+    operation.operationId !== publication.operationId ||
+    operation.fingerprint !== publication.fingerprint ||
+    !recordTransactionPreparationCaptured(db, operation, token)
+  )
+    fail('maintenance preparation requires its genuine verified record token');
+  if (publication.compactMetadata || publication.legacyStamp || publication.bridgeCertified)
+    fail('representation maintenance requires its specialized original proof');
+  const proof: PreparedPublication = {
+    db,
+    originalToken: token,
+    methods,
+    identity: Object.freeze({ ...publication.identity }),
+    headKey: publication.headKey,
+    beforeHead: publication.beforeHead,
+    afterHead: publication.afterHead,
+    source: publication.source,
+    sourcePin: publication.sourcePin,
+    writes: new Map(publication.writes),
+    result: publication.result,
+    mainSchema: publication.mainSchema!,
+    tempSchema: publication.tempSchema!,
+    bytes: publication.bytes,
+  };
+  const preparation = Object.freeze({}) as IntakeMaintenancePreparation;
+  let state = preparedRetained.get(db);
+  if (!state) {
+    state = { entries: new Map(), bytes: 0 };
+    preparedRetained.set(db, state);
+  }
+  while (state.entries.size >= MAX_RETAINED || state.bytes + proof.bytes > MAX_RETAINED_BYTES)
+    discardIntakeMaintenancePreparation(state.entries.keys().next().value!);
+  state.entries.set(preparation, proof);
+  state.bytes += proof.bytes;
+  preparedPublications.set(preparation, proof);
+  return preparation;
+}
+
+export function discardIntakeMaintenancePreparation(
+  preparation: IntakeMaintenancePreparation,
+): void {
+  const proof = preparedPublications.get(preparation);
+  if (!proof) return;
+  preparedPublications.delete(preparation);
+  const state = preparedRetained.get(proof.db);
+  if (state?.entries.delete(preparation)) state.bytes -= proof.bytes;
+}
+
+function preparedSelected(
+  db: DatabaseSync,
+  preparation: IntakeMaintenancePreparation,
+): PreparedPublication {
+  const proof = preparedPublications.get(preparation);
+  if (
+    !proof ||
+    proof.db !== db ||
+    managedDatabaseMethodEpoch(db) !== proof.methods ||
+    !recordPreparedReplayCurrent(db, proof.originalToken)
+  )
+    fail('foreign, expired or unreleased maintenance preparation');
+  return proof!;
+}
+
+function preparedBinding(db: DatabaseSync, proof: PreparedPublication, after: boolean): void {
+  const readMeta = metadataReader(db);
+  if (
+    Number(terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version) !==
+      proof.mainSchema ||
+    Number(terminalStatement(db, 'PRAGMA temp.schema_version').get()!.schema_version) !==
+      proof.tempSchema ||
+    sourceBinding(db, proof.identity, readMeta) !== proof.source ||
+    readMeta(intakeSourcePinKey(proof.identity.intakeId)) !== proof.sourcePin ||
+    readMeta(proof.headKey) !== (after ? proof.afterHead : proof.beforeHead)
+  )
+    fail('maintenance preparation source, schema or selected head changed');
+}
+
+/** Admission is a logical check only. The record owner must retain and close
+ * the complete ORIGINAL artifact/source/namespace proof after all callbacks. */
+export function assertIntakeMaintenancePreparation(
+  db: DatabaseSync,
+  preparation: IntakeMaintenancePreparation,
+): void {
+  const proof = preparedSelected(db, preparation);
+  if (db.isTransaction || proof.token) fail('maintenance preparation admission scope');
+  preparedBinding(db, proof, false);
+  const readMeta = metadataReader(db);
+  for (const key of proof.writes.keys())
+    if (key !== proof.headKey && readMeta(key, MAX_ROW_BYTES) !== undefined)
+      fail('maintenance preparation immutable preimage changed');
+  if (preparedSelected(db, preparation) !== proof || db.isTransaction)
+    fail('maintenance preparation admission changed');
+}
+
+/** Include these exact literals in the genuine record T1 terminal inventory. */
+export function intakeMaintenanceReplayStatements(): readonly {
+  sql: string;
+  bigInts?: boolean;
+}[] {
+  return [
+    { sql: 'PRAGMA main.schema_version' },
+    { sql: 'PRAGMA temp.schema_version' },
+    { sql: 'SELECT total_changes() AS n', bigInts: true },
+    { sql: 'SELECT length(CAST(value AS BLOB)) AS bytes FROM app_meta WHERE key=?' },
+    { sql: 'SELECT value FROM app_meta WHERE key=?' },
+    { sql: 'SELECT length(CAST(details_json AS BLOB)) AS bytes FROM source_files WHERE id=?' },
+    { sql: 'SELECT kind,sha256,details_json FROM source_files WHERE id=?' },
+    { sql: 'SELECT entity,record_id FROM __record_changed' },
+  ];
+}
+
+/** A current transaction token alone cannot revive the disposed T1 handle. */
+export function beginIntakeMaintenanceReplay(
+  db: DatabaseSync,
+  preparation: IntakeMaintenancePreparation,
+  token: object,
+): void {
+  const proof = preparedSelected(db, preparation);
+  if (
+    proof.token ||
+    !db.isTransaction ||
+    currentTransactionToken(db) !== token ||
+    token === proof.originalToken ||
+    !recordPreparedMaintenanceReplayCurrent(db, proof.originalToken, token)
+  )
+    fail('maintenance replay requires its genuine fresh record token');
+  preparedBinding(db, proof, false);
+  const readMeta = metadataReader(db);
+  for (const key of proof.writes.keys())
+    if (key !== proof.headKey && readMeta(key, MAX_ROW_BYTES) !== undefined)
+      fail('maintenance replay immutable preimage changed');
+  if (
+    preparedSelected(db, preparation) !== proof ||
+    !recordPreparedMaintenanceReplayCurrent(db, proof.originalToken, token)
+  )
+    fail('maintenance replay admission changed');
+  proof.token = token;
+}
+
+/** Before fixed bookkeeping: read back the exact frozen roster and result.
+ * expectedChanges comes from the record owner's original counter plus its
+ * literal recipe count; never adopt a post-callback observation as a baseline. */
+export function verifyIntakeMaintenanceReplay(
+  db: DatabaseSync,
+  preparation: IntakeMaintenancePreparation,
+  token: object,
+  resultJson: string,
+  expectedChanges: bigint,
+): void {
+  const proof = preparedSelected(db, preparation),
+    total = () => terminalStatement(db, 'SELECT total_changes() AS n', undefined, true).get()!.n;
+  const current = () => {
+    if (
+      proof.token !== token ||
+      proof.verified ||
+      !db.isTransaction ||
+      currentTransactionToken(db) !== token ||
+      !recordPreparedMaintenanceReplayCurrent(db, proof.originalToken, token) ||
+      total() !== expectedChanges
+    )
+      fail('maintenance replay token or strict write interval changed');
+  };
+  current();
+  if (resultJson !== proof.result) fail('maintenance replay result changed');
+  preparedBinding(db, proof, true);
+  const readMeta = metadataReader(db),
+    seen = new Set<string>();
+  for (const row of terminalStatement(
+    db,
+    'SELECT entity,record_id FROM __record_changed',
+  ).iterate()) {
+    if (row.entity !== 'app_meta' || typeof row.record_id !== 'string')
+      fail('unexpected maintenance replay accepted row');
+    let identity: unknown;
+    try {
+      identity = JSON.parse(row.record_id);
+    } catch {
+      fail('maintenance replay captured row identity');
+    }
+    if (!Array.isArray(identity) || identity.length !== 1 || typeof identity[0] !== 'string')
+      fail('maintenance replay captured row identity');
+    const key = identity[0] as string,
+      expected = proof.writes.get(key);
+    if (expected === undefined || seen.has(key) || readMeta(key, MAX_ROW_BYTES) !== expected)
+      fail('maintenance replay accepted write readback');
+    seen.add(key);
+  }
+  if (seen.size !== proof.writes.size) fail('maintenance replay missing frozen write');
+  heads(proof.identity, proof.beforeHead, proof.afterHead);
+  current();
+  if (preparedSelected(db, preparation) !== proof) fail('maintenance replay proof changed');
+  proof.verified = true;
+}
+
 /** Called only after this exact prepared head was staged inside its owner token. */
 export function stageIntakeCompactMetadataPublication(
   db: DatabaseSync,
