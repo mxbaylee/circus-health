@@ -16,7 +16,11 @@ import {
   type IntakeDetails,
   type IntakeSourceMetadata,
 } from './intake-state-access.ts';
-import { intakeMetadataLabel, isPreparedIntakeCompactScalar } from './intake-compact-scalar.ts';
+import {
+  intakeMetadataLabel,
+  intakeMetadataScalarMatches,
+  isPreparedIntakeCompactScalar,
+} from './intake-compact-scalar.ts';
 import { isRetainOnlyIntake } from '../shared/intake-source-policy.ts';
 import { readIntakeEnvelopeText } from './intake-authority.ts';
 import {
@@ -3315,7 +3319,7 @@ export async function withStagedIntakeChild(
                   d = intakeSourceMetadata(db, id);
                 if (
                   d.parentSourceFileId !== parentId ||
-                  d.locator !== member.locator ||
+                  !intakeMetadataScalarMatches(d.locator, member.locator) ||
                   retained.sha256 !== member.sourceHash ||
                   retained.bytes !== member.bytes
                 )

@@ -175,7 +175,7 @@ export async function prepareIntakeEnvelopeMutation(
       if (ref.type !== 'cell') throw Error('Use explicit put to replace a structured field');
       if (!structuredKind(record.kind, field, text[0]!)) {
         await writer.cell('c:' + ref.id, text);
-        if (record.kind === 'intake' && field === 'originalName')
+        if (record.kind === 'intake' && ['originalName', 'locator'].includes(field))
           await writer.filenameFacts(ref.id);
         return;
       }

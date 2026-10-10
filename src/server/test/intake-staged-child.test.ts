@@ -16,7 +16,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { HttpError, openDatabase } from '../database.ts';
+import { HttpError, openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { createBackup } from '../recovery.ts';
@@ -39,6 +39,16 @@ import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { publishIntakeSourceText } from '../intake-source-text.ts';
 import { readIntakeSourcePin } from '../intake-source-pin.ts';
+import { intakeSourceMetadata } from '../intake-state-access.ts';
+import {
+  intakeMetadataScalarMatches,
+  isPreparedIntakeCompactScalar,
+} from '../intake-compact-scalar.ts';
+import {
+  openIntakeCollectionEnvelope,
+  selectedEnvelopeStore,
+} from '../intake-collection-envelope.ts';
+import { prepareIntakeEnvelopeMutation } from '../intake-envelope-mutation.ts';
 
 const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 function fixture(t: TestContext, recordStorage?: RecordStorage) {
@@ -136,6 +146,85 @@ test('streamed child above 25 MiB uses bounded verification, exact occurrence id
   assert.equal(
     metadataAfter.primitive.coldReconstructions,
     metadataBefore.primitive.coldReconstructions,
+  );
+});
+
+test('staged child retry accepts a retained compact locator and rejects changed locator evidence', async (t) => {
+  const f = fixture(t);
+  const bytes = Buffer.from('%PDF-1.4\nFictional retained child');
+  const input = member(bytes, 'zip:' + 'fictional-folder/'.repeat(1200) + 'child.pdf');
+  const child = await withStagedIntakeChild(f, input, async ({ outputFd }) => {
+    writeSync(outputFd, bytes);
+  });
+  const source = f.db
+    .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
+    .get(child.id)!;
+  await buildIntakeCollectionEnvelope(f.db, source as never);
+  clearIntakeStateCache(f.db);
+  const metadata = intakeSourceMetadata(f.db, child.id);
+  assert.ok(isPreparedIntakeCompactScalar(metadata.locator));
+  assert.equal(intakeMetadataScalarMatches(metadata.locator, input.locator), true);
+  const before = intakeDurability(f.db);
+  const retried = await withStagedIntakeChild(f, input, async () => {
+    assert.fail('a retained occurrence must not be extracted twice');
+  });
+  assert.equal(retried.id, child.id);
+  assert.equal(retried.bytes, child.bytes);
+  assert.equal(retried.contentUrl, child.contentUrl);
+  assert.equal(retried.locatorDescriptor?.scalarHash, metadata.locator.scalarHash);
+  assert.deepEqual(intakeDurability(f.db), before);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM source_files').get()!.n, 2);
+
+  const selected = openIntakeCollectionEnvelope(f.db, { id: child.id, sha256: input.sourceHash });
+  const operationId = randomUUID();
+  const changedLocator = input.locator.replace('fictional-folder/', 'fictional-other/');
+  const changed = await prepareIntakeEnvelopeMutation(
+    f.db,
+    { id: child.id, sha256: input.sourceHash },
+    {
+      reader: selected,
+      operationId,
+      requestDigest: hash(Buffer.from(operationId)),
+      domainVersion: selected.logical.domainVersion + 1,
+      changes: [
+        {
+          op: 'set',
+          record: selected.child(selected.root(), 'intake')!,
+          field: 'locator',
+          jsonText: JSON.stringify(changedLocator),
+        },
+      ],
+    },
+  );
+  assert.ok(changed.prepared && changed.projectDetailsJson);
+  const changedMetadata = changed.projectDetailsJson({ bytes: 65536 });
+  transaction(f.db, () => {
+    selectedEnvelopeStore(f.db, { id: child.id, sha256: input.sourceHash }).collections.stage(
+      changed.prepared!,
+    );
+    f.db
+      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+      .run(changedMetadata, child.id);
+  });
+  const changedView = intakeSourceMetadata(f.db, child.id);
+  assert.ok(isPreparedIntakeCompactScalar(changedView.locator));
+  assert.equal(intakeMetadataScalarMatches(changedView.locator, changedLocator), true);
+  assert.equal(intakeMetadataScalarMatches(changedView.locator, input.locator), false);
+  const beforeRefusal = intakeDurability(f.db);
+  const acceptedSequence = f.db
+    .prepare('SELECT sequence FROM __record_state WHERE singleton=1')
+    .get()!.sequence;
+  await assert.rejects(
+    withStagedIntakeChild(f, input, async () => {
+      assert.fail('a retained occurrence with changed locator evidence must not be extracted');
+    }),
+    (error: unknown) => error instanceof HttpError && error.code === 'SOURCE_CHANGED',
+  );
+  assert.equal(f.db.prepare('SELECT count(*) n FROM source_files').get()!.n, 2);
+  assert.deepEqual(intakeDurability(f.db), beforeRefusal);
+  assert.equal(
+    f.db.prepare('SELECT sequence FROM __record_state WHERE singleton=1').get()!.sequence,
+    acceptedSequence,
   );
 });
 
