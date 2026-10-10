@@ -1024,6 +1024,7 @@ function collectionCellReaderOwned(
     originalRead: IntakeLegacyBridgeReadWitness;
     assertCurrent: () => void;
   },
+  captured?: ReturnType<typeof selectedEnvelopeStore>,
 ): {
   store: EnvelopeCellReader;
   head: IntakeCollectionHead;
@@ -1032,7 +1033,7 @@ function collectionCellReaderOwned(
   build?.assertCurrent();
   const selected = build
     ? selectedIntakeBuildSelection(db, build.view, build.originalRead)
-    : selectedEnvelopeStore(db, input);
+    : (captured ?? selectedEnvelopeStore(db, input));
   build?.assertCurrent();
   const { binding, collections } = selected;
   const source = build ? input : (selected as ReturnType<typeof selectedEnvelopeStore>).source;
@@ -1119,7 +1120,12 @@ export function collectionCellReaderForBuild(
 /** A V4 storage head can still select an exact V3 bridge after interrupted
  * conversion. Only a completed schema may enter native record consumers. */
 export function hasIntakeCollectionEnvelope(db: Database, source: IntakeEnvelopeSource): boolean {
-  const { collections, binding } = selectedEnvelopeStore(db, source);
+  return hasSelectedIntakeCollectionEnvelope(selectedEnvelopeStore(db, source));
+}
+function hasSelectedIntakeCollectionEnvelope({
+  collections,
+  binding,
+}: ReturnType<typeof selectedEnvelopeStore>): boolean {
   if (binding.logicalHead === undefined) return false;
   const view = collections.openView();
   const control = collections.get(view, 'logical', 'envelope.control', 'representation');
@@ -1138,7 +1144,33 @@ export function openIntakeCollectionEnvelope(
   source: IntakeEnvelopeSource,
   options: { fieldSelection?: 'first' | 'last' } = {},
 ): IntakeCollectionEnvelopeReader {
-  const selected = collectionCellReader(db, source),
+  return openSelectedIntakeCollectionEnvelope(db, source, options);
+}
+/** Synchronous ancestry readers classify and open the same checked selection,
+ * without selecting its source and authority a second time. Every field still
+ * passes the reader's normal current-source, logical and physical checks. */
+export function openIntakeCollectionEnvelopeIfNative(
+  db: Database,
+  source: IntakeEnvelopeSource,
+): IntakeCollectionEnvelopeReader | undefined {
+  const captured = selectedEnvelopeStore(db, source);
+  if (!hasSelectedIntakeCollectionEnvelope(captured)) return undefined;
+  return openSelectedIntakeCollectionEnvelope(db, source, {}, captured);
+}
+function openSelectedIntakeCollectionEnvelope(
+  db: Database,
+  source: IntakeEnvelopeSource,
+  options: { fieldSelection?: 'first' | 'last' },
+  captured?: ReturnType<typeof selectedEnvelopeStore>,
+): IntakeCollectionEnvelopeReader {
+  const selected = collectionCellReaderOwned(
+      db,
+      source,
+      'logical',
+      'envelope.data',
+      undefined,
+      captured,
+    ),
     { collections, store, head } = selected;
   const control = parseSchemaControl(
     collections.get(collections.openView(), 'logical', 'envelope.control', 'representation'),

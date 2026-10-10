@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { StatementSync } from 'node:sqlite';
 import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { registerIntakeFile } from '../intake-state-access.ts';
@@ -15,6 +16,13 @@ import { getIntakeSourceText, publishIntakeSourceText } from '../intake-source-t
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import type { SourceTextEvidence } from '../../shared/intake-source-text.ts';
 import { packetSourceAncestry, packetSourceAncestryWork } from '../packet-source-ancestry.ts';
+import { iterateIntakeSourceAncestry } from '../intake-source-ancestry.ts';
+import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
+import {
+  openIntakeCollectionEnvelope,
+  prepareIntakeEnvelopeFieldMutation,
+  stageIntakeEnvelopeFieldMutation,
+} from '../intake-collection-envelope.ts';
 
 const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 function fixture(t: test.TestContext, parents: (string | null | number)[]) {
@@ -79,6 +87,46 @@ const evidence: SourceTextEvidence = {
   relations: [],
   issues: [],
 };
+
+test('native ancestry selects each checked edge once and keeps its post-yield recheck', async (t) => {
+  const f = fixture(t, [null]);
+  await buildIntakeCollectionEnvelope(f.db, { id: f.id });
+  const original = StatementSync.prototype.get;
+  let selections = 0;
+  t.mock.method(StatementSync.prototype, 'get', function (this: StatementSync, ...args: unknown[]) {
+    if (
+      this.sourceSQL === 'SELECT id,kind,sha256,details_json FROM source_files WHERE id=?' &&
+      args[0] === f.id
+    )
+      selections++;
+    return Reflect.apply(original, this, args);
+  });
+  assert.deepEqual(
+    [...iterateIntakeSourceAncestry(f.db, f.profileId, f.id)],
+    [{ id: f.id, parentId: undefined }],
+  );
+  assert.equal(selections, 2, 'the check and recheck each select source metadata once');
+  t.mock.restoreAll();
+
+  const walk = iterateIntakeSourceAncestry(f.db, f.profileId, f.id);
+  assert.deepEqual(walk.next(), { done: false, value: { id: f.id, parentId: undefined } });
+  const reader = openIntakeCollectionEnvelope(f.db, { id: f.id });
+  const change = prepareIntakeEnvelopeFieldMutation(
+    f.db,
+    { id: f.id },
+    {
+      reader,
+      record: reader.child(reader.root(), 'intake')!,
+      field: 'parentSourceFileId',
+      jsonText: JSON.stringify('fictional-missing-parent'),
+      operationId: randomUUID(),
+      requestDigest: digest('fictional-parent-change'),
+      domainVersion: reader.logical.domainVersion + 1,
+    },
+  );
+  transaction(f.db, () => stageIntakeEnvelopeFieldMutation(f.db, { id: f.id }, change));
+  assert.throws(() => walk.next(), { code: 'SOURCE_ANCESTRY' });
+});
 
 test('packet ancestry work bounds duplicate seeds and ancestor advances without changing output', (t) => {
   const f = fixture(
