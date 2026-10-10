@@ -6,6 +6,7 @@ import {
   clearCollectionProcessingException,
 } from './intake-processing-exceptions.ts';
 import { randomUUID } from 'node:crypto';
+import { withVaultIntakeBatchAuthorization } from './vault-app.ts';
 import { modelRecoveryKey } from './model-bridge.ts';
 import { INTAKE_PDF_BOUNDS } from './intake-files.ts';
 import {
@@ -214,6 +215,37 @@ interface BatchAssistantRunOptions {
   assertAuthorized?: (operation: 'dispatch' | 'publish') => void;
 }
 
+declare const batchOwnerBrand: unique symbol;
+export interface IntakeBatchOwner {
+  readonly [batchOwnerBrand]: true;
+}
+const batchOwners = new WeakMap<
+  IntakeBatchOwner,
+  {
+    manager: IntakeBatchManager;
+    db: DatabaseSync;
+    profileId: string;
+    databases: Map<string, DatabaseSync>;
+    generations: Map<string, number>;
+    generation: number;
+    lifetime: { closed: boolean };
+    active: boolean;
+  }
+>();
+/** Only the actual scheduled pump can issue an owner; callers can only inspect it. */
+export function intakeBatchOwnerCurrent(owner: IntakeBatchOwner) {
+  const data = batchOwners.get(owner);
+  if (
+    !data ||
+    !data.active ||
+    data.lifetime.closed ||
+    Map.prototype.get.call(data.databases, data.profileId) !== data.db ||
+    (Map.prototype.get.call(data.generations, data.profileId) || 0) !== data.generation
+  )
+    return undefined;
+  return { manager: data.manager, db: data.db, profileId: data.profileId };
+}
+
 export const SOURCE_STALL_MS = Math.max(180_000, 2 * INTAKE_PDF_BOUNDS.indexTimeoutMs);
 interface BatchManagerOptions {
   /** Deprecated fixture input; automatic capture has no cumulative allowance. */
@@ -326,6 +358,7 @@ export function createIntakeBatchManager({
   const failedPublications = new Map<string, { batch: IntakeBatch; reason: string }>();
   const queueSpans = new Map<string, ReturnType<typeof beginImportPhase>>();
   let closed = false;
+  const ownerLifetime = { closed: false };
   let closeIncomplete = false;
   const key = (profileId: string, batchId: string): string => `${profileId}/${batchId}`;
   const now = (): string => clock().toISOString();
@@ -645,7 +678,19 @@ export function createIntakeBatchManager({
           return;
         }
         pumping.add(profileId);
-        void pump(profileId, batchId, expected)
+        const owner = Object.freeze({}) as IntakeBatchOwner;
+        const ownerData = {
+          manager: service,
+          db: dbFor(profileId),
+          profileId,
+          databases,
+          generations,
+          generation: expected,
+          lifetime: ownerLifetime,
+          active: true,
+        };
+        batchOwners.set(owner, ownerData);
+        void withVaultIntakeBatchAuthorization(owner, () => pump(profileId, batchId, expected))
           .catch(async (error: unknown) => {
             if (!live(profileId, expected)) return;
             const batch = batches.get(key(profileId, pumpBatches.get(profileId) || batchId));
@@ -815,6 +860,7 @@ export function createIntakeBatchManager({
             }
           })
           .finally(() => {
+            ownerData.active = false;
             pumping.delete(profileId);
             pumpBatches.delete(profileId);
             const pending = pendingWake.get(profileId);
@@ -2518,6 +2564,7 @@ export function createIntakeBatchManager({
     if (closed && !closeIncomplete) return;
     const retrying = closed;
     closed = true;
+    ownerLifetime.closed = true;
     closeIncomplete = true;
     const failures: unknown[] = [];
     for (const profileId of databases.keys()) {
@@ -2584,7 +2631,7 @@ export function createIntakeBatchManager({
   // Instantiation follows authorized runtime restoration, never a browser GET.
   for (const profileId of databases.keys()) wake(profileId);
 
-  return {
+  const service: IntakeBatchManager = {
     wake,
     create,
     createPrepared,
@@ -2603,4 +2650,5 @@ export function createIntakeBatchManager({
       );
     },
   };
+  return service;
 }

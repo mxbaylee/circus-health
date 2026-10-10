@@ -4,6 +4,11 @@ import type { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
 import { authorizationSignalAborted } from './authorization-signal.ts';
 import { assistantCompactOwnerCurrent, type AssistantCompactOwner } from './assistant.ts';
+import {
+  intakeBatchOwnerCurrent,
+  type IntakeBatchOwner,
+  type IntakeBatchManager,
+} from './intake-batches.ts';
 import { createApp, type AppOptions } from './index.ts';
 import { vaultStorageTotals } from './vault-storage-totals.ts';
 import {
@@ -81,6 +86,7 @@ const compactAuthorizations = new WeakMap<
     signal?: AbortSignal;
     request?: { active: boolean };
     job?: AssistantCompactOwner;
+    batch?: IntakeBatchOwner;
     isOpen: () => unknown;
   }
 >();
@@ -99,6 +105,7 @@ export function vaultCompactAuthorizationCurrent(
     (!data.signal || !authorizationSignalAborted(data.signal)) &&
     (!data.request || data.request.active) &&
     (!data.job || assistantCompactOwnerCurrent(data.job, db, profileId)) &&
+    (!data.batch || !!intakeBatchOwnerCurrent(data.batch)) &&
     Reflect.apply(data.isOpen, db, []) === true &&
     Reflect.apply(nativeMapGet, data.sessions, [data.client.id]) === data.client &&
     Reflect.apply(nativeSetHas, data.profiles, [profileId]) &&
@@ -116,6 +123,45 @@ export function currentVaultCompactAuthorization(
   return authorization;
 }
 const assistantAuthorizations = new WeakMap<AssistantCompactOwner, VaultCompactAuthorization>();
+type CompactAuthorizationData = NonNullable<ReturnType<typeof compactAuthorizations.get>>;
+const batchIssuers = new WeakMap<
+  IntakeBatchManager,
+  Pick<
+    CompactAuthorizationData,
+    'db' | 'profileId' | 'sessions' | 'opened' | 'state' | 'lifecycle' | 'isOpen'
+  >
+>();
+/** Background dispatch has a real manager lifetime, not the expired HTTP response
+ * inherited by its timer. Only profileApp registers an encrypted manager issuer. */
+export async function withVaultIntakeBatchAuthorization<T>(
+  owner: IntakeBatchOwner,
+  run: () => Promise<T>,
+): Promise<T> {
+  const batch = intakeBatchOwnerCurrent(owner);
+  if (!batch) throw new HttpError(423, 'PROFILE_LOCKED', 'Batch owner changed');
+  const issuer = batchIssuers.get(batch.manager);
+  if (!issuer) {
+    if (compactAuthorizationContext.getStore())
+      throw new HttpError(423, 'PROFILE_LOCKED', 'Batch issuer changed');
+    return run();
+  }
+  if (issuer.db !== batch.db || issuer.profileId !== batch.profileId)
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Batch profile changed');
+  const client = [...issuer.sessions.values()].find((session) =>
+    Reflect.apply(nativeSetHas, session.profiles, [batch.profileId]),
+  );
+  if (!client) throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+  const authorization = Object.freeze({}) as VaultCompactAuthorization;
+  compactAuthorizations.set(authorization, {
+    ...issuer,
+    client,
+    profiles: client.profiles,
+    batch: owner,
+  });
+  if (!vaultCompactAuthorizationCurrent(authorization, batch.db, batch.profileId))
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+  return compactAuthorizationContext.run(authorization, run);
+}
 /** A separate background lifetime is issued before the initiating response,
  * only for an actual assistant job already installed in its private active map. */
 export function captureVaultAssistantAuthorization(
@@ -133,6 +179,7 @@ export function captureVaultAssistantAuthorization(
     ...data,
     signal: undefined,
     request: undefined,
+    batch: undefined,
     job: owner,
   });
   assistantAuthorizations.set(owner, authorization);
@@ -295,8 +342,8 @@ export function createVaultApp({
   function profileApp(id: string) {
     const state = manager.opened.get(id);
     if (!state) throw new HttpError(423, 'PROFILE_LOCKED', 'Unlock this profile');
-    if (!state.app)
-      state.app = createApp({
+    if (!state.app) {
+      const app = createApp({
         root: state.root,
         databases: new Map([[id, state.db]]),
         runtimeRoot: state.root,
@@ -334,6 +381,20 @@ export function createVaultApp({
           },
         },
       });
+      const descriptor = Object.getOwnPropertyDescriptor(state.db, 'isOpen');
+      if (!descriptor?.get || descriptor.configurable)
+        throw new HttpError(423, 'PROFILE_LOCKED', 'Profile owner is unavailable');
+      state.app = app;
+      batchIssuers.set(app.intakeBatches, {
+        db: state.db,
+        profileId: id,
+        sessions,
+        opened: openedProfiles,
+        state,
+        lifecycle,
+        isOpen: descriptor.get,
+      });
+    }
     return state;
   }
   const server = createServer(async (req, res) => {

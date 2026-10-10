@@ -6,6 +6,8 @@ A person importing a long clinical history should not have to babysit arbitrary 
 
 Durable automatic-run intent is scheduling state, not an unlock credential. The coordinator checks current permission for the exact profile/import operation at dispatch and publication, independently of browser selection. Generation and source-dependency guards also apply. Closing a tab does not stop authorized work. Lock/logout/profile switch revoke the ordinary runtime; authorized unlock restores eligible automatic work without Resume. Explicit Stop survives restart and unlock.
 
+Encrypted background dispatch uses authorization issued for the actual active batch manager, independently of the completed upload response. It remains bound to a live authorized session, the same opened profile and database, and the current batch generation. An actual assistant job retains its own lifetime after dispatch, with the same session and profile checks; finishing an HTTP response does not revoke that job, while Stop and profile lock still do.
+
 Restricted import authority after general session access ends remains [CRS-081](../todo/CRS-081.md). Its purpose is to let a person work in another profile without stopping an authorized import or leaving general archive access open (CRS-126 D8). It must reuse this coordinator, retry policy and Stop intent. Clinical acceptance, identity confirmation and browsing still need a live authorized session. Both implementations and their joint journeys are required before claiming the complete post-logout experience; recovery after process loss requires authorized unlock.
 
 ## Durable scheduling
