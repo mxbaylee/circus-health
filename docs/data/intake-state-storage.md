@@ -243,6 +243,16 @@ New compatibility builds use a deterministic identity bound to the exact retaine
 
 Concurrent [source search](source-details-search.md#request-lifetime-and-limits) uses checked read-only authority while this preparation retains its original SQL witness. It defers disposable projection writes instead of refreshing the witness after an arbitrary callback. Upfront source validation, complete text matching and original mutation/physical-authority refusal remain required. This adds source-inventory and compatibility-read work during conversion; it does not change retained progress or grant unrelated writes a publication exemption.
 
+For contributor storage, the legacy bridge also retains its original record-store
+owner, accepted HEAD and immutable-write sequence. A known journal write outside
+that store does not invalidate conversion. Record-store writes (including
+idempotent attempts), unknown paths, aliases into that store, preexisting hardlinks and an
+overflowed write history still refuse. Source, SQL, method and transaction-owner
+checks remain required; the bridge cannot adopt a later baseline. Vault and
+unsupported adapters retain the global physical-write guard. This scoped bridge
+check is not a substitute for final consumed-artifact verification at an ordinary
+accepted-write boundary.
+
 The [conversion recovery fixture](../../src/server/test/intake-envelope-build-resume.test.ts) interrupts raw and normalized builds, deletes their disposable SQLite database, reconstructs accepted authority and verifies that retry adds no duplicate prefix writes. It also refuses concurrent, malformed and changed-and-restored progress, including changes observed during the final physical checks before publication. In one 2026-10-04 run, four versus 24 fictional history entries wrote 920 versus 7,574 collection nodes and about 1.6 versus 13.2 MB of accepted journal data during cold conversion. A fixed version edit then wrote 18 nodes and three journal records at either size. Tree shape affects exact counts; these small fixtures establish the distinction between cold conversion and a changed-scope edit, not acceptable large-fixture capacity or linear total conversion cost.
 
 A separate 2026-10-04 qualification used raw fictional envelopes with 16 and 64

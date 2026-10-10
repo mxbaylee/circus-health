@@ -441,7 +441,7 @@ export function beginIntakeMaintenancePublication(
       fail('compact metadata authority changed before publication');
   }
   if (publication.legacyStamp) {
-    if (!legacyBridgeStampCurrent(db, publication.legacyStamp, true))
+    if (!legacyBridgeStampCurrent(db, publication.legacyStamp, true, token))
       fail('legacy bridge original authority changed before publication');
     publication.legacyStartWrites = Number(publication.legacyStamp.writes);
     publication.startCapturedRows = Number(
@@ -452,7 +452,7 @@ export function beginIntakeMaintenancePublication(
       publication.identity.intakeId,
       publication.headKey,
     );
-    if (!legacyBridgeStampCurrent(db, publication.legacyStamp, true))
+    if (!legacyBridgeStampCurrent(db, publication.legacyStamp, true, token))
       fail('legacy bridge original authority changed during admission');
   }
   publication.token = token;
@@ -549,7 +549,7 @@ export function verifyIntakeMaintenancePublication(
           publication.identity.intakeId,
           publication.headKey,
         ) !== lookupDirtyWrite ||
-        !legacyBridgeStampCurrent(db, stamp, false)
+        !legacyBridgeStampCurrent(db, stamp, false, token)
       )
         fail('legacy bridge unowned publication write');
       const readMeta = metadataReader(db);
@@ -568,7 +568,7 @@ export function verifyIntakeMaintenancePublication(
           publication.identity.intakeId,
           publication.headKey,
         ) !== lookupDirtyWrite ||
-        !legacyBridgeStampCurrent(db, stamp, false)
+        !legacyBridgeStampCurrent(db, stamp, false, token)
       )
         fail('legacy bridge terminal authority changed');
     };

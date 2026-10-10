@@ -54,6 +54,10 @@ import {
   captureRecordAuthorityWitness,
   recordAuthorityWitnessCurrent,
   type RecordAuthorityWitness,
+  captureContributorLegacyBridgeRecordOwner,
+  assertContributorLegacyBridgeRecordOwner,
+  closeRecordReadOwner,
+  type RecordReadOwner,
   prepareRecordSourcePriorFields,
   prepareRecordCompactPublication,
   discardRecordSourcePriorFields,
@@ -146,7 +150,8 @@ const legacyReads = new WeakMap<
 >();
 const legacyAttemptWatches = new WeakMap<IntakeLegacyBridgeStamp, { current: () => boolean }>();
 export interface IntakeLegacyBridgeStamp {
-  readonly authority: RecordAuthorityWitness;
+  readonly authority?: RecordAuthorityWitness;
+  readonly contributor?: RecordReadOwner;
   readonly methods: object;
   readonly mainSchema: unknown;
   readonly tempSchema: unknown;
@@ -155,25 +160,36 @@ export interface IntakeLegacyBridgeStamp {
   readonly frontier?: IntakeFrontierAttemptSnapshot;
   readonly sourceId?: string;
 }
-function captureLegacyBridgeStamp(db: Database, sourceId?: string): IntakeLegacyBridgeStamp {
-  const methods = managedDatabaseMethodEpoch(db);
-  if (!methods) invalid('legacy bridge managed method unavailable');
-  const captured = sourceId === undefined ? undefined : captureIntakeFrontierAttempts(db);
-  const frontier = captured && Object.freeze({ ...captured });
-  if (sourceId !== undefined && !frontier) invalid('legacy bridge original frontier unavailable');
-  const stamp = Object.freeze({
-    authority: captureRecordAuthorityWitness(db),
-    methods,
-    mainSchema: terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version,
-    tempSchema: terminalStatement(db, 'PRAGMA temp.schema_version').get()!.schema_version,
-    peer: terminalStatement(db, 'PRAGMA main.data_version').get()!.data_version,
-    writes: terminalStatement(db, 'SELECT total_changes() AS n').get()!.n,
-    frontier,
-    sourceId,
-  });
-  if (!legacyBridgeStampCurrent(db, stamp, true))
-    invalid('legacy bridge original authority unavailable');
-  return stamp;
+function captureLegacyBridgeStamp(
+  db: Database,
+  sourceId?: string,
+  contributorRead = false,
+): IntakeLegacyBridgeStamp {
+  const contributor = contributorRead ? captureContributorLegacyBridgeRecordOwner(db) : undefined;
+  try {
+    const methods = managedDatabaseMethodEpoch(db);
+    if (!methods) invalid('legacy bridge managed method unavailable');
+    const captured = sourceId === undefined ? undefined : captureIntakeFrontierAttempts(db);
+    const frontier = captured && Object.freeze({ ...captured });
+    if (sourceId !== undefined && !frontier) invalid('legacy bridge original frontier unavailable');
+    const stamp = Object.freeze({
+      authority: contributor ? undefined : captureRecordAuthorityWitness(db),
+      contributor,
+      methods,
+      mainSchema: terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version,
+      tempSchema: terminalStatement(db, 'PRAGMA temp.schema_version').get()!.schema_version,
+      peer: terminalStatement(db, 'PRAGMA main.data_version').get()!.data_version,
+      writes: terminalStatement(db, 'SELECT total_changes() AS n').get()!.n,
+      frontier,
+      sourceId,
+    });
+    if (!legacyBridgeStampCurrent(db, stamp, true))
+      invalid('legacy bridge original authority unavailable');
+    return stamp;
+  } catch (error) {
+    if (contributor) closeRecordReadOwner(contributor);
+    throw error;
+  }
 }
 export function captureIntakeLegacyBridgeReadWitness(
   db: Database,
@@ -198,8 +214,9 @@ export function captureIntakeLegacyBridgeReadWitness(
     },
   );
   if (!stop) invalid('legacy bridge original authorizer unavailable');
+  let stamp: IntakeLegacyBridgeStamp | undefined;
   try {
-    const stamp = captureLegacyBridgeStamp(db, sourceId);
+    stamp = captureLegacyBridgeStamp(db, sourceId, true);
     if (attempted) invalid('legacy bridge original source attempt');
     const witness = Object.freeze({}) as IntakeLegacyBridgeReadWitness;
     const data = { db, sourceId, stamp, stop, active: true };
@@ -207,7 +224,11 @@ export function captureIntakeLegacyBridgeReadWitness(
     legacyReads.set(witness, data);
     return witness;
   } catch (error) {
-    if (db.isOpen) stop();
+    try {
+      if (db.isOpen) stop();
+    } finally {
+      if (stamp?.contributor) closeRecordReadOwner(stamp.contributor);
+    }
     throw error;
   }
 }
@@ -215,7 +236,11 @@ export function disposeIntakeLegacyBridgeReadWitness(witness: IntakeLegacyBridge
   const original = legacyReads.get(witness);
   if (!original || !original.active) return;
   original.active = false;
-  if (original.db.isOpen) original.stop();
+  try {
+    if (original.db.isOpen) original.stop();
+  } finally {
+    if (original.stamp.contributor) closeRecordReadOwner(original.stamp.contributor);
+  }
 }
 export function assertIntakeLegacyBridgeReadWitness(
   db: Database,
@@ -234,7 +259,20 @@ export function legacyBridgeStampCurrent(
   db: Database,
   stamp: IntakeLegacyBridgeStamp,
   beforeWrites: boolean,
+  ownedToken?: object,
 ): boolean {
+  const recordCurrent = () => {
+    if (stamp.contributor) {
+      if (db.isTransaction && currentTransactionToken(db) !== ownedToken) return false;
+      try {
+        assertContributorLegacyBridgeRecordOwner(db, stamp.contributor, ownedToken);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return !!stamp.authority && recordAuthorityWitnessCurrent(db, stamp.authority);
+  };
   const frontier = stamp.frontier;
   const interval = frontier
     ? db.isTransaction
@@ -253,7 +291,7 @@ export function legacyBridgeStampCurrent(
         (beforeWrites ||
           (interval.headSourceIds.length <= 1 &&
             interval.headSourceIds.every((id) => id === stamp.sourceId))))) &&
-    recordAuthorityWitnessCurrent(db, stamp.authority) &&
+    recordCurrent() &&
     managedDatabaseMethodEpoch(db) === stamp.methods &&
     terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version ===
       stamp.mainSchema &&
@@ -262,7 +300,7 @@ export function legacyBridgeStampCurrent(
     terminalStatement(db, 'PRAGMA main.data_version').get()!.data_version === stamp.peer &&
     (!beforeWrites ||
       terminalStatement(db, 'SELECT total_changes() AS n').get()!.n === stamp.writes) &&
-    recordAuthorityWitnessCurrent(db, stamp.authority) &&
+    recordCurrent() &&
     (!frontier ||
       (beforeWrites
         ? db.isTransaction

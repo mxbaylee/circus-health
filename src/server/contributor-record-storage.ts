@@ -20,6 +20,11 @@ import { flockExclusiveNonblocking, flockUnlock } from '../shared/flock.ts';
 import { profilePaths, profileOriginal } from './profile-storage.ts';
 import type { RecordStorage, DurableRecordVersion } from './record-versions.ts';
 import { hashFile } from './vault-store.ts';
+import { captureRecordHeadPhysical } from './record-head-physical.ts';
+import {
+  captureManagedPhysicalScope,
+  managedPhysicalScopeCurrent,
+} from './clinical-review-physical-epoch.ts';
 
 const FORMAT = 'health-contributor-record-authority-v1';
 function fail(message: string): never {
@@ -83,6 +88,156 @@ export function hasContributorAuthority(root: string, profileId: string): boolea
 export interface ContributorRecordStorage extends RecordStorage {
   close(): void;
 }
+interface ContributorReadOwner {
+  storage: ContributorRecordStorage;
+  read: ContributorRecordStorage['read'];
+  write: ContributorRecordStorage['writeImmutable'];
+  publish: ContributorRecordStorage['publishHead'];
+  close: ContributorRecordStorage['close'];
+  base: string;
+  marker: string;
+  profileRoot: string;
+  root: string;
+  profileId: string;
+  live(): boolean;
+  writable(): boolean;
+  selection(): object;
+  immutableSequence(): bigint;
+}
+const readOwnerFactories = new WeakMap<object, ContributorReadOwner>();
+const ownDescriptor = Object.getOwnPropertyDescriptor;
+declare const readOwnerBrand: unique symbol;
+export interface ContributorRecordReadOwner {
+  readonly [readOwnerBrand]: true;
+}
+const readOwners = new WeakMap<
+  ContributorRecordReadOwner,
+  {
+    owner: ContributorReadOwner;
+    selection: object;
+    physical: ReturnType<typeof captureRecordHeadPhysical>;
+  }
+>();
+function readOwnerMethodsCurrent(owner: ContributorReadOwner): boolean {
+  for (const [name, expected] of [
+    ['read', owner.read],
+    ['writeImmutable', owner.write],
+    ['publishHead', owner.publish],
+    ['close', owner.close],
+  ] as const) {
+    const descriptor = ownDescriptor(owner.storage, name);
+    if (!descriptor || !('value' in descriptor) || descriptor.value !== expected) return false;
+  }
+  return owner.live();
+}
+/** Factory provenance and original physical HEAD only, not consumed originals. */
+export function contributorRecordReadOwnerSupported(storage: object): boolean {
+  return readOwnerFactories.has(storage);
+}
+export function captureContributorRecordReadOwner(
+  storage: object,
+): ContributorRecordReadOwner | undefined {
+  const owner = readOwnerFactories.get(storage);
+  if (!owner) return undefined;
+  if (!readOwnerMethodsCurrent(owner)) fail('record read owner unavailable');
+  const physical = captureRecordHeadPhysical(
+      [resolve(owner.base, 'head'), owner.marker],
+      [owner.profileRoot, owner.base],
+    ),
+    capability = Object.freeze({}) as ContributorRecordReadOwner;
+  readOwners.set(capability, { owner, physical, selection: owner.selection() });
+  if (!contributorRecordReadOwnerCurrent(storage, capability)) {
+    closeContributorRecordReadOwner(capability);
+    fail('record read owner changed during capture');
+  }
+  return capability;
+}
+export function contributorRecordReadOwnerCurrent(
+  storage: object,
+  capability: ContributorRecordReadOwner,
+): boolean {
+  const data = readOwners.get(capability);
+  return (
+    !!data &&
+    data.owner.storage === storage &&
+    readOwnerMethodsCurrent(data.owner) &&
+    data.owner.selection() === data.selection &&
+    data.physical.current()
+  );
+}
+export function closeContributorRecordReadOwner(capability: ContributorRecordReadOwner): void {
+  const data = readOwners.get(capability);
+  readOwners.delete(capability);
+  data?.physical.close();
+}
+
+declare const legacyBridgeScopeBrand: unique symbol;
+export interface ContributorLegacyBridgeBackingScope {
+  readonly [legacyBridgeScopeBrand]: true;
+}
+const legacyBridgeScopes = new WeakMap<
+  ContributorLegacyBridgeBackingScope,
+  {
+    owner: ContributorReadOwner;
+    original?: ContributorRecordReadOwner;
+    scope: object;
+    sequence: bigint;
+  }
+>();
+/** Capture before any bridge callback can run; the original scope is never renewed. */
+export function captureContributorLegacyBridgeBackingScopeForStorage(
+  storage: object,
+): ContributorLegacyBridgeBackingScope | undefined {
+  const owner = readOwnerFactories.get(storage);
+  if (!owner) return undefined;
+  const sequence = owner.immutableSequence(),
+    scope = captureManagedPhysicalScope(owner.base);
+  if (!scope || owner.immutableSequence() !== sequence) return undefined;
+  const witness = Object.freeze({}) as ContributorLegacyBridgeBackingScope;
+  legacyBridgeScopes.set(witness, { owner, scope, sequence });
+  return readOwnerMethodsCurrent(owner) &&
+    managedPhysicalScopeCurrent(scope) &&
+    owner.immutableSequence() === sequence
+    ? witness
+    : undefined;
+}
+export function bindContributorLegacyBridgeBackingScope(
+  storage: object,
+  original: ContributorRecordReadOwner,
+  witness: ContributorLegacyBridgeBackingScope,
+): boolean {
+  const data = legacyBridgeScopes.get(witness),
+    read = readOwners.get(original);
+  if (
+    !data ||
+    data.original ||
+    data.owner.storage !== storage ||
+    !read ||
+    read.owner !== data.owner ||
+    data.owner.immutableSequence() !== data.sequence ||
+    !contributorRecordReadOwnerCurrent(storage, original) ||
+    !managedPhysicalScopeCurrent(data.scope)
+  )
+    return false;
+  data.original = original;
+  return true;
+}
+export function contributorLegacyBridgeBackingScopeCurrent(
+  storage: object,
+  original: ContributorRecordReadOwner,
+  witness: ContributorLegacyBridgeBackingScope,
+): boolean {
+  const data = legacyBridgeScopes.get(witness);
+  return (
+    !!data &&
+    data.owner.storage === storage &&
+    data.original === original &&
+    data.owner.immutableSequence() === data.sequence &&
+    contributorRecordReadOwnerCurrent(storage, original) &&
+    managedPhysicalScopeCurrent(data.scope)
+  );
+}
+
 /** Caller holds this lease for the complete attached database lifetime. Read-only
  * recovery uses a pinned head under that writer's lease and never publishes. */
 export function openContributorRecordStorage(
@@ -105,6 +260,8 @@ export function openContributorRecordStorage(
   directory(base);
   let lease: number | undefined;
   let closed = false;
+  let selection = Object.freeze({});
+  let immutableSequence = 0n;
   const check = () => {
     if (closed) fail('closed backend');
     directory(profile.root);
@@ -179,18 +336,20 @@ export function openContributorRecordStorage(
       directory(dirname(resolve(base, value)));
       return resolve(base, value);
     };
-    return {
+    const storage: ContributorRecordStorage = {
       read(value) {
         return readFile(name(value));
       },
       writeImmutable(value, bytes) {
         name(value);
         if (value === 'head') fail('head is not immutable');
+        immutableSequence++;
         write(value, bytes, true);
       },
       publishHead(bytes) {
         name('head');
         write('head', bytes, false);
+        selection = Object.freeze({});
       },
       close() {
         if (closed) return;
@@ -204,6 +363,23 @@ export function openContributorRecordStorage(
         }
       },
     };
+    readOwnerFactories.set(storage, {
+      storage,
+      read: storage.read,
+      write: storage.writeImmutable,
+      publish: storage.publishHead,
+      close: storage.close,
+      base,
+      marker,
+      profileRoot: profile.root,
+      root,
+      profileId,
+      live: () => !closed,
+      writable: () => !readOnly,
+      selection: () => selection,
+      immutableSequence: () => immutableSequence,
+    });
+    return storage;
   } catch (error) {
     if (lease !== undefined) closeSync(lease);
     throw error;

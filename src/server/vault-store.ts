@@ -60,6 +60,7 @@ import {
 import { openVaultIndexSteps, safeVaultName, type VaultIndexLimits } from './vault-index.ts';
 import { setImmediate as yieldHost } from 'node:timers/promises';
 import { openDiagnosticChunkStore, type DiagnosticChunkStore } from './diagnostic-chunk-store.ts';
+import { captureRecordHeadPhysical } from './record-head-physical.ts';
 
 export type VaultDiagnosticWriter = (sequence: number, bytes: Uint8Array) => void;
 const diagnosticWriters = new WeakMap<
@@ -117,6 +118,7 @@ interface RecordStagingOwner {
   key: VaultKey;
   guard(): void;
   live(): boolean;
+  head(): string | null;
   prepareHead(): void;
   installHead(bytes: Uint8Array): void;
   workspace?: string;
@@ -138,6 +140,7 @@ interface RecordStagingData {
   owner: RecordStagingOwner;
   db: DatabaseSync;
   originalEpoch: object;
+  originalSequence: bigint;
   approvedEpoch: object;
   sequence: bigint;
   parents: RecordParent[];
@@ -153,6 +156,92 @@ interface RecordStagingData {
 const recordStagingOwners = new WeakMap<object, RecordStagingOwner>();
 const recordStagingWitnesses = new WeakMap<VaultRecordStagingWitness, RecordStagingData>();
 const ownDescriptor = Object.getOwnPropertyDescriptor;
+declare const recordReadOwnerBrand: unique symbol;
+export interface VaultRecordReadOwner {
+  readonly [recordReadOwnerBrand]: true;
+}
+const recordReadOwners = new WeakMap<
+  VaultRecordReadOwner,
+  {
+    owner: RecordStagingOwner;
+    physical: ReturnType<typeof captureRecordHeadPhysical>;
+    head: string | null;
+    epoch: object;
+    sequence: bigint;
+    workspaceEpoch: object;
+  }
+>();
+/** Only the actual vault storage factory supplies these fixed original paths. */
+export function vaultRecordReadOwnerSupported(storage: object): boolean {
+  return recordStagingOwners.has(storage);
+}
+export function captureVaultRecordReadOwner(storage: object): VaultRecordReadOwner | undefined {
+  const owner = recordStagingOwners.get(storage),
+    epoch = captureManagedPhysicalEpoch();
+  if (!owner) return undefined;
+  if (!epoch || !recordStagingMethodsCurrent(owner))
+    throw Error('Vault record read owner unavailable');
+  owner.guard();
+  const physical = captureRecordHeadPhysical(
+    [resolve(owner.directory, 'vault/manifest.enc')],
+    [owner.directory, resolve(owner.directory, 'vault')],
+  );
+  const cap = Object.freeze({}) as VaultRecordReadOwner;
+  recordReadOwners.set(cap, {
+    owner,
+    physical,
+    head: owner.head(),
+    epoch,
+    sequence: managedPhysicalMutationSequence(),
+    workspaceEpoch: owner.workspaceEpoch(),
+  });
+  if (!vaultRecordReadOwnerCurrent(storage, cap)) {
+    closeVaultRecordReadOwner(cap);
+    throw Error('Vault record read owner changed during capture');
+  }
+  return cap;
+}
+/** Fixed native physical checks and factory-owned memory only. */
+export function vaultRecordReadOwnerCurrent(storage: object, cap: VaultRecordReadOwner): boolean {
+  const data = recordReadOwners.get(cap);
+  return (
+    !!data &&
+    data.owner.storage === storage &&
+    recordStagingMethodsCurrent(data.owner) &&
+    data.owner.head() === data.head &&
+    data.owner.workspaceEpoch() === data.workspaceEpoch &&
+    managedPhysicalEpochCurrent(data.epoch) &&
+    managedPhysicalMutationSequence() === data.sequence &&
+    data.physical.current()
+  );
+}
+/** The private publication owner must keep its original leaf witness. A fresh
+ * witness after writes cannot advance an earlier original HEAD capability. */
+export function vaultRecordReadOwnerStagingCurrent(
+  storage: object,
+  cap: VaultRecordReadOwner,
+  witness: VaultRecordStagingWitness,
+): boolean {
+  const original = recordReadOwners.get(cap),
+    staging = recordStagingWitnesses.get(witness);
+  return (
+    !!original &&
+    !!staging &&
+    original.owner === staging.owner &&
+    original.owner.storage === storage &&
+    original.epoch === staging.originalEpoch &&
+    original.sequence === staging.originalSequence &&
+    original.workspaceEpoch === staging.workspaceEpoch &&
+    original.owner.head() === original.head &&
+    vaultRecordStagingCurrent(witness) &&
+    original.physical.current()
+  );
+}
+export function closeVaultRecordReadOwner(cap: VaultRecordReadOwner): void {
+  const data = recordReadOwners.get(cap);
+  recordReadOwners.delete(cap);
+  data?.physical.close();
+}
 
 function recordParent(path: string): RecordParent {
   const stat = lstatSync(path, { bigint: true });
@@ -207,6 +296,7 @@ export function captureVaultRecordStaging(
     owner,
     db,
     originalEpoch,
+    originalSequence: managedPhysicalMutationSequence(),
     approvedEpoch: originalEpoch,
     sequence: managedPhysicalMutationSequence(),
     parents,
@@ -1156,6 +1246,7 @@ function* openVaultSteps({
       compactReady: () => pendingFiles.size === 0 && pendingObjects.size === 0,
       guard,
       live: () => !closed,
+      head: () => manifest.recordsHead,
       prepareHead() {
         guard();
         beforeHead?.();

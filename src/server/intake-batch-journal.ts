@@ -13,9 +13,9 @@ import {
   mkdirSync,
   openSync,
   writeFileSync,
-  linkSync,
-  unlinkSync,
   renameSync,
+  writeExclusiveJournalFileSync,
+  linkExclusiveJournalFileSync,
 } from './journal-physical-write.ts';
 import { dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -590,16 +590,10 @@ function publishHead(path: string, head: Head): void {
   count('headSerializationCalls');
   count('headSerializedBytes', Buffer.byteLength(serialized));
   const temporary = join(pending(path), 'current.' + randomUUID() + '.pending');
-  const fd = openSync(temporary, 'wx', 0o600);
-  try {
-    writeFileSync(fd, serialized);
-    count('headWrites');
-    count('headWriteBytes', Buffer.byteLength(serialized));
-    fsyncSync(fd);
-    count('fileSyncCalls');
-  } finally {
-    closeSync(fd);
-  }
+  writeExclusiveJournalFileSync(temporary, serialized);
+  count('headWrites');
+  count('headWriteBytes', Buffer.byteLength(serialized));
+  count('fileSyncCalls');
   renameSync(temporary, join(path, 'current'));
   notifyPublication(dirname(dirname(dirname(path))), head.batchId, [
     ...(head.tail ? [head.tail.name] : []),
@@ -724,18 +718,11 @@ export function writeIntakeBatch(
     };
     const temporary = join(pending(path), next.name + '.pending');
     event = join(path, next.name);
-    const fd = openSync(temporary, 'wx', 0o600);
-    try {
-      writeFileSync(fd, serialized);
-      count('eventWrites');
-      count('eventWriteBytes', Buffer.byteLength(serialized));
-      fsyncSync(fd);
-      count('fileSyncCalls');
-    } finally {
-      closeSync(fd);
-    }
-    linkSync(temporary, event);
-    unlinkSync(temporary);
+    const staged = writeExclusiveJournalFileSync(temporary, serialized);
+    count('eventWrites');
+    count('eventWriteBytes', Buffer.byteLength(serialized));
+    count('fileSyncCalls');
+    linkExclusiveJournalFileSync(staged, event);
     // Persist removal of the staging link before selecting single-link authority.
     sync(dirname(temporary));
     sync(path);

@@ -13,9 +13,10 @@ import {
   mkdirSync,
   openSync,
   writeFileSync,
-  linkSync,
   unlinkSync,
   renameSync,
+  writeExclusiveJournalFileSync,
+  linkExclusiveJournalFileSync,
 } from './journal-physical-write.ts';
 import { join, resolve, dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -256,13 +257,10 @@ function publishHead(directory: string, profileId: string, chatId: string, tip: 
   const file = join(directory, 'current');
   const pending = join(pendingDirectory(directory), 'current.' + randomUUID() + '.pending');
   try {
-    const fd = openSync(pending, 'wx', 0o600);
-    try {
-      writeFileSync(fd, JSON.stringify({ format: HEAD, profileId, chatId, ...tip }));
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
+    writeExclusiveJournalFileSync(
+      pending,
+      JSON.stringify({ format: HEAD, profileId, chatId, ...tip }),
+    );
     renameSync(pending, file);
     const dir = openSync(directory, 'r');
     try {
@@ -492,15 +490,8 @@ export function writeChat(root: string, profileId: string, chat: unknown, reason
     file = join(directory, nextTail);
     const temporary = join(pendingDirectory(directory), nextTail + '.' + randomUUID() + '.pending');
     try {
-      const fd = openSync(temporary, 'wx', 0o600);
-      try {
-        writeFileSync(fd, bytes);
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      linkSync(temporary, file);
-      unlinkSync(temporary);
+      const staged = writeExclusiveJournalFileSync(temporary, bytes);
+      linkExclusiveJournalFileSync(staged, file);
       const dir = openSync(directory, 'r');
       try {
         fsyncSync(dir);

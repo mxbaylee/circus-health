@@ -56,7 +56,23 @@ import {
   assertVaultRecordMetadataPrior,
   bindVaultRecordStagingTransaction,
   type VaultRecordStagingWitness,
+  captureVaultRecordReadOwner,
+  vaultRecordReadOwnerCurrent,
+  closeVaultRecordReadOwner,
+  type VaultRecordReadOwner,
+  vaultRecordReadOwnerSupported,
 } from './vault-store.ts';
+import {
+  captureContributorRecordReadOwner,
+  contributorRecordReadOwnerCurrent,
+  closeContributorRecordReadOwner,
+  type ContributorRecordReadOwner,
+  contributorRecordReadOwnerSupported,
+  captureContributorLegacyBridgeBackingScopeForStorage,
+  bindContributorLegacyBridgeBackingScope,
+  contributorLegacyBridgeBackingScopeCurrent,
+  type ContributorLegacyBridgeBackingScope,
+} from './contributor-record-storage.ts';
 import {
   captureManagedPhysicalEpoch,
   managedPhysicalEpochCurrent,
@@ -462,13 +478,20 @@ function readHead(
   storage: RecordStorage,
   read: RecordStorage['read'] = storage.read,
 ): RecordObjectReference | null {
+  return readHeadBinding(storage, read).head;
+}
+function readHeadBinding(
+  storage: RecordStorage,
+  read: RecordStorage['read'],
+): { head: RecordObjectReference | null; wire: string | null } {
   recordVersionWork('headReadCalls');
   const bytes = Reflect.apply(read, storage, ['head']);
   if (Buffer.isBuffer(bytes)) recordVersionWork('headReadBytes', bytes.length);
-  if (bytes === null || bytes === undefined) return null;
+  if (bytes === null || bytes === undefined) return { head: null, wire: null };
   const ref = parseRecordJson(bytes as unknown as string) as unknown;
   if (!refValid(ref)) fail('invalid head');
-  return ref as RecordObjectReference;
+  if (!Buffer.isBuffer(bytes)) fail('record HEAD must be original bytes');
+  return { head: ref as RecordObjectReference, wire: bytes.toString('utf8') };
 }
 function readConfiguredHead(db: Database, config: RecordConfig): RecordObjectReference | null {
   const terminal = activeCompactTerminal.get(db),
@@ -2673,6 +2696,211 @@ function consumeRecordSourcePriorFields(
 }
 export interface RecordAuthorityWitness {
   readonly [authorityWitnessBrand]: true;
+}
+declare const recordReadOwnerBrand: unique symbol;
+export interface RecordReadOwner {
+  readonly [recordReadOwnerBrand]: true;
+}
+const recordReadOwners = new WeakMap<
+  RecordReadOwner,
+  {
+    db: Database;
+    config: RecordConfig;
+    methods: object;
+    read: RecordStorage['read'];
+    status: StatementSync;
+    row: string;
+    head: RecordObjectReference | null;
+    wire: string | null;
+    vault?: VaultRecordReadOwner;
+    contributor?: ContributorRecordReadOwner;
+    legacyBridgeScope?: ContributorLegacyBridgeBackingScope;
+  }
+>();
+/** Factory recognition only, not validity or a fallback on genuine drift. */
+export function recordReadOwnerSupported(db: Database, profileId: string): boolean {
+  const config = state.get(db);
+  return (
+    !!config &&
+    config.profileId === profileId &&
+    (vaultRecordReadOwnerSupported(config.storage) ||
+      contributorRecordReadOwnerSupported(config.storage))
+  );
+}
+/** Capture at read entry, before rendering or caller effects. Only actual
+ * registered storage factories can bind their original durable HEAD paths. */
+export function captureRecordReadOwner(db: Database, profileId: string): RecordReadOwner {
+  const config = state.get(db),
+    methods = managedDatabaseMethodEpoch(db),
+    read = config && ownDescriptor(config.storage, 'read');
+  if (
+    !config ||
+    config.profileId !== profileId ||
+    !methods ||
+    db.isTransaction ||
+    !read ||
+    !('value' in read) ||
+    typeof read.value !== 'function'
+  )
+    fail('original record read owner unavailable');
+  const vault = captureVaultRecordReadOwner(config!.storage),
+    contributor = vault ? undefined : captureContributorRecordReadOwner(config!.storage);
+  if (!vault && !contributor) fail('original record read owner requires a genuine storage factory');
+  const owner = Object.freeze({}) as RecordReadOwner;
+  try {
+    const status = Reflect.apply(readmissionPrepare, db, [
+        'SELECT * FROM main.__record_state WHERE singleton=1',
+      ]),
+      row = Reflect.apply(readmissionGet, status, []) as RecordStateRow | undefined,
+      { head, wire } = readHeadBinding(config!.storage, read!.value);
+    if (!row || !eq(head, parseRecordJson(row.head_json)))
+      fail('original record read HEAD differs from its selected index');
+    recordReadOwners.set(owner, {
+      db,
+      config: config!,
+      methods: methods!,
+      read: read!.value,
+      status,
+      row: stringifyRecordJson(row),
+      head,
+      wire,
+      vault,
+      contributor,
+    });
+    assertRecordReadOwnerBeforeVerification(db, owner);
+    return owner;
+  } catch (error) {
+    recordReadOwners.delete(owner);
+    try {
+      if (vault) closeVaultRecordReadOwner(vault);
+    } finally {
+      if (contributor) closeContributorRecordReadOwner(contributor);
+    }
+    throw error;
+  }
+}
+function recordReadOwnerIntervalCurrent(db: Database, owner: RecordReadOwner): boolean {
+  const proof = recordReadOwners.get(owner),
+    read = proof && ownDescriptor(proof.config.storage, 'read');
+  return (
+    !!proof &&
+    proof.db === db &&
+    db.isOpen &&
+    !db.isTransaction &&
+    state.get(db) === proof.config &&
+    managedDatabaseMethodEpoch(db) === proof.methods &&
+    !!read &&
+    'value' in read &&
+    read.value === proof.read &&
+    (proof.vault
+      ? vaultRecordReadOwnerCurrent(proof.config.storage, proof.vault)
+      : !!proof.contributor &&
+        contributorRecordReadOwnerCurrent(proof.config.storage, proof.contributor))
+  );
+}
+/** The outer result owner retains its separate native SQL-attempt seal. This
+ * continuation checks only original factory/HEAD resources, never queries SQL. */
+export function assertRecordReadOwnerInterval(db: Database, owner: RecordReadOwner): void {
+  if (!recordReadOwnerIntervalCurrent(db, owner)) fail('original record read interval changed');
+}
+/** Real adapter effects are allowed only BEFORE the final original worker. */
+export function assertRecordReadOwnerBeforeVerification(
+  db: Database,
+  owner: RecordReadOwner,
+): void {
+  const proof = recordReadOwners.get(owner);
+  if (
+    !recordReadOwnerIntervalCurrent(db, owner) ||
+    stringifyRecordJson(Reflect.apply(readmissionGet, proof!.status, [])) !== proof!.row ||
+    !eq(readHead(proof!.config.storage, proof!.read), proof!.head) ||
+    !recordReadOwnerIntervalCurrent(db, owner)
+  )
+    fail('original record read authority changed');
+}
+/** Fixed native status read plus genuine factory HEAD/FD identities. The
+ * enclosing finite transport rejects reprepare before any policy callback. */
+export function assertRecordReadOwnerTerminal(db: Database, owner: RecordReadOwner): void {
+  const proof = recordReadOwners.get(owner);
+  if (
+    !terminalStatementsActive(db) ||
+    !recordReadOwnerIntervalCurrent(db, owner) ||
+    stringifyRecordJson(Reflect.apply(readmissionGet, proof!.status, [])) !== proof!.row ||
+    !recordReadOwnerIntervalCurrent(db, owner)
+  )
+    fail('original record read terminal authority changed');
+}
+export function closeRecordReadOwner(owner: RecordReadOwner): void {
+  const proof = recordReadOwners.get(owner);
+  recordReadOwners.delete(owner);
+  if (!proof) return;
+  try {
+    if (proof.vault) closeVaultRecordReadOwner(proof.vault);
+  } finally {
+    if (proof.contributor) closeContributorRecordReadOwner(proof.contributor);
+  }
+}
+/** Only the registered contributor HEAD factory can narrow an original bridge
+ * read against unrelated physical writes. Other adapters retain the global guard. */
+export function captureContributorLegacyBridgeRecordOwner(
+  db: Database,
+): RecordReadOwner | undefined {
+  const config = state.get(db);
+  if (!config || !contributorRecordReadOwnerSupported(config.storage)) return undefined;
+  const scope =
+    captureContributorLegacyBridgeBackingScopeForStorage(config.storage) ??
+    fail('original contributor backing scope unavailable');
+  const owner = captureRecordReadOwner(db, config.profileId);
+  try {
+    const proof =
+      recordReadOwners.get(owner) ?? fail('original contributor record owner unavailable');
+    const contributor = proof.contributor ?? fail('original contributor record owner unavailable');
+    if (!bindContributorLegacyBridgeBackingScope(config.storage, contributor, scope))
+      fail('original contributor backing scope changed during capture');
+    proof.legacyBridgeScope = scope;
+    assertContributorLegacyBridgeRecordOwner(db, owner);
+    return owner;
+  } catch (error) {
+    closeRecordReadOwner(owner);
+    throw error;
+  }
+}
+/** Original contributor HEAD and indexed state, including inside the exact
+ * maintenance transaction. The bridge separately seals its SQL write interval. */
+export function assertContributorLegacyBridgeRecordOwner(
+  db: Database,
+  owner: RecordReadOwner,
+  token?: object,
+): void {
+  const proof = recordReadOwners.get(owner);
+  const current = () => {
+    const read = proof && ownDescriptor(proof.config.storage, 'read');
+    return (
+      !!proof?.contributor &&
+      !proof.vault &&
+      proof.db === db &&
+      db.isOpen &&
+      (token ? db.isTransaction && currentTransactionToken(db) === token : !db.isTransaction) &&
+      state.get(db) === proof.config &&
+      managedDatabaseMethodEpoch(db) === proof.methods &&
+      !!read &&
+      'value' in read &&
+      read.value === proof.read &&
+      contributorRecordReadOwnerCurrent(proof.config.storage, proof.contributor) &&
+      !!proof.legacyBridgeScope &&
+      contributorLegacyBridgeBackingScopeCurrent(
+        proof.config.storage,
+        proof.contributor,
+        proof.legacyBridgeScope,
+      )
+    );
+  };
+  if (
+    !current() ||
+    stringifyRecordJson(Reflect.apply(readmissionGet, proof!.status, [])) !== proof!.row ||
+    !eq(readHead(proof!.config.storage, proof!.read), proof!.head) ||
+    !current()
+  )
+    fail('original contributor record authority changed');
 }
 const authorityWitnesses = new WeakMap<
   RecordAuthorityWitness,
