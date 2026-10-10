@@ -29,7 +29,7 @@ import {
   prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
-import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
+import { collectionClinicalProjectionContextAsync } from './intake-review-collection-session.ts';
 import { prepareNativeDraftHistory } from './intake-review-draft-state.ts';
 import { createReportSnapshotCatalog } from './intake-report-snapshot-catalog.ts';
 import { prepareWorkflowDraftDerived } from './intake-workflow-update.ts';
@@ -162,7 +162,8 @@ export async function saveIntakeDraftRepairRead(
             >
           >();
           try {
-            const contexts: ReturnType<typeof collectionClinicalProjectionContext>[] = [];
+            const contexts: Awaited<ReturnType<typeof collectionClinicalProjectionContextAsync>>[] =
+              [];
             const view = openIntakeCollectionEnvelope(db, file);
             const latest = new Map<string, IntakeReviewDraft>();
             const drafts: IntakeReviewDraft[] = [];
@@ -200,7 +201,8 @@ export async function saveIntakeDraftRepairRead(
                   );
                 selected = prepared;
                 reviews.set(proposalKey, selected);
-                contexts.push(collectionClinicalProjectionContext(selected.session));
+                contexts.push(await collectionClinicalProjectionContextAsync(selected.session));
+                assertRunning();
               }
               const record = required(
                 selected.session.record(correction.recordId),

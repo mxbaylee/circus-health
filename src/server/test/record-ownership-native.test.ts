@@ -188,7 +188,7 @@ test(
     const plan = nativeOwnershipNamePlan(db, profileId, preview.nameEvidence.token);
     assert.equal(plan.reference.targetTotal, 96);
     assert.equal(plan.effects().items[0]!.unknownSupport, true);
-    const decided = chooseNativeOwnershipName(
+    const decided = await chooseNativeOwnershipName(
       db,
       root,
       profileId,

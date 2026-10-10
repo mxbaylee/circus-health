@@ -321,8 +321,9 @@ async function feedWindow(
     last = String(row.ordering);
     const group = JSON.parse(String(row.groupValue)) as CollectionReportGroupReference;
     group.binding = queue.binding;
-    const summary = queue.summary(group.intakeId, group.ordinal);
-    if (!summary) throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report summary');
+    const pointer = queue.findGroup(group.groupId, group.intakeId, group.ordinal);
+    if (!pointer) throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report summary');
+    const summary = await collectionReportGroupSummary(db, root, profileId, queue, pointer);
     group.bytes = Buffer.byteLength(canonicalLiteral(summary));
     groups.set(JSON.stringify([group.intakeId, group.ordinal]), group);
   }
@@ -337,8 +338,9 @@ async function feedWindow(
       ...JSON.parse(String(row.value)),
       binding: queue.binding,
     } as CollectionReportGroupReference;
-    const summary = queue.summary(group.intakeId, group.ordinal);
-    if (!summary) throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report summary');
+    const pointer = queue.findGroup(group.groupId, group.intakeId, group.ordinal);
+    if (!pointer) throw new HttpError(409, 'REPORT_QUEUE_CURSOR', 'Refresh this report summary');
+    const summary = await collectionReportGroupSummary(db, root, profileId, queue, pointer);
     group.bytes = Buffer.byteLength(canonicalLiteral(summary));
     peopleGroups.push(group);
     peopleLast = String(row.ordering);
@@ -1162,7 +1164,7 @@ export async function readCollectionImportFeed(
             feed.signingKey.fill(0);
           }
         }
-        queue.close({ retainReview: successfulRead });
+        queue.close({ retainReview: successfulRead, discard: !successfulRead });
         if (!retained) {
           scratch.close();
           signingKey.fill(0);

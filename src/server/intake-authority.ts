@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
   COMPACT_SCALAR_BYTES,
-  COMPACT_SCALAR_FORMAT,
   compactIntakeScalarSteps,
   isIntakeCompactScalar,
   type IntakeCompactScalarField,
@@ -219,16 +218,7 @@ export function intakeEnvelopeProjection(raw: unknown): {
     ) ||
     !['normalized', 'raw'].includes(String(value.intakeAuthority.mode)) ||
     !object(value.intake) ||
-    Object.keys(value.intake).some((name) => !metadataFields.has(name)) ||
-    (value.intakeAuthority.format === INTAKE_COMPACT_ENVELOPE_FORMAT &&
-      ['originalName', 'locator'].some((name) => {
-        const item = (value.intake as Record<string, unknown>)[name];
-        return (
-          object(item) &&
-          item.format === COMPACT_SCALAR_FORMAT &&
-          (!isIntakeCompactScalar(item) || item.field !== name)
-        );
-      }))
+    Object.keys(value.intake).some((name) => !metadataFields.has(name))
   )
     return fail('unsupported or duplicated original authority');
   return {

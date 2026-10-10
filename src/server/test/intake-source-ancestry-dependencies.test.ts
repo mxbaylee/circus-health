@@ -14,6 +14,7 @@ import { runIntakeSourceExtractionOperation } from '../intake-source-extraction-
 import { getIntakeSourceText, publishIntakeSourceText } from '../intake-source-text.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import type { SourceTextEvidence } from '../../shared/intake-source-text.ts';
+import { packetSourceAncestry, packetSourceAncestryWork } from '../packet-source-ancestry.ts';
 
 const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 function fixture(t: test.TestContext, parents: (string | null | number)[]) {
@@ -78,6 +79,34 @@ const evidence: SourceTextEvidence = {
   relations: [],
   issues: [],
 };
+
+test('packet ancestry work bounds duplicate seeds and ancestor advances without changing output', (t) => {
+  const f = fixture(
+    t,
+    Array.from({ length: 130 }, (_, i) => (i ? `fictional-${i - 1}` : null)),
+  );
+  const expected = [...packetSourceAncestry(f.db, [f.id])];
+  const iterator = packetSourceAncestryWork(
+    f.db,
+    Array.from({ length: 130 }, () => f.id),
+  );
+  let advances = 0;
+  for (;;) {
+    const next = iterator.next();
+    advances++;
+    if (!next.value && !next.done) break;
+    assert.equal(next.done, false);
+  }
+  assert.equal(advances, 1, 'the first64 duplicate seeds produce a work checkpoint before records');
+  iterator.return();
+  const actual = [...packetSourceAncestryWork(f.db, [f.id])];
+  assert.ok(actual.filter((value) => value === undefined).length >= 2);
+  assert.deepEqual(
+    actual.filter((value) => value !== undefined),
+    expected,
+  );
+  assert.equal(expected.length, 130);
+});
 
 test('deep native capture propagates exact pins through every ancestor, replays without writes and cancels warm preparation', async (t) => {
   const f = fixture(

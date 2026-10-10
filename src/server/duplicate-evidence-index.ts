@@ -1,7 +1,17 @@
 /** Complete disposable saved-evidence digests; accepted rows remain authority. */
 import { createHash } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
-import { HttpError, type Database } from './database.ts';
+import {
+  HttpError,
+  managedDatabaseFunctionSetter,
+  observeManagedDatabaseFunctionRegistration,
+  type Database,
+} from './database.ts';
+import {
+  beginIntakeFrontierAuxiliaryPreparation,
+  execIntakeFrontierAuxiliarySQL,
+  finishIntakeFrontierAuxiliaryPreparation,
+} from './intake-lookup-frontier-observer.ts';
 import {
   duplicateEvidenceValue,
   duplicateRecordHeader,
@@ -56,20 +66,23 @@ interface State {
   maxValueBytes: number;
 }
 const states = new WeakMap<Database, State>();
-function checked(db: Database) {
-  const state = states.get(db);
-  if (
-    !state?.ready ||
-    state.schema !== schema(db) ||
-    state.main !== mainSchema(db) ||
-    state.version !== version(db)
-  ) {
-    if (state) state.ready = false;
-    throw pending();
+const functions = new WeakMap<Database, { current: boolean; setter: Database['function'] }>();
+/** Only registers the fixed function; cold evidence reconstruction remains separately awaited. */
+export function ensureDuplicateEvidenceFunction(db: Database): void {
+  let binding = functions.get(db);
+  if (binding?.current && binding.setter === db.function) return;
+  if (db.function !== managedDatabaseFunctionSetter(db)) throw pending();
+  if (!binding) {
+    binding = { current: false, setter: db.function };
+    functions.set(db, binding);
+    const selected = binding;
+    observeManagedDatabaseFunctionRegistration(db, (name) => {
+      if (name.toLowerCase() !== 'circus_duplicate_original_id') return;
+      selected.current = false;
+      const state = states.get(db);
+      if (state) state.ready = false;
+    });
   }
-  return state;
-}
-function initialize(db: Database): State {
   db.function('circus_duplicate_original_id', { deterministic: true }, (locator, fallback) => {
     try {
       const value = JSON.parse(String(locator)) as { originalSourceFileId?: unknown };
@@ -80,76 +93,102 @@ function initialize(db: Database): State {
       return String(fallback);
     }
   });
-  for (const table of tables)
-    for (const action of ['insert', 'update', 'delete'])
-      db.exec(`DROP TRIGGER IF EXISTS temp.__duplicate_evidence_${table}_${action}`);
-  db.exec(`DROP TABLE IF EXISTS temp.${TABLE}; DROP TABLE IF EXISTS temp.${META}; DROP TABLE IF EXISTS temp.${ORIGINALS};
+  binding.current = true;
+}
+function checked(db: Database) {
+  const state = states.get(db);
+  if (
+    !state?.ready ||
+    !functions.get(db)?.current ||
+    functions.get(db)?.setter !== db.function ||
+    state.schema !== schema(db) ||
+    state.main !== mainSchema(db) ||
+    state.version !== version(db)
+  ) {
+    if (state) state.ready = false;
+    throw pending();
+  }
+  return state;
+}
+function initialize(db: Database): State {
+  const frontier = beginIntakeFrontierAuxiliaryPreparation(db, 'duplicate-evidence');
+  let complete = false;
+  const exec = (sql: string) => execIntakeFrontierAuxiliarySQL(db, frontier, sql);
+  try {
+    for (const table of tables)
+      for (const action of ['insert', 'update', 'delete'])
+        exec(`DROP TRIGGER IF EXISTS temp.__duplicate_evidence_${table}_${action}`);
+    exec(`DROP TABLE IF EXISTS temp.${TABLE}; DROP TABLE IF EXISTS temp.${META}; DROP TABLE IF EXISTS temp.${ORIGINALS};
     CREATE TEMP TABLE ${TABLE}(kind TEXT,id TEXT,dirty INTEGER NOT NULL,count INTEGER,digest TEXT,scope_digest TEXT,raw_digest TEXT,error TEXT,PRIMARY KEY(kind,id));
     CREATE TEMP TABLE ${ORIGINALS}(kind TEXT,id TEXT,url TEXT,PRIMARY KEY(kind,id,url));
     CREATE TEMP TABLE ${META}(generation INTEGER NOT NULL); INSERT INTO ${META} VALUES(0);`);
-  for (const action of ['insert', 'update', 'delete']) {
-    const aliases = action === 'update' ? ['OLD', 'NEW'] : [action === 'delete' ? 'OLD' : 'NEW'];
-    const create = (table: string, sql: string, when = '') =>
-      db.exec(
-        `CREATE TEMP TRIGGER __duplicate_evidence_${table}_${action} AFTER ${action} ON main.${table} ${when} BEGIN ${sql} END`,
+    for (const action of ['insert', 'update', 'delete']) {
+      const aliases = action === 'update' ? ['OLD', 'NEW'] : [action === 'delete' ? 'OLD' : 'NEW'];
+      const create = (table: string, sql: string, when = '') =>
+        exec(
+          `CREATE TEMP TRIGGER __duplicate_evidence_${table}_${action} AFTER ${action} ON main.${table} ${when} BEGIN ${sql} END`,
+        );
+      create(
+        'evidence',
+        aliases
+          .map((a) =>
+            dirty(`SELECT ${a}.entity_type,${a}.entity_id WHERE ${a}.entity_type IN ${kinds}`),
+          )
+          .join(' '),
       );
-    create(
-      'evidence',
-      aliases
-        .map((a) =>
-          dirty(`SELECT ${a}.entity_type,${a}.entity_id WHERE ${a}.entity_type IN ${kinds}`),
-        )
-        .join(' '),
+      create(
+        'source_records',
+        aliases
+          .map((a) =>
+            dirty(
+              `SELECT e.entity_type,e.entity_id FROM evidence e WHERE e.source_record_id=${a}.id AND e.entity_type IN ${kinds}`,
+            ),
+          )
+          .join(' '),
+      );
+      create(
+        'providers',
+        aliases
+          .map((a) =>
+            dirty(
+              `SELECT e.entity_type,e.entity_id FROM evidence e JOIN source_records s ON s.id=e.source_record_id WHERE s.provider_id=${a}.id AND e.entity_type IN ${kinds}`,
+            ),
+          )
+          .join(' '),
+        action === 'update' ? 'WHEN OLD.name IS NOT NEW.name OR OLD.id IS NOT NEW.id' : '',
+      );
+      create(
+        'source_files',
+        aliases
+          .map((a) =>
+            dirty(
+              `SELECT e.entity_type,e.entity_id FROM evidence e JOIN source_records s ON s.id=e.source_record_id WHERE (s.source_file_id=${a}.id OR json_extract(e.locator_json,'$.originalSourceFileId')=${a}.id OR circus_duplicate_original_id(e.locator_json,s.source_file_id)=${a}.id) AND e.entity_type IN ${kinds}`,
+            ),
+          )
+          .join(' '),
+        action === 'update'
+          ? 'WHEN OLD.id IS NOT NEW.id OR OLD.sha256 IS NOT NEW.sha256 OR OLD.bytes IS NOT NEW.bytes'
+          : '',
+      );
+    }
+    exec(
+      `INSERT OR IGNORE INTO ${TABLE}(kind,id,dirty) SELECT entity_type,entity_id,1 FROM evidence WHERE entity_type IN ${kinds}`,
     );
-    create(
-      'source_records',
-      aliases
-        .map((a) =>
-          dirty(
-            `SELECT e.entity_type,e.entity_id FROM evidence e WHERE e.source_record_id=${a}.id AND e.entity_type IN ${kinds}`,
-          ),
-        )
-        .join(' '),
-    );
-    create(
-      'providers',
-      aliases
-        .map((a) =>
-          dirty(
-            `SELECT e.entity_type,e.entity_id FROM evidence e JOIN source_records s ON s.id=e.source_record_id WHERE s.provider_id=${a}.id AND e.entity_type IN ${kinds}`,
-          ),
-        )
-        .join(' '),
-      action === 'update' ? 'WHEN OLD.name IS NOT NEW.name OR OLD.id IS NOT NEW.id' : '',
-    );
-    create(
-      'source_files',
-      aliases
-        .map((a) =>
-          dirty(
-            `SELECT e.entity_type,e.entity_id FROM evidence e JOIN source_records s ON s.id=e.source_record_id WHERE (s.source_file_id=${a}.id OR json_extract(e.locator_json,'$.originalSourceFileId')=${a}.id OR circus_duplicate_original_id(e.locator_json,s.source_file_id)=${a}.id) AND e.entity_type IN ${kinds}`,
-          ),
-        )
-        .join(' '),
-      action === 'update'
-        ? 'WHEN OLD.id IS NOT NEW.id OR OLD.sha256 IS NOT NEW.sha256 OR OLD.bytes IS NOT NEW.bytes'
-        : '',
-    );
+    const state = {
+      ready: true,
+      schema: schema(db),
+      main: mainSchema(db),
+      version: version(db),
+      rows: 0,
+      coldRows: 0,
+      maxValueBytes: 0,
+    };
+    states.set(db, state);
+    complete = true;
+    return state;
+  } finally {
+    finishIntakeFrontierAuxiliaryPreparation(db, frontier, complete);
   }
-  db.exec(
-    `INSERT OR IGNORE INTO ${TABLE}(kind,id,dirty) SELECT entity_type,entity_id,1 FROM evidence WHERE entity_type IN ${kinds}`,
-  );
-  const state = {
-    ready: true,
-    schema: schema(db),
-    main: mainSchema(db),
-    version: version(db),
-    rows: 0,
-    coldRows: 0,
-    maxValueBytes: 0,
-  };
-  states.set(db, state);
-  return state;
 }
 function scoped(db: Database, evidence: ReturnType<typeof duplicateEvidenceValue>) {
   const match = /^\/api\/sources\/([^/?#]+)\/content(?:[?#]|$)/.exec(evidence.contentUrl);
@@ -174,6 +213,7 @@ export async function prepareDuplicateEvidenceIndex(
   options: { assertRunning?: () => void } = {},
 ) {
   if (db.isTransaction) throw Error('Prepare saved evidence outside the application transaction');
+  ensureDuplicateEvidenceFunction(db);
   let state: State,
     cold = false;
   try {

@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
+import { Worker } from 'node:worker_threads';
 import { openDatabase, revision, transaction } from '../database.ts';
 import { ensureProfileDirectories, profileOriginal } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
@@ -18,6 +19,8 @@ import {
 } from '../intake-review-collection-host.ts';
 import {
   prepareCollectionClinicalProjection,
+  prepareCollectionClinicalProjectionWithEvidence,
+  withVerifiedClinicalProjectionPublication,
   preparedClinicalProjectionResult,
   preparedClinicalProjectionMatchingRows,
   applyPreparedClinicalProjection,
@@ -127,6 +130,72 @@ test('clinical projection preparation restores all SQL changes; ordinary apply p
   assert.equal(intakeWorkCounters(db).warm.materializationReads, work.warm.materializationReads);
   assert.throws(() => transaction(db, () => applyPreparedClinicalProjection(db, plan)), /Refresh/);
 });
+
+test('cooperative projection verifies original proof after staging and publishes the exact result', async (t) => {
+  const { db, root, profileId, session, decisions, cleanup } = await fixture(t);
+  const before = revision(db);
+  const plan = await prepareCollectionClinicalProjectionWithEvidence(
+    db,
+    root,
+    profileId,
+    session,
+    decisions,
+  );
+  cleanup.push(() => disposePreparedClinicalProjection(plan));
+  assert.equal(revision(db), before);
+  assert.equal(db.prepare('SELECT count(*) n FROM documents').get()!.n, 0);
+  const expected = preparedClinicalProjectionResult(plan);
+  const actual = await withVerifiedClinicalProjectionPublication(db, plan, () =>
+    transaction(db, () => applyPreparedClinicalProjection(db, plan)),
+  );
+  assert.deepEqual(actual, expected);
+  assert.equal(db.prepare('SELECT count(*) n FROM documents').get()!.n, 1);
+});
+
+for (const mutation of ['original', 'method'] as const)
+  test(`cooperative projection refuses ${mutation} changes during its post-staging proof`, async (t) => {
+    const { db, root, profileId, session, decisions, intake } = await fixture(t);
+    const path = profileOriginal(
+      root,
+      String(db.prepare('SELECT path FROM source_files WHERE id=?').get(intake.id)!.path),
+      profileId,
+    );
+    const before = revision(db);
+    const changes = () => Number(db.prepare('SELECT total_changes() n').get()!.n);
+    const originalChanges = changes();
+    const postMessage = Worker.prototype.postMessage;
+    let injected = false;
+    Worker.prototype.postMessage = function (value, transferList) {
+      const message = value as { type?: string; items?: { path?: string }[] };
+      if (
+        !injected &&
+        message.type === 'page' &&
+        changes() > originalChanges &&
+        message.items?.some((item) => item.path === path)
+      ) {
+        injected = true;
+        assert.equal(
+          db.prepare('SELECT count(*) n FROM documents').get()!.n,
+          0,
+          'Speculative rows already rolled back',
+        );
+        if (mutation === 'original') writeFileSync(path, readFileSync(path));
+        else db.function('fictional_projection_gap', () => 1);
+      }
+      return postMessage.call(this, value, transferList);
+    };
+    t.after(() => {
+      Worker.prototype.postMessage = postMessage;
+    });
+    await assert.rejects(
+      prepareCollectionClinicalProjectionWithEvidence(db, root, profileId, session, decisions),
+      /Retained (?:clinical|physical) evidence changed|Refresh this selected clinical review/,
+    );
+    assert.equal(injected, true, 'Mutation hit the actual post-staging worker page');
+    assert.equal(revision(db), before);
+    assert.equal(db.prepare('SELECT count(*) n FROM documents').get()!.n, 0);
+  });
+
 test('failed projection preparation and failed publication both leave no partial projection', async (t) => {
   const { db, root, profileId, session, decisions, cleanup } = await fixture(t);
   const capture = db.createSession();

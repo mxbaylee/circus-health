@@ -16,11 +16,12 @@ export interface IntakeCompactScalar {
   suffix: string;
   truncated: boolean;
 }
+const preparedScalars = new WeakSet<object>();
 export function compactIntakeScalar(
   field: IntakeCompactScalarField,
   facts: IntakeFilenameFacts,
 ): IntakeCompactScalar {
-  return {
+  const value: IntakeCompactScalar = {
     format: COMPACT_SCALAR_FORMAT,
     field,
     scalarHash: facts.scalarHash,
@@ -29,6 +30,12 @@ export function compactIntakeScalar(
     suffix: facts.suffix,
     truncated: facts.truncated,
   };
+  preparedScalars.add(value);
+  return Object.freeze(value);
+}
+/** A retained ordinary object can have the same shape as a descriptor. */
+export function isPreparedIntakeCompactScalar(value: unknown): value is IntakeCompactScalar {
+  return !!value && typeof value === 'object' && preparedScalars.has(value);
 }
 export function isIntakeCompactScalar(value: unknown): value is IntakeCompactScalar {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -57,15 +64,15 @@ export function* compactIntakeScalarSteps(
   return compactIntakeScalar(field, yield* prepareIntakeFilenameFactsSteps(pieces, ''));
 }
 export function intakeMetadataLabel(value: string | IntakeCompactScalar): string {
-  return typeof value === 'string'
-    ? value
-    : value.preview + (value.truncated ? ' [shortened]' : '');
+  return isPreparedIntakeCompactScalar(value)
+    ? value.preview + (value.truncated ? ' [shortened]' : '')
+    : value;
 }
 export function intakeMetadataScalarMatches(
   value: string | IntakeCompactScalar | undefined,
   exact: string | undefined,
 ): boolean {
-  if (typeof value === 'string' || value === undefined) return value === exact;
+  if (!isPreparedIntakeCompactScalar(value)) return value === exact;
   if (exact === undefined) return false;
   const steps = compactIntakeScalarSteps(value.field, [JSON.stringify(exact)]);
   for (;;) {

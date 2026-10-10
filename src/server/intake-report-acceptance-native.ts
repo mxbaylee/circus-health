@@ -30,7 +30,7 @@ import {
   prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
-import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
+import { collectionClinicalProjectionContextAsync } from './intake-review-collection-session.ts';
 import {
   prepareNativeIntakeAcceptanceGroup,
   type NativeAcceptanceGroupMember,
@@ -184,6 +184,9 @@ export async function applyNativeAcceptanceGroup(
             block.proposalId,
             { assertRunning },
           );
+        const { prepareClinicalSourceFingerprintIndex } =
+          await import('./intake-clinical-source-index.ts');
+        await prepareClinicalSourceFingerprintIndex(db, { assertRunning });
         const lookup = await prepareIntakeLookupIndices(db, { assertRunning });
         let discoveryOrder = maximumReportDiscoveryOrder(db);
         const members: NativeAcceptanceGroupMember[] = [];
@@ -221,7 +224,7 @@ export async function applyNativeAcceptanceGroup(
             );
           sessions.push(result.session);
           const session = result.session,
-            context = collectionClinicalProjectionContext(session),
+            context = await collectionClinicalProjectionContextAsync(session),
             view = openIntakeCollectionEnvelope(db, { id: block.intakeId }),
             intake = view.child(view.root(), 'intake')!,
             flow = view.child(intake, 'workflow');
@@ -352,9 +355,6 @@ export async function applyNativeAcceptanceGroup(
           });
         }
         const publicationChecks = new Map<string, () => void>();
-        const { prepareClinicalSourceFingerprintIndex } =
-          await import('./intake-clinical-source-index.ts');
-        await prepareClinicalSourceFingerprintIndex(db, { assertRunning });
         const prepared = await prepareNativeIntakeAcceptanceGroup(db, root, profileId, {
           members,
           operationId: selected.operationId,

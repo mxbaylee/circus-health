@@ -15,6 +15,7 @@ export function* hashIntakeJsonScalarSteps(
   pieces: Iterable<string>,
   leading: readonly (string | null)[] = [],
   onStringUnit?: (unit: string) => void,
+  onNumber?: (value: number) => void,
 ): Generator<
   void,
   { hash: string; kind: 'string' | 'number' | 'boolean' | 'null'; bytes: number }
@@ -190,7 +191,10 @@ export function* hashIntakeJsonScalarSteps(
       const adjusted = exponent - fraction + significant - kept.length - (sticky ? 1 : 0),
         number = started
           ? Number((negative ? '-' : '') + kept + (sticky ? '1' : '') + 'e' + adjusted)
-          : 0;
+          : negative
+            ? -0
+            : 0;
+      onNumber?.(number);
       update(JSON.stringify(number));
     }
     yield* ws();

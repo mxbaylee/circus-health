@@ -140,6 +140,7 @@ function fixture(t: test.TestContext) {
     identity,
     directory,
     authority,
+    legacyDetailsJson: initial.detailsJson,
     source: { id: identity.intakeId, sha256: identity.sourceHash },
   };
 }
@@ -302,8 +303,13 @@ test('cold and revised giant-name summaries use bounded facts and preserve exact
   }
 });
 test('older native filenames upgrade cooperatively, cancel without partial proof, and refuse forged facts', async (t) => {
-  const { db, source, directory, identity } = fixture(t);
+  const { db, source, directory, identity, legacyDetailsJson } = fixture(t);
   await buildIntakeCollectionEnvelope(db, source);
+  transaction(db, () =>
+    db
+      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+      .run(legacyDetailsJson, source.id),
+  );
   const old = await forkFacts(db, source);
   await old.collections.certifySchemaAdoptionAsync(old.prepared);
   old.collections.commitMaintenance(old.prepared);
@@ -378,8 +384,13 @@ test('older native filenames upgrade cooperatively, cancel without partial proof
 });
 
 test('an old-native repair context stays native and prepares its name before refusing changed drafts', async (t) => {
-  const { db, source, directory, identity } = fixture(t);
+  const { db, source, directory, identity, legacyDetailsJson } = fixture(t);
   await buildIntakeCollectionEnvelope(db, source);
+  transaction(db, () =>
+    db
+      .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+      .run(legacyDetailsJson, source.id),
+  );
   const old = await forkFacts(db, source);
   await old.collections.certifySchemaAdoptionAsync(old.prepared);
   old.collections.commitMaintenance(old.prepared);

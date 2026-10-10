@@ -21,7 +21,7 @@ import {
   prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
-import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
+import { collectionClinicalProjectionContextAsync } from './intake-review-collection-session.ts';
 import { readCollectionReviewMembership } from './intake-review-membership-index.ts';
 import { readRetainedPlanEvidence } from './intake-retained-plan.ts';
 import { createReportSnapshotCatalog } from './intake-report-snapshot-catalog.ts';
@@ -291,6 +291,8 @@ export async function prepareCorrectionSupportingEvidence(
             );
           sessions.push(selected.session);
           assertPreparation();
+          const selectedContext = await collectionClinicalProjectionContextAsync(selected.session);
+          assertPreparation();
           const record = selected.session.record(
             ref.recordId,
             ref.candidateId,
@@ -386,7 +388,7 @@ export async function prepareCorrectionSupportingEvidence(
             );
           assertions.push(() => {
             view.address(view.root());
-            collectionClinicalProjectionContext(selected.session);
+            selectedContext.assertCurrent();
             const current = original(db, root, profileId, ref.originalSourceFileId);
             if (JSON.stringify(current) !== JSON.stringify(file))
               throw new HttpError(

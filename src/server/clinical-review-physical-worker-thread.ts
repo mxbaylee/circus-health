@@ -92,4 +92,5 @@ parentPort!.on('message', (message: unknown) => {
     parentPort!.postMessage({ id: nextId++, failure: true });
   }
 });
-parentPort!.postMessage({ ready: true });
+// Cancellation may terminate the worker only after its module graph has finished loading.
+setImmediate(() => parentPort!.postMessage({ ready: true }));

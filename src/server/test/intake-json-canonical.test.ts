@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { canonicalLiteral, parseLiteralJSON } from '../intake-format.ts';
 import {
   prepareIntakeJsonCanonical,
+  prepareIntakeJsonCanonicalSteps,
   intakeJsonCanonicalWorkObserver,
 } from '../intake-json-canonical.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
@@ -15,6 +16,55 @@ function* split(text: string, width = 7) {
   for (let at = 0; at < text.length; at += width) yield text.slice(at, at + width);
 }
 const joined = (pieces: Iterable<string>) => [...pieces].join('');
+
+test('explicit preparation steps preserve engine parity and cancel without publishing a partial tree', () => {
+  const source =
+    '{"escaped\\u006bey":"\\ud800x\\udc00","1":-0,"same":0,"same":' +
+    '9'.repeat(1300) +
+    ',"name":' +
+    JSON.stringify('fictional-'.repeat(54000)) +
+    '}';
+  const steps = prepareIntakeJsonCanonicalSteps(split(source), {
+    mode: 'stringify',
+    preserveNumbers: true,
+  });
+  let turns = 0;
+  for (;;) {
+    const next = steps.next();
+    if (next.done) {
+      try {
+        assert.deepEqual(JSON.parse(joined(next.value.chunks())), JSON.parse(source));
+        assert.ok(joined(next.value.chunks()).includes('9'.repeat(1300)));
+        assert.equal(next.value.work.maxBufferBytes, 8192);
+        assert.ok(turns > 66);
+      } finally {
+        next.value.close();
+      }
+      break;
+    }
+    turns++;
+  }
+  let running = true,
+    finalized = false;
+  const canceled = prepareIntakeJsonCanonicalSteps(
+    (function* () {
+      try {
+        yield* split(source);
+      } finally {
+        finalized = true;
+      }
+    })(),
+    {
+      assertRunning() {
+        if (!running) throw Error('fictional stopped');
+      },
+    },
+  );
+  assert.equal(canceled.next().done, false);
+  running = false;
+  assert.throws(() => canceled.next(), /fictional stopped/);
+  assert.equal(finalized, true);
+});
 
 test('disk canonical/stringify modes match independent JSON.parse oracles including duplicate keys and UTF16 ordering', async () => {
   const values = [

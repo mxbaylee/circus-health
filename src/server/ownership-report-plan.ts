@@ -1,5 +1,10 @@
-import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
+import {
+  assertClinicalOperation,
+  currentClinicalOperation,
+  runExclusiveClinicalOperation,
+} from './clinical-operation.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
 import { identityGroundingGeneration } from './intake-identity-grounding.ts';
 import { ownershipPlanGroups } from './ownership-plan-groups.ts';
 import { ownershipPlanHolds } from './ownership-plan-holds.ts';
@@ -17,7 +22,10 @@ import {
   prepareCollectionClinicalReviewAsync,
   prepareCollectionClinicalReviewDependencies,
 } from './intake-review-collection-host.ts';
-import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
+import {
+  collectionClinicalProjectionContext,
+  collectionClinicalProjectionContextAsync,
+} from './intake-review-collection-session.ts';
 import type { IntakeReview } from '../shared/intake.ts';
 import type { SelectedOwnershipReviewScope } from './record-ownership-authority.ts';
 import { randomUUID, createHash } from 'node:crypto';
@@ -25,6 +33,7 @@ import { setImmediate } from 'node:timers/promises';
 import {
   HttpError,
   currentTransactionToken,
+  installTransactionTerminalGuard,
   rejectCurrentTransaction,
   type Database,
 } from './database.ts';
@@ -232,11 +241,64 @@ export async function prepareOwnershipReportPlan(
       };
       const relationshipDecision = (id: string) =>
         !!selection.sql.prepare('SELECT 1 FROM relationship_choices WHERE id=?').get(id);
-      const artifacts = createClinicalReviewArtifactProof(selection.sql, 'clinical_artifacts');
+      // Finalization updates preview rows. Keep the signed original proofs in a
+      // separate private scratch whose witness stays unchanged through publication.
+      const artifactScratch = disposableSqlite('ownership-artifact-proof-'),
+        artifacts = createClinicalReviewArtifactProof(artifactScratch.db, 'clinical_artifacts');
+      let terminalPhysicalCurrent: (() => void) | undefined,
+        stopTerminalGuard: (() => void) | undefined;
       const assertPreparedCurrent = () => {
         assertCurrent();
-        artifacts.assertCurrent();
+        if (terminalPhysicalCurrent) terminalPhysicalCurrent();
+        else artifacts.assertCurrent();
       };
+      const selectionWitness = () => {
+        if (!selection.sql.isOpen) throw Error('Closed ownership report plan');
+        return [
+          selection.sql.prepare('SELECT total_changes() changes').get()!.changes,
+          selection.sql.prepare('PRAGMA main.schema_version').get()!.schema_version,
+          selection.sql.prepare('PRAGMA temp.schema_version').get()!.schema_version,
+        ].join(':');
+      };
+      const withVerified = async <T>(
+        complete: () => T,
+        mode: 'read-only' | 'publication',
+      ): Promise<T> =>
+        runExclusiveClinicalOperation(
+          db,
+          async (operation) => {
+            if (terminalPhysicalCurrent || db.isTransaction || currentTransactionToken(db))
+              throw Error('Ownership physical verification requires its outside-transaction owner');
+            const witness = selectionWitness();
+            const assertPreflightCurrent = () => {
+              assertClinicalOperation(db, operation);
+              assertCurrent();
+              plan?.assertCurrent();
+              if (db.isTransaction || selectionWitness() !== witness)
+                throw new HttpError(
+                  409,
+                  'OWNERSHIP_CHANGED',
+                  'Ownership preview changed during verification',
+                );
+            };
+            return artifacts.withVerifiedTerminal(
+              { assertCurrent: assertPreflightCurrent },
+              (physicalCurrent) => {
+                assertPreflightCurrent();
+                terminalPhysicalCurrent = physicalCurrent;
+                try {
+                  return complete();
+                } finally {
+                  terminalPhysicalCurrent = undefined;
+                  stopTerminalGuard?.();
+                  stopTerminalGuard = undefined;
+                }
+              },
+              mode,
+            );
+          },
+          { operation: currentClinicalOperation(db) },
+        );
       let retainedReview:
         | {
             key: string;
@@ -270,10 +332,10 @@ export async function prepareOwnershipReportPlan(
             );
           // Copy the host's already-verified identities before this one retained
           // session is replaced. SQL holds the complete fan-in without live sessions.
+          let context: ReturnType<typeof collectionClinicalProjectionContext>;
           try {
-            artifacts.retain(
-              collectionClinicalProjectionContext(ready.session).verifiedArtifacts(),
-            );
+            context = await collectionClinicalProjectionContextAsync(ready.session);
+            artifacts.retain(context.verifiedArtifacts());
           } catch (error) {
             ready.session.close();
             throw error;
@@ -283,7 +345,7 @@ export async function prepareOwnershipReportPlan(
             review: ready.session.review,
             ownership: ready.session.ownership,
             record: (id: string) => ready.session.record(id),
-            assertCurrent: () => collectionClinicalProjectionContext(ready.session).assertCurrent(),
+            assertCurrent: () => context.assertAuthorityCurrent(),
             close: () => ready.session.close(),
           };
         }
@@ -456,7 +518,7 @@ export async function prepareOwnershipReportPlan(
           ]);
           return header;
         };
-        let header = finalize();
+        let header = await withVerified(finalize, 'publication');
         const reference: OwnershipReportEvidenceReference = {
           token,
           digest: ownershipHash([selection.reference, store.sink.digest]),
@@ -639,6 +701,16 @@ export async function prepareOwnershipReportPlan(
           occurrences: selection.occurrences,
           assertCurrent: assertPreparedCurrent,
           finalize: refresh,
+          finalizeVerified() {
+            // This fixed callback owns the preview-row updates made by finalize.
+            return withVerified(refresh, 'publication');
+          },
+          withVerifiedRead<T>(complete: () => T) {
+            return withVerified(complete, 'read-only');
+          },
+          withVerifiedPublication<T>(complete: () => T) {
+            return withVerified(complete, 'publication');
+          },
           requestForGroup(group: OwnershipPreview['commitGroups'][number]): OwnershipRequest {
             // The approved parent can be read after an earlier independent child commits.
             // Each child reselects and checks its own current clinical authority.
@@ -690,8 +762,7 @@ export async function prepareOwnershipReportPlan(
             return runExclusiveClinicalOperation(
               db,
               async () => {
-                assertCurrent();
-                plan!.assertCurrent();
+                await withVerified(() => undefined, 'read-only');
                 if (!object(input))
                   throw new HttpError(
                     400,
@@ -703,6 +774,7 @@ export async function prepareOwnershipReportPlan(
                   previousHeader = header,
                   previousReference = { ...reference };
                 selection.sql.exec('SAVEPOINT ownership_choice');
+                artifactScratch.db.exec('SAVEPOINT ownership_choice');
                 try {
                   let recordId: string;
                   if (
@@ -782,11 +854,15 @@ export async function prepareOwnershipReportPlan(
                     await setImmediate();
                   }
                   holds = await prepareHolds();
-                  refresh();
+                  await withVerified(refresh, 'publication');
                   selection.sql.exec('RELEASE ownership_choice');
+                  artifactScratch.db.exec('RELEASE ownership_choice');
                 } catch (error) {
                   try {
                     selection.sql.exec('ROLLBACK TO ownership_choice; RELEASE ownership_choice');
+                    artifactScratch.db.exec(
+                      'ROLLBACK TO ownership_choice; RELEASE ownership_choice',
+                    );
                   } catch {
                     /* Profile lock can close the disposable plan while preparation yields. */
                   }
@@ -805,6 +881,19 @@ export async function prepareOwnershipReportPlan(
             stageToken = currentTransactionToken(db);
             if (!stageToken)
               throw Error('Report publication requires its owned atomic transaction');
+            if (terminalPhysicalCurrent) {
+              const witness = selectionWitness(),
+                physicalCurrent = terminalPhysicalCurrent;
+              stopTerminalGuard = installTransactionTerminalGuard(db, stageToken, () => {
+                physicalCurrent();
+                if (selectionWitness() !== witness)
+                  throw new HttpError(
+                    409,
+                    'OWNERSHIP_CHANGED',
+                    'Ownership preview changed during publication',
+                  );
+              });
+            }
           },
           preview(): OwnershipCommitView {
             if (!stageToken || stageToken !== currentTransactionToken(db))
@@ -1091,12 +1180,14 @@ export async function prepareOwnershipReportPlan(
             retainedReview?.close();
             plan!.close();
             selection.close();
+            artifactScratch.close();
           },
         };
       } catch (error) {
         retainedReview?.close();
         plan?.close();
         selection.close();
+        artifactScratch.close();
         if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
         throw error;
       }

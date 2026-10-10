@@ -191,10 +191,11 @@ export function createProfilePasskeys(
   verification: PasskeyVerification = { verifyRegistrationResponse, verifyAuthenticationResponse },
 ) {
   const challenges = new Map<string, PasskeyChallenge>(),
-    generations = new Map<string, number>();
+    generations = new Map<string, number>(),
+    unlocking = new Map<PasskeyChallenge, AbortController>();
   const generation = (id: string): number => generations.get(id) || 0;
   const assertCurrent = (id: string, expected: number): void => {
-    manager.card(id);
+    manager.assertProfileExists(id);
     if (generation(id) !== expected)
       throw new HttpError(
         409,
@@ -316,12 +317,17 @@ export function createProfilePasskeys(
     invalidate(profileId: string): void {
       generations.set(profileId, generation(profileId) + 1);
       for (const [id, challenge] of challenges)
-        if (challenge.profileId === profileId) challenges.delete(id);
+        if (challenge.profileId === profileId) {
+          unlocking.get(challenge)?.abort(Error('Passkey request was cancelled'));
+          challenges.delete(id);
+        }
     },
     cancel(profileId: string, sessionId: string, input: { challengeId: string }) {
       const challenge = challenges.get(input.challengeId);
-      if (challenge && challenge.profileId === profileId && challenge.sessionId === sessionId)
+      if (challenge && challenge.profileId === profileId && challenge.sessionId === sessionId) {
+        unlocking.get(challenge)?.abort(Error('Passkey request was cancelled'));
         challenges.delete(input.challengeId);
+      }
       return { cancelled: true };
     },
     async registrationOptions(profileId: string, sessionId: string, origin: string) {
@@ -505,7 +511,7 @@ export function createProfilePasskeys(
       }
     },
     async authenticationOptions(profileId: string, sessionId: string, origin: string) {
-      manager.card(profileId);
+      manager.assertProfileExists(profileId);
       const expectedGeneration = generation(profileId),
         ring = manager.keyring(profileId),
         rpID = new URL(origin).hostname,
@@ -590,13 +596,33 @@ export function createProfilePasskeys(
             throw new HttpError(409, 'PASSKEY_CHANGED', 'Passkey state changed. Try again.');
           current.counter = result.authenticationInfo.newCounter;
           manager.writeKeyring(profileId, currentRing);
-          const profile = manager.unlockWithKey(profileId, key);
+          const controller = new AbortController();
+          unlocking.set(challenge, controller);
+          const authorize = () => {
+            assertPending(input.challengeId, challenge);
+            const fresh = manager.keyring(profileId).passkeys.find((p) => p.id === saved.id);
+            if (
+              !fresh ||
+              fresh.counter !== result.authenticationInfo.newCounter ||
+              fresh.publicKey !== saved.publicKey ||
+              fresh.salt !== saved.salt ||
+              fresh.rpID !== saved.rpID ||
+              JSON.stringify(fresh.wrapped) !== JSON.stringify(saved.wrapped)
+            )
+              throw new HttpError(409, 'PASSKEY_CHANGED', 'Passkey state changed. Try again.');
+          };
+          const profile = await manager.unlockWithKeyAsync(profileId, key, {
+            signal: controller.signal,
+            assertAuthorized: authorize,
+          });
+          authorize();
           key = null;
           return profile;
         } finally {
           key?.fill(0);
         }
       } finally {
+        unlocking.delete(challenge);
         finish(input.challengeId, challenge);
       }
     },

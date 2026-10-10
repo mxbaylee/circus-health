@@ -3,7 +3,7 @@ import { currentClinicalOperation, runExclusiveClinicalOperation } from './clini
 import { indexedReviewQuestions } from './intake-review-question-index.ts';
 import { finishClinicalReviewWork, runClinicalReviewWork } from './clinical-review-work.ts';
 import { reviewPreparationStamp } from './clinical-review-maintenance.ts';
-import { revision } from './database.ts';
+import { revision, managedDatabaseMethodEpoch } from './database.ts';
 import {
   reviewReadStamp,
   preparedClinicalReviewRead,
@@ -18,7 +18,7 @@ import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import { reviewIssueFactory, createReviewIssueScratch } from './intake-review-issue-state.ts';
 /** Native clinical host orchestration. Authorization and verified proposal bytes precede all policy reads. */
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import { assertIntakeOwner } from './intake.ts';
@@ -97,9 +97,14 @@ import {
 } from './intake-review-collection.ts';
 import {
   createCollectionClinicalReviewSessionWork,
-  collectionClinicalProjectionContext,
+  collectionClinicalProjectionContextAsync,
   type CollectionClinicalReviewResult,
 } from './intake-review-collection-session.ts';
+import {
+  captureManagedPhysicalEpoch,
+  managedPhysicalEpochCurrent,
+} from './clinical-review-physical-epoch.ts';
+import { openClinicalPhysicalVerifier } from './clinical-review-physical-worker.ts';
 import type {
   IntakeReportContextReference,
   IntakeMetadata,
@@ -302,7 +307,17 @@ export async function prepareCollectionClinicalReviewDependencies(
 export function prepareCollectionClinicalReview(
   ...input: Parameters<typeof prepareCollectionClinicalReviewWork>
 ): CollectionClinicalReviewResult {
-  return finishClinicalReviewWork(prepareCollectionClinicalReviewWork(...input));
+  return finishClinicalReviewWork(
+    prepareCollectionClinicalReviewWork(
+      input[0],
+      input[1],
+      input[2],
+      input[3],
+      input[4],
+      input[5],
+      false,
+    ),
+  );
 }
 export async function prepareCollectionClinicalReviewAsync(
   ...input: Parameters<typeof prepareCollectionClinicalReviewWork>
@@ -313,27 +328,44 @@ export async function prepareCollectionClinicalReviewAsync(
       const [db, , profileId] = input;
       if (db.isTransaction) throw Error('Cooperative clinical review cannot hold a transaction');
       input[5]?.assertRunning?.();
-      const result = await runClinicalReviewWork(prepareCollectionClinicalReviewWork(...input), {
-        signal: input[5]?.signal,
-        capture() {
-          input[5]?.assertRunning?.();
-          assertIntakeOwner(db, profileId);
-          const stamp = reviewPreparationStamp(db);
-          if (stamp === undefined) throw Error('Clinical review authority is unavailable');
-          return () => {
+      const result = await runClinicalReviewWork(
+        prepareCollectionClinicalReviewWork(
+          input[0],
+          input[1],
+          input[2],
+          input[3],
+          input[4],
+          input[5],
+          true,
+        ),
+        {
+          signal: input[5]?.signal,
+          capture() {
             input[5]?.assertRunning?.();
             assertIntakeOwner(db, profileId);
-            if (reviewPreparationStamp(db) !== stamp)
-              throw new HttpError(
-                409,
-                'INTAKE_REVIEW_CHANGED',
-                'Review changed while preparing; refresh this review',
-              );
-          };
+            const stamp = reviewPreparationStamp(db);
+            if (stamp === undefined) throw Error('Clinical review authority is unavailable');
+            return () => {
+              input[5]?.assertRunning?.();
+              assertIntakeOwner(db, profileId);
+              if (reviewPreparationStamp(db) !== stamp)
+                throw new HttpError(
+                  409,
+                  'INTAKE_REVIEW_CHANGED',
+                  'Review changed while preparing; refresh this review',
+                );
+            };
+          },
         },
-      });
+      );
       try {
         input[5]?.assertRunning?.();
+        if (result.status === 'ready')
+          await collectionClinicalProjectionContextAsync(
+            result.session,
+            input[5]?.signal,
+            input[5]?.assertRunning,
+          );
         return result;
       } catch (error) {
         if (result.status === 'ready') result.session.close();
@@ -360,6 +392,7 @@ function* prepareCollectionClinicalReviewWork(
     signal?: AbortSignal;
     assertRunning?: () => void;
   } = {},
+  cooperativePhysical = false,
 ): Generator<void, CollectionClinicalReviewResult, void> {
   assertIntakeOwner(db, profileId);
   const metadataBytes = options.metadataBytes ?? 256 * 1024;
@@ -395,12 +428,26 @@ function* prepareCollectionClinicalReviewWork(
     }
   })();
   let retainedIssueScratch = false;
+  let preparingCooperatively = cooperativePhysical;
   try {
     issueScratch.db.exec(
-      'CREATE TABLE consumed_source_files (id TEXT PRIMARY KEY, path TEXT, identity TEXT)',
+      'CREATE TABLE main.consumed_source_files (id TEXT PRIMARY KEY, path TEXT, identity TEXT, seal TEXT)',
     );
+    const physicalSealKey = randomBytes(32);
+    const physicalSeal = (id: string, path: string, identity: string) =>
+      createHmac('sha256', physicalSealKey)
+        .update(JSON.stringify([id, path, identity]))
+        .digest('hex');
+    const physicallySealed = (
+      row: Record<string, unknown>,
+    ): row is { id: string; path: string; identity: string; seal: string } =>
+      typeof row.id === 'string' &&
+      typeof row.path === 'string' &&
+      typeof row.identity === 'string' &&
+      typeof row.seal === 'string' &&
+      row.seal === physicalSeal(row.id, row.path, row.identity);
     const retainConsumedFile = issueScratch.db.prepare(
-      'INSERT OR IGNORE INTO consumed_source_files (id) VALUES (?)',
+      'INSERT OR IGNORE INTO main.consumed_source_files (id) VALUES (?)',
     );
     const opened = new Map<string, ReturnType<typeof open>>();
     function open(original: ClinicalScopeOriginal) {
@@ -526,7 +573,7 @@ function* prepareCollectionClinicalReviewWork(
           const before = reviewReadStamp(db);
           if (before === undefined) throw Error('Clinical source scope authority unavailable');
           view.address(view.root());
-          assertPhysicalEvidenceCurrent();
+          if (!preparingCooperatively) assertPhysicalEvidenceCurrent();
           options.assertRunning?.();
           assertCurrent();
           const after = reviewReadStamp(db);
@@ -726,7 +773,7 @@ function* prepareCollectionClinicalReviewWork(
     if (!validation.valid)
       throw new HttpError(400, 'INVALID_JSONL', 'Convert the original before clinical review');
     const rememberPhysical = issueScratch.db.prepare(
-      'INSERT OR REPLACE INTO consumed_source_files VALUES (?, ?, ?)',
+      'INSERT OR REPLACE INTO main.consumed_source_files VALUES (?, ?, ?, ?)',
     );
     for (const id of clinicalSourceScopeDependencyIdsWork(db, file, validation.entries!)) {
       yield;
@@ -734,29 +781,121 @@ function* prepareCollectionClinicalReviewWork(
       const dependency = requiredFile(db, id, true),
         path = profileOriginal(root, dependency.path, profileId);
       const identity = yield* verifyIntakeFileHashWork(path, dependency);
-      rememberPhysical.run(id, path, identity);
+      rememberPhysical.run(id, path, identity, physicalSeal(id, path, identity));
       yield;
     }
     const proposalPath = profileOriginal(root, inputFile.path, profileId);
+    const proposalIdentity = yield* verifyIntakeFileHashWork(proposalPath, inputFile);
     rememberPhysical.run(
       inputFile.id,
       proposalPath,
-      yield* verifyIntakeFileHashWork(proposalPath, inputFile),
+      proposalIdentity,
+      physicalSeal(inputFile.id, proposalPath, proposalIdentity),
+    );
+    const originalPhysicalCount = Number(
+      issueScratch.db.prepare('SELECT count(*) count FROM main.consumed_source_files').get()!.count,
     );
     const assertPhysicalEvidenceCurrent = () => {
+      let seen = 0;
       for (const row of issueScratch.db
-        .prepare('SELECT path,identity FROM consumed_source_files ORDER BY id')
-        .iterate())
-        if (
-          typeof row.path !== 'string' ||
-          typeof row.identity !== 'string' ||
-          intakeFileIdentity(row.path) !== row.identity
-        )
+        .prepare('SELECT id,path,identity,seal FROM main.consumed_source_files ORDER BY id')
+        .iterate()) {
+        if (!physicallySealed(row) || intakeFileIdentity(row.path) !== row.identity)
           throw new HttpError(
             409,
             'SOURCE_CHANGED',
             'Retained clinical evidence changed; refresh this review',
           );
+        seen++;
+      }
+      if (seen !== originalPhysicalCount)
+        throw new HttpError(
+          409,
+          'SOURCE_CHANGED',
+          'Retained clinical evidence changed; refresh this review',
+        );
+    };
+    const verifyPhysicalEvidenceCooperatively = async (
+      signal?: AbortSignal,
+      assertRunning?: () => void,
+    ) => {
+      const changed = () =>
+        new HttpError(
+          409,
+          'SOURCE_CHANGED',
+          'Retained clinical evidence changed; refresh this review',
+        );
+      const epoch = captureManagedPhysicalEpoch();
+      const methodEpoch = managedDatabaseMethodEpoch(db);
+      if (!epoch || !methodEpoch || db.isTransaction || !issueScratch.db.isOpen) throw changed();
+      const mainStamp = reviewReadStamp(db);
+      if (mainStamp === undefined) throw changed();
+      const scratchStamp = () => {
+        if (!issueScratch.db.isOpen) throw changed();
+        const row = issueScratch.db
+          .prepare(
+            'SELECT total_changes() changes, (SELECT data_version FROM pragma_data_version) external, (SELECT schema_version FROM pragma_schema_version) schema',
+          )
+          .get()!;
+        return `${row.changes}:${row.external}:${row.schema}`;
+      };
+      const pinnedScratch = scratchStamp();
+      const expectedCount = originalPhysicalCount;
+      const current = () => {
+        signal?.throwIfAborted();
+        assertRunning?.();
+        assertCurrent();
+        if (
+          !managedPhysicalEpochCurrent(epoch) ||
+          managedDatabaseMethodEpoch(db) !== methodEpoch ||
+          reviewReadStamp(db) !== mainStamp ||
+          scratchStamp() !== pinnedScratch
+        )
+          throw changed();
+      };
+      current();
+      const verifier = await openClinicalPhysicalVerifier(signal);
+      let closed = false;
+      try {
+        current();
+        let seen = 0;
+        let cursor: string | undefined;
+        for (;;) {
+          const rows =
+            cursor === undefined
+              ? issueScratch.db
+                  .prepare(
+                    'SELECT id,path,identity,seal FROM main.consumed_source_files ORDER BY id LIMIT 64',
+                  )
+                  .all()
+              : issueScratch.db
+                  .prepare(
+                    'SELECT id,path,identity,seal FROM main.consumed_source_files WHERE id>? ORDER BY id LIMIT 64',
+                  )
+                  .all(cursor);
+          if (!rows.length) break;
+          const page: { kind: 'identity'; path: string; expectedIdentity: string }[] = [];
+          for (const row of rows) {
+            if (!physicallySealed(row)) throw changed();
+            page.push({ kind: 'identity', path: row.path, expectedIdentity: row.identity });
+          }
+          cursor = String(rows[rows.length - 1]!.id);
+          seen += page.length;
+          if (seen > expectedCount) throw changed();
+          current();
+          await verifier.verifyPage(page);
+          current();
+        }
+        if (seen !== expectedCount) throw changed();
+        await verifier.close();
+        closed = true;
+        current();
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        throw changed();
+      } finally {
+        if (!closed) await verifier.abort();
+      }
     };
     const metadata = read<IntakeMetadata>(intake, 'metadata');
     const reviewed = {
@@ -1132,34 +1271,38 @@ function* prepareCollectionClinicalReviewWork(
       },
       validation: validationSummary(validation),
       assertProjectionEvidenceCurrent: assertPhysicalEvidenceCurrent,
+      verifyProjectionEvidenceCooperatively: cooperativePhysical
+        ? verifyPhysicalEvidenceCooperatively
+        : undefined,
       beginProjectionConsumption() {
         const last = issueScratch.db
-          .prepare('SELECT COALESCE(max(rowid),0) AS ordinal FROM consumed_source_files')
+          .prepare('SELECT COALESCE(max(rowid),0) AS ordinal FROM main.consumed_source_files')
           .get()!.ordinal;
         return () => {
-          issueScratch.db.prepare('DELETE FROM consumed_source_files WHERE rowid>?').run(last);
+          issueScratch.db.prepare('DELETE FROM main.consumed_source_files WHERE rowid>?').run(last);
         };
       },
       *consumedArtifactIds() {
+        let seen = 0;
         for (const row of issueScratch.db
-          .prepare('SELECT id FROM consumed_source_files ORDER BY id')
+          .prepare('SELECT id FROM main.consumed_source_files ORDER BY id')
           .iterate()) {
           if (typeof row.id !== 'string') throw Error('Incomplete clinical consumed source');
+          seen++;
           yield row.id;
         }
+        if (seen !== originalPhysicalCount) throw Error('Incomplete clinical consumed source');
       },
       *verifiedArtifacts() {
+        let seen = 0;
         for (const row of issueScratch.db
-          .prepare('SELECT id,path,identity FROM consumed_source_files ORDER BY id')
+          .prepare('SELECT id,path,identity,seal FROM main.consumed_source_files ORDER BY id')
           .iterate()) {
-          if (
-            typeof row.id !== 'string' ||
-            typeof row.path !== 'string' ||
-            typeof row.identity !== 'string'
-          )
-            throw Error('Incomplete clinical artifact proof');
+          if (!physicallySealed(row)) throw Error('Incomplete clinical artifact proof');
+          seen++;
           yield { id: row.id, path: row.path, identity: row.identity };
         }
+        if (seen !== originalPhysicalCount) throw Error('Incomplete clinical artifact proof');
       },
       sourceText: {
         stale,
@@ -1170,8 +1313,9 @@ function* prepareCollectionClinicalReviewWork(
     });
     if (result.status === 'ready') {
       try {
+        preparingCooperatively = false;
         // All consumed source dependencies remain covered even after the bounded opened-scope LRU evicts them.
-        assertPhysicalEvidenceCurrent();
+        if (!cooperativePhysical) assertPhysicalEvidenceCurrent();
         assertCurrent();
       } catch (error) {
         result.session.close();
@@ -1379,7 +1523,6 @@ async function readPreparedClinicalTransport<T>(
           owned = prepared.session;
         }
         const session = cached?.session || owned!;
-        const projection = collectionClinicalProjectionContext(session);
         const output = render(session);
         if (
           output &&
@@ -1395,7 +1538,7 @@ async function readPreparedClinicalTransport<T>(
         ) as T;
         // Recheck all consumed physical evidence after rendering and detachment.
         // The SQL/registry/grounding guards below must run after the last physical stat.
-        projection.assertCurrent();
+        await collectionClinicalProjectionContextAsync(session);
         assertIntakeOwner(db, profileId);
         if (
           requestRevision !== revision(db) ||

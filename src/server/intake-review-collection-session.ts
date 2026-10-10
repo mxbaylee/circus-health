@@ -92,6 +92,10 @@ export interface CollectionClinicalProjectionContext {
   assertCurrent(): void;
   /** Projection plans pair this logical guard with their own copied physical proof. */
   assertAuthorityCurrent(): void;
+  verifyPhysicalEvidenceCooperatively?(
+    signal?: AbortSignal,
+    assertRunning?: () => void,
+  ): Promise<void>;
 }
 const projectionContexts = new WeakMap<
   CollectionClinicalReviewSession,
@@ -104,6 +108,21 @@ export function collectionClinicalProjectionContext(
   const context = projectionContexts.get(session);
   if (!context) throw Error('Foreign selected clinical review session');
   context.assertCurrent();
+  return context;
+}
+/** Async host reads verify the session's original physical proof off the main thread. */
+export async function collectionClinicalProjectionContextAsync(
+  session: CollectionClinicalReviewSession,
+  signal?: AbortSignal,
+  assertRunning?: () => void,
+): Promise<CollectionClinicalProjectionContext> {
+  const context = projectionContexts.get(session);
+  if (!context) throw Error('Foreign selected clinical review session');
+  context.assertAuthorityCurrent();
+  if (context.verifyPhysicalEvidenceCooperatively)
+    await context.verifyPhysicalEvidenceCooperatively(signal, assertRunning);
+  else context.assertCurrent();
+  context.assertAuthorityCurrent();
   return context;
 }
 /** Complete bounded JSONL input uses the same pure clinical/identity/pair logic as v1. Package history stays selected. */
@@ -125,6 +144,10 @@ export function* createCollectionClinicalReviewSessionWork(input: {
   projection: SelectedClinicalProjectionScope;
   validation: IntakeValidation;
   assertProjectionEvidenceCurrent?(): void;
+  verifyProjectionEvidenceCooperatively?(
+    signal?: AbortSignal,
+    assertRunning?: () => void,
+  ): Promise<void>;
   verifiedArtifacts?(): Iterable<VerifiedClinicalArtifact>;
   consumedArtifactIds?(): Iterable<string>;
   beginProjectionConsumption?(): () => void;
@@ -541,6 +564,7 @@ export function* createCollectionClinicalReviewSessionWork(input: {
         input.assertCurrent();
         input.assertProjectionEvidenceCurrent?.();
       },
+      verifyPhysicalEvidenceCooperatively: input.verifyProjectionEvidenceCooperatively,
     });
     completed = true;
     return { status: 'ready', session };

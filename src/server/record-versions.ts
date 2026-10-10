@@ -8,17 +8,48 @@ import {
 } from './record-version-work.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
+import {
+  prepareRecordPriorFields,
+  recordFieldDigest,
+  recordStringFieldDigest,
+  type PreparedRecordPriorFields,
+} from './record-prior-fields.ts';
+import {
+  consumeIntakeMaintenancePriorFields,
+  sealIntakeMaintenancePriorFields,
+  renewIntakeMaintenanceAfterIndex,
+} from './intake-state-maintenance.ts';
+import {
+  captureVaultRecordStaging,
+  vaultRecordStagingCurrent,
+  stageVaultRecordObject,
+  prepareVaultRecordHead,
+  installVaultRecordHead,
+  discardVaultRecordStaging,
+  prepareVaultRecordStagingBacking,
+  finishVaultRecordStagingPreparation,
+  assertVaultRecordMetadataPrior,
+  bindVaultRecordStagingTransaction,
+  type VaultRecordStagingWitness,
+} from './vault-store.ts';
+import {
+  captureManagedPhysicalEpoch,
+  managedPhysicalEpochCurrent,
+} from './clinical-review-physical-epoch.ts';
 // Logical record journal. All storage callbacks operate on plaintext bytes in
 // memory; the profile vault must authenticate/encrypt durable objects and own
 // the single-writer lock. This module never writes a plaintext journal to disk.
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, rmSync } from 'node:fs';
+import { setImmediate as yieldHost } from 'node:timers/promises';
 import {
   openDatabase,
   databaseSchemaVersion,
   revision,
   observeDatabaseClose,
   registerTransactionDurability,
+  managedDatabaseMethodEpoch,
+  currentTransactionToken,
   HttpError,
   type Database,
   type SqliteRow,
@@ -337,9 +368,17 @@ function readHead(storage: RecordStorage): RecordObjectReference | null {
   if (!refValid(ref)) fail('invalid head');
   return ref as RecordObjectReference;
 }
-function writeObject(storage: RecordStorage, bytes: Buffer): RecordObjectReference {
+function writeObject(
+  storage: RecordStorage,
+  bytes: Buffer,
+  prior?: SourcePriorData,
+): RecordObjectReference {
   const ref = { name: 'objects/' + randomUUID(), sha256: digest(bytes), bytes: bytes.length };
-  storage.writeImmutable(ref.name, bytes);
+  const staging = prior && authorityWitnesses.get(prior.authority)?.staging;
+  if (staging) {
+    prior!.assertCurrent();
+    stageVaultRecordObject(staging, ref, bytes);
+  } else storage.writeImmutable(ref.name, bytes);
   readObject(storage, ref); // Verify staged bytes before publishing acceptance.
   return ref;
 }
@@ -594,7 +633,22 @@ function implicitInitialMetadataFields(version: DurableRecordVersion): boolean {
   );
 }
 const currentStatements = new WeakMap<Database, ReturnType<Database['prepare']>>();
-function current(db: Database, entity: string, id: string): CurrentVersionRow | undefined {
+function current(
+  db: Database,
+  entity: string,
+  id: string,
+  prior?: SourcePriorData,
+): CurrentVersionRow | undefined {
+  if (prior && entity === 'source_files' && id === prior.recordId) {
+    const row = db
+      .prepare(
+        'SELECT v.version_id,v.deleted FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?',
+      )
+      .get(entity, id);
+    if (!row || row.version_id !== prior.versionId || row.deleted !== 0)
+      fail('prepared prior version changed');
+    return row as CurrentVersionRow;
+  }
   let statement = currentStatements.get(db);
   if (!statement) {
     statement = db.prepare(
@@ -635,6 +689,7 @@ function validateVersion(
   commit: RecordCommit,
   version: DurableRecordVersion,
   identities: { has(value: string): boolean; add(value: string): void },
+  prior?: SourcePriorData,
 ): CurrentVersionRow | undefined {
   recordVersionWork('versionValidations');
   const table = config.schema.find((table) => table.name === version.entity);
@@ -657,7 +712,14 @@ function validateVersion(
   const key = stringifyRecordJson([version.entity, version.recordId]);
   if (identities.has(key)) fail('duplicate record in transaction');
   identities.add(key);
-  const previous = current(db, version.entity, version.recordId);
+  if (
+    prior &&
+    version.entity === 'source_files' &&
+    version.recordId === prior.recordId &&
+    version.deleted
+  )
+    fail('prepared prior comparison cannot delete source');
+  const previous = current(db, version.entity, version.recordId, prior);
   if (version.previousVersion !== (previous?.version_id ?? null))
     fail('invalid previous-version reference');
   if (version.deleted && (!previous || previous.deleted)) fail('deletion without current record');
@@ -671,7 +733,9 @@ function indexTransaction(
   db: Database,
   config: RecordConfig,
   { ref, commit, versions }: IndexedTransaction,
+  prior?: SourcePriorData,
 ): void {
+  if (prior) prior.indexedWrites = 0;
   const indexed = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as
     RecordStateRow | undefined;
   if (
@@ -703,10 +767,10 @@ function indexTransaction(
   try {
     for (const version of versions) {
       recordVersionWork('indexedVersionAttempts');
-      const previous = validateVersion(db, config, commit, version, identities);
+      const previous = validateVersion(db, config, commit, version, identities, prior);
       const implicitFields = implicitInitialMetadataFields(version);
       const { contents, ...metadata } = version;
-      insertVersion.run(
+      const versionWrite = insertVersion.run(
         version.versionId,
         config.profileId,
         version.entity,
@@ -719,11 +783,30 @@ function indexTransaction(
         stringifyRecordJson(contents),
         stringifyRecordJson(metadata),
       );
-      selectVersion.run(version.entity, version.recordId, version.versionId);
+      const currentWrite = selectVersion.run(version.entity, version.recordId, version.versionId);
+      if (prior) {
+        if (versionWrite.changes !== 1 || currentWrite.changes !== 1)
+          fail('indexed version write count');
+        prior.indexedWrites! += 2;
+        if (version.entity === 'source_files' && version.recordId === prior.recordId) {
+          if (prior.newSource) fail('duplicate compact indexed source');
+          prior.newSource = {
+            versionId: version.versionId,
+            contents: stringifyRecordJson(contents),
+            metadata: stringifyRecordJson(metadata),
+          };
+        }
+      }
       if (!implicitFields) {
-        const before = values(
-            previous && !previous.deleted ? parseRecordJson(previous.contents_json) : null,
-          ),
+        const preparedBefore =
+          prior && version.entity === 'source_files' && version.recordId === prior.recordId
+            ? prior.fields
+            : undefined;
+        const before = preparedBefore
+            ? undefined
+            : values(
+                previous && !previous.deleted ? parseRecordJson(previous.contents_json) : null,
+              ),
           after = values(version.deleted ? null : version.contents);
         const fields: SQLInputValue[] = [];
         const flushFields = () => {
@@ -737,11 +820,29 @@ function indexTransaction(
             );
             fieldStatements.set(rows, insert);
           }
-          insert.run(...fields);
+          const written = insert.run(...fields);
+          if (prior) {
+            if (written.changes !== rows) fail('indexed field write count');
+            prior.indexedWrites! += rows;
+          }
           fields.length = 0;
         };
-        for (const field of new Set([...before.keys(), ...after.keys()]))
-          if (before.get(field) !== after.get(field)) {
+        const beforeHas = (field: string) =>
+          preparedBefore ? preparedBefore.get(field) !== undefined : before!.has(field);
+        const changed = (field: string) => {
+          if (!preparedBefore) return before!.get(field) !== after.get(field);
+          const old = preparedBefore.get(field),
+            value = after.get(field);
+          if (!old || value === undefined) return !!old || value !== undefined;
+          const next = recordFieldDigest(value);
+          return old.hash !== next.hash || old.bytes !== next.bytes;
+        };
+        const union = function* () {
+          yield* preparedBefore ? preparedBefore.fields() : before!.keys();
+          for (const field of after.keys()) if (!beforeHas(field)) yield field;
+        };
+        for (const field of union())
+          if (changed(field)) {
             fields.push(
               version.versionId,
               config.profileId,
@@ -750,7 +851,7 @@ function indexTransaction(
               field,
               version.sequence,
               previous?.version_id ?? null,
-              Number(before.has(field)),
+              Number(beforeHas(field)),
               Number(after.has(field)),
             );
             if (fields.length === 32 * 9) flushFields();
@@ -761,13 +862,19 @@ function indexTransaction(
   } finally {
     identities.close();
   }
-  db.prepare('INSERT INTO __record_transactions VALUES(?,?,?,?,?)').run(
-    commit.operationId,
-    commit.sequence,
-    commit.fingerprint as SQLInputValue,
-    stringifyRecordJson(commit.result),
-    stringifyRecordJson(commit),
-  );
+  const transactionWrite = db
+    .prepare('INSERT INTO __record_transactions VALUES(?,?,?,?,?)')
+    .run(
+      commit.operationId,
+      commit.sequence,
+      commit.fingerprint as SQLInputValue,
+      stringifyRecordJson(commit.result),
+      stringifyRecordJson(commit),
+    );
+  if (prior) {
+    if (transactionWrite.changes !== 1) fail('indexed transaction write count');
+    prior.indexedWrites!++;
+  }
   const expectedState = expectIntakeFrontierStateWrite(db);
   let wroteState = false;
   try {
@@ -784,11 +891,26 @@ function indexTransaction(
   } finally {
     finishIntakeFrontierMetaWrite(db, expectedState, wroteState);
   }
+  if (prior) {
+    if (!wroteState || !prior.newSource) fail('compact indexed state/source missing');
+    prior.indexedWrites!++;
+    const proof = Object.freeze({}) as RecordIndexedPublication;
+    indexedPublications.set(proof, {
+      db,
+      config,
+      prior,
+      ref,
+      commit,
+      token: currentTransactionToken(db)!,
+    });
+    prior.indexed = proof;
+  }
 }
 function* collect(
   db: Database,
   config: RecordConfig,
   baseline = false,
+  prior?: SourcePriorData,
 ): Generator<PendingRecordVersion> {
   const keys = baseline
     ? (function* () {
@@ -820,7 +942,7 @@ function* collect(
       readers.set(table!, read);
     }
     const contents = read.get(...id);
-    const previous = current(db, entity, recordId);
+    const previous = current(db, entity, recordId, prior);
     if (!contents && (!previous || previous.deleted)) continue;
     yield {
       entity,
@@ -847,7 +969,50 @@ function publish(
   records: Iterable<PendingRecordVersion>,
   operation: TransactionOperation = {},
   result: unknown = null,
+  prior?: SourcePriorData,
 ) {
+  if (prior?.plan) {
+    const plan = prior.plan,
+      staging = authorityWitnesses.get(prior.authority)?.staging;
+    if (
+      plan.consumed ||
+      !staging ||
+      operation.operationId !== plan.operation.operationId ||
+      operation.fingerprint !== plan.operation.fingerprint ||
+      operation.actor !== 'intake-state' ||
+      operation.origin != null ||
+      operation.references != null ||
+      !eq(result, plan.operation.result) ||
+      revision(db) !== plan.commit.revision ||
+      readStatusRow(db).sequence + 1 !== plan.commit.sequence
+    )
+      fail('compact prepared publication operation changed');
+    bindVaultRecordStagingTransaction(staging!);
+    let count = 0;
+    for (const record of records) {
+      if (!eq(record, plan.pending[count++])) fail('compact prepared publication rows changed');
+      prior.assertCurrent();
+    }
+    if (count !== plan.pending.length) fail('compact prepared publication rows missing');
+    plan.consumed = true;
+    prior.assertCurrent();
+    indexTransaction(
+      db,
+      config,
+      {
+        ref: plan.ref,
+        commit: plan.commit,
+        versions: readSegmentVersions(config.storage, plan.commit),
+      },
+      prior,
+    );
+    prepareVaultRecordHead(staging!);
+    renewIntakeMaintenanceAfterIndex(db, operation.intakeMaintenance!, prior.indexed!);
+    installVaultRecordHead(staging!, encode(plan.ref));
+    if (!eq(readHead(config.storage), plan.ref))
+      fail('compact HEAD publication failed verification');
+    return { sequence: plan.commit.sequence, operationId: plan.commit.operationId, records: count };
+  }
   if (
     meta(db, 'owner_profile_id') !== config.profileId ||
     databaseSchemaVersion(db) !== config.schemaVersion
@@ -879,7 +1044,7 @@ function publish(
     };
     const bytes = encode(value);
     if (bytes.length > SEGMENT_PAGE_BYTES) fail('segment page exceeds controlled format');
-    segmentHead = writeObject(config.storage, bytes);
+    segmentHead = writeObject(config.storage, bytes, prior);
     recordVersionWork('segmentIndexPagesWritten');
     page = [];
   };
@@ -887,7 +1052,7 @@ function publish(
     size = 0;
   const flush = (): void => {
     if (size) {
-      page.push(writeObject(config.storage, Buffer.concat(chunks)));
+      page.push(writeObject(config.storage, Buffer.concat(chunks), prior));
       segmentCount++;
       recordVersionWorkMaximum('maxSegmentReferencesBuffered', page.length);
       if (page.length === SEGMENT_REFERENCE_WINDOW) flushPage();
@@ -936,15 +1101,27 @@ function publish(
     segments: { format: 'health-record-segment-index-v1', head: segmentHead, count: segmentCount },
     records: count,
   };
-  const ref = writeObject(config.storage, encode(commit));
+  const ref = writeObject(config.storage, encode(commit), prior);
+  prior?.assertCurrent();
   // All validation/indexing happens before the one acceptance boundary. The
   // SQLite transaction can roll back; the published commit remains recoverable.
-  indexTransaction(db, config, {
-    ref,
-    commit,
-    versions: readSegmentVersions(config.storage, commit),
-  });
-  config.storage.publishHead(encode(ref));
+  indexTransaction(
+    db,
+    config,
+    {
+      ref,
+      commit,
+      versions: readSegmentVersions(config.storage, commit),
+    },
+    prior,
+  );
+  if (prior) {
+    const staging = authorityWitnesses.get(prior.authority)?.staging;
+    if (staging) prepareVaultRecordHead(staging);
+    renewIntakeMaintenanceAfterIndex(db, operation.intakeMaintenance!, prior.indexed!);
+    if (staging) installVaultRecordHead(staging, encode(ref));
+    else config.storage.publishHead(encode(ref));
+  } else config.storage.publishHead(encode(ref));
   if (!eq(readHead(config.storage), ref)) fail('head publication failed verification');
   return { sequence, operationId, records: count };
 }
@@ -1228,7 +1405,25 @@ export function attachRecordDurability(
     },
     markDirty: markPersisted,
     prepare(_captured, { operation, result }) {
-      publish(db, config, collect(db, config), operation, result);
+      const prior = operation.intakeMaintenance
+        ? consumeIntakeMaintenancePriorFields(db, operation.intakeMaintenance)
+        : undefined;
+      const prepared = prior && consumeRecordSourcePriorFields(db, prior);
+      if (prepared)
+        prepared.assertCurrent = () => {
+          if (
+            consumeIntakeMaintenancePriorFields(db, operation.intakeMaintenance!) !== prior ||
+            !recordAuthorityWitnessCurrent(db, prepared.authority) ||
+            managedDatabaseMethodEpoch(db) !== prepared.methods
+          )
+            fail('prepared prior comparison changed before indexing');
+          prepared.expectedWrites = sealIntakeMaintenancePriorFields(
+            db,
+            operation.intakeMaintenance!,
+          );
+        };
+      prepared?.assertCurrent();
+      publish(db, config, collect(db, config, false, prepared), operation, result, prepared);
     },
     release(captured) {
       if (captured) db.exec('DELETE FROM __record_changed');
@@ -1281,6 +1476,492 @@ export function recordDurabilityStatus(db: Database): RecordDurabilityStatus | n
     persistedRevision: revision(db),
     sequence: row.sequence,
   };
+}
+declare const authorityWitnessBrand: unique symbol;
+declare const priorFieldsBrand: unique symbol;
+declare const indexedPublicationBrand: unique symbol;
+export interface RecordIndexedPublication {
+  readonly [indexedPublicationBrand]: true;
+}
+const indexedPublications = new WeakMap<
+  RecordIndexedPublication,
+  {
+    db: Database;
+    config: RecordConfig;
+    prior: SourcePriorData;
+    ref: RecordObjectReference;
+    commit: RecordCommit;
+    token: object;
+  }
+>();
+/** A count derived only from actual fixed index writes, never observed drift. */
+export function recordIndexedPublicationWrites(
+  db: Database,
+  proof: RecordIndexedPublication,
+  original: RecordAuthorityWitness,
+): number {
+  const data = indexedPublications.get(proof);
+  if (
+    !data ||
+    data.db !== db ||
+    data.prior.authority !== original ||
+    data.prior.indexed !== proof ||
+    data.token !== currentTransactionToken(db) ||
+    data.prior.expectedWrites === undefined ||
+    data.prior.indexedWrites === undefined
+  )
+    fail('foreign indexed compact publication');
+  return data!.prior.expectedWrites! + data!.prior.indexedWrites!;
+}
+/** Exact indexed transition, while physical acceptance still names original HEAD. */
+export function recordIndexedPublicationCurrent(
+  db: Database,
+  proof: RecordIndexedPublication,
+  original: RecordAuthorityWitness,
+): boolean {
+  recordIndexedPublicationWrites(db, proof, original);
+  const data = indexedPublications.get(proof)!,
+    authority = authorityWitnesses.get(original)!;
+  if (state.get(db) !== data.config || !recordAuthorityWitnessIntervalCurrent(db, original))
+    return false;
+  const indexed = readStatusRow(db),
+    expected = data.prior.newSource!;
+  if (
+    indexed.profile_id !== data.config.profileId ||
+    indexed.projection !== PROJECTION ||
+    indexed.schema_version !== data.config.schemaVersion ||
+    indexed.sequence !== data.commit.sequence ||
+    indexed.head_json !== stringifyRecordJson(data.ref)
+  )
+    return false;
+  const transaction = db
+    .prepare('SELECT * FROM __record_transactions WHERE sequence=?')
+    .get(data.commit.sequence);
+  if (
+    !transaction ||
+    transaction.operation_id !== data.commit.operationId ||
+    transaction.fingerprint !== data.commit.fingerprint ||
+    transaction.result_json !== stringifyRecordJson(data.commit.result) ||
+    transaction.commit_json !== stringifyRecordJson(data.commit)
+  )
+    return false;
+  const selected = db
+    .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
+    .get('source_files', data.prior.recordId);
+  const version = db
+    .prepare('SELECT * FROM __record_versions WHERE version_id=?')
+    .get(expected.versionId);
+  if (
+    selected?.version_id !== expected.versionId ||
+    !version ||
+    version.profile_id !== data.config.profileId ||
+    version.entity !== 'source_files' ||
+    version.record_id !== data.prior.recordId ||
+    version.sequence !== data.commit.sequence ||
+    version.recorded_at !== data.commit.recordedAt ||
+    version.previous_version !== data.prior.versionId ||
+    version.operation_id !== data.commit.operationId ||
+    version.deleted !== 0 ||
+    version.contents_json !== expected.contents ||
+    version.metadata_json !== expected.metadata
+  )
+    return false;
+  return (
+    eq(readHead(data.config.storage), authority.head) &&
+    recordAuthorityWitnessIntervalCurrent(db, original)
+  );
+}
+export interface RecordSourcePriorFields {
+  readonly [priorFieldsBrand]: true;
+}
+interface SourcePriorData {
+  db: Database;
+  authority: RecordAuthorityWitness;
+  methods: object;
+  recordId: string;
+  versionId: string;
+  contents: string;
+  fields: PreparedRecordPriorFields;
+  assertCurrent(): void;
+  consumed?: boolean;
+  expectedWrites?: number;
+  indexedWrites?: number;
+  newSource?: { versionId: string; contents: string; metadata: string };
+  indexed?: RecordIndexedPublication;
+  plan?: {
+    pending: readonly PendingRecordVersion[];
+    ref: RecordObjectReference;
+    commit: RecordCommitV2;
+    operation: { operationId: string; fingerprint: string; result: unknown };
+    consumed: boolean;
+  };
+}
+const sourcePriorFields = new WeakMap<RecordSourcePriorFields, SourcePriorData>();
+/** This prepares changed immutable objects only. The issuing maintenance proof
+ * must still admit the exact SQL transition and consume this private plan. */
+export async function prepareRecordCompactPublication(
+  db: Database,
+  capability: RecordSourcePriorFields,
+  input: {
+    sourceRow: Readonly<Record<string, SQLOutputValue>>;
+    target: string;
+    headKey: string;
+    afterHead: string;
+    sourcePinKey: string;
+    writes: readonly { key: string; value: string }[];
+    operationId: string;
+    fingerprint: string;
+    result: unknown;
+  },
+  assertRunning: () => void,
+): Promise<void> {
+  const found = sourcePriorFields.get(capability),
+    prior = found!,
+    authority = prior && authorityWitnesses.get(prior.authority),
+    staging = authority?.staging;
+  if (!prior || prior.db !== db || prior.consumed || prior.plan || !authority)
+    fail('foreign compact publication preparation');
+  // Non-vault contributor adapters retain their original publication boundary.
+  if (!staging) return;
+  const config = authority.config;
+  const check = () => {
+    assertRunning();
+    prior.assertCurrent();
+    if (db.isTransaction || sourcePriorFields.get(capability) !== prior || prior.consumed)
+      fail('compact immutable preparation expired');
+  };
+  check();
+  const sourceColumns = config.schema.find((table) => table.name === 'source_files')!.columns,
+    head = config.storage.read('head');
+  if (!Buffer.isBuffer(head)) fail('compact accepted HEAD missing');
+  await prepareVaultRecordStagingBacking(
+    staging,
+    head!.toString('utf8'),
+    {
+      sourceId: String(input.sourceRow.id),
+      previousVersion: prior.versionId,
+      preimage: await recordStringFieldDigest(prior.contents, check),
+      fields: sourceColumns.map((name) => ({ name, ...prior.fields.get(name)! })),
+      metadata: [input.headKey, input.sourcePinKey].map((key) => ({
+        key,
+        value: meta(db, key) as string | undefined,
+      })),
+    },
+    check,
+  );
+  check();
+  const pending: PendingRecordVersion[] = [],
+    metadata = new Map(input.writes.map((row) => [row.key, row.value]));
+  metadata.set(input.headKey, input.afterHead);
+  metadata.set('revision', String(revision(db) + 1));
+  if (meta(db, 'clinical_review_revision') === undefined)
+    metadata.set('clinical_review_revision', String(revision(db)));
+  let work = 0;
+  for (const [key, value] of metadata) {
+    check();
+    const recordId = stringifyRecordJson([key]),
+      previous = current(db, 'app_meta', recordId),
+      existing = meta(db, key) as string | undefined;
+    await assertVaultRecordMetadataPrior(
+      staging,
+      key,
+      existing,
+      previous && {
+        versionId: previous.version_id,
+        contents: previous.contents_json,
+        deleted: previous.deleted,
+      },
+    );
+    if (key === input.headKey || key === 'revision' || existing === undefined)
+      pending.push({
+        entity: 'app_meta',
+        recordId,
+        contents: { key, value },
+        deleted: false,
+        previousVersion: previous?.version_id ?? null,
+      });
+    else if (existing !== value) fail('compact immutable metadata preimage differs');
+    if (++work % 64 === 0) await yieldHost();
+  }
+  const contents: Record<string, unknown> = {};
+  for (const column of sourceColumns)
+    contents[column] = column === 'details_json' ? input.target : input.sourceRow[column];
+  pending.push({
+    entity: 'source_files',
+    recordId: prior.recordId,
+    contents,
+    deleted: false,
+    previousVersion: prior.versionId,
+  });
+  pending.sort(
+    (a, b) =>
+      (a.entity < b.entity ? -1 : a.entity > b.entity ? 1 : 0) ||
+      (a.recordId < b.recordId ? -1 : a.recordId > b.recordId ? 1 : 0),
+  );
+  const sequence = readStatusRow(db).sequence + 1,
+    recordedAt = new Date().toISOString(),
+    operationId = input.operationId;
+  let segmentHead: RecordObjectReference | null = null,
+    segmentCount = 0,
+    page: RecordObjectReference[] = [],
+    chunks: Buffer[] = [],
+    size = 0;
+  const stage = async (bytes: Buffer): Promise<RecordObjectReference> => {
+    check();
+    const ref = writeObject(config.storage, bytes, prior);
+    await yieldHost();
+    check();
+    return ref;
+  };
+  const flushPage = async () => {
+    if (!page.length) return;
+    const value: RecordSegmentPage = {
+      format: 'health-record-segment-page-v1',
+      profileId: config.profileId,
+      schemaVersion: config.schemaVersion,
+      sequence,
+      operationId,
+      previous: segmentHead,
+      firstSegment: segmentCount - page.length,
+      segments: page,
+    };
+    const bytes = encode(value);
+    if (bytes.length > SEGMENT_PAGE_BYTES) fail('compact segment page exceeds controlled format');
+    segmentHead = await stage(bytes);
+    recordVersionWork('segmentIndexPagesWritten');
+    page = [];
+  };
+  const flush = async () => {
+    if (!size) return;
+    page.push(await stage(Buffer.concat(chunks)));
+    chunks = [];
+    size = 0;
+    segmentCount++;
+    recordVersionWorkMaximum('maxSegmentReferencesBuffered', page.length);
+    if (page.length === SEGMENT_REFERENCE_WINDOW) await flushPage();
+  };
+  for (const record of pending) {
+    check();
+    const version: DurableRecordVersion = {
+      format: FORMAT,
+      profileId: config.profileId,
+      schemaVersion: config.schemaVersion,
+      sequence,
+      recordedAt,
+      operationId,
+      versionId: randomUUID(),
+      actor: 'intake-state',
+      origin: null,
+      references: null,
+      ...record,
+    };
+    // The worker verified original references from authenticated history. This
+    // derivative changes only metadata, not any original path/hash/byte column.
+    const bytes = encode(version);
+    for (let offset = 0; offset < bytes.length;) {
+      const take = Math.min(config.segmentBytes - size, bytes.length - offset);
+      chunks.push(bytes.subarray(offset, offset + take));
+      size += take;
+      offset += take;
+      if (size === config.segmentBytes) await flush();
+    }
+  }
+  await flush();
+  await flushPage();
+  const commit: RecordCommitV2 = {
+    format: COMMIT_FORMAT,
+    profileId: config.profileId,
+    schemaVersion: config.schemaVersion,
+    sequence,
+    revision: revision(db) + 1,
+    previous: authority.head,
+    operationId,
+    fingerprint: input.fingerprint,
+    result: structuredClone(input.result),
+    recordedAt,
+    segments: { format: 'health-record-segment-index-v1', head: segmentHead, count: segmentCount },
+    records: pending.length,
+  };
+  const ref = await stage(encode(commit));
+  await finishVaultRecordStagingPreparation(staging);
+  check();
+  prior.plan = {
+    pending,
+    ref,
+    commit,
+    operation: {
+      operationId,
+      fingerprint: input.fingerprint,
+      result: structuredClone(input.result),
+    },
+    consumed: false,
+  };
+}
+export async function prepareRecordSourcePriorFields(
+  db: Database,
+  sourceId: string,
+  assertRunning: () => void,
+  sourceRow: Readonly<Record<string, SQLOutputValue>>,
+  originalAuthority?: RecordAuthorityWitness,
+): Promise<RecordSourcePriorFields> {
+  assertRunning();
+  const authority = originalAuthority ?? captureRecordAuthorityWitness(db),
+    methods = managedDatabaseMethodEpoch(db),
+    recordId = stringifyRecordJson([sourceId]),
+    previous = current(db, 'source_files', recordId),
+    writes = db.prepare('SELECT total_changes() AS n').get()!.n;
+  if (!methods || !previous || previous.deleted) fail('prior source comparison unavailable');
+  const authorityData = authorityWitnesses.get(authority);
+  if (!authorityData || !recordAuthorityWitnessCurrent(db, authority))
+    fail('foreign original source authority');
+  if (authorityData!.staging) fail('original source staging already prepared');
+  authorityData!.staging = captureVaultRecordStaging(
+    db,
+    authorityData!.config.storage,
+    authorityData!.epoch,
+  );
+  const check = () => {
+    assertRunning();
+    if (
+      !recordAuthorityWitnessCurrent(db, authority) ||
+      managedDatabaseMethodEpoch(db) !== methods ||
+      db.prepare('SELECT total_changes() AS n').get()!.n !== writes
+    )
+      fail('prior source comparison authority changed');
+  };
+  const fields = await prepareRecordPriorFields([previous!.contents_json], check);
+  try {
+    check();
+    const columns = authorityData!.config.schema.find(
+      (table) => table.name === 'source_files',
+    )!.columns;
+    for (const column of columns) {
+      const value = sourceRow[column];
+      const expected =
+        typeof value === 'string'
+          ? await recordStringFieldDigest(value, check)
+          : recordFieldDigest(stringifyRecordJson(value));
+      const accepted = fields.get(column);
+      if (!accepted || accepted.hash !== expected.hash || accepted.bytes !== expected.bytes)
+        fail('compact source differs from its accepted prior version');
+      check();
+    }
+    const retained = db
+      .prepare(
+        'SELECT 1 FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=? AND v.version_id=? AND v.contents_json IS ? AND v.deleted=0',
+      )
+      .get('source_files', recordId, previous!.version_id, previous!.contents_json);
+    if (!retained) fail('prior source comparison changed');
+    const capability = Object.freeze({}) as RecordSourcePriorFields;
+    sourcePriorFields.set(capability, {
+      db,
+      authority,
+      methods: methods!,
+      recordId,
+      versionId: previous!.version_id,
+      contents: previous!.contents_json,
+      fields,
+      assertCurrent: check,
+    });
+    return capability;
+  } catch (error) {
+    fields.close();
+    throw error;
+  }
+}
+export function discardRecordSourcePriorFields(capability: RecordSourcePriorFields): void {
+  const data = sourcePriorFields.get(capability);
+  sourcePriorFields.delete(capability);
+  data?.fields.close();
+  const staging = data && authorityWitnesses.get(data.authority)?.staging;
+  if (staging) discardVaultRecordStaging(staging);
+}
+function consumeRecordSourcePriorFields(
+  db: Database,
+  capability: RecordSourcePriorFields,
+): SourcePriorData {
+  const data = sourcePriorFields.get(capability);
+  if (
+    !data ||
+    data.db !== db ||
+    data.consumed ||
+    (authorityWitnesses.get(data.authority)?.staging && !data.plan) ||
+    !recordAuthorityWitnessCurrent(db, data.authority) ||
+    managedDatabaseMethodEpoch(db) !== data.methods ||
+    !db
+      .prepare(
+        'SELECT 1 FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=? AND v.version_id=? AND v.contents_json IS ? AND v.deleted=0',
+      )
+      .get('source_files', data.recordId, data.versionId, data.contents)
+  )
+    fail('foreign, expired or changed prior source comparison');
+  data!.consumed = true;
+  return data!;
+}
+export interface RecordAuthorityWitness {
+  readonly [authorityWitnessBrand]: true;
+}
+const authorityWitnesses = new WeakMap<
+  RecordAuthorityWitness,
+  {
+    db: Database;
+    config: RecordConfig;
+    read: RecordStorage['read'];
+    row: string;
+    head: RecordObjectReference | null;
+    epoch: object;
+    staging?: VaultRecordStagingWitness;
+  }
+>();
+/** Same configured authority and managed mutation interval only. This does not
+ * replace off-host verification of the consumed immutable backing objects. */
+export function captureRecordAuthorityWitness(db: Database): RecordAuthorityWitness {
+  const config = state.get(db),
+    epoch = captureManagedPhysicalEpoch();
+  if (!config || !epoch || db.isTransaction) fail('record authority witness unavailable');
+  const row = readStatusRow(db),
+    head = readHead(config!.storage);
+  if (!eq(head, parseRecordJson(row.head_json))) fail('record authority witness stale');
+  const witness = Object.freeze({}) as RecordAuthorityWitness;
+  authorityWitnesses.set(witness, {
+    db,
+    config: config!,
+    read: config!.storage.read,
+    row: stringifyRecordJson(row),
+    head,
+    epoch: epoch!,
+  });
+  if (!recordAuthorityWitnessCurrent(db, witness)) fail('record authority witness changed');
+  return witness;
+}
+export function recordAuthorityWitnessCurrent(
+  db: Database,
+  witness: RecordAuthorityWitness,
+): boolean {
+  const proof = authorityWitnesses.get(witness);
+  if (!recordAuthorityWitnessIntervalCurrent(db, witness)) return false;
+  return (
+    stringifyRecordJson(readStatusRow(db)) === proof!.row &&
+    eq(readHead(proof!.config.storage), proof!.head) &&
+    recordAuthorityWitnessIntervalCurrent(db, witness)
+  );
+}
+/** Closing identity/interval check only: no SQL, filesystem or storage callback. */
+export function recordAuthorityWitnessIntervalCurrent(
+  db: Database,
+  witness: RecordAuthorityWitness,
+): boolean {
+  const proof = authorityWitnesses.get(witness);
+  return (
+    !!proof &&
+    proof.db === db &&
+    db.isOpen &&
+    state.get(db) === proof.config &&
+    proof.config.storage.read === proof.read &&
+    (proof.staging
+      ? vaultRecordStagingCurrent(proof.staging)
+      : managedPhysicalEpochCurrent(proof.epoch))
+  );
 }
 export function flushRecordDurability(db: Database): RecordDurabilityStatus | null {
   const config = state.get(db);

@@ -8,6 +8,7 @@ import {
   installTransactionTerminalGuard,
   rejectCurrentTransaction,
   observeTransactionOutcome,
+  managedDatabaseMethodEpoch,
 } from './database.ts';
 import {
   projectClinicalReview,
@@ -21,18 +22,22 @@ import {
 import { matchingClinicalSourceCanonicals } from './intake-clinical-source-index.ts';
 import {
   collectionClinicalProjectionContext,
+  collectionClinicalProjectionContextAsync,
   type CollectionClinicalReviewSession,
+  type CollectionClinicalProjectionContext,
 } from './intake-review-collection-session.ts';
 import type { IntakeReviewDecision } from '../shared/intake.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import {
   prepareDuplicateEvidenceSnapshots,
+  checkedDuplicateEvidenceProjectionContext,
   type PreparedDuplicateEvidence,
 } from './duplicate-evidence-preparation.ts';
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { applyObservedClinicalProjectionChangeset } from './intake-lookup-frontier-observer.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
 
 declare const projectionBrand: unique symbol;
 export interface PreparedClinicalProjection {
@@ -58,6 +63,7 @@ interface State {
   stopObserving(): void;
   closeArtifacts(): void;
   evidence?: PreparedDuplicateEvidence;
+  applyEvidence(): void;
 }
 const plans = new WeakMap<PreparedClinicalProjection, State>();
 const activePlans = new WeakMap<DatabaseSync, Set<PreparedClinicalProjection>>();
@@ -123,12 +129,29 @@ export async function prepareCollectionClinicalProjectionGroupWithEvidence(
     ...member,
     decisions: structuredClone(member.decisions),
   }));
-  const pairScopes = validatePreparedEvidencePairs(db, selected);
-  const evidence = await prepareDuplicateEvidenceSnapshots(db, selected);
+  const contexts = await prepareProjectionContexts(selected);
+  const pairScopes = validatePreparedEvidencePairs(db, selected, contexts);
+  const evidence = selected.some((member) =>
+    member.decisions.some((decision) => decision.comparisons?.length),
+  )
+    ? await prepareDuplicateEvidenceSnapshots(db, selected)
+    : undefined;
   try {
-    return prepareProjectionGroup(db, root, profileId, selected, undefined, evidence, pairScopes);
+    return await finishVerifiedProjection(
+      db,
+      prepareProjectionGroup(
+        db,
+        root,
+        profileId,
+        selected,
+        undefined,
+        evidence,
+        pairScopes,
+        contexts,
+      ),
+    );
   } catch (error) {
-    evidence.dispose();
+    evidence?.dispose();
     throw error;
   }
 }
@@ -142,20 +165,56 @@ export async function prepareCollectionClinicalTerminalPairProjectionWithEvidenc
   if (decision.action !== 'skip' || !decision.comparisons?.length)
     throw new HttpError(400, 'IMPORT_REVIEW', 'Choose a reviewed terminal evidence relationship');
   const members = [{ session, decisions: [structuredClone(decision)] }],
-    pairScopes = validatePreparedEvidencePairs(db, members),
+    contexts = await prepareProjectionContexts(members),
+    pairScopes = validatePreparedEvidencePairs(db, members, contexts),
     evidence = await prepareDuplicateEvidenceSnapshots(db, members);
   try {
-    return prepareProjectionGroup(
+    return await finishVerifiedProjection(
       db,
-      root,
-      profileId,
-      members,
-      decision.recordId,
-      evidence,
-      pairScopes,
+      prepareProjectionGroup(
+        db,
+        root,
+        profileId,
+        members,
+        decision.recordId,
+        evidence,
+        pairScopes,
+        contexts,
+      ),
     );
   } catch (error) {
     evidence.dispose();
+    throw error;
+  }
+}
+async function prepareProjectionContexts(members: { session: CollectionClinicalReviewSession }[]) {
+  const contexts: CollectionClinicalProjectionContext[] = [];
+  for (const member of members)
+    contexts.push(await collectionClinicalProjectionContextAsync(member.session));
+  for (const context of contexts) context.assertAuthorityCurrent();
+  return contexts;
+}
+
+async function finishVerifiedProjection(db: DatabaseSync, plan: PreparedClinicalProjection) {
+  const value = state(plan);
+  const stamp = reviewReadStamp(db);
+  const methodEpoch = managedDatabaseMethodEpoch(db);
+  const assertCurrent = () => {
+    if (
+      !stamp ||
+      !methodEpoch ||
+      db.isTransaction ||
+      value.closed ||
+      reviewReadStamp(db) !== stamp ||
+      managedDatabaseMethodEpoch(db) !== methodEpoch
+    )
+      throw changed();
+    value.assertWithoutArtifacts();
+  };
+  try {
+    return await value.artifacts.withVerifiedTerminal({ assertCurrent }, () => plan);
+  } catch (error) {
+    disposePreparedClinicalProjection(plan);
     throw error;
   }
 }
@@ -166,9 +225,11 @@ function validatePreparedEvidencePairs(
     decisions: IntakeReviewDecision[];
     reviewed?: boolean;
   }[],
+  contexts: CollectionClinicalProjectionContext[],
 ) {
-  return members.map((member) => {
-    const context = collectionClinicalProjectionContext(member.session);
+  return members.map((member, index) => {
+    const context = contexts[index]!;
+    context.assertAuthorityCurrent();
     return member.reviewed === false
       ? undefined
       : validateClinicalPairScopes(
@@ -223,13 +284,16 @@ function prepareProjectionGroup(
   terminalRecordId?: string,
   evidence?: PreparedDuplicateEvidence,
   preparedPairScopes?: (Set<string> | undefined)[],
+  preparedContexts?: CollectionClinicalProjectionContext[],
 ): PreparedClinicalProjection {
   if (!members.length) throw Error('Clinical projection group is empty');
   if (db.isTransaction)
     throw Error('Prepare clinical projection before the application transaction');
   const beforeRevision = revision(db);
   const blocks = members.map((member, memberIndex) => {
-    const originalContext = collectionClinicalProjectionContext(member.session),
+    const originalContext = preparedContexts
+        ? preparedContexts[memberIndex]!
+        : collectionClinicalProjectionContext(member.session),
       complete = evidence
         ? {
             ...originalContext,
@@ -340,13 +404,15 @@ function prepareProjectionGroup(
   };
   try {
     const artifacts = createClinicalReviewArtifactProof(artifactScratch.db, 'artifacts');
+    const evidenceContext = evidence && checkedDuplicateEvidenceProjectionContext(db, evidence);
     for (const { context } of blocks) artifacts.retain(context.verifiedArtifacts());
+    if (evidenceContext) artifacts.retain(evidenceContext.verifiedArtifacts());
     for (const { context } of blocks) restoreConsumption.push(context.beginProjectionConsumption());
     const assertContextsCurrent = (includeArtifacts = true) => {
       for (const { context } of blocks) context.assertAuthorityCurrent();
       if (includeArtifacts) artifacts.assertCurrent();
     };
-    assertContextsCurrent();
+    assertContextsCurrent(!preparedContexts);
     const dataVersion = Number(db.prepare('PRAGMA data_version').get()!.data_version);
     const results: (Result | undefined)[] = [];
     let changes: Uint8Array;
@@ -422,7 +488,7 @@ function prepareProjectionGroup(
       }
     }
     for (const { context } of blocks) artifacts.assertContains(context.consumedArtifactIds());
-    assertContextsCurrent();
+    assertContextsCurrent(!preparedContexts);
     // Restore every borrowed context before a plan can take ownership or escape.
     restoreConsumed();
     if (revision(db) !== beforeRevision) throw changed();
@@ -475,7 +541,7 @@ function prepareProjectionGroup(
       invalidated = false;
     });
     const assertNonArtifactCurrent = () => {
-      evidence?.assertCurrent();
+      evidenceContext?.assertAuthorityCurrent();
       if (
         invalidated ||
         revision(db) !== guardedRevision ||
@@ -497,6 +563,7 @@ function prepareProjectionGroup(
       stopObserving,
       closeArtifacts: () => artifactScratch.close(),
       evidence,
+      applyEvidence: () => evidenceContext?.applyStandalone(),
       assertCurrent() {
         assertContextsCurrent();
         assertNonArtifactCurrent();
@@ -636,7 +703,8 @@ export function applyPreparedClinicalProjectionGroup(
         value.terminalPhysicalCurrent,
       );
     } else value.assertCurrent();
-    value.evidence?.applyStandalone();
+    if (value.terminalPhysicalCurrent) value.applyEvidence();
+    else value.evidence?.applyStandalone();
     if (!applyObservedClinicalProjectionChangeset(db, value.changes)) throw changed();
     value.applied = true;
     value.appliedToken = token;

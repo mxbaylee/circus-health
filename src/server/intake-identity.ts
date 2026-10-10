@@ -1,4 +1,4 @@
-import { currentClinicalOperation } from './clinical-operation.ts';
+import { assertClinicalOperation, currentClinicalOperation } from './clinical-operation.ts';
 import type { NativeIdentityReadOptions } from './intake-identity-native.ts';
 import {
   effectiveKnownNames,
@@ -26,7 +26,14 @@ import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { HttpError, json, now } from './database.ts';
+import {
+  HttpError,
+  clinicalReviewRevision,
+  managedDatabaseMethodEpoch,
+  json,
+  now,
+} from './database.ts';
+import { prepareIntakeFilenameSummary } from './intake-summary-name.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import {
   getIntake,
@@ -119,6 +126,25 @@ const groupFor = (intake: Intake, groupId: string): IntakeReportGroup => {
 /** Existence is evidence location only; neither mode supplies identity authority. */
 async function identityEvidence(context: Context, groupId: string): Promise<Evidence> {
   const { db, root, profileId, id } = context;
+  const operation = currentClinicalOperation(db),
+    revision = clinicalReviewRevision(db),
+    methods = managedDatabaseMethodEpoch(db),
+    before = db.prepare('SELECT sha256,details_json FROM main.source_files WHERE id=?').get(id);
+  const assertCurrent = () => {
+    if (operation) assertClinicalOperation(db, operation);
+    assertIntakeOwner(db, profileId);
+    const current = db
+      .prepare('SELECT sha256,details_json FROM main.source_files WHERE id=?')
+      .get(id);
+    if (
+      clinicalReviewRevision(db) !== revision ||
+      managedDatabaseMethodEpoch(db) !== methods ||
+      current?.sha256 !== before?.sha256 ||
+      current?.details_json !== before?.details_json
+    )
+      reject('The identity scope changed; review the current original and exact members again');
+  };
+  assertCurrent();
   const intake = getIntake(db, root, profileId, id);
   const group = groupFor(intake, groupId);
   let evidenceId = id;
@@ -138,6 +164,14 @@ async function identityEvidence(context: Context, groupId: string): Promise<Evid
         COMPACT_SCALAR_FORMAT,
         locatorScalarHash(member.locator),
       ) as { id: string } | undefined;
+    if (child) {
+      await prepareIntakeFilenameSummary(
+        db,
+        { id: child.id, sha256: member.sourceHash },
+        { assertRunning: assertCurrent },
+      );
+      assertCurrent();
+    }
     if (!child || !intakeFirstLocatorMatches(db, child.id, member.locator))
       return reject('Open and retain this exact package member before confirming its identity');
     evidenceId = child.id;
@@ -171,7 +205,10 @@ async function identityEvidence(context: Context, groupId: string): Promise<Evid
       // Keep decoded JSON keys, roles and object boundaries with the retained
       // string values. Flattening values alone makes guardian names look like
       // patient names and hides a structured patient's DOB key.
-      text = decodeOriginalIdentityText(text, reference.filename);
+      text = decodeOriginalIdentityText(
+        text,
+        reference.filenameDescriptor?.suffix ?? reference.filename,
+      );
       // Do not match hidden HTML instructions as visible subject evidence.
       if (original.mimeType === 'text/html')
         text = text

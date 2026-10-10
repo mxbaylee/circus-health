@@ -35,7 +35,16 @@ import {
   projectSchemaCompactMetadataSteps,
 } from './intake-collection-envelope.ts';
 import { intakeSourcePinKey } from './intake-source-pin.ts';
-import { recordDurabilityStatus } from './record-versions.ts';
+import {
+  recordDurabilityStatus,
+  captureRecordAuthorityWitness,
+  recordAuthorityWitnessCurrent,
+  type RecordAuthorityWitness,
+  prepareRecordSourcePriorFields,
+  prepareRecordCompactPublication,
+  discardRecordSourcePriorFields,
+  type RecordSourcePriorFields,
+} from './record-versions.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import { protectedIntakeLookupTempShadow } from './intake-lookup-frontier-observer.ts';
 
@@ -55,8 +64,10 @@ interface CompactProofData {
   target: string;
   sequence: number;
   stamp: IntakeCompactMetadataStamp;
+  priorFields: RecordSourcePriorFields;
 }
 export interface IntakeCompactMetadataStamp {
+  readonly authority: RecordAuthorityWitness;
   readonly methods: object;
   readonly mainSchema: unknown;
   readonly tempSchema: unknown;
@@ -69,6 +80,7 @@ export function intakeCompactMetadataStampCurrent(
   beforeWrites: boolean,
 ): boolean {
   return (
+    recordAuthorityWitnessCurrent(db, stamp.authority) &&
     managedDatabaseMethodEpoch(db) === stamp.methods &&
     !protectedIntakeLookupTempShadow(db) &&
     db.prepare('PRAGMA main.schema_version').get()!.schema_version === stamp.mainSchema &&
@@ -167,14 +179,21 @@ function certificate(binding: IntakeLegacyBridgeBinding): string {
 export function clearIntakeLegacyBridgeProofs(db: Database): void {
   for (const proof of retained.get(db) ?? []) proofs.delete(proof);
   retained.delete(db);
-  for (const proof of compactRetained.get(db) ?? []) compactProofs.delete(proof);
+  for (const proof of compactRetained.get(db) ?? []) {
+    const item = compactProofs.get(proof);
+    if (item) discardRecordSourcePriorFields(item.priorFields);
+    compactProofs.delete(proof);
+  }
   compactRetained.delete(db);
 }
 /** Distinct, exact-target permission. No caller-supplied metadata is accepted. */
 export async function prepareIntakeCompactMetadataProofAsync(
   db: Database,
   candidate: Omit<IntakeLegacyBridgeBinding, 'sourcePin' | 'detailsJson'>,
-  options: { assertRunning?: () => void } = {},
+  options: {
+    assertRunning?: () => void;
+    publication?: { operationId: string; fingerprint: string; result: unknown };
+  } = {},
 ): Promise<IntakeCompactMetadataProof | undefined> {
   const source = db
     .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
@@ -202,6 +221,7 @@ export async function prepareIntakeCompactMetadataProofAsync(
   const methods = managedDatabaseMethodEpoch(db);
   if (!methods) invalid('compact metadata managed database policy');
   const stamp: IntakeCompactMetadataStamp = Object.freeze({
+    authority: captureRecordAuthorityWitness(db),
     methods: methods!,
     mainSchema,
     tempSchema,
@@ -247,6 +267,7 @@ export async function prepareIntakeCompactMetadataProofAsync(
     adoption.return(undefined as never);
   }
   let complete = false;
+  let priorFields: RecordSourcePriorFields | undefined;
   try {
     const rows = new Map(candidate.writes.map((item) => [item.key, item.value])),
       prefix = intakeNamespace(candidate.identity),
@@ -277,6 +298,30 @@ export async function prepareIntakeCompactMetadataProofAsync(
       steps.return(undefined as never);
     }
     assertCurrent();
+    if (target! === source.details_json) return undefined;
+    priorFields = await prepareRecordSourcePriorFields(
+      db,
+      candidate.identity.intakeId,
+      assertCurrent,
+      sourceRow,
+      stamp.authority,
+    );
+    if (options.publication)
+      await prepareRecordCompactPublication(
+        db,
+        priorFields,
+        {
+          sourceRow,
+          target: target!,
+          headKey: key,
+          afterHead: candidate.afterHead,
+          sourcePinKey: intakeSourcePinKey(candidate.identity.intakeId),
+          writes: candidate.writes,
+          ...options.publication,
+        },
+        assertCurrent,
+      );
+    assertCurrent();
     const finalSource = db
       .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
       .get(candidate.identity.intakeId);
@@ -291,7 +336,6 @@ export async function prepareIntakeCompactMetadataProofAsync(
     withIntakeWork(db, 'reconstruction', () =>
       recordIntakeWork('compactMetadataProjectionBytes', Buffer.byteLength(target!)),
     );
-    if (target! === source.details_json) return undefined;
     const proof = Object.freeze({}) as IntakeCompactMetadataProof;
     let entries = compactRetained.get(db);
     if (!entries) {
@@ -304,6 +348,7 @@ export async function prepareIntakeCompactMetadataProofAsync(
       if (prior) {
         proofs.delete(prior.bridge);
         retained.get(db)?.delete(prior.bridge);
+        discardRecordSourcePriorFields(prior.priorFields);
       }
       compactProofs.delete(old);
       entries.delete(old);
@@ -316,6 +361,7 @@ export async function prepareIntakeCompactMetadataProofAsync(
       target: target!,
       sequence: status!.sequence,
       stamp,
+      priorFields,
       binding: certificate({
         ...candidate,
         sourcePin: pin as string | undefined,
@@ -326,6 +372,7 @@ export async function prepareIntakeCompactMetadataProofAsync(
     return proof;
   } finally {
     if (!complete) {
+      if (priorFields) discardRecordSourcePriorFields(priorFields);
       proofs.delete(bridge);
       retained.get(db)?.delete(bridge);
     }
@@ -340,34 +387,42 @@ export function consumeIntakeCompactMetadataProof(
   target: string;
   sequence: number;
   stamp: IntakeCompactMetadataStamp;
+  priorFields: RecordSourcePriorFields;
 } {
   const item = compactProofs.get(proof);
   compactProofs.delete(proof);
   compactRetained.get(db)?.delete(proof);
-  if (!item || item.db !== db || item.binding !== certificate(binding))
-    invalid('foreign or expired compact metadata proof');
-  verifyIntakeLegacyBridgeProof(item!.bridge, db, binding);
-  const current = recordDurabilityStatus(db);
-  if (
-    !current?.configured ||
-    current.dirty ||
-    current.conflicted ||
-    current.sequence !== item!.sequence ||
-    !intakeCompactMetadataStampCurrent(db, item!.stamp, true) ||
-    !intakeCompactSourceRowsEqual(
-      db
-        .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
-        .get(binding.identity.intakeId),
-      item!.sourceRow,
+  let consumed = false;
+  try {
+    if (!item || item.db !== db || item.binding !== certificate(binding))
+      invalid('foreign or expired compact metadata proof');
+    verifyIntakeLegacyBridgeProof(item!.bridge, db, binding);
+    const current = recordDurabilityStatus(db);
+    if (
+      !current?.configured ||
+      current.dirty ||
+      current.conflicted ||
+      current.sequence !== item!.sequence ||
+      !intakeCompactMetadataStampCurrent(db, item!.stamp, true) ||
+      !intakeCompactSourceRowsEqual(
+        db
+          .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
+          .get(binding.identity.intakeId),
+        item!.sourceRow,
+      )
     )
-  )
-    invalid('compact metadata proof source or physical authority changed');
-  return {
-    sourceRow: item!.sourceRow,
-    target: item!.target,
-    sequence: item!.sequence,
-    stamp: item!.stamp,
-  };
+      invalid('compact metadata proof source or physical authority changed');
+    consumed = true;
+    return {
+      sourceRow: item!.sourceRow,
+      target: item!.target,
+      sequence: item!.sequence,
+      stamp: item!.stamp,
+      priorFields: item!.priorFields,
+    };
+  } finally {
+    if (!consumed && item) discardRecordSourcePriorFields(item.priorFields);
+  }
 }
 export function intakeCompactSourceRowsEqual(
   actual: Record<string, unknown> | undefined,

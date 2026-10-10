@@ -705,7 +705,8 @@ export async function indexIntakeEvidence({
     return { kind: 'unsupported', sections: [], missingAssets: [], coverage: 'unreadable_binary' };
   }
   const html =
-    /\.html?$/i.test(original.filename) || /<(?:html|table|body)\b/i.test(text.slice(0, 4096));
+    /\.html?$/i.test(original.filenameDescriptor?.suffix ?? original.filename) ||
+    /<(?:html|table|body)\b/i.test(text.slice(0, 4096));
   if (!html)
     return {
       kind: 'text',

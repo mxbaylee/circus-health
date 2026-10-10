@@ -92,6 +92,10 @@ export function createReportSnapshotCatalog(
   options: {
     assertRunning?: () => void;
     onCheckpoint?: () => void | Promise<void>;
+    /** Source-owned publication closes its original physical proof at the fixed commit. */
+    withVerifiedPublication?: (
+      commit: (terminalPhysicalCurrent: () => void) => void,
+    ) => Promise<void>;
     /** Other domain owners can reuse the same authenticated snapshot codec. */
     catalog?:
       | 'report.snapshots'
@@ -141,7 +145,7 @@ export function createReportSnapshotCatalog(
     )
       throw Error('Stale report snapshot source or logical state');
   };
-  const checkpoint = async (changes: readonly IntakeCollectionChange[]) => {
+  const checkpoint = async (changes: readonly IntakeCollectionChange[], publication = false) => {
     return runExclusiveClinicalOperation(
       db,
       async () => {
@@ -153,14 +157,26 @@ export function createReportSnapshotCatalog(
         );
         withIntakeWork(db, 'warm', () => recordIntakeWork('reportSnapshotCheckpointBatches'));
         const id = randomUUID();
-        collections.commitMaintenance(
-          collections.prepare(collections.openView(), {
-            operationId: id,
-            requestDigest: hash(id),
-            domainVersion: version,
-            changes,
-          }),
-        );
+        const prepared = collections.prepare(collections.openView(), {
+          operationId: id,
+          requestDigest: hash(id),
+          domainVersion: version,
+          changes,
+        });
+        try {
+          const commit = (terminalPhysicalCurrent: () => void) => {
+            terminalPhysicalCurrent();
+            collections.commitMaintenance(prepared, { assertCurrent: terminalPhysicalCurrent });
+          };
+          if (publication && options.withVerifiedPublication)
+            await options.withVerifiedPublication((terminalPhysicalCurrent) => {
+              commit(terminalPhysicalCurrent);
+              assertCurrent();
+            });
+          else collections.commitMaintenance(prepared);
+        } finally {
+          collections.disposePreparation(prepared);
+        }
         await options.onCheckpoint?.();
         await setImmediate();
         assertCurrent();
@@ -651,16 +667,19 @@ export function createReportSnapshotCatalog(
       const key = snapshotKey(snapshotId);
       if (collections.getCollectionReference(collections.openView(), 'builds', catalog, key))
         throw Error('Report snapshot identifier already exists');
-      await checkpoint([
-        {
-          area: 'builds',
-          collection: catalog,
-          op: 'putCollection',
-          key,
-          fromArea: 'builds',
-          fromCollection: name,
-        },
-      ]);
+      await checkpoint(
+        [
+          {
+            area: 'builds',
+            collection: catalog,
+            op: 'putCollection',
+            key,
+            fromArea: 'builds',
+            fromCollection: name,
+          },
+        ],
+        true,
+      );
     },
     identityScopeReuseReader(snapshotId, requestedArea) {
       if (
@@ -718,16 +737,19 @@ export function createReportSnapshotCatalog(
       const value = await writer(resolve),
         name = names.get(value)!;
       await init();
-      await checkpoint([
-        {
-          area: 'builds',
-          collection: catalog,
-          op: 'putCollection',
-          key: 'identity-current:' + hash(groupId),
-          fromArea: 'builds',
-          fromCollection: name,
-        },
-      ]);
+      await checkpoint(
+        [
+          {
+            area: 'builds',
+            collection: catalog,
+            op: 'putCollection',
+            key: 'identity-current:' + hash(groupId),
+            fromArea: 'builds',
+            fromCollection: name,
+          },
+        ],
+        true,
+      );
     },
     async finalChanges() {
       assertCurrent();

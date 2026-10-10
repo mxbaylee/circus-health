@@ -1,9 +1,10 @@
 /** Complete disposable routing, certified only after scanning one selected intake root.
- * TEMP rows share the profile connection lifetime; no source/group-sized JS cache. */
+ * Private scratch shares the profile lifetime without mutating its SQL read witness. */
 import { setImmediate } from 'node:timers/promises';
-import { HttpError, type Database } from './database.ts';
+import { HttpError, observeDatabaseClose, type Database } from './database.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 import { intakeCollectionCacheGeneration } from './intake-state-collections.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
 
 const prefix = '__report_source_routing';
 const ddl = [
@@ -24,11 +25,28 @@ interface State {
   version: number;
   signature: string;
   stamp: string;
+  authorityStamp: string;
   registry: object;
   /** Eviction affects only preparation work, never the available product scope. */
   proofs: Map<string, string>;
 }
 const schemas = new WeakMap<Database, State>();
+const caches = new WeakMap<Database, ReturnType<typeof disposableSqlite>>();
+function routingCache(db: Database): Database {
+  if (!db.isOpen) throw unavailable();
+  let cache = caches.get(db);
+  if (!cache) {
+    cache = disposableSqlite('circus-report-source-routing-');
+    caches.set(db, cache);
+    const owned = cache;
+    observeDatabaseClose(db, () => {
+      caches.delete(db);
+      schemas.delete(owned.db);
+      owned.close();
+    });
+  }
+  return cache.db;
+}
 const stamp = (db: Database) => {
   const read = db.prepare(
     'SELECT total_changes() AS changes,(SELECT data_version FROM pragma_data_version) AS external,(SELECT schema_version FROM pragma_schema_version) AS mainSchema',
@@ -48,7 +66,7 @@ const schema = (db: Database) =>
       )
       .all(prefix + '*', prefix + '*'),
   );
-function ensure(db: Database) {
+function ensure(db: Database, authority: Database) {
   const retained = schemas.get(db),
     version = schemaVersion(db);
   if (retained?.version === version) return retained;
@@ -64,7 +82,8 @@ function ensure(db: Database) {
     version: schemaVersion(db),
     signature: schema(db),
     stamp: stamp(db),
-    registry: intakeCollectionCacheGeneration(db),
+    authorityStamp: stamp(authority),
+    registry: intakeCollectionCacheGeneration(authority),
     proofs: new Map<string, string>(),
   };
   schemas.set(db, state);
@@ -87,15 +106,23 @@ export async function prepareReportSourceRouting(
     await preparing.get(db);
     input.assertCurrent();
   }
-  let state = ensure(db);
+  const cache = routingCache(db);
+  let state = ensure(cache, db);
   const currentState = () => {
-    state = ensure(db);
-    const actual = stamp(db);
+    state = ensure(cache, db);
+    const actual = stamp(cache);
+    const source = stamp(db);
     const registry = intakeCollectionCacheGeneration(db);
-    if (actual !== state.stamp || registry !== state.registry || db.isTransaction) {
+    if (
+      actual !== state.stamp ||
+      source !== state.authorityStamp ||
+      registry !== state.registry ||
+      db.isTransaction
+    ) {
       state.proofs.clear();
       state.stamp = actual;
       state.registry = registry;
+      state.authorityStamp = source;
     }
     return state;
   };
@@ -103,7 +130,7 @@ export async function prepareReportSourceRouting(
     input.assertCurrent();
     const current = currentState();
     if (current.proofs.get(input.sourceId) !== input.binding) return false;
-    const row = db
+    const row = cache
       .prepare(`SELECT binding,ready FROM ${prefix} WHERE source=?`)
       .get(input.sourceId);
     return row?.ready === 1 && row.binding === input.binding;
@@ -115,7 +142,8 @@ export async function prepareReportSourceRouting(
       const ownWrite = (write: () => void) => {
         if (
           db.isTransaction ||
-          stamp(db) !== state.stamp ||
+          stamp(cache) !== state.stamp ||
+          stamp(db) !== state.authorityStamp ||
           intakeCollectionCacheGeneration(db) !== state.registry
         ) {
           state.proofs.clear();
@@ -123,9 +151,10 @@ export async function prepareReportSourceRouting(
         }
         const before = state.stamp;
         write();
-        const after = stamp(db);
+        const after = stamp(cache);
         if (
           after.slice(after.indexOf(':')) !== before.slice(before.indexOf(':')) ||
+          stamp(db) !== state.authorityStamp ||
           intakeCollectionCacheGeneration(db) !== state.registry
         ) {
           state.proofs.clear();
@@ -134,16 +163,18 @@ export async function prepareReportSourceRouting(
         state.stamp = after;
       };
       ownWrite(() => {
-        db.prepare(
-          `INSERT INTO ${prefix} VALUES(?,?,0) ON CONFLICT(source) DO UPDATE SET binding=excluded.binding,ready=0`,
-        ).run(input.sourceId, input.binding);
-        db.prepare(`DELETE FROM ${prefix}_owners WHERE source=?`).run(input.sourceId);
-        db.prepare(`DELETE FROM ${prefix}_drafts WHERE source=?`).run(input.sourceId);
+        cache
+          .prepare(
+            `INSERT INTO ${prefix} VALUES(?,?,0) ON CONFLICT(source) DO UPDATE SET binding=excluded.binding,ready=0`,
+          )
+          .run(input.sourceId, input.binding);
+        cache.prepare(`DELETE FROM ${prefix}_owners WHERE source=?`).run(input.sourceId);
+        cache.prepare(`DELETE FROM ${prefix}_drafts WHERE source=?`).run(input.sourceId);
       });
-      const owner = db.prepare(
+      const owner = cache.prepare(
           `INSERT INTO ${prefix}_owners VALUES(?,?,?,?,?) ON CONFLICT(source,candidate,version) DO UPDATE SET groupId=excluded.groupId,basis=excluded.basis WHERE excluded.basis>=basis`,
         ),
-        draft = db.prepare(
+        draft = cache.prepare(
           `INSERT INTO ${prefix}_drafts VALUES(?,?,?) ON CONFLICT(source,identity) DO UPDATE SET disposition=excluded.disposition`,
         );
       // Read a bounded window before writing it. Interleaving every envelope read
@@ -174,7 +205,7 @@ export async function prepareReportSourceRouting(
       flush();
       input.assertCurrent();
       ownWrite(() =>
-        db
+        cache
           .prepare(`UPDATE ${prefix} SET ready=1 WHERE source=? AND binding=?`)
           .run(input.sourceId, input.binding),
       );
@@ -197,17 +228,21 @@ export async function prepareReportSourceRouting(
   return {
     owner(candidate: string, version: string) {
       checked();
-      return db
+      const value = cache
         .prepare(
           `SELECT groupId FROM ${prefix}_owners WHERE source=? AND candidate=? AND version=?`,
         )
         .get(input.sourceId, candidate, version)?.groupId;
+      checked();
+      return value;
     },
     disposition(identity: string) {
       checked();
-      return db
+      const value = cache
         .prepare(`SELECT disposition FROM ${prefix}_drafts WHERE source=? AND identity=?`)
         .get(input.sourceId, identity)?.disposition;
+      checked();
+      return value;
     },
   };
 }

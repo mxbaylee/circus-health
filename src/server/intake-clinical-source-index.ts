@@ -2,7 +2,11 @@
 import { createHash } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
 import type { DatabaseSync } from 'node:sqlite';
-import { HttpError } from './database.ts';
+import {
+  HttpError,
+  managedDatabaseFunctionSetter,
+  observeManagedDatabaseFunctionRegistration,
+} from './database.ts';
 import { canonicalLiteral, parseLiteralJSON } from './intake-format.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import {
@@ -29,9 +33,31 @@ interface State {
   dataVersion: number;
   schema: string;
   mainSchema: string;
-  registered: boolean;
 }
 const states = new WeakMap<DatabaseSync, State>();
+const functions = new WeakMap<
+  DatabaseSync,
+  { current: boolean; setter: DatabaseSync['function'] }
+>();
+/** Register fixed prerequisites before a lookup proof is captured, without scanning records. */
+export function ensureClinicalSourceFingerprintFunction(db: DatabaseSync): void {
+  let binding = functions.get(db);
+  if (binding?.current && binding.setter === db.function) return;
+  if (db.function !== managedDatabaseFunctionSetter(db)) throw unavailable();
+  if (!binding) {
+    binding = { current: false, setter: db.function };
+    functions.set(db, binding);
+    const selected = binding;
+    observeManagedDatabaseFunctionRegistration(db, (name) => {
+      if (name.toLowerCase() !== FUNCTION) return;
+      selected.current = false;
+      const state = states.get(db);
+      if (state) state.ready = false;
+    });
+  }
+  db.function(FUNCTION, { deterministic: true }, (raw) => canonicalDigest(db, raw, 'warm'));
+  binding.current = true;
+}
 const unavailable = () =>
   new HttpError(
     409,
@@ -72,6 +98,8 @@ function checked(db: DatabaseSync): State {
   const state = states.get(db);
   if (
     !state?.ready ||
+    !functions.get(db)?.current ||
+    functions.get(db)?.setter !== db.function ||
     state.dataVersion !== dataVersion(db) ||
     state.schema !== schema(db) ||
     state.mainSchema !== mainSchema(db)
@@ -88,6 +116,7 @@ export async function prepareClinicalSourceFingerprintIndex(
 ): Promise<void> {
   if (db.isTransaction)
     throw Error('Prepare canonical source fingerprints outside the application transaction');
+  ensureClinicalSourceFingerprintFunction(db);
   try {
     checked(db);
     return;
@@ -97,17 +126,13 @@ export async function prepareClinicalSourceFingerprintIndex(
   }
   let state = states.get(db);
   if (!state) {
-    state = { ready: false, dataVersion: 0, schema: '', mainSchema: '', registered: false };
+    state = { ready: false, dataVersion: 0, schema: '', mainSchema: '' };
     states.set(db, state);
   }
   state.ready = false;
   const frontier = beginIntakeFrontierAuxiliaryPreparation(db, 'clinical-source');
   let complete = false;
   try {
-    if (!state.registered) {
-      db.function(FUNCTION, { deterministic: true }, (raw) => canonicalDigest(db, raw, 'warm'));
-      state.registered = true;
-    }
     for (const event of ['insert', 'delete', 'update'])
       execIntakeFrontierAuxiliarySQL(
         db,

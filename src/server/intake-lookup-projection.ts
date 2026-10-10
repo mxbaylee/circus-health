@@ -35,6 +35,21 @@ import {
 import { consumeWorkflowReceiptAppendProof } from './intake-workflow-update.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { protectedIntakeLookupTempShadow } from './intake-lookup-frontier-observer.ts';
+import {
+  acknowledgeProjectionInputs,
+  assertProjectionAnswerWitness,
+  discardIntakeProjectionWitness,
+  ensureIntakeProjectionWitness,
+  intakeProjectionWitnessCurrent,
+  ownedIntakeProjectionWrite,
+  projectionInputVersion,
+  projectionAnswerWitness,
+  projectionWitnessHasForeignMutation,
+  projectionWitnessRevision,
+  renewIntakeProjectionWitnessAfterIndexRepair,
+  resetIntakeProjectionWitness,
+  sealIntakeProjectionWitness,
+} from './intake-lookup-projection-witness.ts';
 export {
   prepareIntakeLookupIndices,
   intakeDiscoveryRevision,
@@ -171,13 +186,14 @@ export function intakeLookupCounters(db: DatabaseSync): IntakeLookupCounters {
 /** Counters describe logical changed-row payload bytes, not physical SQLite writes. */
 /** Remove decrypted connection state; TEMP tracking is recreated safely on next use. */
 export function clearIntakeLookupCache(db: DatabaseSync): void {
+  discardIntakeProjectionWitness(db);
   connections.get(db)?.dispose();
   connections.delete(db);
 }
 function schemaVersion(db: DatabaseSync): number {
   return Number(db.prepare('PRAGMA schema_version').get()!.schema_version);
 }
-function tracking(db: DatabaseSync): void {
+function tracking(db: DatabaseSync): boolean {
   // An outer UPSERT can override a trigger's OR IGNORE conflict policy.
   // Avoid inserting repeated OLD/NEW keys, as the authority triggers do.
   const markDirty = (id: string) =>
@@ -207,11 +223,16 @@ function tracking(db: DatabaseSync): void {
   );
   const canonical = (statement: string) =>
     statement.replace(/^CREATE TEMP (TABLE|TRIGGER) IF NOT EXISTS /, 'CREATE $1 ');
+  let changed = false;
   for (let index = 0; index < names.length; index++) {
     const actual = existing.get(names[index]!);
     if (actual !== undefined && actual !== canonical(statements[index]!)) fail('tracking schema');
-    if (actual === undefined) db.exec(statements[index]!);
+    if (actual === undefined) {
+      db.exec(statements[index]!);
+      changed = true;
+    }
   }
+  return changed;
 }
 function initialize(db: DatabaseSync, connection: Connection, profile: string): void {
   // Reconstruction cannot inherit text retained by an aborted attempt or an
@@ -288,6 +309,7 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
   }
   // Every row here is disposable. Never delete source/accepted evidence to repair this cache.
   if (!valid) {
+    resetIntakeProjectionWitness(db);
     for (const name of Object.keys(tables) as Array<keyof typeof tables>)
       db.exec(`DROP TABLE IF EXISTS ${table(name)}`);
     db.exec(`CREATE TABLE ${table('state')}(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format INTEGER NOT NULL,profile_id TEXT NOT NULL);
@@ -333,9 +355,13 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
   }
   for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
     const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
-    db.exec(
-      `CREATE TEMP TRIGGER IF NOT EXISTS __intake_lookup_authority_${op} AFTER ${op} ON main.app_meta BEGIN ${refs.map((ref) => `INSERT INTO __intake_lookup_dirty SELECT source_id FROM __intake_lookup_authorities a WHERE authority_key=${ref}.key AND NOT EXISTS(SELECT 1 FROM __intake_lookup_dirty d WHERE d.source_id=a.source_id);`).join(' ')} END`,
-    );
+    const name = `__intake_lookup_authority_${op}`;
+    const sql = `CREATE TRIGGER ${name} AFTER ${op} ON main.app_meta BEGIN ${refs.map((ref) => `INSERT INTO __intake_lookup_dirty SELECT source_id FROM __intake_lookup_authorities a WHERE authority_key=${ref}.key AND NOT EXISTS(SELECT 1 FROM __intake_lookup_dirty d WHERE d.source_id=a.source_id);`).join(' ')} END`;
+    const existing = db
+      .prepare("SELECT sql FROM sqlite_temp_schema WHERE type='trigger' AND name=?")
+      .get(name)?.sql;
+    if (existing !== undefined && existing !== sql) fail('authority tracking schema');
+    if (existing === undefined) db.exec(sql.replace('CREATE TRIGGER ', 'CREATE TEMP TRIGGER '));
   }
   db.exec(
     `DELETE FROM temp.__intake_lookup_authorities; INSERT OR IGNORE INTO temp.__intake_lookup_authorities SELECT authority_key,source_id FROM ${table('sources')} WHERE authority_key IS NOT NULL`,
@@ -360,9 +386,12 @@ function prune(db: DatabaseSync, connection: Connection, obsolete: Set<string>):
       ? Buffer.byteLength(JSON.stringify(retained))
       : 0;
     if (!retained) {
-      const removed = db
-        .prepare(`DELETE FROM ${table('payloads')} WHERE hash=? RETURNING payload`)
-        .get(hash);
+      const removed = ownedIntakeProjectionWrite(
+        db,
+        { table: 'payloads', operations: ['delete'], key: hash },
+        () =>
+          db.prepare(`DELETE FROM ${table('payloads')} WHERE hash=? RETURNING payload`).get(hash),
+      );
       if (removed) {
         connection.hashes?.db
           .prepare('DELETE FROM verified_payloads WHERE payload=?')
@@ -412,7 +441,11 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
   if (!source) {
     db.prepare('DELETE FROM temp.__intake_lookup_authorities WHERE source_id=?').run(id);
     for (const name of ['groups', 'acceptances', 'identities', 'sources'] as const) {
-      const rows = db.prepare(`DELETE FROM ${table(name)} WHERE source_id=? RETURNING *`).all(id);
+      const rows = ownedIntakeProjectionWrite(
+        db,
+        { table: name, operations: ['delete'], key: id },
+        () => db.prepare(`DELETE FROM ${table(name)} WHERE source_id=? RETURNING *`).all(id),
+      );
       for (const row of rows) countWrite(connection, { ...row, deleted: true });
       if (name === 'identities') connection.counters.identityLinksWritten += rows.length;
       if (name === 'sources' && rows[0]?.identity_first !== null)
@@ -436,12 +469,18 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
             .prepare(`SELECT hash FROM ${table(name)} WHERE source_id=? LIMIT 1`)
             .get(id);
           if (!row) break;
-          db.prepare(`DELETE FROM ${table(name)} WHERE source_id=? AND hash=?`).run(id, row.hash!);
+          ownedIntakeProjectionWrite(db, { table: name, operations: ['delete'], key: id }, () =>
+            db
+              .prepare(`DELETE FROM ${table(name)} WHERE source_id=? AND hash=?`)
+              .run(id, row.hash!),
+          );
           prune(db, connection, new Set([String(row.hash)]));
           countWrite(connection, { id, hash: row.hash, deleted: true });
         }
       }
-      db.prepare(`DELETE FROM ${table('groups')} WHERE source_id=?`).run(id);
+      ownedIntakeProjectionWrite(db, { table: 'groups', operations: ['delete'], key: id }, () =>
+        db.prepare(`DELETE FROM ${table('groups')} WHERE source_id=?`).run(id),
+      );
     }
     if (
       !prior ||
@@ -451,9 +490,22 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
       prior.authority_head !== binding.logicalHead ||
       prior.identity_first !== -1
     ) {
-      db.prepare(
-        `INSERT INTO ${table('sources')} VALUES(?,?,?,?,?,-1) ON CONFLICT(source_id) DO UPDATE SET source_order=excluded.source_order,kind=excluded.kind,authority_key=excluded.authority_key,authority_head=excluded.authority_head,identity_first=-1`,
-      ).run(id, source.source_order!, source.kind!, binding.key, binding.logicalHead);
+      ownedIntakeProjectionWrite(
+        db,
+        { table: 'sources', operations: ['insert', 'update'], key: id },
+        () =>
+          db
+            .prepare(
+              `INSERT INTO ${table('sources')} VALUES(?,?,?,?,?,-1) ON CONFLICT(source_id) DO UPDATE SET source_order=excluded.source_order,kind=excluded.kind,authority_key=excluded.authority_key,authority_head=excluded.authority_head,identity_first=-1`,
+            )
+            .run(
+              id,
+              Number(source.source_order),
+              String(source.kind),
+              binding.key,
+              binding.logicalHead!,
+            ),
+      );
       countWrite(connection, { id, logicalHead: binding.logicalHead });
     }
     db.prepare('DELETE FROM temp.__intake_lookup_authorities WHERE source_id=?').run(id);
@@ -496,9 +548,16 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     prior.authority_key !== binding.key ||
     prior.authority_head !== binding.head
   ) {
-    db.prepare(
-      `INSERT INTO ${table('sources')}(source_id,source_order,kind,authority_key,authority_head) VALUES(?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET source_order=excluded.source_order,kind=excluded.kind,authority_key=excluded.authority_key,authority_head=excluded.authority_head`,
-    ).run(id, source.source_order!, source.kind!, binding.key, binding.head);
+    ownedIntakeProjectionWrite(
+      db,
+      { table: 'sources', operations: ['insert', 'update'], key: id },
+      () =>
+        db
+          .prepare(
+            `INSERT INTO ${table('sources')}(source_id,source_order,kind,authority_key,authority_head) VALUES(?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET source_order=excluded.source_order,kind=excluded.kind,authority_key=excluded.authority_key,authority_head=excluded.authority_head`,
+          )
+          .run(id, source.source_order!, source.kind!, binding.key, binding.head),
+    );
     countWrite(connection, {
       id,
       source_order: source.source_order,
@@ -554,16 +613,27 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
   readRows(connection, oldGroup);
   for (const row of oldGroup)
     if (row.ordinal !== 0) {
-      db.prepare(`DELETE FROM ${table('groups')} WHERE source_id=? AND ordinal=?`).run(
-        id,
-        row.ordinal!,
+      ownedIntakeProjectionWrite(
+        db,
+        { table: 'groups', operations: ['delete'], key: id, subkey: String(row.ordinal) },
+        () =>
+          db
+            .prepare(`DELETE FROM ${table('groups')} WHERE source_id=? AND ordinal=?`)
+            .run(id, row.ordinal!),
       );
       countWrite(connection, { id, ordinal: row.ordinal, deleted: true });
     }
   if (!oldGroup.some((row) => row.ordinal === 0 && row.discovery_order === maximum)) {
-    db.prepare(
-      `INSERT INTO ${table('groups')} VALUES(?,0,?) ON CONFLICT(source_id,ordinal) DO UPDATE SET discovery_order=excluded.discovery_order`,
-    ).run(id, maximum);
+    ownedIntakeProjectionWrite(
+      db,
+      { table: 'groups', operations: ['insert', 'update'], key: id, subkey: '0' },
+      () =>
+        db
+          .prepare(
+            `INSERT INTO ${table('groups')} VALUES(?,0,?) ON CONFLICT(source_id,ordinal) DO UPDATE SET discovery_order=excluded.discovery_order`,
+          )
+          .run(id, maximum),
+    );
     countWrite(connection, { id, ordinal: 0, discovery_order: maximum });
   }
   const payload = (value: unknown): string => {
@@ -585,9 +655,16 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     const stored = db.prepare(`SELECT payload FROM ${table('payloads')} WHERE hash=?`).get(hash);
     readRows(connection, stored ? [stored] : []);
     if (!stored || stored.payload !== text) {
-      db.prepare(
-        `INSERT INTO ${table('payloads')} VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET payload=excluded.payload`,
-      ).run(hash, text);
+      ownedIntakeProjectionWrite(
+        db,
+        { table: 'payloads', operations: ['insert', 'update'], key: hash },
+        () =>
+          db
+            .prepare(
+              `INSERT INTO ${table('payloads')} VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET payload=excluded.payload`,
+            )
+            .run(hash, text),
+      );
       countWrite(connection, { hash, payload: text });
     }
     return hash;
@@ -609,17 +686,28 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     seenOperations.add(operation);
     const hash = payload(entry.payload);
     if (acceptanceMap.get(operation) !== hash) {
-      db.prepare(
-        `INSERT INTO ${table('acceptances')} VALUES(?,?,?) ON CONFLICT(source_id,operation_id) DO UPDATE SET hash=excluded.hash`,
-      ).run(id, operation, hash);
+      ownedIntakeProjectionWrite(
+        db,
+        { table: 'acceptances', operations: ['insert', 'update'], key: id, subkey: operation },
+        () =>
+          db
+            .prepare(
+              `INSERT INTO ${table('acceptances')} VALUES(?,?,?) ON CONFLICT(source_id,operation_id) DO UPDATE SET hash=excluded.hash`,
+            )
+            .run(id, operation, hash),
+      );
       countWrite(connection, { id, operation, hash });
     }
     acceptanceMap.delete(operation);
   }
   for (const operation of acceptanceMap.keys()) {
-    db.prepare(`DELETE FROM ${table('acceptances')} WHERE source_id=? AND operation_id=?`).run(
-      id,
-      operation,
+    ownedIntakeProjectionWrite(
+      db,
+      { table: 'acceptances', operations: ['delete'], key: id, subkey: operation },
+      () =>
+        db
+          .prepare(`DELETE FROM ${table('acceptances')} WHERE source_id=? AND operation_id=?`)
+          .run(id, operation),
     );
     countWrite(connection, { id, operation, deleted: true });
   }
@@ -675,24 +763,39 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     const row = nextRows[index]!,
       next = nextRows[index + 1]?.id ?? null;
     if (!row.before || row.before.next !== next) {
-      db.prepare(
-        `INSERT INTO ${table('identities')} VALUES(?,?,?,?) ON CONFLICT(source_id,id) DO UPDATE SET next=excluded.next,hash=excluded.hash`,
-      ).run(id, row.id, next, row.hash);
+      ownedIntakeProjectionWrite(
+        db,
+        { table: 'identities', operations: ['insert', 'update'], key: id, subkey: String(row.id) },
+        () =>
+          db
+            .prepare(
+              `INSERT INTO ${table('identities')} VALUES(?,?,?,?) ON CONFLICT(source_id,id) DO UPDATE SET next=excluded.next,hash=excluded.hash`,
+            )
+            .run(id, row.id, next, row.hash),
+      );
       countWrite(connection, { id, occurrence: row.id, next, hash: row.hash });
       connection.counters.identityLinksWritten++;
     }
   }
   for (const row of oldIdentities)
     if (!used.has(Number(row.id))) {
-      db.prepare(`DELETE FROM ${table('identities')} WHERE source_id=? AND id=?`).run(id, row.id!);
+      ownedIntakeProjectionWrite(
+        db,
+        { table: 'identities', operations: ['delete'], key: id, subkey: String(row.id) },
+        () =>
+          db
+            .prepare(`DELETE FROM ${table('identities')} WHERE source_id=? AND id=?`)
+            .run(id, row.id!),
+      );
       countWrite(connection, { id, occurrence: row.id, deleted: true });
       connection.counters.identityLinksWritten++;
     }
   const nextFirst = nextRows[0]?.id ?? null;
   if (first !== nextFirst) {
-    db.prepare(`UPDATE ${table('sources')} SET identity_first=? WHERE source_id=?`).run(
-      nextFirst,
-      id,
+    ownedIntakeProjectionWrite(db, { table: 'sources', operations: ['update'], key: id }, () =>
+      db
+        .prepare(`UPDATE ${table('sources')} SET identity_first=? WHERE source_id=?`)
+        .run(nextFirst, id),
     );
     countWrite(connection, { id, identity_first: nextFirst });
     connection.counters.identityLinksWritten++;
@@ -718,20 +821,60 @@ function current(db: DatabaseSync): Connection {
   if (typeof profile !== 'string' || !profile)
     throw Error('Intake lookup projection: profile binding');
   const connection = connections.get(db) ?? create(db);
-  tracking(db);
-  if (connection.schema !== schemaVersion(db)) initialize(db, connection, profile);
+  const cold = connection.schema === -1;
+  if (tracking(db)) discardIntakeProjectionWitness(db);
+  if (connection.schema !== schemaVersion(db)) {
+    initialize(db, connection, profile);
+    if (!cold) renewIntakeProjectionWitnessAfterIndexRepair(db);
+  }
   const binding = db.prepare(`SELECT profile_id FROM ${table('state')} WHERE singleton=1`).get();
   if (binding?.profile_id !== profile) initialize(db, connection, profile);
+  if (cold) ensureIntakeProjectionWitness(db);
+  const inputVersion = projectionInputVersion(db);
+  const witnessRevision = cold ? projectionWitnessRevision(db) : undefined;
+  const reconciled = new Set<string>();
   db.exec('SAVEPOINT __intake_lookup_reconcile');
   try {
-    while (true) {
-      const row = db
-        .prepare('SELECT source_id FROM temp.__intake_lookup_dirty ORDER BY source_id LIMIT 1')
-        .get();
-      if (!row) break;
-      prune(db, connection, reconcile(db, connection, String(row.source_id)));
+    if (cold) {
+      // A lost/overflowed input witness needs a complete rebuild independent of
+      // disposable dirty notifications, including projected rows whose source vanished.
+      let after: string | undefined;
+      for (;;) {
+        const rows =
+          after === undefined
+            ? db
+                .prepare(
+                  `SELECT id AS source_id FROM main.source_files UNION SELECT source_id FROM main.${table('sources')} ORDER BY source_id LIMIT 64`,
+                )
+                .all()
+            : db
+                .prepare(
+                  `SELECT id AS source_id FROM main.source_files WHERE id>? UNION SELECT source_id FROM main.${table('sources')} WHERE source_id>? ORDER BY source_id LIMIT 64`,
+                )
+                .all(after, after);
+        if (!rows.length) break;
+        for (const row of rows) {
+          const id =
+            typeof row.source_id === 'string'
+              ? row.source_id
+              : fail('invalid cold source identity');
+          prune(db, connection, reconcile(db, connection, id));
+        }
+        after = String(rows.at(-1)!.source_id);
+      }
+    } else {
+      while (true) {
+        const row = db
+          .prepare('SELECT source_id FROM temp.__intake_lookup_dirty ORDER BY source_id LIMIT 1')
+          .get();
+        if (!row) break;
+        const id = String(row.source_id);
+        prune(db, connection, reconcile(db, connection, id));
+        reconciled.add(id);
+      }
     }
     db.exec('RELEASE __intake_lookup_reconcile');
+    if (!cold) acknowledgeProjectionInputs(db, inputVersion, reconciled);
   } catch (error) {
     try {
       db.exec('ROLLBACK TO __intake_lookup_reconcile; RELEASE __intake_lookup_reconcile');
@@ -748,6 +891,7 @@ function current(db: DatabaseSync): Connection {
     clearPayloadMemo(connection);
     connection.schema = -1;
   }
+  if (cold && connection.schema !== -1) sealIntakeProjectionWitness(db, witnessRevision, true);
   return connection;
 }
 export function reconcileActiveIntakeLookup(db: DatabaseSync): void {
@@ -1478,6 +1622,7 @@ export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
   }
   if (allOriginalsNative) return nativeMaximum ?? 0;
   refreshLegacyProjection(db, connection);
+  const answerWitness = projectionAnswerWitness(db);
   let maximum = db
     .prepare(
       `SELECT MAX(g.discovery_order) n FROM ${table('groups')} g JOIN ${table('sources')} s ON s.source_id=g.source_id JOIN main.source_files f ON f.id=s.source_id WHERE f.kind='intake_original' AND (s.identity_first IS NULL OR s.identity_first<>-1)`,
@@ -1485,6 +1630,7 @@ export function maximumIntakeDiscoveryOrder(db: DatabaseSync): number {
     .get()!.n;
   if (nativeMaximum !== null && (maximum === null || nativeMaximum > Number(maximum)))
     maximum = nativeMaximum;
+  assertProjectionAnswerWitness(db, answerWitness);
   return Number(maximum || 0);
 }
 export function retainedIntakeAcceptance(db: DatabaseSync, operationId: string): unknown {
@@ -1549,6 +1695,7 @@ export function retainedIntakeAcceptanceReference(
   }
   if (allOriginalsNative) return native;
   refreshLegacyProjection(db, connection);
+  const answerWitness = projectionAnswerWitness(db);
   const row = db
     .prepare(
       `SELECT p.payload,s.source_id,s.source_order FROM ${table('acceptances')} a JOIN ${table('payloads')} p ON p.hash=a.hash JOIN ${table('sources')} s ON s.source_id=a.source_id JOIN main.source_files f ON f.id=s.source_id WHERE a.operation_id=? AND f.kind='intake_original' AND (s.identity_first IS NULL OR s.identity_first<>-1) ORDER BY s.source_order LIMIT 1`,
@@ -1558,6 +1705,7 @@ export function retainedIntakeAcceptanceReference(
     ? { mode: 'legacy', sourceId: String(row.source_id), value: JSON.parse(String(row.payload)) }
     : null;
   if (native && nativeOrder < (row ? Number(row.source_order) : Infinity)) selected = native;
+  assertProjectionAnswerWitness(db, answerWitness);
   return selected;
 }
 type NativeSource = IntakeEnvelopeSource & {
@@ -1578,6 +1726,9 @@ function actualOriginalSourceRows(db: DatabaseSync) {
       "SELECT id,kind,sha256,details_json,rowid source_order FROM main.source_files WHERE kind='intake_original' ORDER BY rowid",
     )
     .iterate();
+}
+function actualSourceIds(db: DatabaseSync) {
+  return db.prepare('SELECT id FROM main.source_files ORDER BY rowid').iterate();
 }
 function actualNativeSource(
   db: DatabaseSync,
@@ -1609,12 +1760,34 @@ function assertProjectedNativeBinding(
     return fail('native source projection binding is unavailable');
 }
 function refreshLegacyProjection(db: DatabaseSync, connection: Connection): void {
+  ensureIntakeProjectionWitness(db);
+  if (intakeProjectionWitnessCurrent(db)) return;
+  if (projectionWitnessHasForeignMutation(db))
+    fail('invalid identity occurrence chain or disposable projection mutation');
+  const witnessRevision = projectionWitnessRevision(db);
   db.exec('SAVEPOINT __intake_lookup_legacy_read');
   try {
-    for (const row of actualOriginalSourceRows(db))
+    for (const row of actualSourceIds(db))
       prune(db, connection, reconcile(db, connection, String(row.id)));
+    let after: string | null = null;
+    const orphanPage = db.prepare(
+      `SELECT s.source_id FROM ${table('sources')} s
+       WHERE (? IS NULL OR s.source_id>?)
+         AND NOT EXISTS(SELECT 1 FROM main.source_files f WHERE f.id=s.source_id)
+       ORDER BY s.source_id LIMIT 64`,
+    );
+    while (true) {
+      const rows: Array<Record<string, unknown>> = orphanPage.all(after, after);
+      if (rows.length === 0) break;
+      for (const row of rows)
+        prune(db, connection, reconcile(db, connection, String(row.source_id)));
+      after = String(rows[rows.length - 1]!.source_id);
+    }
     db.exec('RELEASE __intake_lookup_legacy_read');
+    // Every current source and every projected source no longer present was replayed.
+    sealIntakeProjectionWitness(db, witnessRevision, true);
   } catch (error) {
+    discardIntakeProjectionWitness(db);
     try {
       db.exec('ROLLBACK TO __intake_lookup_legacy_read; RELEASE __intake_lookup_legacy_read');
     } catch {
@@ -1678,12 +1851,15 @@ export type IntakeIdentityReference = IntakeLookupReceiptReference;
 export function* iterateIntakeIdentityReferences(
   db: DatabaseSync,
 ): Generator<IntakeIdentityReference> {
-  current(db);
+  const connection = current(db);
+  refreshLegacyProjection(db, connection);
+  const answerWitness = projectionAnswerWitness(db);
   for (const source of db
     .prepare(
       `SELECT f.id source_id,f.kind,f.sha256,f.details_json,f.rowid source_order,s.authority_head,s.identity_first FROM source_files f LEFT JOIN ${table('sources')} s ON s.source_id=f.id ORDER BY f.rowid`,
     )
     .iterate()) {
+    assertProjectionAnswerWitness(db, answerWitness);
     const selected = { ...source, id: String(source.source_id) } as unknown as NativeSource;
     const logicalHead = intakeEnvelopeAuthorityBinding(db, selected).logicalHead;
     if (logicalHead !== undefined && hasIntakeCollectionEnvelope(db, selected)) {
@@ -1700,7 +1876,9 @@ export function* iterateIntakeIdentityReferences(
           String(ordinal),
         ]);
         if (!record) return fail('native identity index occurrence missing');
+        assertProjectionAnswerWitness(db, answerWitness);
         yield { mode: 'native', sourceId: String(source.source_id), view, record };
+        assertProjectionAnswerWitness(db, answerWitness);
       }
       view.address(view.root());
     } else {
@@ -1721,12 +1899,16 @@ export function* iterateIntakeIdentityReferences(
           .get(source.source_id!, next!);
         if (!row || typeof row.payload !== 'string')
           return fail('invalid identity occurrence chain');
-        yield { mode: 'legacy', sourceId: String(source.source_id), value: json(row.payload) };
+        const value = json(row.payload);
+        assertProjectionAnswerWitness(db, answerWitness);
+        yield { mode: 'legacy', sourceId: String(source.source_id), value };
+        assertProjectionAnswerWitness(db, answerWitness);
         next = row.next;
       }
       if (next !== null) return fail('invalid identity occurrence chain');
     }
   }
+  assertProjectionAnswerWitness(db, answerWitness);
 }
 /** Explicit small-scope compatibility decode. Large native receipts use refs. */
 export function readIntakeIdentityReference(reference: IntakeIdentityReference): unknown {
@@ -1739,10 +1921,13 @@ export function readIntakeIdentityReference(reference: IntakeIdentityReference):
     : value;
 }
 export function indexedIntakeIdentityConfirmations(db: DatabaseSync): unknown[] {
-  current(db);
+  const connection = current(db);
+  refreshLegacyProjection(db, connection);
+  const answerWitness = projectionAnswerWitness(db);
   const native = !!db
     .prepare(`SELECT 1 FROM ${table('sources')} WHERE identity_first=-1 LIMIT 1`)
     .get();
+  assertProjectionAnswerWitness(db, answerWitness);
   const values: unknown[] = [];
   let bytes = 2;
   for (const reference of iterateIntakeIdentityReferences(db)) {
@@ -1754,5 +1939,6 @@ export function indexedIntakeIdentityConfirmations(db: DatabaseSync): unknown[] 
     }
     values.push(value);
   }
+  assertProjectionAnswerWitness(db, answerWitness);
   return values;
 }

@@ -10,8 +10,51 @@ import {
   managedPhysicalEpochCurrent,
   withManagedPhysicalMutation,
 } from '../clinical-review-physical-epoch.ts';
-import { openClinicalPhysicalVerifier } from '../clinical-review-physical-worker.ts';
+import {
+  clinicalPhysicalVerificationPages,
+  openClinicalPhysicalVerifier,
+  type ClinicalPhysicalItem,
+} from '../clinical-review-physical-worker.ts';
 import { intakeFileIdentity } from '../intake-files.ts';
+
+test('physical transport splits escaped fields without losing or rebinding items', () => {
+  const items: ClinicalPhysicalItem[] = Array.from({ length: 64 }, (_, index) => ({
+    kind: 'identity',
+    path: '/' + '\u0001'.repeat(4000) + index,
+    expectedIdentity: '\u0002'.repeat(4096),
+  }));
+  const pages = clinicalPhysicalVerificationPages(items);
+  assert.ok(pages.length > 1);
+  assert.deepEqual(pages.flat(), items);
+  for (const page of pages) {
+    assert.ok(page.length > 0 && page.length <= 64);
+    assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 512 * 1024);
+  }
+  const originalPath = pages[0]![0]!.path;
+  items[0]!.path = '/fictional-replacement';
+  assert.equal(pages[0]![0]!.path, originalPath);
+  const marker: ClinicalPhysicalItem = {
+    kind: 'marker',
+    path: '/fictional-marker',
+    expected: { sha256: 'a'.repeat(64), bytes: 12 },
+  };
+  const retained = clinicalPhysicalVerificationPages([marker]);
+  marker.expected = 'absent';
+  assert.deepEqual(retained[0]![0], {
+    kind: 'marker',
+    path: '/fictional-marker',
+    expected: { sha256: 'a'.repeat(64), bytes: 12 },
+  });
+  assert.throws(() => clinicalPhysicalVerificationPages([]), /physical evidence changed/);
+  assert.throws(
+    () => clinicalPhysicalVerificationPages([...items, items[0]!]),
+    /physical evidence changed/,
+  );
+  assert.throws(
+    () => clinicalPhysicalVerificationPages([{ ...items[0]!, path: '/' + 'x'.repeat(4096) }]),
+    /physical evidence changed/,
+  );
+});
 
 test('physical worker checks bounded original, marker, directory and absence pages', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'fictional-physical-worker-'));
@@ -119,4 +162,14 @@ test('physical worker preserves its caller abort reason and drains', async () =>
     (error) => error === reason,
   );
   await verifier.abort();
+});
+
+test('physical worker drains cancellation during module startup before rejecting', async () => {
+  const controller = new AbortController();
+  const opening = openClinicalPhysicalVerifier(controller.signal);
+  const reason = new DOMException('Fictional startup cancellation', 'AbortError');
+  controller.abort(reason);
+  await assert.rejects(opening, (error) => error === reason);
+  const verifier = await openClinicalPhysicalVerifier();
+  await verifier.close();
 });

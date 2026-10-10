@@ -68,6 +68,24 @@ export function createClinicalReviewArtifactProof(sql: DatabaseSync, table: stri
           throw changed();
       }
     },
+    /** Streams only the originally signed identities into a second owned proof. */
+    *verifiedArtifacts(): Iterable<VerifiedClinicalArtifact> {
+      let seen = 0;
+      for (const row of sql
+        .prepare(`SELECT id,path,identity,signature FROM ${table} ORDER BY id`)
+        .iterate()) {
+        if (
+          typeof row.id !== 'string' ||
+          typeof row.path !== 'string' ||
+          typeof row.identity !== 'string' ||
+          row.signature !== signature(row.id, row.path, row.identity)
+        )
+          throw changed();
+        seen++;
+        yield { id: row.id, path: row.path, identity: row.identity };
+      }
+      if (seen !== count) throw changed();
+    },
     /** Restore only together with the caller's SQL savepoint rollback. */
     checkpoint() {
       const previousCount = count;

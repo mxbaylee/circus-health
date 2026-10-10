@@ -4,14 +4,29 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
-import { observeDatabaseClose, openDatabase, transaction } from '../database.ts';
+import { constants, DatabaseSync } from 'node:sqlite';
+import {
+  observeDatabaseClose,
+  observeManagedDatabaseAuthorization,
+  openDatabase,
+  transaction,
+} from '../database.ts';
 import {
   maximumReportDiscoveryOrder,
   retainedReportAcceptance,
   intakeIdentityConfirmations,
 } from '../intake-state-access.ts';
-import { clearIntakeLookupCache, intakeLookupCounters } from '../intake-lookup-projection.ts';
+import {
+  clearIntakeLookupCache,
+  intakeLookupCounters,
+  prepareIntakeLookupProjection,
+  iterateIntakeIdentityReferences,
+} from '../intake-lookup-projection.ts';
+import {
+  ensureIntakeProjectionWitness,
+  projectionWitnessRevision,
+  sealIntakeProjectionWitness,
+} from '../intake-lookup-projection-witness.ts';
 import {
   memoryRecordAuthority,
   registerRawIntakeFixture,
@@ -125,6 +140,114 @@ test('raw writes, reordered contributions, kind and ID changes preserve scoped l
   assert.equal(maximumReportDiscoveryOrder(db), 12);
   assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 12 }, { marker: 100 }]);
 });
+
+for (const mode of ['ordinary', 'lost-cold-notification', 'late-source-event'] as const)
+  test(`cold lookup replay closes input overflow without losing original answers: ${mode}`, (t) => {
+    const { db, insert, write, body } = fixture(t);
+    insert('first', 7);
+    insert('deleted', 99);
+    assert.equal(maximumReportDiscoveryOrder(db), 99);
+    transaction(db, () => {
+      const metadata = db.prepare('INSERT INTO main.app_meta(key,value) VALUES(?,?)');
+      for (let index = 0; index < 101; index++)
+        metadata.run(`fictional-unrelated-input-${index}`, 'fictional');
+      write('first', body(14));
+      db.prepare('DELETE FROM main.source_files WHERE id=?').run('deleted');
+      insert('added', 22);
+      for (let index = 0; index < 65; index++)
+        db.prepare(
+          'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+        ).run(
+          `fictional-derived-${index}`,
+          `fictional-derived-${index}.txt`,
+          'a'.repeat(64),
+          0,
+          'derived',
+          '{}',
+        );
+    });
+    db.exec('DELETE FROM temp.__intake_lookup_dirty');
+    clearIntakeLookupCache(db);
+    const exec = DatabaseSync.prototype.exec;
+    let injected = false;
+    if (mode !== 'ordinary')
+      DatabaseSync.prototype.exec = function (sql: string) {
+        if (
+          this === db &&
+          !injected &&
+          mode === 'lost-cold-notification' &&
+          sql === 'SAVEPOINT __intake_lookup_reconcile'
+        ) {
+          injected = true;
+          exec.call(db, "DELETE FROM temp.__intake_lookup_dirty WHERE source_id='first'");
+        }
+        if (
+          this === db &&
+          !injected &&
+          mode === 'late-source-event' &&
+          sql === 'RELEASE __intake_lookup_reconcile'
+        ) {
+          injected = true;
+          db.prepare('UPDATE main.source_files SET path=? WHERE id=?').run(
+            'fictional-late.txt',
+            'first',
+          );
+        }
+        return exec.call(this, sql);
+      };
+    try {
+      if (mode === 'late-source-event') {
+        assert.throws(() => prepareIntakeLookupProjection(db), /witness is unavailable/);
+        assert.equal(injected, true);
+      } else {
+        prepareIntakeLookupProjection(db);
+        if (mode === 'lost-cold-notification') assert.equal(injected, true);
+        assert.equal(maximumReportDiscoveryOrder(db), 22);
+        assert.deepEqual(retainedReportAcceptance(db, 'same'), {
+          receipt: { operationId: 'same' },
+          marker: 14,
+        });
+        assert.equal(retainedReportAcceptance(db, 'fictional-missing-operation'), null);
+        assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 14 }, { marker: 22 }]);
+        assert.equal(
+          db
+            .prepare('SELECT 1 FROM main.__record_intake_lookup_sources WHERE source_id=?')
+            .get('deleted'),
+          undefined,
+        );
+        assert.equal(
+          db.prepare('SELECT COUNT(*) n FROM main.__record_intake_lookup_sources').get()!.n,
+          67,
+        );
+      }
+    } finally {
+      DatabaseSync.prototype.exec = exec;
+    }
+  });
+
+test('a paused identity reader cannot borrow a later completed reconciliation', (t) => {
+  const { db, body, insert } = fixture(t);
+  insert('first', 3);
+  insert('other', 100, 'derived');
+  const previous = iterateIntakeIdentityReferences(db);
+  assert.equal(previous.next().done, false);
+  assert.equal(maximumReportDiscoveryOrder(db), 3);
+  db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(body(200), 'other');
+  assert.equal(maximumReportDiscoveryOrder(db), 3);
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 3 }, { marker: 200 }]);
+  assert.throws(() => previous.next(), /answer witness changed/);
+});
+
+test('a paused identity reader refuses a newly introduced TEMP source shadow', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 3);
+  insert('other', 100, 'derived');
+  const previous = iterateIntakeIdentityReferences(db);
+  assert.equal(previous.next().done, false);
+  db.exec('CREATE TEMP TABLE source_files AS SELECT * FROM main.source_files');
+  assert.throws(() => previous.next(), /answer witness changed/);
+  db.exec('DROP TABLE temp.source_files');
+});
 test('rollback restores allocation and freshness even when first build occurs inside transaction', (t) => {
   const { db, body, insert, write } = fixture(t);
   insert('first', 2);
@@ -180,6 +303,447 @@ test('schema/index loss and cold payload corruption rebuild without persistent t
       .get()!.n,
     0,
   );
+});
+test('warm legacy lookup refuses a preprepared disposable projection forgery', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 5);
+  prepareIntakeLookupProjection(db);
+  const forge = db.prepare('UPDATE __record_intake_lookup_groups SET discovery_order=999');
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+  const before = intakeLookupCounters(db).authorityReads;
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+  assert.equal(intakeLookupCounters(db).authorityReads, before);
+  forge.run();
+  assert.throws(() => maximumReportDiscoveryOrder(db), /disposable projection mutation/);
+  clearIntakeLookupCache(db);
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+});
+test('erasing a changed source dirty marker cannot preserve a stale projection seal', (t) => {
+  const { db, body, insert } = fixture(t);
+  insert('other', 100, 'derived');
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 100 }]);
+  transaction(db, () => {
+    db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(body(200), 'other');
+    db.prepare('DELETE FROM temp.__intake_lookup_dirty WHERE source_id=?').run('other');
+  });
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 200 }]);
+});
+test('erasing an accepted head dirty marker cannot preserve a stale projection seal', (t) => {
+  const { db, body, insert, write } = fixture(t);
+  insert('first', 5);
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+  transaction(db, () => {
+    write('first', body(6));
+    db.prepare("DELETE FROM temp.__intake_lookup_dirty WHERE source_id='first'").run();
+  });
+  assert.equal(maximumReportDiscoveryOrder(db), 6);
+});
+test('source change during the final schema read cannot seal a stale projection', (t) => {
+  const { db, body, insert } = fixture(t);
+  insert('first', 5);
+  insert('other', 100, 'derived');
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== 'sqlite_master' ||
+        detail !== 'sql' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(body(200), 'other');
+      db.prepare("DELETE FROM temp.__intake_lookup_dirty WHERE source_id='other'").run();
+    },
+    () => {},
+  );
+  try {
+    assert.throws(() => maximumReportDiscoveryOrder(db), /projection witness is unavailable/);
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 5 }, { marker: 200 }]);
+});
+test('source change during witness setup cannot be cleared without reconciliation', (t) => {
+  const { db, body, insert } = fixture(t);
+  insert('first', 5);
+  insert('other', 100, 'derived');
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 5 }, { marker: 100 }]);
+  clearIntakeLookupCache(db);
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== 'sqlite_temp_master' ||
+        detail !== 'sql' ||
+        database !== 'temp'
+      )
+        return;
+      fired = true;
+      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(body(200), 'other');
+      db.prepare("DELETE FROM temp.__intake_lookup_dirty WHERE source_id='other'").run();
+    },
+    () => {},
+  );
+  try {
+    ensureIntakeProjectionWitness(db);
+    assert.equal(fired, true);
+    assert.throws(
+      () => sealIntakeProjectionWitness(db, projectionWitnessRevision(db)),
+      /projection witness is unavailable/,
+    );
+  } finally {
+    stop?.();
+  }
+  clearIntakeLookupCache(db);
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 5 }, { marker: 200 }]);
+});
+test('accepted head attempt during the final schema read cannot be erased by TEMP bookkeeping', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 5);
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+  const key = String(
+    db
+      .prepare("SELECT authority_key FROM __record_intake_lookup_sources WHERE source_id='first'")
+      .get()!.authority_key,
+  );
+  clearIntakeLookupCache(db);
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== 'sqlite_master' ||
+        detail !== 'sql' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      db.prepare('UPDATE app_meta SET value=value WHERE key=?').run(key);
+      db.prepare("DELETE FROM temp.__intake_lookup_dirty WHERE source_id='first'").run();
+    },
+    () => {},
+  );
+  try {
+    assert.throws(() => maximumReportDiscoveryOrder(db), /projection witness is unavailable/);
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+});
+test('restored schema settings during the final schema read cannot authorize a seal', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 5);
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== 'sqlite_master' ||
+        detail !== 'sql' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      const before = Number(db.prepare('PRAGMA temp.schema_version').get()!.schema_version);
+      db.exec(`PRAGMA temp.schema_version=${before + 1}; PRAGMA temp.schema_version=${before}`);
+    },
+    () => {},
+  );
+  try {
+    assert.throws(() => maximumReportDiscoveryOrder(db), /projection witness is unavailable/);
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+});
+test('foreign projection mutation during the final schema read cannot authorize a seal', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 5);
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== 'sqlite_master' ||
+        detail !== 'sql' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      db.exec('UPDATE __record_intake_lookup_groups SET discovery_order=999');
+    },
+    () => {},
+  );
+  try {
+    assert.throws(() => maximumReportDiscoveryOrder(db), /projection witness is unavailable/);
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  clearIntakeLookupCache(db);
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+});
+test('maximum answer read refuses a foreign projection write before returning it', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 5);
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== '__record_intake_lookup_groups' ||
+        detail !== 'discovery_order' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      db.prepare('UPDATE __record_intake_lookup_groups SET discovery_order=999').run();
+    },
+    () => {},
+  );
+  try {
+    assert.throws(() => maximumReportDiscoveryOrder(db), /projection answer witness changed/);
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  clearIntakeLookupCache(db);
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+});
+test('maximum answer read refuses a restored TEMP schema attempt', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 5);
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== '__record_intake_lookup_groups' ||
+        detail !== 'discovery_order' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      const before = Number(db.prepare('PRAGMA temp.schema_version').get()!.schema_version);
+      db.exec(`PRAGMA temp.schema_version=${before + 1}; PRAGMA temp.schema_version=${before}`);
+    },
+    () => {},
+  );
+  try {
+    assert.throws(() => maximumReportDiscoveryOrder(db), /projection answer witness changed/);
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  clearIntakeLookupCache(db);
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+});
+test('receipt answer read refuses an altered payload before returning it', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 5);
+  assert.equal((retainedReportAcceptance(db, 'same') as unknown as { marker: number }).marker, 5);
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== '__record_intake_lookup_payloads' ||
+        detail !== 'payload' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      db.prepare('UPDATE __record_intake_lookup_payloads SET payload=?').run(
+        JSON.stringify({ marker: 999 }),
+      );
+    },
+    () => {},
+  );
+  try {
+    assert.throws(() => retainedReportAcceptance(db, 'same'), /projection answer witness changed/);
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  clearIntakeLookupCache(db);
+  assert.equal((retainedReportAcceptance(db, 'same') as unknown as { marker: number }).marker, 5);
+});
+test('receipt answer read refuses erased accepted-head bookkeeping', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 5);
+  assert.equal((retainedReportAcceptance(db, 'same') as unknown as { marker: number }).marker, 5);
+  const key = String(
+    db
+      .prepare("SELECT authority_key FROM __record_intake_lookup_sources WHERE source_id='first'")
+      .get()!.authority_key,
+  );
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== '__record_intake_lookup_acceptances' ||
+        detail !== 'operation_id' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      db.prepare('UPDATE app_meta SET value=value WHERE key=?').run(key);
+      db.prepare("DELETE FROM temp.__intake_lookup_dirty WHERE source_id='first'").run();
+    },
+    () => {},
+  );
+  try {
+    assert.throws(() => retainedReportAcceptance(db, 'same'), /projection answer witness changed/);
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  clearIntakeLookupCache(db);
+  assert.equal((retainedReportAcceptance(db, 'same') as unknown as { marker: number }).marker, 5);
+});
+test('missing receipt answer read still closes its projection witness', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 5);
+  assert.equal(retainedReportAcceptance(db, 'missing'), null);
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== '__record_intake_lookup_acceptances' ||
+        detail !== 'operation_id' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      db.prepare('UPDATE __record_intake_lookup_groups SET discovery_order=999').run();
+    },
+    () => {},
+  );
+  try {
+    assert.throws(
+      () => retainedReportAcceptance(db, 'missing'),
+      /projection answer witness changed/,
+    );
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  clearIntakeLookupCache(db);
+  assert.equal(retainedReportAcceptance(db, 'missing'), null);
+});
+test('identity answer read refuses erased source bookkeeping before yielding', (t) => {
+  const { db, body, insert } = fixture(t);
+  insert('first', 5);
+  insert('other', 100, 'derived');
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 5 }, { marker: 100 }]);
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== '__record_intake_lookup_payloads' ||
+        detail !== 'payload' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(body(200), 'other');
+      db.prepare("DELETE FROM temp.__intake_lookup_dirty WHERE source_id='other'").run();
+    },
+    () => {},
+  );
+  try {
+    assert.throws(() => intakeIdentityConfirmations(db), /projection answer witness changed/);
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  clearIntakeLookupCache(db);
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 5 }, { marker: 200 }]);
+});
+test('empty identity traversal still closes its source query witness', (t) => {
+  const { db } = fixture(t);
+  registerRawIntakeFixture(db, 'first', JSON.stringify({ intake: { workflow: {} } }));
+  assert.deepEqual(intakeIdentityConfirmations(db), []);
+  let fired = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        fired ||
+        action !== constants.SQLITE_READ ||
+        name !== 'source_files' ||
+        detail !== 'id' ||
+        database !== 'main'
+      )
+        return;
+      fired = true;
+      db.prepare('UPDATE __record_intake_lookup_groups SET discovery_order=999').run();
+    },
+    () => {},
+  );
+  try {
+    assert.throws(() => intakeIdentityConfirmations(db), /projection answer witness changed/);
+    assert.equal(fired, true);
+  } finally {
+    stop?.();
+  }
+  clearIntakeLookupCache(db);
+  assert.deepEqual(intakeIdentityConfirmations(db), []);
+});
+test('nested projection side effects cannot borrow an owned reconciliation ticket', (t) => {
+  const { db, body, insert, write } = fixture(t);
+  insert('first', 5);
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+  db.exec(`CREATE TEMP TRIGGER fictional_nested_projection AFTER UPDATE ON main.__record_intake_lookup_groups
+    BEGIN UPDATE __record_intake_lookup_payloads SET payload='{}'; END`);
+  write('first', body(6));
+  assert.throws(() => maximumReportDiscoveryOrder(db), /owned write diverged/);
+  db.exec('DROP TRIGGER temp.fictional_nested_projection');
+  assert.equal(maximumReportDiscoveryOrder(db), 6);
+});
+test('identity iteration refuses a forged disposable successor before returning a receipt', (t) => {
+  const { db, insert } = fixture(t);
+  insert('first', 5);
+  assert.equal(maximumReportDiscoveryOrder(db), 5);
+  db.prepare('UPDATE __record_intake_lookup_identities SET next=999 WHERE source_id=?').run(
+    'first',
+  );
+  assert.throws(() => intakeIdentityConfirmations(db), /identity occurrence chain/);
+  clearIntakeLookupCache(db);
+  assert.deepEqual(intakeIdentityConfirmations(db), [{ marker: 5 }]);
 });
 test('invalid non-original JSON is skipped while malformed original contribution state remains unavailable', (t) => {
   const { db, insert } = fixture(t);

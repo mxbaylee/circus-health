@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { openDatabase } from '../database.ts';
+import { DatabaseSync } from 'node:sqlite';
+import { openDatabase, managedDatabaseMethodSerial } from '../database.ts';
 import { canonicalLiteral } from '../intake-format.ts';
 import {
   duplicateRecord,
@@ -10,10 +11,113 @@ import {
   intakePairScope,
 } from '../duplicate-review.ts';
 import {
+  ensureDuplicateEvidenceFunction,
   prepareDuplicateEvidenceIndex,
   duplicateEvidenceIndexWork,
   readSavedDuplicateEvidence,
 } from '../duplicate-evidence-index.ts';
+import {
+  ensureIntakeFrontierObserver,
+  captureIntakeFrontierAttempts,
+  readIntakeFrontierAttempts,
+} from '../intake-lookup-frontier-observer.ts';
+import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
+
+test('duplicate function prerequisite does no index work and cold empty index DDL preserves the frontier', async (t) => {
+  const db = openDatabase(':memory:', 'fictional');
+  memoryRecordAuthority(db);
+  t.after(() => db.close());
+  const schema = db.prepare('PRAGMA temp.schema_version').get()!.schema_version;
+  ensureDuplicateEvidenceFunction(db);
+  assert.equal(db.prepare('PRAGMA temp.schema_version').get()!.schema_version, schema);
+  ensureIntakeFrontierObserver(db);
+  const captured = captureIntakeFrontierAttempts(db);
+  assert.ok(captured);
+  const method = managedDatabaseMethodSerial(db);
+  await prepareDuplicateEvidenceIndex(db);
+  await prepareDuplicateEvidenceIndex(db);
+  assert.equal(managedDatabaseMethodSerial(db), method);
+  assert.ok(readIntakeFrontierAttempts(db, captured));
+});
+
+for (const mode of ['replacement', 'failed-registration'] as const)
+  test(`duplicate index refuses same-name ${mode} and cannot restore an older frontier`, async (t) => {
+    const db = openDatabase(':memory:', 'fictional');
+    memoryRecordAuthority(db);
+    t.after(() => db.close());
+    db.prepare(
+      "INSERT INTO source_files(id,path,sha256,bytes) VALUES('original','fictional.txt',?,1)",
+    ).run('1'.repeat(64));
+    db.prepare(
+      "INSERT INTO source_records(id,source_file_id,source_key,raw_json) VALUES('source','original','source','{}')",
+    ).run();
+    db.prepare(
+      "INSERT INTO documents(id,source_record_id,title) VALUES('saved','source','Fictional')",
+    ).run();
+    db.prepare(
+      "INSERT INTO evidence(id,entity_type,entity_id,source_record_id) VALUES('evidence','document','saved','source')",
+    ).run();
+    await prepareDuplicateEvidenceIndex(db);
+    const expected = intakePairReference(db, nativeDuplicateRecord(db, 'document', 'saved'));
+    ensureIntakeFrontierObserver(db);
+    const captured = captureIntakeFrontierAttempts(db);
+    assert.ok(captured);
+    const name = 'CIRCUS_DUPLICATE_ORIGINAL_ID';
+    if (mode === 'replacement') db.function(name, { deterministic: true }, () => 'forged');
+    else assert.throws(() => Reflect.apply(db.function, db, [name, { deterministic: true }, null]));
+    assert.throws(() => nativeDuplicateRecord(db, 'document', 'saved'), {
+      code: 'DUPLICATE_EVIDENCE_PENDING',
+    });
+    assert.equal(readIntakeFrontierAttempts(db, captured), undefined);
+    await prepareDuplicateEvidenceIndex(db);
+    assert.deepEqual(
+      intakePairReference(db, nativeDuplicateRecord(db, 'document', 'saved')),
+      expected,
+    );
+    assert.equal(readIntakeFrontierAttempts(db, captured), undefined);
+    const method = managedDatabaseMethodSerial(db);
+    await prepareDuplicateEvidenceIndex(db);
+    assert.equal(managedDatabaseMethodSerial(db), method);
+  });
+
+for (const mutation of ['protected-main', 'foreign-temp'] as const)
+  test(`duplicate auxiliary initialization cannot forgive a ${mutation} write`, async (t) => {
+    const db = openDatabase(':memory:', 'fictional');
+    memoryRecordAuthority(db);
+    t.after(() => db.close());
+    db.prepare('INSERT INTO main.app_meta(key,value) VALUES(?,?)').run('fictional-input', 'before');
+    ensureDuplicateEvidenceFunction(db);
+    ensureIntakeFrontierObserver(db);
+    const captured = captureIntakeFrontierAttempts(db);
+    assert.ok(captured);
+    const exec = DatabaseSync.prototype.exec;
+    let injected = false;
+    DatabaseSync.prototype.exec = function (sql: string) {
+      if (this === db && !injected && sql.includes('__duplicate_evidence_')) {
+        injected = true;
+        if (mutation === 'protected-main')
+          db.prepare('UPDATE main.app_meta SET value=? WHERE key=?').run(
+            'after',
+            'fictional-input',
+          );
+        else exec.call(db, 'CREATE TEMP TABLE fictional_foreign(value TEXT)');
+      }
+      return exec.call(this, sql);
+    };
+    try {
+      await prepareDuplicateEvidenceIndex(db);
+      assert.equal(injected, true);
+      assert.equal(readIntakeFrontierAttempts(db, captured), undefined);
+    } finally {
+      DatabaseSync.prototype.exec = exec;
+    }
+  });
+
+test('duplicate function prerequisite refuses an unmanaged connection', (t) => {
+  const db = new DatabaseSync(':memory:');
+  t.after(() => db.close());
+  assert.throws(() => ensureDuplicateEvidenceFunction(db), { code: 'DUPLICATE_EVIDENCE_PENDING' });
+});
 
 test('complete saved evidence index streams exact hashes, bounded windows and changed-target invalidation', async () => {
   const db = openDatabase(':memory:', 'fictional');

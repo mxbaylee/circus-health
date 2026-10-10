@@ -1,5 +1,6 @@
 import { readNativeReportSourceScopeFragment } from '../intake-report-source-review.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { captureReportRoutingScratch } from './helpers/report-routing-scratch.ts';
 import { createReportSnapshotCatalog } from '../intake-report-snapshot-catalog.ts';
 import { migrateReportMemberSnapshot } from '../intake-report-member-migration.ts';
 import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
@@ -487,6 +488,7 @@ test(
   'source routing scans complete history once for all selected-root report scopes',
   { timeout: 30_000 },
   async (t) => {
+    const routing = captureReportRoutingScratch(t);
     const f = await fixture(t, 3, (workflow) => {
       const first = workflow.reportGroups![0]!;
       for (let index = 1; index <= 2; index++)
@@ -548,7 +550,7 @@ test(
       /owning profile/,
     );
     // Damaged derived rows are never trusted as authoritative absence.
-    f.db.prepare('DELETE FROM __report_source_routing_owners WHERE source=?').run(f.source.id);
+    routing().prepare('DELETE FROM __report_source_routing_owners WHERE source=?').run(f.source.id);
     const rebuilt = await prepareNativeReportSourceReviewScope(f.db, f.source, {
       profileId: f.identity.profileId,
       groupId: 'anchored-2',
@@ -560,7 +562,7 @@ test(
       rebuilt.close();
     }
     assert.equal(intakeWorkCounters(f.db).warm.reportSourceScopeRoutingBuilds, 2);
-    f.db.exec('DROP TABLE __report_source_routing_owners');
+    routing().exec('DROP TABLE __report_source_routing_owners');
     const recovered = await prepareNativeReportSourceReviewScope(f.db, f.source, {
       profileId: f.identity.profileId,
       groupId: 'anchored-2',

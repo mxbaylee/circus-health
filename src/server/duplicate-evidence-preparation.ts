@@ -6,9 +6,12 @@ import { duplicateEvidenceValue, nativeDuplicateRecord } from './duplicate-revie
 import { ownershipDecisionQueries } from './ownership-decision-index.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import { createDuplicateEvidenceSnapshotPreparation } from './duplicate-evidence-snapshots.ts';
+import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
 import {
-  collectionClinicalProjectionContext,
+  collectionClinicalProjectionContextAsync,
   type CollectionClinicalReviewSession,
+  type VerifiedClinicalArtifact,
 } from './intake-review-collection-session.ts';
 import type { IntakeReviewDecision } from '../shared/intake.ts';
 import type { RetainedDuplicateEvidenceReference } from '../shared/saved-duplicate-evidence.ts';
@@ -87,6 +90,31 @@ export interface PreparedDuplicateEvidence {
   applyStandalone(): void;
   dispose(): void;
 }
+const preparedProvenance = new WeakMap<
+  PreparedDuplicateEvidence,
+  {
+    db: Database;
+    assertAuthorityCurrent(): void;
+    verifiedArtifacts(): Iterable<VerifiedClinicalArtifact>;
+    applyStandalone(): void;
+  }
+>();
+
+/** Internal projection preparation can copy only this preparation's original
+ * selected proofs; an arbitrary caller cannot substitute a new baseline. */
+export function checkedDuplicateEvidenceProjectionContext(
+  db: Database,
+  evidence: PreparedDuplicateEvidence,
+) {
+  const provenance = preparedProvenance.get(evidence);
+  if (!provenance || provenance.db !== db) throw Error('Foreign duplicate evidence preparation');
+  provenance.assertAuthorityCurrent();
+  return Object.freeze({
+    assertAuthorityCurrent: () => provenance.assertAuthorityCurrent(),
+    verifiedArtifacts: () => provenance.verifiedArtifacts(),
+    applyStandalone: () => provenance.applyStandalone(),
+  });
+}
 export async function prepareDuplicateEvidenceSnapshots(
   db: Database,
   members: {
@@ -95,7 +123,16 @@ export async function prepareDuplicateEvidenceSnapshots(
   }[],
 ): Promise<PreparedDuplicateEvidence> {
   const basis = clinicalReviewRevision(db),
-    contexts = members.map((m) => collectionClinicalProjectionContext(m.session));
+    contexts: Awaited<ReturnType<typeof collectionClinicalProjectionContextAsync>>[] = [];
+  for (const member of members) {
+    contexts.push(await collectionClinicalProjectionContextAsync(member.session));
+    if (clinicalReviewRevision(db) !== basis)
+      throw new HttpError(
+        409,
+        'DUPLICATE_EVIDENCE_CHANGED',
+        'Refresh this exact reviewed evidence',
+      );
+  }
   const refs = new Map<string, RetainedDuplicateEvidenceReference>(),
     pins = new Map<string, ReturnType<typeof nativeDuplicateRecord>>(),
     factories = new Map<string, Factory>(),
@@ -104,14 +141,21 @@ export async function prepareDuplicateEvidenceSnapshots(
     composed = new Set<string>();
   let disposed = false,
     staged = false;
-  const assertCurrent = () => {
+  const proofScratch = disposableSqlite('duplicate-preparation-artifacts-');
+  const assertBasis = () => {
     if (disposed || clinicalReviewRevision(db) !== basis)
       throw new HttpError(
         409,
         'DUPLICATE_EVIDENCE_CHANGED',
         'Refresh this exact reviewed evidence',
       );
-    for (const context of contexts) context.assertCurrent();
+  };
+  const assertAuthorityCurrent = () => {
+    assertBasis();
+    for (const context of contexts) context.assertAuthorityCurrent();
+  };
+  const assertPinnedCurrent = () => {
+    assertBasis();
     for (const target of pins.values())
       if (
         canonicalLiteral(nativeDuplicateRecord(db, target.kind, target.id)) !==
@@ -124,11 +168,27 @@ export async function prepareDuplicateEvidenceSnapshots(
         );
     for (const factory of factories.values()) factory.assertCurrent();
   };
+  const assertTerminalCurrent = () => {
+    assertAuthorityCurrent();
+    assertPinnedCurrent();
+  };
+  const assertCurrent = () => {
+    assertBasis();
+    for (const context of contexts) context.assertCurrent();
+    assertPinnedCurrent();
+  };
+  const stageStandalone = () => {
+    for (const [id, selected] of standalone) if (!composed.has(id)) selected.apply();
+    staged = true;
+  };
   try {
+    const artifacts = createClinicalReviewArtifactProof(proofScratch.db, 'artifacts');
+    for (const context of contexts) artifacts.retain(context.verifiedArtifacts());
     for (const [index, member] of members.entries())
       for (const decision of member.decisions)
         for (const pair of decision.comparisons || []) {
-          assertCurrent();
+          assertBasis();
+          contexts[index]!.assertAuthorityCurrent();
           const record = member.session.record(decision.recordId);
           if (!record?.comparisonReference)
             throw new HttpError(
@@ -142,7 +202,10 @@ export async function prepareDuplicateEvidenceSnapshots(
           if (refs.has(targetKey)) continue;
           const target = nativeDuplicateRecord(db, kind, id);
           pins.set(targetKey, target);
-          const { previous, previousKind } = await previousSnapshot(db, target, assertCurrent);
+          const { previous, previousKind } = await previousSnapshot(db, target, () => {
+            assertBasis();
+            contexts[index]!.assertAuthorityCurrent();
+          });
           const importedOriginal = db
             .prepare(
               `SELECT json_extract(extra_json,'$.import.intakeId') AS id FROM ${kind === 'observation' ? 'observations' : kind === 'medication' ? 'medications' : kind === 'procedure' ? 'procedures' : 'documents'} WHERE id=?`,
@@ -216,39 +279,62 @@ export async function prepareDuplicateEvidenceSnapshots(
       stages.set(id, stage);
       standalone.set(id, stage.prepareStandalone());
     }
-    assertCurrent();
-    return {
-      reference(kind, id) {
-        const value = refs.get(key(kind, id));
-        if (!value || disposed)
-          throw new HttpError(
-            409,
-            'DUPLICATE_EVIDENCE_PENDING',
-            'Prepare this selected evidence snapshot',
-          );
-        return value;
+    for (const context of contexts) artifacts.assertContains(context.consumedArtifactIds());
+    const prepared = await artifacts.withVerifiedTerminal(
+      { assertCurrent: assertTerminalCurrent },
+      () => {
+        for (const context of contexts) artifacts.assertContains(context.consumedArtifactIds());
+        return {
+          reference(kind, id) {
+            const value = refs.get(key(kind, id));
+            if (!value || disposed)
+              throw new HttpError(
+                409,
+                'DUPLICATE_EVIDENCE_PENDING',
+                'Prepare this selected evidence snapshot',
+              );
+            return value;
+          },
+          changes(id) {
+            if (staged) throw Error('Evidence catalogs already staged');
+            composed.add(id);
+            standalone.get(id)?.dispose();
+            standalone.delete(id);
+            return stages.get(id)?.changes || [];
+          },
+          assertCurrent,
+          applyStandalone() {
+            assertCurrent();
+            stageStandalone();
+          },
+          dispose() {
+            if (disposed) return;
+            disposed = true;
+            proofScratch.close();
+            for (const stage of standalone.values()) stage.dispose();
+            for (const stage of stages.values()) stage.dispose();
+          },
+        } satisfies PreparedDuplicateEvidence;
       },
-      changes(id) {
-        if (staged) throw Error('Evidence catalogs already staged');
-        composed.add(id);
-        standalone.get(id)?.dispose();
-        standalone.delete(id);
-        return stages.get(id)?.changes || [];
+    );
+    preparedProvenance.set(prepared, {
+      db,
+      assertAuthorityCurrent: assertTerminalCurrent,
+      *verifiedArtifacts() {
+        assertTerminalCurrent();
+        for (const context of contexts) yield* context.verifiedArtifacts();
+        assertTerminalCurrent();
       },
-      assertCurrent,
+      // Only the owning projection's verified synchronous terminal callback may
+      // use this; the public method still performs the complete physical check.
       applyStandalone() {
-        assertCurrent();
-        for (const [id, selected] of standalone) if (!composed.has(id)) selected.apply();
-        staged = true;
+        assertTerminalCurrent();
+        stageStandalone();
       },
-      dispose() {
-        if (disposed) return;
-        disposed = true;
-        for (const stage of standalone.values()) stage.dispose();
-        for (const stage of stages.values()) stage.dispose();
-      },
-    };
+    });
+    return prepared;
   } catch (error) {
+    proofScratch.close();
     for (const stage of standalone.values()) stage.dispose();
     for (const stage of stages.values()) stage.dispose();
     for (const factory of factories.values()) factory.dispose();

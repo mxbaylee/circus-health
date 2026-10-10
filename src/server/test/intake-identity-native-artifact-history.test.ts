@@ -641,9 +641,11 @@ test(
     // Node's test runner isolates files in child processes. Observe actual allocations
     // in this fixture's process; sibling files' temporary scopes are not ours.
     const allocatedScopes = new Set<string>(),
-      scopePrefixes = ['fictional-identity-scope-', 'fictional-identity-delta-'].map((prefix) =>
-        join(tmpdir(), prefix),
-      ),
+      scopePrefixes = [
+        'fictional-identity-scope-',
+        'fictional-identity-delta-',
+        'fictional-identity-original-proof-',
+      ].map((prefix) => join(tmpdir(), prefix)),
       originalMkdtemp = fs.mkdtempSync;
     const allocationObserver = t.mock.method(fs, 'mkdtempSync', ((
       ...args: Parameters<typeof originalMkdtemp>

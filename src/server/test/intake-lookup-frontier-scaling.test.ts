@@ -29,6 +29,7 @@ import {
   retainedIntakeAcceptance,
 } from '../intake-lookup-projection.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
+import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import type { IntakeReportAcceptanceRequest } from '../../shared/intake.ts';
 
 function fictionalLine(id: string) {
@@ -54,16 +55,19 @@ function fictionalLine(id: string) {
   });
 }
 
-for (const { count, warmAttention } of [
-  { count: 1, warmAttention: false },
-  { count: 8, warmAttention: false },
-  { count: 8, warmAttention: true },
+for (const { count, warmAttention, firstAcceptance } of [
+  { count: 1, warmAttention: false, firstAcceptance: false },
+  { count: 8, warmAttention: false, firstAcceptance: false },
+  { count: 8, warmAttention: true, firstAcceptance: false },
+  { count: 1, warmAttention: false, firstAcceptance: true },
+  { count: 8, warmAttention: false, firstAcceptance: true },
+  { count: 32, warmAttention: false, firstAcceptance: true },
 ])
-  test(`one accepted source keeps global lookup frontier work changed-only among ${count} originals${warmAttention ? ' with prepared attention' : ''}`, async (t) => {
+  test(`${firstAcceptance ? 'first acceptance' : 'one accepted source'} keeps global lookup frontier work changed-only among ${count} originals${warmAttention ? ' with prepared attention' : ''}`, async (t) => {
     const root = mkdtempSync(join(tmpdir(), 'fictional-lookup-frontier-'));
     const profileId = 'fictional-frontier';
     const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-    memoryRecordAuthority(db);
+    const authority = memoryRecordAuthority(db);
     t.after(() => {
       clearIntakeStateCache(db);
       db.close();
@@ -110,31 +114,37 @@ for (const { count, warmAttention } of [
         },
       ],
     };
-    await acceptIntakeReportSelectionAsync(db, root, profileId, request);
-    await prepareIntakeLookupIndices(db);
-    await prepareDuplicateEvidenceIndex(db);
-    const followup = prepareCollectionClinicalReview(db, root, profileId, original.id, proposalId);
+    if (!firstAcceptance) {
+      await acceptIntakeReportSelectionAsync(db, root, profileId, request);
+      await prepareIntakeLookupIndices(db);
+      await prepareDuplicateEvidenceIndex(db);
+    }
+    const followup = firstAcceptance
+      ? reviewed
+      : prepareCollectionClinicalReview(db, root, profileId, original.id, proposalId);
     if (followup.status !== 'ready') throw Error('Expected follow-up native review');
     const nextRecord = followup.session.review.records.at(-1)!;
-    const nextRequest: IntakeReportAcceptanceRequest = {
-      operationId: randomUUID(),
-      blocks: [
-        {
-          intakeId: original.id,
-          proposalId,
-          intakeVersion: followup.session.review.version,
-          reviewToken: followup.session.review.reviewToken,
-          selections: [
+    const nextRequest: IntakeReportAcceptanceRequest = firstAcceptance
+      ? request
+      : {
+          operationId: randomUUID(),
+          blocks: [
             {
-              recordId: nextRecord.id,
-              candidateId: nextRecord.candidateId!,
-              candidateVersionId: nextRecord.candidateVersionId!,
-              mapping: nextRecord.mapping,
+              intakeId: original.id,
+              proposalId,
+              intakeVersion: followup.session.review.version,
+              reviewToken: followup.session.review.reviewToken,
+              selections: [
+                {
+                  recordId: nextRecord.id,
+                  candidateId: nextRecord.candidateId!,
+                  candidateVersionId: nextRecord.candidateVersionId!,
+                  mapping: nextRecord.mapping,
+                },
+              ],
             },
           ],
-        },
-      ],
-    };
+        };
     if (warmAttention) await readPreparedSourceAttention(db, profileId, 0, () => 0);
     ensureIntakeFrontierObserver(db);
     await prepareIntakeLookupIndices(db);
@@ -295,8 +305,19 @@ for (const { count, warmAttention } of [
       return Reflect.apply(functionBeforeAcceptance, this, parameters);
     } as typeof DatabaseSync.prototype.function;
     let saved: Awaited<ReturnType<typeof acceptIntakeReportSelectionAsync>>;
+    const workBefore = intakeWorkCounters(db);
+    const immutableBefore = new Set(authority.objects.keys());
+    let acceptedWork: ReturnType<typeof intakeWorkCounters>;
+    let immutableObjects = 0;
+    let immutableBytes = 0;
     try {
       saved = await acceptIntakeReportSelectionAsync(db, root, profileId, nextRequest);
+      acceptedWork = intakeWorkCounters(db);
+      for (const [name, bytes] of authority.objects) {
+        if (name === 'head' || immutableBefore.has(name)) continue;
+        immutableObjects++;
+        immutableBytes += bytes.byteLength;
+      }
       const acceptedRows = acceptanceOriginalRows;
       for (const _source of db
         .prepare(
@@ -433,6 +454,22 @@ for (const { count, warmAttention } of [
       JSON.stringify({
         count,
         warmAttention,
+        firstAcceptance,
+        immutableObjects,
+        immutableBytes,
+        acceptedWork: Object.fromEntries(
+          (['warm', 'reconstruction', 'primitive'] as const).map((phase) => [
+            phase,
+            Object.fromEntries(
+              Object.entries(acceptedWork[phase])
+                .map(([key, value]) => [
+                  key,
+                  value - (workBefore[phase] as Record<string, number>)[key]!,
+                ])
+                .filter(([, value]) => value !== 0),
+            ),
+          ]),
+        ),
         rows,
         postOriginalRows,
         cursorStatements,

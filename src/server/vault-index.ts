@@ -163,7 +163,7 @@ function readGeneration(
   return generation as unknown as IndexGeneration;
 }
 /** One disposable index writer belongs to the vault's existing single-writer lease. */
-export function openVaultIndex(
+export function* openVaultIndexSteps(
   directory: string,
   profileId: string,
   key: VaultKey,
@@ -223,6 +223,7 @@ export function openVaultIndex(
       if (usage.entries > limits.entries) fail();
       chain.push(generation);
       ref = generation.previous;
+      yield;
     }
     if (
       JSON.stringify(usage) !==
@@ -233,7 +234,8 @@ export function openVaultIndex(
       })
     )
       fail();
-    for (const generation of chain.reverse()) {
+    for (let position = chain.length - 1; position >= 0; position--) {
+      const generation = chain[position]!;
       const names = new Set<string>();
       for (const entry of generation.objects) {
         if (
@@ -255,10 +257,12 @@ export function openVaultIndex(
         names.add(name);
         files[name] = entry[1];
       }
+      yield;
     }
     for (const id of knownObjects) {
       const content = lstatSync(resolve(directory, 'vault/objects', id + '.enc'));
       if (!content.isFile() || content.isSymbolicLink() || content.nlink !== 1) fail();
+      yield;
     }
   } else {
     if (!initialize) throw Error('Missing authoritative vault manifest');
@@ -384,4 +388,14 @@ export function openVaultIndex(
       knownObjects = new Set();
     },
   };
+}
+
+export function openVaultIndex(
+  ...args: Parameters<typeof openVaultIndexSteps>
+): ReturnType<typeof openVaultIndexSteps> extends Generator<unknown, infer R, unknown> ? R : never {
+  const steps = openVaultIndexSteps(...args);
+  for (;;) {
+    const next = steps.next();
+    if (next.done) return next.value;
+  }
 }

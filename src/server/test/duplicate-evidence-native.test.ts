@@ -4,7 +4,14 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { openDatabase, transaction, revision, observeTransactionOutcome } from '../database.ts';
+import { Worker } from 'node:worker_threads';
+import {
+  openDatabase,
+  transaction,
+  revision,
+  clinicalReviewRevision,
+  observeTransactionOutcome,
+} from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import {
@@ -25,8 +32,18 @@ import { selectedClinicalPair } from '../intake-clinical-record-sections.ts';
 import { duplicateRecord } from '../duplicate-review.ts';
 import { canonicalLiteral } from '../intake-format.ts';
 import { prepareRetainedDuplicateEvidenceSnapshot } from '../duplicate-evidence-snapshots.ts';
+import {
+  checkedDuplicateEvidenceProjectionContext,
+  prepareDuplicateEvidenceSnapshots,
+} from '../duplicate-evidence-preparation.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { hasIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
+import { prepareClinicalSourceFingerprintIndex } from '../intake-clinical-source-index.ts';
+import {
+  prepareCollectionClinicalProjectionWithEvidence,
+  withVerifiedClinicalProjectionPublication,
+  disposePreparedClinicalProjection,
+} from '../intake-clinical-projection-plan.ts';
 import type { IntakeReportAcceptanceRequest } from '../../shared/intake.ts';
 import type { RetainedDuplicateEvidenceReference } from '../../shared/saved-duplicate-evidence.ts';
 import {
@@ -89,6 +106,23 @@ test('direct native import retains fresh same-event evidence through own mainten
     comparison = selectedClinicalPair(db, selected.session.review, record, targetId);
   assert.ok(comparison?.scope);
   assert.equal(comparison.scope.format, 'intake-pair-scope-v2');
+  const proof = await prepareDuplicateEvidenceSnapshots(db, [
+    { session: selected.session, decisions: [] },
+  ]);
+  try {
+    const provenance = checkedDuplicateEvidenceProjectionContext(db, proof);
+    assert.ok([...provenance.verifiedArtifacts()].length > 0);
+    provenance.assertAuthorityCurrent();
+    assert.throws(
+      () => checkedDuplicateEvidenceProjectionContext(db, {} as typeof proof),
+      /Foreign duplicate evidence preparation/,
+    );
+  } finally {
+    proof.dispose();
+  }
+  assert.throws(() => checkedDuplicateEvidenceProjectionContext(db, proof), {
+    code: 'DUPLICATE_EVIDENCE_CHANGED',
+  });
   const input = {
     version: selected.session.review.version,
     reviewToken: selected.session.review.reviewToken,
@@ -188,6 +222,92 @@ test('direct native import retains fresh same-event evidence through own mainten
     assert.equal(pair?.previousDecision?.scopeStatus, 'current');
   } finally {
     reopened.session.close();
+  }
+});
+
+test('duplicate projection publication refuses a saved target changed during its physical proof', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-duplicate-terminal-target-')),
+    profileId = 'fictional-profile',
+    db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId });
+  t.after(() => {
+    clearIntakeStateCache(db);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const upload = (id: string) =>
+    uploadIntake(db, root, profileId, {
+      filename: id + '.jsonl',
+      newProviderName: 'Fictional clinic',
+      bytes: Buffer.from(JSON.stringify(envelope(id))),
+    });
+  const saved = upload('saved-target'),
+    review = reviewIntake(db, root, profileId, saved.id);
+  importIntake(db, root, profileId, saved.id, {
+    version: review.version,
+    reviewToken: review.reviewToken,
+    decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+  });
+  const targetId = String(db.prepare('SELECT id FROM documents').get()!.id),
+    incoming = upload('incoming-target');
+  await buildIntakeCollectionEnvelope(db, { id: incoming.id, sha256: incoming.sha256 });
+  await prepareCollectionClinicalReviewDependencies(db, root, profileId, incoming.id);
+  await prepareClinicalSourceFingerprintIndex(db);
+  const selected = prepareCollectionClinicalReview(db, root, profileId, incoming.id);
+  if (selected.status !== 'ready') throw Error('Expected complete duplicate review');
+  t.after(() => selected.session.close());
+  const record = selected.session.review.records[0]!,
+    comparison = selectedClinicalPair(db, selected.session.review, record, targetId);
+  assert.ok(comparison?.scope);
+  const plan = await prepareCollectionClinicalProjectionWithEvidence(
+    db,
+    root,
+    profileId,
+    selected.session,
+    [
+      {
+        recordId: record.id,
+        action: 'accept',
+        mapping: {},
+        comparisons: [
+          {
+            otherRecordId: targetId,
+            scope: comparison.scope,
+            outcome: 'same_event',
+            occurrenceEvidence: 'attach',
+            reason: 'Fictional saved target is pinned for publication.',
+          },
+        ],
+      },
+    ],
+  );
+  const priorClinicalRevision = clinicalReviewRevision(db),
+    postMessage = Worker.prototype.postMessage;
+  let changedDuringProof = false;
+  Worker.prototype.postMessage = function (value, transferList) {
+    const message = value as { type?: string };
+    if (!changedDuringProof && message.type === 'page') {
+      changedDuringProof = true;
+      db.prepare('UPDATE documents SET title=? WHERE id=?').run(
+        'Changed fictional target',
+        targetId,
+      );
+    }
+    return postMessage.call(this, value, transferList);
+  };
+  try {
+    await assert.rejects(
+      withVerifiedClinicalProjectionPublication(db, plan, () => {
+        throw Error('Changed target reached publication');
+      }),
+      { code: 'DUPLICATE_EVIDENCE_CHANGED' },
+    );
+    assert.equal(changedDuringProof, true, 'mutation reached the publication worker page');
+    assert.equal(clinicalReviewRevision(db), priorClinicalRevision);
+    assert.equal(db.prepare('SELECT count(*) n FROM documents').get()!.n, 1);
+  } finally {
+    Worker.prototype.postMessage = postMessage;
+    disposePreparedClinicalProjection(plan);
   }
 });
 

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import type { ServerResponse, IncomingMessage } from 'node:http';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -14,6 +15,7 @@ import {
   exportEvidence,
   exportPdf,
   createNoteExports,
+  prepareNoteExportMetadata,
 } from '../note-exports.ts';
 import { createNote, saveNote, getNote, finishNote } from '../notes.ts';
 import type { ClinicalKind } from '../clinical-references.ts';
@@ -28,6 +30,8 @@ const hasCode = (error: unknown, code: string): boolean =>
 const hasStatus = (error: unknown, status: number): boolean =>
   error instanceof Error && 'status' in error && error.status === status;
 const route = (value: object): ExportRouteContext => value as unknown as ExportRouteContext;
+const requestEvents = () => new EventEmitter() as IncomingMessage;
+const responseEvents = () => new EventEmitter() as ServerResponse;
 interface EvidenceCompanion {
   format: string;
   main: { links: unknown[] };
@@ -67,6 +71,37 @@ test('note-only is safe rendered markdown, draft-preserving and excludes unselec
   assert.match(html, /Image reference: do not fetch/);
   assert.match(html, /Questions for my appointment/);
   assert.ok(!JSON.stringify(snapshot).includes(sensitive.content));
+});
+test('export metadata preflight preserves selected scope and refuses ownership or selection changes', async (t) => {
+  const { db, input, note } = fixture(t);
+  const value = { ...input, selected: ['observation:lab-1'] };
+  const before = exportSnapshot(db, value).fingerprint;
+  await prepareNoteExportMetadata(db, 'cookie-dough', value);
+  assert.equal(exportSnapshot(db, value).fingerprint, before);
+  await assert.rejects(prepareNoteExportMetadata(db, 'another-profile', value), (e: unknown) =>
+    hasCode(e, 'EXPORT_STALE'),
+  );
+  let checks = 0;
+  await assert.rejects(
+    prepareNoteExportMetadata(db, 'cookie-dough', value, {
+      assertRunning() {
+        if (++checks === 2)
+          saveNote(db, note.id, {
+            version: note.version,
+            content: 'A changed fictional selection.',
+          });
+      },
+    }),
+    (e: unknown) => hasCode(e, 'EXPORT_STALE'),
+  );
+  await assert.rejects(
+    prepareNoteExportMetadata(db, 'cookie-dough', value, {
+      assertRunning() {
+        throw Error('fictional export cancellation');
+      },
+    }),
+    /fictional export cancellation/,
+  );
 });
 test('current medication options use personal confirmation, retain doses and provenance; source issuer differs from acquisition', (t) => {
   const { db, input } = fixture(t),
@@ -308,8 +343,8 @@ test('profile scoped preview tokens reject another profile and changed selected 
     method: 'POST',
     db,
     profileId: 'cookie-dough',
-    req: {} as IncomingMessage,
-    res: {} as ServerResponse,
+    req: requestEvents(),
+    res: responseEvents(),
     respond: (data: unknown) => {
       result = data as PreviewResult;
     },
@@ -865,15 +900,15 @@ test('evidence companion keeps literal source tokens and indexed citations, reje
     method: 'POST',
     db,
     profileId: 'cookie-dough',
-    req: {} as IncomingMessage,
-    res: {
+    req: requestEvents(),
+    res: Object.assign(responseEvents(), {
       writeHead: (_status: number, h: Record<string, string>) => {
         headers = h;
       },
       end: (b: string) => {
         body = b;
       },
-    } as unknown as ServerResponse,
+    }),
     respond: (r: unknown) => {
       response = r as PreviewResult;
     },
@@ -1098,8 +1133,8 @@ test('finished note exports resolve old clinical kinds while preserving link att
     method: 'POST',
     db,
     profileId: profile.id,
-    req: {} as IncomingMessage,
-    res: {} as ServerResponse,
+    req: requestEvents(),
+    res: responseEvents(),
     respond: (value: unknown) => {
       previewResult = value as PreviewResult;
     },

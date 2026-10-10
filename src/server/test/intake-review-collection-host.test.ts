@@ -2,6 +2,7 @@ import { reviewIntakeRead, readIntakeReviewRecord, readIntakeReviewFragment } fr
 import { readPreparedCollectionClinicalReview } from '../intake-review-collection-host.ts';
 import nodeFs, { readdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
+import { Worker } from 'node:worker_threads';
 import { syncBuiltinESMExports } from 'node:module';
 import { intakeNamespace } from '../intake-state-evidence.ts';
 import { profileOriginal } from '../profile-storage.ts';
@@ -67,6 +68,7 @@ import {
   listIntakeImportFeedRead,
   clearPreparedCollectionQueues,
   readIntakeReportRecords,
+  prepareCollectionQueueRead,
 } from '../intake-queue-native.ts';
 import { listIntakeImportFeed } from '../intake-report-queue.ts';
 import { createIntakeFileWorkCounters, withIntakeFileWork } from '../intake-file-work.ts';
@@ -1953,6 +1955,89 @@ test(
   },
 );
 
+for (const boundary of ['refresh', 'summary', 'cached summary'] as const)
+  test(`native queue ${boundary} verifies original physical evidence off the request thread`, async (t) => {
+    const { db, root, profileId } = fixture(t);
+    const source = uploadIntake(db, root, profileId, {
+      filename: 'fictional-terminal-proof.jsonl',
+      bytes: Buffer.from(JSON.stringify(envelope('fictional-terminal-proof'))),
+    });
+    await buildIntakeCollectionEnvelope(db, { id: source.id });
+    if (boundary === 'refresh') {
+      await listIntakeImportFeedRead(db, root, profileId, { view: 'all', limit: '1' });
+      const opened = prepareCollectionClinicalReview(db, root, profileId, source.id);
+      if (opened.status !== 'ready') throw Error('Expected original selected review');
+      try {
+        const record = opened.session.review.records[0]!;
+        await applyClinicalRecordAction(db, root, profileId, source.id, {
+          proposalId: null,
+          recordId: record.id,
+          candidateVersionId: record.candidateVersionId!,
+          version: opened.session.review.version,
+          reviewToken: opened.session.review.reviewToken,
+          operationId: randomUUID(),
+          patch: {
+            mapping: { documentTitle: 'Fictional revised title' },
+            correctionPatch: { documentTitle: 'Fictional revised title' },
+            correctionReason: 'Fictional correction',
+          },
+        });
+      } finally {
+        opened.session.close();
+      }
+    }
+    await prepareCollectionQueueRead(db, root, profileId);
+    const originalPath = profileOriginal(
+      root,
+      String(db.prepare('SELECT path FROM source_files WHERE id=?').get(source.id)!.path),
+      profileId,
+    );
+    const queue =
+      boundary !== 'refresh' ? await openCollectionReportQueue(db, root, profileId) : undefined;
+    if (boundary === 'cached summary' && queue) {
+      const pointer = [...queue.groups('all')][0]!;
+      const first = await collectionReportGroupSummary(db, root, profileId, queue, pointer);
+      assert.deepEqual(
+        await collectionReportGroupSummary(db, root, profileId, queue, pointer),
+        first,
+      );
+    }
+    const post = Worker.prototype.postMessage;
+    let replaced = false;
+    Worker.prototype.postMessage = function (message, ...args) {
+      if (
+        !replaced &&
+        Array.isArray(message?.items) &&
+        message.items.some(
+          (item: { kind: string; path: string }) =>
+            item.kind === 'identity' && item.path === originalPath,
+        )
+      ) {
+        replaced = true;
+        // Same bytes, new physical identity: no managed epoch notification masks the proof.
+        writeFileSync(originalPath, readFileSync(originalPath));
+      }
+      return Reflect.apply(post, this, [message, ...args]);
+    };
+    try {
+      await assert.rejects(
+        () =>
+          queue
+            ? collectionReportGroupSummary(db, root, profileId, queue, [...queue.groups('all')][0]!)
+            : openCollectionReportQueue(db, root, profileId),
+        /physical evidence changed|Retained clinical evidence changed|Refresh/,
+      );
+      assert.equal(
+        replaced,
+        true,
+        'the actual terminal worker receives retained original evidence',
+      );
+    } finally {
+      Worker.prototype.postMessage = post;
+      queue?.close();
+    }
+  });
+
 test('concurrent cold queue opens preserve the global four-queue bound', async (t) => {
   // Distinct databases need distinct cache entries. Same-key callers on one DB
   // are serialized and borrow leases on one existing queue.
@@ -2635,15 +2720,18 @@ test('selected section transport refuses changes during its final physical check
     profileId,
   );
   const originalBytes = readFileSync(path),
-    stat = nodeFs.statSync;
+    post = Worker.prototype.postMessage;
   const peer = new DatabaseSync(String(db.prepare('PRAGMA database_list').get()!.file));
   let peerMutation:
     { before: unknown; after: unknown; row: unknown; complete: boolean } | undefined;
   let calls = 0,
     target = 0,
     inject: (() => void) | undefined;
-  Reflect.set(nodeFs, 'statSync', ((selected, ...args) => {
-    if (String(selected) === path) {
+  Worker.prototype.postMessage = function (message, ...args) {
+    if (
+      message?.type === 'page' &&
+      message.items?.some((item: { path?: string }) => item.path === path)
+    ) {
       calls++;
       if (inject && calls === target) {
         const action = inject;
@@ -2651,9 +2739,8 @@ test('selected section transport refuses changes during its final physical check
         action();
       }
     }
-    return Reflect.apply(stat, nodeFs, [selected, ...args]);
-  }) as typeof nodeFs.statSync);
-  syncBuiltinESMExports();
+    return Reflect.apply(post, this, [message, ...args]);
+  };
   try {
     for (const change of [
       () => {
@@ -2686,13 +2773,12 @@ test('selected section transport refuses changes during its final physical check
         assert.equal(peerMutation.row, undefined, 'peer committed ABA restored the exact rows');
         peerMutation = undefined;
       }
-      assert.equal(inject, undefined, 'change reached the last consumed-original stat');
+      assert.equal(inject, undefined, 'change reached the last consumed-original worker page');
       assert.equal(reviewIssueScratchCounts(db).databases, 0);
       writeFileSync(path, originalBytes);
     }
   } finally {
-    Reflect.set(nodeFs, 'statSync', stat);
-    syncBuiltinESMExports();
+    Worker.prototype.postMessage = post;
     writeFileSync(path, originalBytes);
     peer.close();
   }

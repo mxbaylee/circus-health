@@ -7,7 +7,10 @@ import {
   importStorageEstimate,
   assertImportCapacity,
 } from './archive-storage.ts';
-import { createEncryptedProfiles } from './encrypted-profiles.ts';
+import {
+  createEncryptedProfiles,
+  type CreateEncryptedProfilesOptions,
+} from './encrypted-profiles.ts';
 import { importDiagnostics, type ImportDiagnostics } from './import-diagnostics.ts';
 import { createProfilePasskeys } from './profile-passkeys.ts';
 import { writeChat, forgetChatJournal } from './assistant-journal.ts';
@@ -47,6 +50,7 @@ interface VaultAppOptions {
   assistantOptions?: AppOptions['assistantOptions'];
   diagnostics?: ImportDiagnostics;
   port?: number;
+  unlockCheckpoint?: CreateEncryptedProfilesOptions['unlockCheckpoint'];
 }
 interface Session {
   id: string;
@@ -60,8 +64,14 @@ export function createVaultApp({
   assistantOptions,
   diagnostics = importDiagnostics,
   port = 3001,
+  unlockCheckpoint,
 }: VaultAppOptions) {
-  const manager = createEncryptedProfiles({ dataDirectory, runtimeDirectory, diagnostics }),
+  const manager = createEncryptedProfiles({
+      dataDirectory,
+      runtimeDirectory,
+      diagnostics,
+      unlockCheckpoint,
+    }),
     passkeys = createProfilePasskeys(manager),
     sessions = new Map<string, Session>();
   let closed = false,
@@ -243,7 +253,24 @@ export function createVaultApp({
         return;
       }
       if (path === '/api/profile-setups/resume' && method === 'POST') {
-        send(res, 200, { data: manager.resume((await body(req)).recovery) });
+        const controller = new AbortController(),
+          abort = () => {
+            if (!res.writableEnded) controller.abort(Error('Setup request was disconnected'));
+          };
+        res.once('close', abort);
+        try {
+          send(res, 200, {
+            data: await manager.resumeAsync((await body(req)).recovery, {
+              signal: controller.signal,
+              assertAuthorized: () => {
+                if (closed || sessions.get(client.id) !== client)
+                  throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+              },
+            }),
+          });
+        } finally {
+          res.off('close', abort);
+        }
         return;
       }
       if (path === '/api/profile-setups' && method === 'POST') {
@@ -254,24 +281,57 @@ export function createVaultApp({
       }
       const setup = path.match(/^\/api\/profile-setups\/([A-Za-z0-9_-]+)\/verify$/);
       if (setup && method === 'POST') {
-        const input = await body(req),
-          p = await activate(
-            () =>
-              manager.verify(setup[1], input, {
-                authorizeCopySource: (sourceId) => requireAccess(sourceId, client),
-              }),
-            client,
-          );
-        send(res, 201, { data: publicCard(p, client, hostname) });
+        const controller = new AbortController(),
+          abort = () => {
+            if (!res.writableEnded) controller.abort(Error('Setup request was disconnected'));
+          };
+        res.once('close', abort);
+        try {
+          const input = await body(req),
+            p = await activate(
+              () =>
+                manager.verifyAsync(setup[1], input, {
+                  authorizeCopySource: (sourceId) => requireAccess(sourceId, client),
+                  signal: controller.signal,
+                  assertAuthorized: () => {
+                    if (closed || sessions.get(client.id) !== client)
+                      throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+                  },
+                }),
+              client,
+            );
+          send(res, 201, { data: publicCard(p, client, hostname) });
+        } finally {
+          res.off('close', abort);
+        }
         return;
       }
       const match = path.match(/^\/api\/profiles\/(p-[0-9a-f-]+)(?:\/(.*))?$/);
       if (!match) throw new HttpError(404, 'NOT_FOUND', 'Resource not found');
       const [, id, action] = match;
       if (action === 'unlock' && method === 'POST') {
-        const input = await body(req),
-          p = await activate(() => manager.unlock(id, input.recovery), client);
-        send(res, 200, { data: publicCard(p, client, hostname) });
+        const input = await body(req);
+        const controller = new AbortController();
+        const abort = () => {
+          if (!res.writableEnded) controller.abort(Error('Unlock request was disconnected'));
+        };
+        res.once('close', abort);
+        try {
+          const p = await activate(
+            () =>
+              manager.unlockAsync(id, input.recovery, {
+                signal: controller.signal,
+                assertAuthorized: () => {
+                  if (closed || sessions.get(client.id) !== client)
+                    throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+                },
+              }),
+            client,
+          );
+          send(res, 200, { data: publicCard(p, client, hostname) });
+        } finally {
+          res.off('close', abort);
+        }
         return;
       }
       if (action === 'passkeys/authentication-options' && method === 'POST') {

@@ -7,6 +7,7 @@ import { createClinicalReviewArtifactProof } from './clinical-review-artifact-pr
 import { captureManagedPhysicalEpoch } from './clinical-review-physical-epoch.ts';
 import {
   collectionClinicalProjectionContext,
+  collectionClinicalProjectionContextAsync,
   type VerifiedClinicalArtifact,
 } from './intake-review-collection-session.ts';
 import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
@@ -35,7 +36,7 @@ import {
   verifyIntakeOriginal,
   withVerifiedIntakeOriginalDescriptor,
 } from './intake.ts';
-import { verifyIntakeFileHash } from './intake-files.ts';
+import { intakeFileIdentity, verifyIntakeFileHash } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
 import { intakeSourceVersion } from './intake-state-access.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
@@ -425,6 +426,29 @@ export interface RetainedCollectionClinicalPolicy {
   retainArtifacts(retain: (artifacts: Iterable<VerifiedClinicalArtifact>) => void): void;
   close(): void;
 }
+type CheckedRetainedPolicy = Readonly<{
+  assertAuthorityCurrent(): void;
+  record(
+    recordId: string,
+    candidateId: string,
+    candidateVersionId: string,
+  ): import('../shared/intake.ts').IntakeReviewRecord | undefined;
+  verifiedArtifacts(): Iterable<VerifiedClinicalArtifact>;
+}>;
+const checkedRetainedPolicies = new WeakMap<
+  RetainedCollectionClinicalPolicy,
+  { db: DatabaseSync; checked: CheckedRetainedPolicy }
+>();
+/** Exact private borrow provenance; this never grants physical publication authority alone. */
+export function checkedRetainedCollectionClinicalPolicyContext(
+  db: DatabaseSync,
+  borrowed: RetainedCollectionClinicalPolicy,
+): CheckedRetainedPolicy {
+  const binding = checkedRetainedPolicies.get(borrowed);
+  if (!binding || binding.db !== db) throw Error('Foreign retained clinical policy borrow');
+  binding.checked.assertAuthorityCurrent();
+  return binding.checked;
+}
 /** Only borrow an idle completed owner; never construct, refresh or wait for policy here. */
 export function tryBorrowRetainedCollectionClinicalPolicy(
   db: DatabaseSync,
@@ -485,8 +509,11 @@ export function tryBorrowRetainedCollectionClinicalPolicy(
       close();
       return miss();
     }
+    const { checked, ...methods } = borrowed;
+    const result = { ...methods, close };
+    checkedRetainedPolicies.set(result, { db, checked });
     withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueuePolicyBorrowHits'));
-    return { ...borrowed, close };
+    return result;
   } catch (error) {
     close();
     throw error;
@@ -635,11 +662,12 @@ async function openCollectionReportQueueNow(db: DatabaseSync, root: string, prof
         { operation: currentClinicalOperation(db) },
       );
     },
-    close(options: { retainReview?: boolean } = {}) {
+    close(options: { retainReview?: boolean; discard?: boolean } = {}) {
       if (released) return;
       released = true;
       selected.users--;
       selected.queue.releaseReview(options.retainReview === true);
+      if (options.discard && !selected.closed) closeQueueCache(selected);
     },
     assertCurrent() {
       if (released || selected.closed) throw changed();
@@ -802,12 +830,15 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     const assertRefresh = () => {
       assertIntakeOwner(db, profileId);
       if (
-        (expectedMethod === undefined
+        expectedMethod === undefined
           ? managedDatabaseMethodEpoch(db) !== expectedMethodEpoch
-          : reviewPreparationMethodStamp(db) !== expectedMethod) ||
-        captureManagedPhysicalEpoch() !== expectedPhysicalEpoch ||
-        (!db.isTransaction &&
-          (!expectedPreparation || reviewPreparationStamp(db) !== expectedPreparation))
+          : reviewPreparationMethodStamp(db) !== expectedMethod
+      )
+        throw changed();
+      if (captureManagedPhysicalEpoch() !== expectedPhysicalEpoch) throw changed();
+      if (
+        !db.isTransaction &&
+        (!expectedPreparation || reviewPreparationStamp(db) !== expectedPreparation)
       )
         throw changed();
     };
@@ -1118,9 +1149,13 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
                   }
                   if (prepared.status !== 'ready')
                     throw new IntakeReviewFragmentRequired(prepared.reference);
-                  artifacts.retain(
-                    collectionClinicalProjectionContext(prepared.session).verifiedArtifacts(),
+                  const projection = await collectionClinicalProjectionContextAsync(
+                    prepared.session,
+                    undefined,
+                    () => assertStagedSource(source, pin),
                   );
+                  assertStagedSource(source, pin);
+                  artifacts.retain(projection.verifiedArtifacts());
                   const selected = prepared.session.record(
                     member.recordId,
                     member.candidateId,
@@ -1364,13 +1399,21 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       const terminal = await collectionQueueBinding(db, profileId);
       assertRefresh();
       if ((terminal?.binding ?? bindingNow()) !== expected) throw changed();
-      artifacts.assertCurrent();
-      cache.exec('COMMIT');
-      binding = expected;
-      bindingWitness = terminal;
-      clinicalRevision = currentRevision;
+      await artifacts.withVerifiedTerminal({ assertCurrent: assertRefresh }, (physicalCurrent) => {
+        assertRefresh();
+        physicalCurrent();
+        cache.exec('COMMIT');
+        assertRefresh();
+        physicalCurrent();
+        binding = expected;
+        bindingWitness = terminal;
+        clinicalRevision = currentRevision;
+      });
     } catch (error) {
-      cache.exec('ROLLBACK');
+      if (cache.isTransaction) cache.exec('ROLLBACK');
+      binding = '';
+      bindingWitness = undefined;
+      clinicalRevision = '';
       throw error;
     } finally {
       proofScratch.close();
@@ -1383,6 +1426,19 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     throw error;
   }
   let closed = false;
+  const summaryProofs = new Map<
+    string,
+    {
+      value: string;
+      artifacts: ReturnType<typeof createClinicalReviewArtifactProof>;
+      close(): void;
+    }
+  >();
+  const discardSummary = (intakeId: string, ordinal: number) => {
+    const key = JSON.stringify([intakeId, ordinal]);
+    summaryProofs.get(key)?.close();
+    summaryProofs.delete(key);
+  };
   const assertCurrent = () => {
     if (closed) throw changed();
     if (db.isTransaction) {
@@ -1400,13 +1456,10 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
   const prepareCurrent = async () => {
     if (closed) throw changed();
     const assertPreparation = () => {
-      if (
-        !bindingWitness ||
-        reviewPreparationStamp(db) !== bindingWitness.preparationStamp ||
-        reviewPreparationMethodStamp(db) !== bindingWitness.preparationMethods ||
-        captureManagedPhysicalEpoch() !== bindingWitness.physicalEpoch
-      )
-        throw changed();
+      if (!bindingWitness) throw changed();
+      if (reviewPreparationStamp(db) !== bindingWitness.preparationStamp) throw changed();
+      if (reviewPreparationMethodStamp(db) !== bindingWitness.preparationMethods) throw changed();
+      if (captureManagedPhysicalEpoch() !== bindingWitness.physicalEpoch) throw changed();
     };
     if (!db.isTransaction) assertPreparation();
     const current = await collectionQueueBinding(db, profileId);
@@ -1475,7 +1528,9 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
       proposalId: string | null,
       assertOwner: () => void,
       assertOwnerCurrent: () => void,
-    ): Omit<RetainedCollectionClinicalPolicy, 'close'> | undefined {
+    ):
+      | (Omit<RetainedCollectionClinicalPolicy, 'close'> & { checked: CheckedRetainedPolicy })
+      | undefined {
       const key = canonicalLiteral([intakeId, proposalId]),
         stamp = reviewReadStamp(db);
       if (
@@ -1507,14 +1562,13 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         )
           throw changed();
       };
-      const assertBorrowedCurrent = () => {
+      const assertBorrowedAuthorityCurrent = () => {
         assertOwner();
         assertSelected();
         assertCurrent();
-        // Complete consumed physical proof precedes the final cheap original witness.
-        collectionClinicalProjectionContext(selected.session);
         const sourcePin = canonicalLiteral(intakeSourceVersion(db, intakeId)),
           requestRevision = revision(db);
+        projection?.assertAuthorityCurrent();
         assertOwnerCurrent();
         assertSelected();
         if (
@@ -1524,9 +1578,35 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         )
           throw changed();
       };
+      let projection: ReturnType<typeof collectionClinicalProjectionContext> | undefined;
+      const assertBorrowedCurrent = () => {
+        assertBorrowedAuthorityCurrent();
+        // Public borrows still recheck complete consumed physical evidence.
+        projection = collectionClinicalProjectionContext(selected.session);
+        assertBorrowedAuthorityCurrent();
+      };
       // Once selected, stale physical/source/callback observations refuse, never fall back.
       assertBorrowedCurrent();
+      const checked = Object.freeze({
+        assertAuthorityCurrent: assertBorrowedAuthorityCurrent,
+        record(recordId: string, candidateId: string, candidateVersionId: string) {
+          assertBorrowedAuthorityCurrent();
+          const record = selected.session.record(recordId, candidateId, candidateVersionId);
+          assertBorrowedAuthorityCurrent();
+          return record;
+        },
+        *verifiedArtifacts() {
+          assertBorrowedAuthorityCurrent();
+          for (const artifact of projection!.verifiedArtifacts()) {
+            assertBorrowedAuthorityCurrent();
+            yield { ...artifact };
+            assertBorrowedAuthorityCurrent();
+          }
+          assertBorrowedAuthorityCurrent();
+        },
+      });
       return {
+        checked,
         assertCurrent: assertBorrowedCurrent,
         record(recordId, candidateId, candidateVersionId) {
           assertBorrowedCurrent();
@@ -1556,6 +1636,8 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
     close() {
       closed = true;
       resetReview();
+      for (const proof of summaryProofs.values()) proof.close();
+      summaryProofs.clear();
       scratch.close();
     },
     resetReview,
@@ -1588,53 +1670,85 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
         }
       }
     },
-    summary(intakeId: string, ordinal: number) {
+    async summary(intakeId: string, ordinal: number) {
       const row = cache
         .prepare('SELECT value FROM summaries WHERE intake=? AND ordinal=? AND grounding=?')
         .get(intakeId, ordinal, currentGroundingEpoch(intakeId));
-      if (!row) return undefined;
-      const value = JSON.parse(String(row.value)) as CollectionReportGroupSummary;
-      value.intakeVersion = intakeSourceVersion(db, intakeId).version;
-      const logical = openIntakeCollectionEnvelope(db, { id: intakeId }).logical;
-      const refresh = (field: unknown) => {
-        if (
-          field &&
-          typeof field === 'object' &&
-          (field as { format?: string }).format === 'health-intake-review-fragment-v1'
-        )
-          (field as IntakeReviewFragmentReference).logical = logical;
-      };
-      for (const field of [
-        value.title,
-        value.source,
-        value.original.filename,
-        value.member?.filename,
-        value.member?.locator,
-        value.report,
-        value.reportContext,
-      ])
-        refresh(field);
-      for (const kind of ['current', 'saved'] as const) {
-        const cursor = value.sourceCoverage[kind].bySource.nextCursor;
-        if (cursor) {
-          const parts = JSON.parse(Buffer.from(cursor, 'base64url').toString());
-          parts[0] = binding;
-          value.sourceCoverage[kind].bySource.nextCursor = Buffer.from(
-            JSON.stringify(parts),
-          ).toString('base64url');
-        }
+      const key = JSON.stringify([intakeId, ordinal]),
+        proof = summaryProofs.get(key);
+      if (!row || !proof || proof.value !== row.value) {
+        discardSummary(intakeId, ordinal);
+        return undefined;
       }
-      return value;
+      try {
+        return await proof.artifacts.withVerifiedTerminal({ assertCurrent }, () => {
+          if (
+            summaryProofs.get(key) !== proof ||
+            cache
+              .prepare('SELECT value FROM summaries WHERE intake=? AND ordinal=? AND grounding=?')
+              .get(intakeId, ordinal, currentGroundingEpoch(intakeId))?.value !== proof.value
+          )
+            throw changed();
+          const value = JSON.parse(String(row.value)) as CollectionReportGroupSummary;
+          value.intakeVersion = intakeSourceVersion(db, intakeId).version;
+          const logical = openIntakeCollectionEnvelope(db, { id: intakeId }).logical;
+          const refresh = (field: unknown) => {
+            if (
+              field &&
+              typeof field === 'object' &&
+              (field as { format?: string }).format === 'health-intake-review-fragment-v1'
+            )
+              (field as IntakeReviewFragmentReference).logical = logical;
+          };
+          for (const field of [
+            value.title,
+            value.source,
+            value.original.filename,
+            value.member?.filename,
+            value.member?.locator,
+            value.report,
+            value.reportContext,
+          ])
+            refresh(field);
+          for (const kind of ['current', 'saved'] as const) {
+            const cursor = value.sourceCoverage[kind].bySource.nextCursor;
+            if (cursor) {
+              const parts = JSON.parse(Buffer.from(cursor, 'base64url').toString());
+              parts[0] = binding;
+              value.sourceCoverage[kind].bySource.nextCursor = Buffer.from(
+                JSON.stringify(parts),
+              ).toString('base64url');
+            }
+          }
+          summaryProofs.delete(key);
+          summaryProofs.set(key, proof);
+          return value;
+        });
+      } catch (error) {
+        discardSummary(intakeId, ordinal);
+        throw error;
+      }
     },
-    cacheSummary(value: CollectionReportGroupSummary) {
+    discardSummary,
+    cacheSummary(
+      value: CollectionReportGroupSummary,
+      proof: {
+        artifacts: ReturnType<typeof createClinicalReviewArtifactProof>;
+        close(): void;
+      },
+    ) {
+      const encoded = JSON.stringify(value),
+        key = JSON.stringify([value.intakeId, value.groupOrdinal]);
       cache
         .prepare('INSERT OR REPLACE INTO summaries VALUES(?,?,?,?)')
-        .run(
-          value.intakeId,
-          value.groupOrdinal,
-          JSON.stringify(value),
-          currentGroundingEpoch(value.intakeId),
-        );
+        .run(value.intakeId, value.groupOrdinal, encoded, currentGroundingEpoch(value.intakeId));
+      discardSummary(value.intakeId, value.groupOrdinal);
+      summaryProofs.set(key, { ...proof, value: encoded });
+      while (summaryProofs.size > 64) {
+        const oldest = summaryProofs.keys().next().value!;
+        summaryProofs.get(oldest)!.close();
+        summaryProofs.delete(oldest);
+      }
     },
     cacheMemberFacts: putFacts,
     beginSummary(intakeId: string, ordinal: number) {
@@ -1761,7 +1875,15 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
               throw new IntakeReviewFragmentRequired(reviewCache.reference);
             // A queued lease may have waited after its initial file verification.
             // Recheck every consumed physical identity before using a warm session.
-            const projection = collectionClinicalProjectionContext(reviewCache.session);
+            const selectedReview = reviewCache;
+            const projection = await collectionClinicalProjectionContextAsync(
+              selectedReview.session,
+              undefined,
+              assertRunning,
+            );
+            assertRunning();
+            assertCurrent();
+            if (reviewCache !== selectedReview) throw changed();
             retainArtifacts?.(projection.verifiedArtifacts());
             const record = reviewCache.session.record(
               member.recordId,
@@ -1956,7 +2078,7 @@ export async function collectionReportGroupSummary(
       queue.assertCurrent();
       const grounding = identityGroundingGeneration(db);
       if (!sourcePage) {
-        const cached = queue.summary(pointer.intakeId, pointer.ordinal);
+        const cached = await queue.summary(pointer.intakeId, pointer.ordinal);
         if (cached) return cached;
       }
       withIntakeWork(db, 'warm', () => recordIntakeWork('collectionQueueSummaryBuilds'));
@@ -1979,6 +2101,7 @@ export async function collectionReportGroupSummary(
         'CREATE TABLE sources(kind TEXT,source TEXT,count INTEGER,PRIMARY KEY(kind,source))',
       );
       let sourceReview: CollectionReportGroupSummary['sourceReview'] = null;
+      let retainedProof = false;
       try {
         const artifacts = createClinicalReviewArtifactProof(coverageDb, 'clinical_artifacts');
         const report = group && view.child(group, 'report');
@@ -2149,6 +2272,12 @@ export async function collectionReportGroupSummary(
         await withVerifiedIntakeOriginalDescriptor(
           { db, root, profileId, id: intakeId },
           async ({ assertRunning }) => {
+            const retained = db.prepare('SELECT path FROM source_files WHERE id=?').get(intakeId);
+            if (typeof retained?.path !== 'string') throw changed();
+            const path = profileOriginal(root, retained.path, profileId),
+              identity = intakeFileIdentity(path);
+            assertRunning();
+            artifacts.retain([{ id: intakeId, path, identity }]);
             for await (const pointer of people.pointersCooperative(groupId, assertRunning))
               if (!firstPerson || pointer.order < firstPerson.order) firstPerson = pointer;
           },
@@ -2171,46 +2300,55 @@ export async function collectionReportGroupSummary(
                   : selected?.member.locator || null,
             }
           : null;
-        queue.assertCurrent();
-        if (identityGroundingGeneration(db) !== grounding) throw changed();
-        artifacts.assertCurrent();
-        const summary: CollectionReportGroupSummary = {
-          format: 'health-intake-report-group-v2',
-          intakeId,
-          intakeVersion: intakeSourceVersion(db, intakeId).version,
-          groupId,
-          groupOrdinal: pointer.ordinal,
-          groupVersionId: current ? scalar<string>(view, current, 'id') || null : null,
-          basis: pointer.basis,
-          discoveryOrder: group ? (scalar<number>(view, group, 'discoveryOrder') ?? null) : null,
-          title:
-            pointer.basis === 'candidate_fallback'
-              ? fallbackTitle || (firstPerson ? people.person(firstPerson).title : '') || filename
-              : current
-                ? evidence(view, current, 'title')
-                : filename,
-          source: effective || intakeSource || issuer,
-          sourceScope: effective ? 'report' : intakeSource ? 'intake' : issuer ? 'issuer' : null,
-          date: dates.size === 1 ? [...dates][0]! : null,
-          original: {
-            filename,
-            contentUrl: '/api/sources/' + encodeURIComponent(intakeId) + '/content',
-            parentSourceFileId: scalar<string | null>(view, intake, 'parentSourceFileId') || null,
-          },
-          member,
-          report: group ? evidence(view, group, 'report') : null,
-          reportContext: current ? evidence(view, current, 'context') : null,
-          counts: tally,
-          peopleCounts: queue.peopleCounts(intakeId, groupId),
-          sourceCoverage,
-          sourceReview,
-          records: { intakeId, groupId },
-          people: { intakeId, groupId },
+        const assertSummaryCurrent = () => {
+          queue.assertCurrent();
+          if (identityGroundingGeneration(db) !== grounding) throw changed();
         };
-        if (!sourcePage) queue.cacheSummary(summary);
-        return summary;
+        return await artifacts.withVerifiedTerminal({ assertCurrent: assertSummaryCurrent }, () => {
+          const summary: CollectionReportGroupSummary = {
+            format: 'health-intake-report-group-v2',
+            intakeId,
+            intakeVersion: intakeSourceVersion(db, intakeId).version,
+            groupId,
+            groupOrdinal: pointer.ordinal,
+            groupVersionId: current ? scalar<string>(view, current, 'id') || null : null,
+            basis: pointer.basis,
+            discoveryOrder: group ? (scalar<number>(view, group, 'discoveryOrder') ?? null) : null,
+            title:
+              pointer.basis === 'candidate_fallback'
+                ? fallbackTitle || (firstPerson ? people.person(firstPerson).title : '') || filename
+                : current
+                  ? evidence(view, current, 'title')
+                  : filename,
+            source: effective || intakeSource || issuer,
+            sourceScope: effective ? 'report' : intakeSource ? 'intake' : issuer ? 'issuer' : null,
+            date: dates.size === 1 ? [...dates][0]! : null,
+            original: {
+              filename,
+              contentUrl: '/api/sources/' + encodeURIComponent(intakeId) + '/content',
+              parentSourceFileId: scalar<string | null>(view, intake, 'parentSourceFileId') || null,
+            },
+            member,
+            report: group ? evidence(view, group, 'report') : null,
+            reportContext: current ? evidence(view, current, 'context') : null,
+            counts: tally,
+            peopleCounts: queue.peopleCounts(intakeId, groupId),
+            sourceCoverage,
+            sourceReview,
+            records: { intakeId, groupId },
+            people: { intakeId, groupId },
+          };
+          if (!sourcePage) {
+            queue.cacheSummary(summary, { artifacts, close: coverageScratch.close });
+            retainedProof = true;
+          }
+          return summary;
+        });
+      } catch (error) {
+        if (retainedProof) queue.discardSummary(intakeId, pointer.ordinal);
+        throw error;
       } finally {
-        coverageScratch.close();
+        if (!retainedProof) coverageScratch.close();
       }
     },
     { operation: currentClinicalOperation(db) },

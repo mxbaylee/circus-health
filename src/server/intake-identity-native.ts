@@ -4,12 +4,16 @@ import {
   assertClinicalOperation,
   type ClinicalOperation,
 } from './clinical-operation.ts';
-import { collectionClinicalProjectionContext } from './intake-review-collection-session.ts';
+import { collectionClinicalProjectionContextAsync } from './intake-review-collection-session.ts';
 import {
   tryBorrowRetainedCollectionClinicalPolicy,
   type RetainedCollectionClinicalPolicy,
 } from './intake-report-group-collection.ts';
 import { createClinicalReviewArtifactProof } from './clinical-review-artifact-proof.ts';
+import {
+  captureManagedPhysicalEpoch,
+  managedPhysicalEpochCurrent,
+} from './clinical-review-physical-epoch.ts';
 import { runClinicalReviewWork } from './clinical-review-work.ts';
 /** Native common identity uses complete repeatable authority and exact scoped references. */
 import { createHash, randomUUID } from 'node:crypto';
@@ -17,6 +21,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import {
   HttpError,
   clinicalReviewRevision,
+  managedDatabaseMethodEpoch,
   revision as requestRevision,
   now,
   json,
@@ -89,6 +94,7 @@ import {
   prepareNativeDraftHistory,
 } from './intake-review-draft-state.ts';
 import { prepareRetainedPlanAccess, readRetainedPlanEvidence } from './intake-retained-plan.ts';
+import { prepareIntakeFilenameSummary } from './intake-summary-name.ts';
 import {
   prepareCollectionClinicalReviewDependencies,
   prepareCollectionClinicalReview,
@@ -254,6 +260,28 @@ async function open(
           sourceHash: scalar<string>(selected.view, selected.record, 'sourceHash')!,
         };
   };
+  const memberId = scalar<string>(view, groupRecord, 'memberId');
+  const selectedMember = memberId && member(memberId);
+  if (selectedMember) {
+    const child = identityChild(db, id, selectedMember);
+    if (child) {
+      const methods = managedDatabaseMethodEpoch(db);
+      const assertPreparation = () => {
+        assertCurrent();
+        if (!methods || managedDatabaseMethodEpoch(db) !== methods)
+          reject('The identity metadata preparation policy changed');
+      };
+      assertPreparation();
+      await prepareIntakeFilenameSummary(
+        db,
+        { id: String(child.id), sha256: selectedMember.sourceHash },
+        {
+          assertRunning: assertPreparation,
+        },
+      );
+      assertPreparation();
+    }
+  }
   const catalog = createReportSnapshotCatalog(db, file, {
     assertRunning: assertCurrent,
   });
@@ -433,6 +461,23 @@ async function open(
     assertCurrent,
   };
 }
+function identityChild(
+  db: DatabaseSync,
+  id: string,
+  member: { sourceHash: string; locator: string },
+) {
+  return db
+    .prepare(
+      "SELECT id FROM source_files WHERE sha256=? AND json_extract(details_json,'$.intake.parentSourceFileId')=? AND (json_extract(details_json,'$.intake.locator')=? OR (json_extract(details_json,'$.intake.locator.format')=? AND json_extract(details_json,'$.intake.locator.field')='locator' AND json_extract(details_json,'$.intake.locator.scalarHash')=?))",
+    )
+    .get(
+      member.sourceHash,
+      id,
+      member.locator,
+      COMPACT_SCALAR_FORMAT,
+      locatorScalarHash(member.locator),
+    );
+}
 async function evidence(context: Context) {
   const { db, root, profileId, id, file, group, scope } = context;
   if (group.basis !== 'report_anchor' || !group.report?.subject)
@@ -445,17 +490,7 @@ async function evidence(context: Context) {
   if (group.memberId) {
     const member = context.member(group.memberId);
     if (!member) return reject('This package occurrence is not in the retained inventory');
-    const child = db
-      .prepare(
-        "SELECT id FROM source_files WHERE sha256=? AND json_extract(details_json,'$.intake.parentSourceFileId')=? AND (json_extract(details_json,'$.intake.locator')=? OR (json_extract(details_json,'$.intake.locator.format')=? AND json_extract(details_json,'$.intake.locator.field')='locator' AND json_extract(details_json,'$.intake.locator.scalarHash')=?))",
-      )
-      .get(
-        member.sourceHash,
-        id,
-        member.locator,
-        COMPACT_SCALAR_FORMAT,
-        locatorScalarHash(member.locator),
-      );
+    const child = identityChild(db, id, member);
     if (!child || !intakeFirstLocatorMatches(db, String(child.id), member.locator))
       return reject('Open and retain this exact package member before confirming its identity');
     evidenceId = String(child.id);
@@ -482,7 +517,10 @@ async function evidence(context: Context) {
       } catch {
         return reject('This original needs individual identity review');
       }
-      text = decodeOriginalIdentityText(text, reference.filename);
+      text = decodeOriginalIdentityText(
+        text,
+        reference.filenameDescriptor?.suffix ?? reference.filename,
+      );
       if (original.mimeType === 'text/html')
         text = text
           .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
@@ -728,12 +766,16 @@ function rows() {
     assertArtifacts() {
       artifacts?.assertCurrent();
     },
+    *verifiedArtifacts() {
+      if (artifacts) yield* artifacts.verifiedArtifacts();
+    },
     withVerifiedTerminal<T>(
       controls: { assertCurrent(): void; signal?: AbortSignal },
-      complete: () => T,
+      complete: (terminalPhysicalCurrent: () => void) => T,
+      mode: 'read-only' | 'publication' = 'read-only',
     ): Promise<T> {
       if (!artifacts) throw Error('Retained artifact proof is unavailable');
-      return artifacts.withVerifiedTerminal(controls, complete);
+      return artifacts.withVerifiedTerminal(controls, complete, mode);
     },
     count,
     get,
@@ -752,6 +794,25 @@ function rows() {
   };
 }
 type Rows = ReturnType<typeof rows>;
+function verifiedIdentityPublication(context: Context, stored: Rows) {
+  return (commit: (terminalPhysicalCurrent: () => void) => void) => {
+    const methods = managedDatabaseMethodEpoch(context.db);
+    if (!methods) reject('Identity publication requires current database methods');
+    const assertCurrent = () => {
+      context.assertCurrent();
+      if (managedDatabaseMethodEpoch(context.db) !== methods)
+        reject('Identity publication methods changed');
+    };
+    return stored.withVerifiedTerminal(
+      { assertCurrent },
+      (terminalPhysicalCurrent) => {
+        commit(terminalPhysicalCurrent);
+        assertCurrent();
+      },
+      'publication',
+    );
+  };
+}
 function runNativeIdentityWork<T>(
   context: Context,
   stored: Rows,
@@ -775,6 +836,54 @@ function runNativeIdentityWork<T>(
       };
     },
   });
+}
+async function runNativeIdentityArtifactVerification(context: Context, stored: Rows) {
+  const { db } = context;
+  context.assertCurrent();
+  const stamp = reviewPreparationStamp(db),
+    methods = managedDatabaseMethodEpoch(db),
+    epoch = captureManagedPhysicalEpoch();
+  if (stamp === undefined || !methods || !epoch)
+    reject('Identity artifact verification requires current authority');
+  const originalEpoch = epoch!;
+  const assertAuthority = () => {
+    context.assertCurrent();
+    if (
+      reviewPreparationStamp(db) !== stamp ||
+      managedDatabaseMethodEpoch(db) !== methods ||
+      !managedPhysicalEpochCurrent(originalEpoch)
+    )
+      reject('Identity artifact authority changed during verification');
+  };
+  const originalScratch = disposableSqlite('fictional-identity-original-proof-');
+  try {
+    const original = createClinicalReviewArtifactProof(originalScratch.db, 'original_artifacts');
+    await runClinicalReviewWork(
+      (function* () {
+        for (const artifact of stored.verifiedArtifacts()) {
+          original.retain([artifact]);
+          yield;
+        }
+      })(),
+      { capture: () => (assertAuthority(), assertAuthority) },
+    );
+    assertAuthority();
+    const originalCurrent = await original.withVerifiedTerminal(
+      { assertCurrent: assertAuthority },
+      (physicalCurrent) => physicalCurrent,
+    );
+    const current = () => {
+      assertAuthority();
+      originalCurrent();
+    };
+    await runClinicalReviewWork(verifyPreviewArtifactsWork(context, stored), {
+      capture: () => (current(), current),
+    });
+    current();
+    await stored.withVerifiedTerminal({ assertCurrent: current }, () => undefined);
+  } finally {
+    originalScratch.close();
+  }
 }
 async function build(
   context: Context,
@@ -897,8 +1006,9 @@ async function build(
         cached = { proposalId, selected };
         assertPreparationCurrent();
         stored.retainArtifacts(
-          collectionClinicalProjectionContext(selected.session).verifiedArtifacts(),
+          (await collectionClinicalProjectionContextAsync(selected.session)).verifiedArtifacts(),
         );
+        assertPreparationCurrent();
       }
       // Acquire a new complete selection only after prerequisites and physical
       // authority are verified. Previously borrowed providers stay invalid.
@@ -1782,8 +1892,9 @@ async function collectGroupIdentity(context: Context, stored: Rows) {
           };
           context.assertCurrent();
           stored.retainArtifacts(
-            collectionClinicalProjectionContext(selected.session).verifiedArtifacts(),
+            (await collectionClinicalProjectionContextAsync(selected.session)).verifiedArtifacts(),
           );
+          context.assertCurrent();
         }
         const record = cached.session.record(
           occurrence.recordId,
@@ -1920,7 +2031,6 @@ function* verifyPreviewArtifactsWork(context: Context, stored: Rows): Generator<
   const seen = rows();
   try {
     context.assertCurrent();
-    stored.assertArtifacts();
     const original = getRetainedIntakeOriginalReference(db, root, profileId, id);
     withIntakeWork(db, 'warm', () => recordIntakeWork('identityPreviewArtifactChecks'));
     const originalIdentity = yield* verifyIntakeFileHashWork(original.path, {
@@ -1955,7 +2065,6 @@ function* verifyPreviewArtifactsWork(context: Context, stored: Rows): Generator<
         seen.put('verifiedProposals', proposalId, true);
       }
     }
-    stored.assertArtifacts();
     context.assertCurrent();
   } finally {
     seen.close();
@@ -2044,7 +2153,7 @@ export function getNativeIntakeIdentityReview(
           let proof: Rows | undefined;
           try {
             proof = rows();
-            await runNativeIdentityWork(context, proof, verifyPreviewArtifactsWork(context, proof));
+            await runNativeIdentityArtifactVerification(context, proof);
             const value = detachIdentityPreview(cached.value);
             const current = await proof.withVerifiedTerminal(
               {
@@ -2255,7 +2364,7 @@ async function getNativeIntakeIdentityReviewInner(
       context = await open(db, root, profileId, id, groupId, assertRunning);
       self = selfSnapshot(db);
       correctedPerson = correction();
-      await runNativeIdentityWork(context, stored, verifyPreviewArtifactsWork(context, stored));
+      await runNativeIdentityArtifactVerification(context, stored);
       const freshOriginal = await evidence(context);
       reuseFirstBuild =
         reuseFirstBuild && firstBuildCurrent() && sameOriginalEvidence(original, freshOriginal);
@@ -2269,6 +2378,7 @@ async function getNativeIntakeIdentityReviewInner(
         catalog: 'report.snapshots',
         catalogArea: 'builds',
         assertRunning: context.assertCurrent,
+        withVerifiedPublication: verifiedIdentityPublication(context, stored),
       });
       await writeSnapshot(context, built, stored, catalog, 'preview');
       const inlineWarnings: IntakeIdentityWarning[] = [];
@@ -2298,15 +2408,25 @@ async function getNativeIntakeIdentityReviewInner(
       const collections = selectedEnvelopeStore(db, context.file).collections,
         operationId = randomUUID();
       assertRunning();
-      if (changes.length)
-        collections.commitMaintenance(
-          collections.prepare(collections.openView(), {
-            operationId,
-            requestDigest: hash(operationId),
-            domainVersion: context.before.rawVersion,
-            changes,
-          }),
-        );
+      if (changes.length) {
+        const prepared = collections.prepare(collections.openView(), {
+          operationId,
+          requestDigest: hash(operationId),
+          domainVersion: context.before.rawVersion,
+          changes,
+        });
+        try {
+          await verifiedIdentityPublication(
+            context,
+            stored,
+          )((terminalPhysicalCurrent) => {
+            terminalPhysicalCurrent();
+            collections.commitMaintenance(prepared, { assertCurrent: terminalPhysicalCurrent });
+          });
+        } finally {
+          collections.disposePreparation(prepared);
+        }
+      }
       rememberPreview(db, built.display);
       const value: IntakeIdentityReview = {
         ...built.assessment,
@@ -2320,7 +2440,7 @@ async function getNativeIntakeIdentityReviewInner(
         correctedPerson,
         ...peoplePreview(db),
       };
-      await runNativeIdentityWork(context, stored, verifyPreviewArtifactsWork(context, stored));
+      await runNativeIdentityArtifactVerification(context, stored);
       return await stored.withVerifiedTerminal(
         {
           assertCurrent: () => {
@@ -2778,6 +2898,7 @@ async function confirmNativeIntakeIdentityScopeInner(
       try {
         const original = await evidence(context),
           built = await build(context, original, stored);
+        await runNativeIdentityArtifactVerification(context, stored);
         const preparedPerson =
           input.personSelection && 'newPerson' in input.personSelection
             ? {
@@ -2830,10 +2951,12 @@ async function confirmNativeIntakeIdentityScopeInner(
           );
         const catalog = createReportSnapshotCatalog(db, file, {
           assertRunning: context.assertCurrent,
+          withVerifiedPublication: verifiedIdentityPublication(context, stored),
         });
         const draftCatalog = createReportSnapshotCatalog(db, file, {
           catalog: 'review.snapshots',
           assertRunning: context.assertCurrent,
+          withVerifiedPublication: verifiedIdentityPublication(context, stored),
         });
         const at = now(),
           correction = planned.assignedPerson

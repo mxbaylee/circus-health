@@ -326,14 +326,44 @@ checked derivative against the selected exact occurrence, preserving SQLite's
 first-member and operational last-member semantics rather than joining labels.
 
 HTTP and assistant readiness cooperatively prepare complete older native
-projections before presentation. The private, single-use publication proof
+projections before presentation. Identity preparation covers only the exact
+retained child before sealing its scope. Packet export preparation covers the
+selected citations and their checked ancestry, keeping the original selection
+pinned across cooperative checkpoints. Ancestry authorization reads the exact
+parent edge without requiring filename presentation. Filename-based format
+rules use the checked suffix, not the shortened display label.
+The private, single-use publication proof
 certifies the exact retained graph and complete source row, then permits only
 the derived `details_json` replacement in its owner transaction. Ordinary
 maintenance cannot write source rows. The original and exact selected envelope
 remain unchanged, and the public/domain version does not advance. Policy,
-schema, peer, source, selected-head or physical-authority drift refuses the proof;
+schema, peer, source, selected-head, configured accepted-HEAD or managed physical
+mutation drift refuses the proof;
 cancellation does not publish a partial proof. Warm name/locator metadata and
 assistant source bindings do not reread those giant scalar bytes.
+The source replacement remains an accepted record version, with its exact prior
+version and field-history references. Compatibility preparation compares the old
+record's fields cooperatively using a disposable disk-backed derivative rather
+than decoding a giant prior source header during publication. Its private field
+digests are signed and retain exact scratch SQL, schema, peer and membership
+continuity; a disposable row or point result cannot supply a new comparison.
+The actual encrypted-vault path pairs this comparator with an adapter-owned
+worker replay of the accepted HEAD. It verifies the exact source preimage,
+column digests, metadata predecessors, retained originals, complete vault
+namespace and included workspace against accepted manifest data. Selected queue
+files are checked by their exact frontier, not by adopting unselected history or
+crash tails. Changed immutable objects are created before the owner transaction;
+the worker checks the original namespace plus exact owned additions before the
+fixed SQL publication consumes the matching records and operation once. Ordinary
+record publication and its workspace callback are unchanged.
+The compact workspace path instead compares the workspace against the accepted
+manifest in its worker; it does not invoke the ordinary workspace callback again
+or authorize arbitrary publication callbacks.
+
+The current compatibility verifier reconstructs accepted profile history for
+each cold proof. Repeated-source proof reuse and bounded oversized-source replay
+remain unfinished qualification requirements, not a global recovery bound or a
+completed scaling claim.
 
 This contracts these two known string fields, not arbitrary metadata. ZIP names
 have their format's declared name-byte bound, while PDF attachment keys and
@@ -666,10 +696,21 @@ issue token or list.
 Read-only record sections and their fragments share the existing one-session
 public review cache with record and review pages. They select the exact record
 and candidate version from its complete policy, render a bounded response
-synchronously, and detach that response before rechecking consumed physical
-evidence and current authority. A caller receives no session or mutable policy
-alias. Failed rendering or a cancelled result handoff discards the matching
-cached attempt; mutation preparation continues to own its separate session.
+synchronously, and detach that response before verifying the originally captured
+consumed physical identities in worker pages and checking current authority. A
+caller receives no session or mutable policy alias. Failed rendering or a
+cancelled result handoff discards the matching cached attempt; mutation
+preparation continues to own its separate session. Async clinical preparation
+uses the same complete worker proof before returning a ready session. The
+private consumed-source rows are sealed against scratch replacement. Synchronous
+session callers still check all consumed physical identities on the request thread; these paths
+remain outside the cooperative host-read claim.
+Worker proofs retain the original identities and reject managed application
+writes through their final handoff. They do not provide an atomic filesystem
+snapshot against unrelated host processes: an unmanaged rewrite after its page
+was checked can be observed by the next proof rather than the current response.
+This temporal limit does not authorize refreshing the captured identities or
+ignoring managed writes between pages and handoff.
 The first cold request still constructs the complete selected review.
 Referenced question and report-link sections use session-owned dense ordinal
 indexes for later pages and fragments; they do not replay preceding entries.
@@ -728,6 +769,13 @@ write attempt and the final unchanged logical binding are accounted for. Unknown
 SQL, rollback, failed outcomes, protected TEMP/schema changes, peer/profile/registry
 drift and mixed or legacy originals require complete derivation. Neither an old
 raw stamp nor an old token is simply refreshed.
+The fixed duplicate-evidence and clinical-source SQL functions are registered
+before capturing the lookup frontier, without constructing their indexes.
+Their guarded cold index builders can add only their own disposable TEMP
+objects; they do not authorize protected source writes. Replacing either
+function, including a failed registration attempt, invalidates its index and
+the prior frontier. Repair rebuilds the index under the fixed function and
+does not revive the old proof.
 Existing receipt rows join the freshly validated source head instead of being
 rewritten when that head changes. Detached hints are bounded to 64 keys per
 source, at most 100 sources and 1 MiB of retained string data per operation.
@@ -835,10 +883,34 @@ Parsing, replay and directory enumeration check that owner before resuming;
 enumeration yields after at most 64 entries even when names are ignored or
 journals are empty. Cancelled cold work removes its private scratch before a
 successor enters. A cancelled warm reader does not discard another valid shared
-activity index. Completion still requires the existing synchronous physical
-marker check across all journals; this remains work proportional to journal
-count, not a new constant-work physical frontier or an immediate cancellation
-guarantee during that final check.
+activity index. Complete physical marker verification runs off the request thread
+in pages of at most 64 selected markers, retaining their original hashes or
+legacy absence and the original container identities. The closing check retains
+the original scratch, owner and managed filesystem-mutation witnesses; it does
+not adopt a new physical baseline. Total verification work remains proportional
+to journal count, not a constant-work physical frontier.
+
+Physical-worker transport retains at most 64 items and the existing per-field
+bounds, but splits their encoded representation into messages of at most 512 KiB.
+Escaped fields cannot enlarge a message or cause an otherwise valid item to be
+omitted. Each bounded input is detached before asynchronous verification, and
+all resulting pages retain their order. Startup cancellation waits for the
+worker's module-loading readiness boundary and drains its exit before returning.
+
+Report-source routing uses a private disk-backed cache tied to the profile
+connection lifetime. Preparing routing does not write the profile connection's
+main or TEMP schema, so it cannot invalidate an in-progress queue merely by
+building its own disposable rows. Routing still checks both its private cache
+and the profile's original SQL and collection-registry witnesses; changed or
+rolled-back rows require complete selected-source reconstruction. Closing the
+profile also removes the routing scratch.
+
+Publishing a new batch marks its disposable ordering as unprepared instead of
+synchronously enumerating all batch directories. Guarded preparation revisits
+batch IDs in bounded turns, preserving filesystem-order ties without replaying
+retained events. No reader can consume partially repaired ordering. Cancellation
+leaves that ordering unprepared, and retry must finish both ordering and the
+complete physical marker proof before exposing it.
 
 Queue source binding scans yield after at most 64 originals under one unchanged
 database, TEMP, peer, registry and managed-method witness. The final pass validates

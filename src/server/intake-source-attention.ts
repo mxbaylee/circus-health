@@ -9,6 +9,7 @@ import {
 } from './clinical-operation.ts';
 import {
   execClinicalReviewMaintenance,
+  runClinicalReviewMaintenance,
   prepareClinicalReviewMaintenance,
   registerAttentionMaintenanceObserver,
 } from './clinical-review-maintenance.ts';
@@ -176,7 +177,7 @@ function prepareTables(db: Database, resetTriggers = false) {
     `CREATE TEMP TABLE IF NOT EXISTS ${state}(singleton INTEGER PRIMARY KEY,profile_id TEXT NOT NULL,data_version INTEGER NOT NULL)`,
   ])
     execClinicalReviewMaintenance(db, 'attention', sql);
-  if (!complete) execClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${state}`);
+  if (!complete) runClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${state}`);
   if (resetTriggers)
     for (const kind of ['files', 'meta'])
       for (const action of ['insert', 'update', 'delete'])
@@ -249,7 +250,7 @@ async function readPreparedSourceAttentionOwned(
     owned(guard, () => {
       prepareTables(db, true);
       installGuardTriggers(db, guard);
-      execClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${state}`);
+      runClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${state}`);
       guard.invalid = false;
     });
   const dataVersion = () => Number(db.prepare('PRAGMA data_version').get()!.data_version),
@@ -279,9 +280,9 @@ async function readPreparedSourceAttentionOwned(
     selected.data_version !== selectedDataVersion
   ) {
     owned(guard, () => {
-      execClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${rows}`);
-      execClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${dirty}`);
-      execClinicalReviewMaintenance(
+      runClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${rows}`);
+      runClinicalReviewMaintenance(db, 'attention', `DELETE FROM temp.${dirty}`);
+      runClinicalReviewMaintenance(
         db,
         'attention',
         `INSERT INTO temp.${dirty} SELECT id FROM source_files WHERE kind='intake_original'`,

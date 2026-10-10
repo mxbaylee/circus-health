@@ -72,16 +72,19 @@ export function intakeJsonCanonicalWorkObserver(db: DatabaseSync, phase: IntakeW
     });
 }
 
-export async function prepareIntakeJsonCanonical(
+export interface IntakeJsonCanonicalOptions {
+  mode?: 'canonical' | 'stringify';
+  /** Preserve each valid numeric token for literal-preserving authority hashes. */
+  preserveNumbers?: boolean;
+  assertRunning?: () => void;
+  onWork?: (work: Readonly<IntakeJsonCanonicalWork>) => void;
+}
+
+/** The same parser with explicit work boundaries for off-host replay drivers. */
+export function* prepareIntakeJsonCanonicalSteps(
   pieces: Iterable<string>,
-  options: {
-    mode?: 'canonical' | 'stringify';
-    /** Preserve each valid numeric token for literal-preserving authority hashes. */
-    preserveNumbers?: boolean;
-    assertRunning?: () => void;
-    onWork?: (work: Readonly<IntakeJsonCanonicalWork>) => void;
-  } = {},
-): Promise<PreparedIntakeJsonCanonical> {
+  options: IntakeJsonCanonicalOptions = {},
+): Generator<void, PreparedIntakeJsonCanonical> {
   if (options.mode !== undefined && options.mode !== 'canonical' && options.mode !== 'stringify')
     throw Error('Invalid JSON canonical mode');
   options.assertRunning?.();
@@ -92,18 +95,36 @@ export async function prepareIntakeJsonCanonical(
     options.onWork,
     options.preserveNumbers ?? false,
   );
+  let complete = false;
   try {
     for (const _ of engine.prepare()) {
       void _;
       options.assertRunning?.();
       engine.work.yields++;
-      await setImmediate();
+      yield;
     }
     options.assertRunning?.();
-    return engine.result();
-  } catch (error) {
-    engine.close();
-    throw error;
+    const result = engine.result();
+    complete = true;
+    return result;
+  } finally {
+    if (!complete) engine.close();
+  }
+}
+
+export async function prepareIntakeJsonCanonical(
+  pieces: Iterable<string>,
+  options: IntakeJsonCanonicalOptions = {},
+): Promise<PreparedIntakeJsonCanonical> {
+  const steps = prepareIntakeJsonCanonicalSteps(pieces, options);
+  try {
+    for (;;) {
+      const next = steps.next();
+      if (next.done) return next.value;
+      await setImmediate();
+    }
+  } finally {
+    steps.return(undefined as never);
   }
 }
 

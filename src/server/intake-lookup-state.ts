@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { currentTransactionToken, rejectCurrentTransaction } from './database.ts';
+import { ensureDuplicateEvidenceFunction } from './duplicate-evidence-index.ts';
+import { ensureClinicalSourceFingerprintFunction } from './intake-clinical-source-index.ts';
 import { intakeEnvelopeAuthorityBinding, type IntakeEnvelopeSource } from './intake-authority.ts';
 import {
   hasIntakeCollectionEnvelope,
@@ -215,6 +217,9 @@ export async function prepareIntakeLookupIndices(
 ) {
   if (db.isTransaction)
     throw Error('Intake lookup preparation requires an outside-transaction maintenance phase');
+  options.assertRunning?.();
+  ensureDuplicateEvidenceFunction(db);
+  ensureClinicalSourceFingerprintFunction(db);
   const prior = preparedLookupReads.get(db);
   preparedLookupReads.delete(db);
   options.assertRunning?.();
@@ -224,10 +229,14 @@ export async function prepareIntakeLookupIndices(
   }
   if (prior?.frontier) {
     const nativeTransition = nativeIntakeLookupCatalogAllOriginalsNative(db, prior);
-    const readInterval = nativeTransition
-      ? readIntakeFrontierAcceptedTransition
-      : readIntakeFrontierAttempts;
-    const interval = readInterval(db, prior.frontier);
+    // Fixed maintenance needs no accepted outcome. Only the separate accepted
+    // transition may account for one ordinary clinical owner transaction.
+    const maintenance = readIntakeFrontierAttempts(db, prior.frontier);
+    const readInterval =
+      maintenance || !nativeTransition
+        ? readIntakeFrontierAttempts
+        : readIntakeFrontierAcceptedTransition;
+    const interval = maintenance ?? readInterval(db, prior.frontier);
     const stamp = reviewReadStamp(db);
     const registry = intakeCollectionCacheGeneration(db);
     const projection = intakeLookupProjectionGeneration(db);
@@ -272,11 +281,16 @@ export async function prepareIntakeLookupIndices(
         reused: prior.reused,
         discoveryRevision: prior.discoveryRevision,
       };
+      const unchangedMaintenanceHeads =
+        maintenance !== undefined &&
+        maintenance.ordinaryTokens.length === 0 &&
+        nativeTransition &&
+        nativeIntakeLookupCatalogHeadBindingsEqual(db, prior, maintenance.headSourceIds);
       const changed = await advanceNativeIntakeLookupCatalog(
         db,
         prior,
         next,
-        interval.headSourceIds,
+        unchangedMaintenanceHeads ? [] : interval.headSourceIds,
         interval.ordinaryTokens[0],
         current,
         options,

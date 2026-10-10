@@ -22,6 +22,11 @@ only v1 projections can refuse the updated runtime state: use the separate
 checked pre-update backup for prior-build recovery, not the candidate's working
 runtime. Arbitrary older acquisition and other metadata remain outside this
 two-field contraction; CRS-231's integrated release qualification is still open.
+The candidate's encrypted compatibility publication also verifies the actual
+accepted backing and stages only changed immutable objects before its fixed
+transaction. This does not qualify bounded cold source-history reconstruction
+or repeated-source proof reuse; those remain release gates, with no extra
+operator setting or permitted authority downgrade.
 See the [bounded-view contract](../data/intake-bounded-views.md).
 
 Native Import report-group pages now use a disposable indexed group order and retained page totals. After updating, reload an open Import queue if its older group cursor is refused; its cursor is navigation state and is not portable across this change. No original, accepted-record or operator-configuration migration is required. The prior build continues to use its own queue ordering and cache behavior. See the [report review queue contract](../../src/server/INTAKE.md#report-review-queue).

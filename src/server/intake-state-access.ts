@@ -30,6 +30,7 @@ import {
 } from './intake-collection-envelope.ts';
 import {
   isIntakeCompactScalar,
+  isPreparedIntakeCompactScalar,
   compactIntakeScalar,
   type IntakeCompactScalar,
 } from './intake-compact-scalar.ts';
@@ -119,6 +120,28 @@ export type IntakeSourceMetadata = Omit<
   originalName: string | IntakeCompactScalar;
   locator?: string | IntakeCompactScalar;
 };
+/** Ancestry authorization depends on the exact parent, not presentation facts. */
+export function intakeSourceParent(db: DatabaseSync, id: string): unknown {
+  const source = db
+    .prepare("SELECT id,kind,sha256 FROM main.source_files WHERE id=? AND kind='intake_original'")
+    .get(id);
+  if (!source) throw Error('Source intake not found');
+  if (
+    !hasIntakeCollectionEnvelope(
+      db,
+      source as unknown as Parameters<typeof openIntakeCollectionEnvelope>[1],
+    )
+  )
+    return intakeSourceMetadata(db, id).parentSourceFileId;
+  const view = openIntakeCollectionEnvelope(db, { id, sha256: source.sha256 as string });
+  const intake = view.child(view.root(), 'intake');
+  if (!intake) throw Error('Source intake header missing');
+  const selected = view.field(intake, 'parentSourceFileId', { bytes: 16384 });
+  if (selected.kind === 'missing') return undefined;
+  if (selected.kind === 'value') return selected.value;
+  // Preserve retained parent representations; this is not a new ID length cap.
+  return JSON.parse([...view.fieldChunks(intake, 'parentSourceFileId')].join(''));
+}
 
 /** A checked compact source header, independent of inventory/workflow size.
  * Current authority and source identity are still checked on every call. The
@@ -165,8 +188,14 @@ export function intakeSourceMetadata(db: DatabaseSync, id: string): IntakeSource
   const value = JSON.parse(source.details_json as string) as { intake: IntakeSourceMetadata };
   for (const field of ['originalName', 'locator'] as const) {
     const scalar = value.intake?.[field];
-    if (!isIntakeCompactScalar(scalar)) continue;
-    if (!view || scalar.field !== field)
+    if (!scalar || typeof scalar !== 'object') continue;
+    // Only a scalar cell can produce a compact string descriptor. Retained
+    // objects, including descriptor-shaped objects, remain ordinary values.
+    if (view) {
+      const intake = view.child(view.root(), 'intake');
+      if (intake && view.child(intake, field)) continue;
+    } else continue;
+    if (!isIntakeCompactScalar(scalar) || scalar.field !== field)
       throw Error('Source metadata scalar requires native evidence');
     const intake = view.child(view.root(), 'intake');
     if (!intake) throw Error('Source intake header missing');
@@ -178,12 +207,14 @@ export function intakeSourceMetadata(db: DatabaseSync, id: string): IntakeSource
         'Prepare the selected source metadata first.',
       );
     const facts = parseIntakeFilenameFacts(cell.facts);
+    const prepared = compactIntakeScalar(field, facts);
     if (
       facts.binding !== cell.binding ||
       facts.bytes !== cell.bytes ||
-      JSON.stringify(compactIntakeScalar(field, facts)) !== JSON.stringify(scalar)
+      JSON.stringify(prepared) !== JSON.stringify(scalar)
     )
       throw Error('Source metadata scalar conflicts with exact evidence');
+    value.intake[field] = prepared;
   }
   return value.intake;
 }
@@ -194,7 +225,7 @@ export function intakeMetadataScalarReference(
   metadata: IntakeSourceMetadata,
 ): IntakeMetadataScalarReference | undefined {
   const scalar = metadata[field];
-  if (!isIntakeCompactScalar(scalar)) return undefined;
+  if (!isPreparedIntakeCompactScalar(scalar)) return undefined;
   const source = db.prepare('SELECT sha256 FROM main.source_files WHERE id=?').get(id);
   const view = openIntakeCollectionEnvelope(db, { id, sha256: source?.sha256 as string });
   const version = intakeSourceVersion(db, id);
@@ -219,7 +250,7 @@ export function intakeFirstLocatorMatcher(
 ): (exact: string) => boolean {
   const source = db
     .prepare(
-      "SELECT id,kind,sha256,details_json,json_extract(details_json,'$.intake.locator') locator FROM main.source_files WHERE id=?",
+      "SELECT id,kind,sha256,details_json,json_type(details_json,'$.intake.locator') locatorType,json_extract(details_json,'$.intake.locator') locator FROM main.source_files WHERE id=?",
     )
     .get(id);
   if (!source || source.kind !== 'intake_original') return () => false;
@@ -228,14 +259,11 @@ export function intakeFirstLocatorMatcher(
     source as unknown as Parameters<typeof intakeEnvelopeAuthorityBinding>[1],
   );
   if (typeof source.locator !== 'string') return () => false;
-  let value: unknown;
-  try {
-    value = JSON.parse(source.locator);
-  } catch {
-    return (exact) => source.locator === exact;
-  }
-  if (!isIntakeCompactScalar(value) || value.field !== 'locator')
-    return (exact) => source.locator === exact;
+  const native = hasIntakeCollectionEnvelope(
+    db,
+    source as unknown as Parameters<typeof openIntakeCollectionEnvelope>[1],
+  );
+  if (!native) return (exact) => source.locatorType === 'text' && source.locator === exact;
   const view = openIntakeCollectionEnvelope(
     db,
     { id, sha256: source.sha256 as string },
@@ -243,6 +271,22 @@ export function intakeFirstLocatorMatcher(
   );
   const intake = view.child(view.root(), 'intake');
   if (!intake) return () => false;
+  if (source.locatorType === 'text') {
+    const selected = view.field(intake, 'locator', { bytes: 16384 });
+    if (selected.kind === 'fragmented')
+      throw new HttpError(
+        409,
+        'INTAKE_SUMMARY_UNAVAILABLE',
+        'Prepare the selected source metadata first.',
+      );
+    if (selected.kind !== 'value' || selected.value !== source.locator)
+      throw Error('Source locator conflicts with exact first-occurrence evidence');
+    return (exact) => source.locator === exact;
+  }
+  if (source.locatorType !== 'object') return () => false;
+  if (view.child(intake, 'locator')) return () => false;
+  const value: unknown = JSON.parse(source.locator);
+  if (!isIntakeCompactScalar(value) || value.field !== 'locator') return () => false;
   const cell = intakeEnvelopeFilenameCell(view, intake, 'locator');
   if (cell.facts === undefined)
     throw new HttpError(

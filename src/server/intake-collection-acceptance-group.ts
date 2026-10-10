@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { HttpError, revision, type Database } from './database.ts';
 import { canonicalLiteral, cloneLiteral } from './intake-format.ts';
 import {
-  collectionClinicalProjectionContext,
+  collectionClinicalProjectionContextAsync,
   type CollectionClinicalReviewSession,
 } from './intake-review-collection-session.ts';
 import {
@@ -86,8 +86,18 @@ export async function prepareNativeIntakeAcceptanceGroup(
 ) {
   if (!input.members.length || input.members.length > 100)
     throw new HttpError(400, 'REPORT_ACCEPTANCE_INPUT', 'Select 1–100 proposal blocks');
-  const members = input.members.map((member) => {
-    const context = collectionClinicalProjectionContext(member.session);
+  const members = [] as (NativeAcceptanceGroupMember & {
+    context: Awaited<ReturnType<typeof collectionClinicalProjectionContextAsync>>;
+    source: Awaited<
+      ReturnType<typeof collectionClinicalProjectionContextAsync>
+    >['proposal']['file'];
+    version: ReturnType<typeof intakeSourceVersion>;
+    decisions: ReturnType<typeof nativeAcceptanceDecisions>;
+  })[];
+  for (const member of input.members) {
+    input.assertRunning?.();
+    const context = await collectionClinicalProjectionContextAsync(member.session);
+    input.assertRunning?.();
     if (
       context.db !== db ||
       context.profileId !== profileId ||
@@ -108,8 +118,8 @@ export async function prepareNativeIntakeAcceptanceGroup(
         'VERSION_CONFLICT',
         'This intake changed. Reload it before continuing.',
       );
-    return { ...member, context, source, version, decisions };
-  });
+    members.push({ ...member, context, source, version, decisions });
+  }
   const count = members.reduce((sum, m) => sum + m.decisions.length, 0),
     bytes = members.reduce((sum, m) => sum + Number(m.context.proposal.inputFile.bytes), 0),
     candidates = new Set<string>(),

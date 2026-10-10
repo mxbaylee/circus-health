@@ -47,12 +47,12 @@ export function usesNativeOwnershipEvidence(db: Database) {
     if (hasIntakeCollectionEnvelope(db, row as { id: string })) return true;
   return false;
 }
-function referencePreview(
+async function referencePreview(
   preview: OwnershipPreview,
   plan: PreparedOwnershipNamePlan,
   report?: PreparedOwnershipReportPlan,
-): OwnershipPreviewReference | OwnershipReportPreviewReference {
-  if (report) return report.publicPreview();
+): Promise<OwnershipPreviewReference | OwnershipReportPreviewReference> {
+  if (report) return report.withVerifiedRead(() => report.publicPreview());
   const { names, ...header } = preview;
   const selected = preview as OwnershipPreview & { blockerEvidence?: OwnershipBlockerReference };
   const publicRecords = preview.records.map((record) => {
@@ -97,12 +97,17 @@ async function prepare(
         );
     },
   });
-  return {
-    preview: report.finalize(),
-    plan: report.plan,
-    report,
-    blockers: undefined as OwnershipBlockerStore | undefined,
-  };
+  try {
+    return {
+      preview: await report.finalizeVerified(),
+      plan: report.plan,
+      report,
+      blockers: undefined as OwnershipBlockerStore | undefined,
+    };
+  } catch (error) {
+    report.close();
+    throw error;
+  }
 }
 export async function previewNativeRecordOwnership(
   db: Database,
@@ -121,8 +126,9 @@ export async function previewNativeRecordOwnership(
           'The selected ownership evidence is still being prepared',
         );
       preparingPlans.add(db);
+      let prepared: Awaited<ReturnType<typeof prepare>> | undefined;
       try {
-        const prepared = await prepare(db, root, profileId, input, options);
+        prepared = await prepare(db, root, profileId, input, options);
         const previous = selectedPlans.get(db);
         if (
           previous &&
@@ -134,7 +140,9 @@ export async function previewNativeRecordOwnership(
         ) {
           let currentPrevious = false;
           try {
-            previous.plan.assertCurrent();
+            if (previous.report)
+              await previous.report.withVerifiedRead(() => previous.plan.assertCurrent());
+            else previous.plan.assertCurrent();
             currentPrevious = true;
           } catch {
             /* Stale previous authority supplies no decisions. */
@@ -153,7 +161,7 @@ export async function previewNativeRecordOwnership(
             }
           }
           prepared.preview = prepared.report
-            ? prepared.report.finalize()
+            ? await prepared.report.finalizeVerified()
             : previewRecordOwnership(db, root, profileId, prepared.plan.request, {
                 namePlan: prepared.plan,
                 blockerStore: prepared.blockers,
@@ -162,7 +170,11 @@ export async function previewNativeRecordOwnership(
         if (previous?.report) previous.report.close();
         else previous?.plan.close();
         selectedPlans.set(db, { ...prepared, scopeToken: prepared.preview.scopeToken, profileId });
-        return referencePreview(prepared.preview, prepared.plan, prepared.report);
+        return await referencePreview(prepared.preview, prepared.plan, prepared.report);
+      } catch (error) {
+        prepared?.report.close();
+        if (prepared && selectedPlans.get(db)?.report === prepared.report) selectedPlans.delete(db);
+        throw error;
       } finally {
         preparingPlans.delete(db);
       }
@@ -170,7 +182,7 @@ export async function previewNativeRecordOwnership(
     { operation: currentClinicalOperation(db) },
   );
 }
-export function chooseNativeOwnershipName(
+export async function chooseNativeOwnershipName(
   db: Database,
   root: string,
   profileId: string,
@@ -178,18 +190,38 @@ export function chooseNativeOwnershipName(
   key: string,
   outcome: import('../shared/record-ownership.ts').OwnershipNameEffect['decision'],
 ) {
-  const plan = nativeOwnershipNamePlan(db, profileId, token);
-  plan.choose(key, outcome);
-  const report = selectedPlans.get(db)?.report,
-    blockers = selectedPlans.get(db)?.blockers;
-  const preview = report
-    ? report.finalize()
-    : previewRecordOwnership(db, root, profileId, plan.request, {
-        namePlan: plan,
-        blockerStore: blockers,
-      });
-  selectedPlans.set(db, { plan, report, blockers, scopeToken: preview.scopeToken, profileId });
-  return referencePreview(preview, plan, report);
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      const plan = nativeOwnershipNamePlan(db, profileId, token),
+        report = selectedPlans.get(db)?.report,
+        blockers = selectedPlans.get(db)?.blockers;
+      preparingPlans.add(db);
+      try {
+        const finalize = () => {
+          plan.choose(key, outcome);
+          return report
+            ? report.finalize()
+            : previewRecordOwnership(db, root, profileId, plan.request, {
+                namePlan: plan,
+                blockerStore: blockers,
+              });
+        };
+        const preview = report ? await report.withVerifiedPublication(finalize) : finalize();
+        selectedPlans.set(db, {
+          plan,
+          report,
+          blockers,
+          scopeToken: preview.scopeToken,
+          profileId,
+        });
+        return await referencePreview(preview, plan, report);
+      } finally {
+        preparingPlans.delete(db);
+      }
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export function nativeOwnershipNamePlan(db: Database, profileId: string, token: string) {
   if (committingPlans.has(db) || preparingPlans.has(db))
@@ -203,6 +235,22 @@ export function nativeOwnershipNamePlan(db: Database, profileId: string, token: 
     );
   selected.plan.assertCurrent();
   return selected.plan;
+}
+export async function withNativeOwnershipNamePlan<T>(
+  db: Database,
+  profileId: string,
+  token: string,
+  complete: (plan: PreparedOwnershipNamePlan) => T,
+) {
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      const plan = nativeOwnershipNamePlan(db, profileId, token),
+        report = selectedPlans.get(db)?.report;
+      return report ? report.withVerifiedRead(() => complete(plan)) : complete(plan);
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function commitNativeRecordOwnership(
   db: Database,
@@ -266,7 +314,7 @@ async function commitNativeOwnershipOwned(
   if (!report) throw Error('Native ownership requires its complete selected plan');
   if (ownershipHash(request) !== ownershipHash(selected.plan.request))
     throw new HttpError(409, 'OWNERSHIP_CHANGED', 'Review the selected correction before saving');
-  const preview = report.finalize();
+  const preview = await report.finalizeVerified();
   if (preview.scopeToken !== supplied.scopeToken || preview.version !== supplied.version)
     throw new HttpError(
       409,
@@ -282,7 +330,17 @@ async function commitNativeOwnershipOwned(
   };
   if (preview.commitGroups.length <= 1) {
     await report.prepareSourceSnapshots();
-    commitRecordOwnershipPlannedUnit(db, root, profileId, input, selected.plan, undefined, report);
+    await report.withVerifiedPublication(() =>
+      commitRecordOwnershipPlannedUnit(
+        db,
+        root,
+        profileId,
+        input,
+        selected.plan,
+        undefined,
+        report,
+      ),
+    );
     return published();
   }
   const fingerprint = ownershipHash({ ...supplied, request }),
@@ -298,23 +356,26 @@ async function commitNativeOwnershipOwned(
         approvedRelationshipDecisions: () => report.relationshipChoicesForGroup(group),
       });
       child = prepared.report;
+      const childPlan = child;
       for (const choice of approvedChoices())
         if (child.plan.has(choice.key)) child.plan.choose(choice.key, choice.outcome);
-      const current = child.finalize();
+      const current = await child.finalizeVerified();
       await child.prepareSourceSnapshots();
-      const receipt = commitRecordOwnershipPlannedUnit(
-        db,
-        root,
-        profileId,
-        {
-          operationId: childOwnershipOperation(supplied.operationId, group.id),
-          request: current.request,
-          scopeToken: current.scopeToken,
-          version: current.version,
-        },
-        child.plan,
-        { operationId: supplied.operationId, fingerprint, groups: preview.commitGroups },
-        child,
+      const receipt = await child.withVerifiedPublication(() =>
+        commitRecordOwnershipPlannedUnit(
+          db,
+          root,
+          profileId,
+          {
+            operationId: childOwnershipOperation(supplied.operationId, group.id),
+            request: current.request,
+            scopeToken: current.scopeToken,
+            version: current.version,
+          },
+          childPlan.plan,
+          { operationId: supplied.operationId, fingerprint, groups: preview.commitGroups },
+          childPlan,
+        ),
       );
       if ('newPerson' in destination) {
         const note = db
@@ -336,7 +397,7 @@ async function commitNativeOwnershipOwned(
   return published();
 }
 
-export function nativeOwnershipReportPlan(db: Database, profileId: string, token: string) {
+function selectedOwnershipReportPlan(db: Database, profileId: string, token: string) {
   if (committingPlans.has(db) || preparingPlans.has(db))
     throw new HttpError(409, 'OWNERSHIP_COMMITTING', 'The report correction is being saved');
   const selected = selectedPlans.get(db);
@@ -350,8 +411,27 @@ export function nativeOwnershipReportPlan(db: Database, profileId: string, token
       'OWNERSHIP_CHANGED',
       'Prepare current report evidence before viewing it',
     );
-  selected.report.assertCurrent();
   return selected.report;
+}
+export function nativeOwnershipReportPlan(db: Database, profileId: string, token: string) {
+  const report = selectedOwnershipReportPlan(db, profileId, token);
+  report.assertCurrent();
+  return report;
+}
+export async function withNativeOwnershipReportPlan<T>(
+  db: Database,
+  profileId: string,
+  token: string,
+  complete: (plan: PreparedOwnershipReportPlan) => T,
+) {
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      const report = selectedOwnershipReportPlan(db, profileId, token);
+      return report.withVerifiedRead(() => complete(report));
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }
 export async function chooseNativeOwnershipReport(
   db: Database,
@@ -362,13 +442,13 @@ export async function chooseNativeOwnershipReport(
   return runExclusiveClinicalOperation(
     db,
     async () => {
-      const report = nativeOwnershipReportPlan(db, profileId, token),
+      const report = selectedOwnershipReportPlan(db, profileId, token),
         selected = selectedPlans.get(db)!;
       preparingPlans.add(db);
       try {
         await report.choose(input);
-        selected.scopeToken = report.finalize().scopeToken;
-        return report.publicPreview();
+        selected.scopeToken = (await report.finalizeVerified()).scopeToken;
+        return await report.withVerifiedRead(() => report.publicPreview());
       } finally {
         preparingPlans.delete(db);
       }
@@ -392,4 +472,21 @@ export function nativeOwnershipBlockerStore(db: Database, profileId: string, tok
     throw new HttpError(409, 'OWNERSHIP_CHANGED', 'Refresh this ownership review');
   selected.plan.assertCurrent();
   return selected.blockers;
+}
+
+export async function withNativeOwnershipBlockerStore<T>(
+  db: Database,
+  profileId: string,
+  token: string,
+  complete: (store: OwnershipBlockerStore) => T,
+) {
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      const store = nativeOwnershipBlockerStore(db, profileId, token),
+        report = selectedPlans.get(db)?.report;
+      return report ? report.withVerifiedRead(() => complete(store)) : complete(store);
+    },
+    { operation: currentClinicalOperation(db) },
+  );
 }

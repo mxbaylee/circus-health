@@ -7,7 +7,11 @@ import {
 } from './packet-reading-gaps-native.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { packetSourcesReachFile } from './packet-source-membership.ts';
-import { packetSourceAncestry } from './packet-source-ancestry.ts';
+import { packetSourceAncestry, packetSourceAncestryWork } from './packet-source-ancestry.ts';
+import { clinicalReviewRevision, managedDatabaseMethodEpoch } from './database.ts';
+import { intakeIdentityRequestLifetime } from './intake-identity-request.ts';
+import { prepareIntakeFilenameSummary } from './intake-summary-name.ts';
+import { setImmediate } from 'node:timers/promises';
 import { sourceAssertionBoundary, sourceAssertionOwnership } from './source-assertion-ownership.ts';
 import { recordOwner } from './record-owner.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
@@ -1074,26 +1078,26 @@ function patientInformation(db: Database, personId = 'patient'): PatientInformat
       : {}),
   };
 }
+function* exportRecordSourceFiles(db: Database, records: Iterable<ExportRecord>) {
+  for (const record of records) {
+    if (record.type === 'source_file') yield record.id;
+    for (const citation of record.citations) {
+      const row = db
+        .prepare('SELECT source_file_id FROM source_records WHERE id=?')
+        .get(citation.id);
+      if (row?.source_file_id) yield String(row.source_file_id);
+    }
+  }
+}
 function includedReadingGaps(
   db: Database,
   records: Iterable<ExportRecord>,
   budget: PacketOutputBudget,
   retain: boolean,
 ) {
-  function* sourceFiles() {
-    for (const record of records) {
-      if (record.type === 'source_file') yield record.id;
-      for (const citation of record.citations) {
-        const row = db
-          .prepare('SELECT source_file_id FROM source_records WHERE id=?')
-          .get(citation.id);
-        if (row?.source_file_id) yield String(row.source_file_id);
-      }
-    }
-  }
   const items: NoteExportSnapshot['readingGaps'] = [];
   let incomplete = false;
-  for (const source of packetSourceAncestry(db, sourceFiles())) {
+  for (const source of packetSourceAncestry(db, exportRecordSourceFiles(db, records))) {
     const sourceId = source.id,
       native =
         source.kind === 'intake_original' && hasIntakeCollectionEnvelope(db, { id: sourceId }),
@@ -1349,11 +1353,7 @@ function selectedRecordProjection(
   };
 }
 
-export function exportSnapshot(
-  db: Database,
-  value: unknown,
-  now = new Date().toISOString(),
-): NoteExportSnapshot {
+function snapshotSelection(db: Database, value: unknown) {
   let input = packetSelection(db, inputRecord(value));
   if (!['note', 'document', 'person'].includes(input.type))
     throw new HttpError(400, 'INVALID_EXPORT', 'Invalid export options.');
@@ -1448,6 +1448,68 @@ export function exportSnapshot(
   for (const key of plan.selected)
     if (key !== main.key && !records.has(key)) records.set(key, candidatesByKey.get(key)!);
   const mainSelected = main.note?.kind === 'person' || plan.selected.has(main.key);
+  return { input, personId, main, records, selected, plan, mainSelected };
+}
+/** Only selected citations are prepared; ordinary snapshot authorization is reused. */
+export async function prepareNoteExportMetadata(
+  db: Database,
+  profileId: string,
+  value: unknown,
+  options: { assertRunning?: () => void } = {},
+): Promise<void> {
+  const revision = clinicalReviewRevision(db),
+    methods = managedDatabaseMethodEpoch(db);
+  const assertCurrent = () => {
+    options.assertRunning?.();
+    if (
+      !db.isOpen ||
+      !methods ||
+      managedDatabaseMethodEpoch(db) !== methods ||
+      db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value !==
+        profileId ||
+      clinicalReviewRevision(db) !== revision
+    )
+      throw new HttpError(409, 'EXPORT_STALE', 'The selected export changed during preparation.');
+  };
+  assertCurrent();
+  const { main, records, plan } = snapshotSelection(db, value);
+  if (plan.active) return;
+  const sources = packetSourceAncestryWork(
+    db,
+    exportRecordSourceFiles(db, [main, ...records.values()]),
+  );
+  let visited = 0;
+  try {
+    for (;;) {
+      assertCurrent();
+      const next = sources.next();
+      assertCurrent();
+      if (next.done) break;
+      if (!next.value) await setImmediate();
+      else {
+        if (next.value.kind === 'intake_original')
+          await prepareIntakeFilenameSummary(
+            db,
+            { id: next.value.id, sha256: next.value.hash ?? undefined },
+            { assertRunning: assertCurrent },
+          );
+        if (++visited % 64 === 0) await setImmediate();
+      }
+      assertCurrent();
+    }
+  } finally {
+    sources.return(undefined);
+  }
+}
+export function exportSnapshot(
+  db: Database,
+  value: unknown,
+  now = new Date().toISOString(),
+): NoteExportSnapshot {
+  let { input, personId, main, records, selected, plan, mainSelected } = snapshotSelection(
+    db,
+    value,
+  );
   // Originals are selected from the same scoped evidence, then independently disclosed.
   if (plan.active) {
     const assetIds = new Set(
@@ -2408,6 +2470,14 @@ export function createNoteExports() {
       delete input.packetApproval;
       if (input.packetSelection?.approvals?.length)
         input.packetApproval = { actor: 'profile-user', approvedAt: new Date().toISOString() };
+      const lifetime = intakeIdentityRequestLifetime(req, res);
+      try {
+        await prepareNoteExportMetadata(db, profileId, input, {
+          assertRunning: () => lifetime.signal.throwIfAborted(),
+        });
+      } finally {
+        lifetime.dispose();
+      }
       const snapshot = exportSnapshot(db, input),
         token = randomUUID();
       if (snapshots.size >= 30) {
@@ -2456,6 +2526,14 @@ export function createNoteExports() {
           'EXPORT_EXPIRED',
           'Preview expired or is unavailable in this profile. Refresh the preview.',
         );
+      const lifetime = intakeIdentityRequestLifetime(req, res);
+      try {
+        await prepareNoteExportMetadata(db, profileId, entry.input, {
+          assertRunning: () => lifetime.signal.throwIfAborted(),
+        });
+      } finally {
+        lifetime.dispose();
+      }
       const validate = () => {
         let current: NoteExportSnapshot;
         try {

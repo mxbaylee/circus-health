@@ -16,7 +16,7 @@ import {
   type IntakeDetails,
   type IntakeSourceMetadata,
 } from './intake-state-access.ts';
-import { intakeMetadataLabel, isIntakeCompactScalar } from './intake-compact-scalar.ts';
+import { intakeMetadataLabel, isPreparedIntakeCompactScalar } from './intake-compact-scalar.ts';
 import { isRetainOnlyIntake } from '../shared/intake-source-policy.ts';
 import { readIntakeEnvelopeText } from './intake-authority.ts';
 import {
@@ -756,17 +756,16 @@ export function getIntakeEvidenceHeader(
     format: 'health-intake-evidence-header-v1' as const,
     id: file.id,
     filename: intakeMetadataLabel(metadata.originalName),
-    ...(isIntakeCompactScalar(metadata.originalName)
+    ...(isPreparedIntakeCompactScalar(metadata.originalName)
       ? {
           filenameDescriptor: metadata.originalName,
           filenameReference: intakeMetadataScalarReference(db, id, 'originalName', metadata),
         }
       : {}),
     retainOnly: isRetainOnlyIntake({
-      filename:
-        typeof metadata.originalName === 'string'
-          ? metadata.originalName
-          : metadata.originalName.suffix,
+      filename: isPreparedIntakeCompactScalar(metadata.originalName)
+        ? metadata.originalName.suffix
+        : metadata.originalName,
       mimeType: file.mime_type,
     }),
     mimeType: file.mime_type,
@@ -820,17 +819,16 @@ export function getRetainedIntakeOriginalReference(
     sourceHash: file.sha256,
     mimeType: file.mime_type,
     filename: intakeMetadataLabel(metadata.originalName),
-    ...(isIntakeCompactScalar(metadata.originalName)
+    ...(isPreparedIntakeCompactScalar(metadata.originalName)
       ? {
           filenameDescriptor: metadata.originalName,
           filenameReference: intakeMetadataScalarReference(db, id, 'originalName', metadata),
         }
       : {}),
     retainOnly: isRetainOnlyIntake({
-      filename:
-        typeof metadata.originalName === 'string'
-          ? metadata.originalName
-          : metadata.originalName.suffix,
+      filename: isPreparedIntakeCompactScalar(metadata.originalName)
+        ? metadata.originalName.suffix
+        : metadata.originalName,
       mimeType: file.mime_type,
     }),
   };
@@ -3088,7 +3086,7 @@ function childDescriptor(
     id: file.id,
     filename: intakeMetadataLabel(d.originalName),
     locator: d.locator === undefined ? undefined : intakeMetadataLabel(d.locator),
-    ...(isIntakeCompactScalar(d.originalName)
+    ...(isPreparedIntakeCompactScalar(d.originalName)
       ? {
           filenameDescriptor: d.originalName,
           filenameReference: intakeMetadataScalarReference(
@@ -3099,7 +3097,7 @@ function childDescriptor(
           ),
         }
       : {}),
-    ...(isIntakeCompactScalar(d.locator)
+    ...(isPreparedIntakeCompactScalar(d.locator)
       ? {
           locatorDescriptor: d.locator,
           locatorReference: intakeMetadataScalarReference(
@@ -3111,7 +3109,9 @@ function childDescriptor(
         }
       : {}),
     retainOnly: isRetainOnlyIntake({
-      filename: typeof d.originalName === 'string' ? d.originalName : d.originalName.suffix,
+      filename: isPreparedIntakeCompactScalar(d.originalName)
+        ? d.originalName.suffix
+        : d.originalName,
       mimeType: file.mime_type,
     }),
     derivative: d.derivative,

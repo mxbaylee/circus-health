@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
 import {
   execClinicalReviewMaintenance,
+  runClinicalReviewMaintenance,
   prepareClinicalReviewMaintenance,
 } from './clinical-review-maintenance.ts';
 import { HttpError, type Database } from './database.ts';
@@ -114,7 +115,6 @@ function ensure(db: Database) {
     execClinicalReviewMaintenance(db, 'reader', `DROP TABLE IF EXISTS temp.${P}${table}`);
   for (const sql of [
     `CREATE TEMP TABLE ${P}control(singleton INTEGER PRIMARY KEY,generation INTEGER NOT NULL)`,
-    `INSERT INTO ${P}control VALUES(1,0)`,
     `CREATE TEMP TABLE ${P}sources(id TEXT PRIMARY KEY,logical TEXT NOT NULL,sourceHash TEXT NOT NULL,ready INTEGER NOT NULL,generation INTEGER NOT NULL,run TEXT NOT NULL)`,
     `CREATE TEMP TABLE ${P}plans(source TEXT,ordinal INTEGER,address TEXT,unitCount INTEGER,eligible INTEGER,summary TEXT,PRIMARY KEY(source,ordinal))`,
     `CREATE INDEX temp.${P}plan_address ON ${P}plans(source,address)`,
@@ -132,6 +132,7 @@ function ensure(db: Database) {
     `CREATE TEMP TABLE ${P}path(source TEXT,run TEXT,after TEXT,PRIMARY KEY(source,run,after))`,
   ])
     execClinicalReviewMaintenance(db, 'reader', sql);
+  runClinicalReviewMaintenance(db, 'reader', `INSERT INTO ${P}control VALUES(1,0)`);
   for (const event of events) {
     const row = event === 'delete' ? 'OLD' : 'NEW';
     const metaChanged =
@@ -185,7 +186,7 @@ export function invalidateCollectionReaderRoleDependencies(
   );
   for (const member of members) put.run(roleKey(id, member));
   if (members.length)
-    execClinicalReviewMaintenance(db, 'reader', `UPDATE ${P}control SET generation=generation+1`);
+    runClinicalReviewMaintenance(db, 'reader', `UPDATE ${P}control SET generation=generation+1`);
 }
 export interface ReaderCoverageEffects {
   planAddresses?: readonly string[];

@@ -1,7 +1,7 @@
 import { setImmediate } from 'node:timers/promises';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
-import { intakeSourceMetadata } from './intake-state-access.ts';
+import { intakeSourceParent } from './intake-state-access.ts';
 
 /** Follow checked original identities with constant retained memory. Brent's
  * cycle detector keeps two IDs instead of a growing ancestor set. */
@@ -28,19 +28,17 @@ export function* iterateIntakeSourceAncestry(
     assertRunning();
     // Checking the endpoint too prevents a missing/foreign stop ID from being
     // accepted merely because its spelling matches the requested root.
-    const parent: string | null | undefined = intakeSourceMetadata(db, current).parentSourceFileId;
+    const parent = intakeSourceParent(db, current);
     if (parent != null && (typeof parent !== 'string' || !parent))
       throw new HttpError(409, 'SOURCE_ANCESTRY', 'Invalid retained source ancestry');
-    yield { id: current, parentId: parent ?? undefined };
+    yield { id: current, parentId: (parent ?? undefined) as string | undefined };
     checkOwner();
     // Async preparation may yield or migrate this source between steps. The
     // already checked edge must still select the same parent before continuing.
-    if (
-      (intakeSourceMetadata(db, current).parentSourceFileId ?? undefined) !== (parent ?? undefined)
-    )
+    if ((intakeSourceParent(db, current) ?? undefined) !== (parent ?? undefined))
       throw new HttpError(409, 'SOURCE_ANCESTRY', 'Retained source ancestry changed');
     if (current === stopAt) return true;
-    current = parent ?? undefined;
+    current = (parent ?? undefined) as string | undefined;
     if (current !== undefined) {
       length++;
       if (current === anchor)

@@ -132,7 +132,7 @@ test('supporting ancestry cancellation stops at the next bounded host turn', asy
     const result = Reflect.apply(original, this, args);
     if (
       this.sourceSQL ===
-        "SELECT id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'" &&
+        "SELECT id,kind,sha256 FROM main.source_files WHERE id=? AND kind='intake_original'" &&
       typeof args[0] === 'string' &&
       args[0].startsWith('fictional-ancestor-') &&
       /\bat prepareSupportingSourceRoot \(/.test(new Error().stack ?? '')

@@ -11,10 +11,10 @@ import {
   usesNativeOwnershipEvidence,
   previewNativeRecordOwnership,
   commitNativeRecordOwnership,
-  nativeOwnershipNamePlan,
-  nativeOwnershipBlockerStore,
+  withNativeOwnershipNamePlan,
+  withNativeOwnershipBlockerStore,
   chooseNativeOwnershipName,
-  nativeOwnershipReportPlan,
+  withNativeOwnershipReportPlan,
   chooseNativeOwnershipReport,
 } from './record-ownership-native.ts';
 import {
@@ -55,22 +55,23 @@ export async function handleRecordOwnershipRoute(context: {
   }
   if (method === 'GET' && id === 'blocker-evidence' && action) {
     const url = new URL(req.url || '/', 'http://profile.invalid'),
-      store = nativeOwnershipBlockerStore(db, profileId, action),
       key = url.searchParams.get('contribution') || '';
     respond(
-      url.searchParams.has('ordinal')
-        ? store.fragment(
-            key,
-            Number(url.searchParams.get('ordinal')),
-            Number(url.searchParams.get('offset') ?? '0'),
-            Number(url.searchParams.get('bytes') ?? '32768'),
-          )
-        : store.page(
-            key,
-            Number(url.searchParams.get('after') ?? '-1'),
-            Number(url.searchParams.get('limit') ?? '16'),
-            Number(url.searchParams.get('bytes') ?? '65536'),
-          ),
+      await withNativeOwnershipBlockerStore(db, profileId, action, (store) =>
+        url.searchParams.has('ordinal')
+          ? store.fragment(
+              key,
+              Number(url.searchParams.get('ordinal')),
+              Number(url.searchParams.get('offset') ?? '0'),
+              Number(url.searchParams.get('bytes') ?? '32768'),
+            )
+          : store.page(
+              key,
+              Number(url.searchParams.get('after') ?? '-1'),
+              Number(url.searchParams.get('limit') ?? '16'),
+              Number(url.searchParams.get('bytes') ?? '65536'),
+            ),
+      ),
     );
     return true;
   }
@@ -79,12 +80,11 @@ export async function handleRecordOwnershipRoute(context: {
       section = url.searchParams.get('section') || 'records';
     if (!['records', 'pending', 'relationships', 'holds'].includes(section))
       throw new HttpError(400, 'OWNERSHIP_CURSOR', 'Invalid report evidence section');
-    const plan = nativeOwnershipReportPlan(db, profileId, action);
-    if (url.searchParams.has('contribution')) {
-      const key = url.searchParams.get('contribution')!,
-        source = url.searchParams.get('source');
-      respond(
-        url.searchParams.has('ordinal')
+    const evidence = await withNativeOwnershipReportPlan(db, profileId, action, (plan) => {
+      if (url.searchParams.has('contribution')) {
+        const key = url.searchParams.get('contribution')!,
+          source = url.searchParams.get('source');
+        return url.searchParams.has('ordinal')
           ? plan.contributionFragment(
               key,
               source,
@@ -98,28 +98,23 @@ export async function handleRecordOwnershipRoute(context: {
               Number(url.searchParams.get('after') ?? '-1'),
               Number(url.searchParams.get('limit') ?? '16'),
               Number(url.searchParams.get('bytes') ?? '65536'),
-            ),
-      );
-      return true;
-    }
-    if (url.searchParams.has('ordinal'))
-      respond(
-        plan.fragment(
-          section as 'records' | 'pending' | 'relationships' | 'holds',
-          Number(url.searchParams.get('ordinal')),
-          Number(url.searchParams.get('offset') ?? '0'),
-          Number(url.searchParams.get('bytes') ?? '65536'),
-        ),
-      );
-    else
-      respond(
-        plan.page(
-          section as 'records' | 'pending' | 'relationships' | 'holds',
-          Number(url.searchParams.get('after') ?? '-1'),
-          Number(url.searchParams.get('limit') ?? '32'),
-          Number(url.searchParams.get('bytes') ?? '65536'),
-        ),
-      );
+            );
+      }
+      return url.searchParams.has('ordinal')
+        ? plan.fragment(
+            section as 'records' | 'pending' | 'relationships' | 'holds',
+            Number(url.searchParams.get('ordinal')),
+            Number(url.searchParams.get('offset') ?? '0'),
+            Number(url.searchParams.get('bytes') ?? '65536'),
+          )
+        : plan.page(
+            section as 'records' | 'pending' | 'relationships' | 'holds',
+            Number(url.searchParams.get('after') ?? '-1'),
+            Number(url.searchParams.get('limit') ?? '32'),
+            Number(url.searchParams.get('bytes') ?? '65536'),
+          );
+    });
+    respond(evidence);
     return true;
   }
   if (method === 'GET' && id === 'outcomes' && action) {
@@ -183,7 +178,7 @@ export async function handleRecordOwnershipRoute(context: {
     )
       throw new HttpError(400, 'OWNERSHIP_DECISION', 'Select an exact name association outcome');
     respond(
-      chooseNativeOwnershipName(
+      await chooseNativeOwnershipName(
         db,
         root,
         profileId,
@@ -195,7 +190,6 @@ export async function handleRecordOwnershipRoute(context: {
     return true;
   }
   if (method === 'GET' && id === 'name-evidence' && action) {
-    const plan = nativeOwnershipNamePlan(db, profileId, action);
     const url = new URL(req.url || '/', 'http://profile.invalid');
     const effect = url.searchParams.get('effect'),
       support = url.searchParams.get('support');
@@ -206,12 +200,15 @@ export async function handleRecordOwnershipRoute(context: {
         throw new HttpError(400, 'OWNERSHIP_CURSOR', 'Invalid evidence page cursor');
       return Number(text);
     };
-    if (support !== null) {
-      if (!effect || !/^\d+$/.test(support) || !Number.isSafeInteger(Number(support)))
-        throw new HttpError(400, 'OWNERSHIP_CURSOR', 'Select an exact effect and support');
-      respond(plan.targets(effect, Number(support), numeric('after', -1), numeric('limit', 32)));
-    } else if (effect) respond(plan.supports(effect, numeric('after', 0), numeric('limit', 16)));
-    else respond(plan.effects(url.searchParams.get('after') || '', numeric('limit', 16)));
+    const evidence = await withNativeOwnershipNamePlan(db, profileId, action, (plan) => {
+      if (support !== null) {
+        if (!effect || !/^\d+$/.test(support) || !Number.isSafeInteger(Number(support)))
+          throw new HttpError(400, 'OWNERSHIP_CURSOR', 'Select an exact effect and support');
+        return plan.targets(effect, Number(support), numeric('after', -1), numeric('limit', 32));
+      } else if (effect) return plan.supports(effect, numeric('after', 0), numeric('limit', 16));
+      return plan.effects(url.searchParams.get('after') || '', numeric('limit', 16));
+    });
+    respond(evidence);
     return true;
   }
   if (method === 'GET' && id === 'people' && !action) {

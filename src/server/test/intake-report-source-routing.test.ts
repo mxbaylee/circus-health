@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { prepareReportSourceRouting } from '../intake-report-source-routing.ts';
 import { clearIntakeCollectionCache } from '../intake-state-collections.ts';
+import { captureReportRoutingScratch } from './helpers/report-routing-scratch.ts';
 
 test('source routing keeps private bounded certificates across only known own writes', async (t) => {
+  const scratch = captureReportRoutingScratch(t);
   const db = new DatabaseSync(':memory:');
   t.after(() => db.close());
   let builds = 0;
@@ -25,30 +27,41 @@ test('source routing keeps private bounded certificates across only known own wr
     },
   };
   const read = () => prepareReportSourceRouting(db, input);
+  const authorityStamp = () =>
+    JSON.stringify([
+      db.prepare('SELECT total_changes() n').get(),
+      db.prepare('PRAGMA main.schema_version').get(),
+      db.prepare('PRAGMA temp.schema_version').get(),
+    ]);
+  const before = authorityStamp();
   assert.equal((await read()).owner('candidate', 'version'), 'correct');
+  assert.equal(authorityStamp(), before, 'cold routing does not write the profile SQL connection');
+  assert.notEqual(scratch(), db);
   await prepareReportSourceRouting(db, { ...input, sourceId: 'fictional-b' });
   assert.equal((await read()).disposition('exact-occurrence'), 'review_later');
   assert.equal(builds, 2, 'known writes preparing another source preserve the first proof');
-  db.exec(
+  scratch().exec(
     "UPDATE __report_source_routing_owners SET groupId='wrong'; UPDATE __report_source_routing SET ready=1",
   );
   assert.equal((await read()).owner('candidate', 'version'), 'correct');
   assert.equal(builds, 3, 'a restored SQL readiness flag cannot restore a private proof');
-  db.exec("BEGIN; UPDATE __report_source_routing_owners SET groupId='wrong'");
+  db.exec('BEGIN');
+  scratch().exec("BEGIN; UPDATE __report_source_routing_owners SET groupId='wrong'");
   await assert.rejects(read, /outside-transaction/);
   db.exec('ROLLBACK');
+  scratch().exec('ROLLBACK');
   assert.equal((await read()).owner('candidate', 'version'), 'correct');
   assert.equal(builds, 4, 'rolled-back writes still invalidate the old proof');
   clearIntakeCollectionCache(db);
   assert.equal((await read()).owner('candidate', 'version'), 'correct');
   assert.equal(builds, 5, 'registry identity is checked independently of serialized stamp values');
-  db.exec(
+  scratch().exec(
     "CREATE TEMP TRIGGER unrelated_name AFTER INSERT ON __report_source_routing_owners BEGIN UPDATE __report_source_routing_owners SET groupId='wrong'; END",
   );
   assert.equal((await read()).owner('candidate', 'version'), 'correct');
   assert.equal(builds, 6, 'an unexpected attached trigger is removed before rebuilding');
   assert.equal(
-    db.prepare("SELECT name FROM sqlite_temp_schema WHERE name='unrelated_name'").get(),
+    scratch().prepare("SELECT name FROM sqlite_temp_schema WHERE name='unrelated_name'").get(),
     undefined,
   );
   for (let index = 0; index < 33; index++)
@@ -57,7 +70,23 @@ test('source routing keeps private bounded certificates across only known own wr
   assert.equal(builds, 40, 'the private 32-source proof window evicts and safely rebuilds');
 });
 
+test('routing scratch closes with its profile connection', async (t) => {
+  const scratch = captureReportRoutingScratch(t);
+  const db = new DatabaseSync(':memory:');
+  await prepareReportSourceRouting(db, {
+    sourceId: 'fictional',
+    binding: 'empty',
+    assertCurrent() {},
+    *rows() {},
+  });
+  const retained = scratch();
+  assert.equal(retained.isOpen, true);
+  db.close();
+  assert.equal(retained.isOpen, false);
+});
+
 test('source routing rejects interleaved cache mutation rather than certifying partial preparation', async (t) => {
+  const scratch = captureReportRoutingScratch(t);
   const db = new DatabaseSync(':memory:');
   t.after(() => db.close());
   const input = {
@@ -76,7 +105,7 @@ test('source routing rejects interleaved cache mutation rather than certifying p
     },
   };
   const pending = prepareReportSourceRouting(db, input);
-  db.exec(
+  scratch().exec(
     "UPDATE __report_source_routing_owners SET groupId='wrong'; UPDATE __report_source_routing SET ready=1",
   );
   await assert.rejects(() => pending, /Refresh this complete/);

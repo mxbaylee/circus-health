@@ -1861,7 +1861,14 @@ export function createIntakeCollections(owner: {
           afterHead: data.after,
           writes: data.writes,
         },
-        options,
+        {
+          ...options,
+          publication: {
+            operationId: data.result.operationId,
+            fingerprint: prefix + data.requestDigest,
+            result: data.result,
+          },
+        },
       );
       if (!proof) return false;
       run(() => {
@@ -1905,6 +1912,7 @@ export function createIntakeCollections(owner: {
           fingerprint,
           legacyBridge: data.legacyBridge,
           compactMetadata: data.compactMetadata,
+          assertCurrent: data.compactMetadata ? options.assertCurrent : undefined,
         });
         return transaction(
           db,

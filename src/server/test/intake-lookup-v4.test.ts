@@ -26,6 +26,7 @@ import {
   intakeLookupProjectionGeneration,
   nativeIntakeReceiptAppendBasis,
   retainNativeIntakeReceiptAppend,
+  nativeIntakeLookupCatalogHeadBindingsEqual,
 } from '../intake-lookup-projection.ts';
 import {
   openIntakeIdentityReference,
@@ -49,6 +50,7 @@ import {
   intakeDiscoveryRevision,
   assertIntakeDiscoveryRevision,
   preparedIntakeLookupReadToken,
+  preparedIntakeDiscoveryRevision,
 } from '../intake-lookup-state.ts';
 
 const summaryOptions = { mappingVersion: 'fictional-v1', isSourceContextVersion: () => false };
@@ -702,6 +704,182 @@ const lookupProofFixture = async (t: test.TestContext) => {
   return f;
 };
 
+function rewriteLookupBuildHead(f: Awaited<ReturnType<typeof lookupProofFixture>>) {
+  const { collections } = createIntakeStateStorage(f.db, f.identity);
+  const before = collections.binding(collections.openView())!;
+  const operationId = randomUUID();
+  collections.commitMaintenance(
+    collections.prepare(collections.openView(), {
+      operationId,
+      requestDigest: createHash('sha256').update(operationId).digest('hex'),
+      domainVersion: 0,
+      changes: [
+        { area: 'builds', collection: 'fictional.progress', op: 'put', key: 'one', value: 'done' },
+      ],
+    }),
+  );
+  const after = collections.binding(collections.openView())!;
+  assert.notDeepEqual(after, before, 'The control must rewrite the physical collection head');
+  assert.deepEqual(after.logical, before.logical);
+}
+
+test('maintenance-only native head rewrites renew lookup without scanning originals', async (t) => {
+  const f = await lookupProofFixture(t);
+  const before = await prepareIntakeLookupIndices(f.db);
+  const token = preparedIntakeLookupReadToken(f.db)!;
+  rewriteLookupBuildHead(f);
+  assert.equal(preparedIntakeLookupReadToken(f.db), undefined);
+  assert.equal(nativeIntakeLookupCatalogHeadBindingsEqual(f.db, token, [f.source.id]), true);
+  assert.equal(preparedIntakeDiscoveryRevision(f.db), before.discoveryRevision);
+  const objects = f.authority.objects.size;
+  assert.equal(
+    await lookupSourceRows(f.db, async () => {
+      assert.deepEqual(await prepareIntakeLookupIndices(f.db), {
+        prepared: 0,
+        reused: before.reused,
+        discoveryRevision: before.discoveryRevision,
+      });
+    }),
+    0,
+  );
+  assert.notEqual(preparedIntakeLookupReadToken(f.db), token);
+  assert.equal(f.authority.objects.size, objects);
+  assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
+  assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-proof'), {
+    receipt: { operationId: 'fictional-proof' },
+    marker: 'retained',
+  });
+  assert.equal(retainedIntakeAcceptance(f.db, 'fictional-missing'), null);
+});
+
+for (const change of ['unrelated-sql', 'sql-aba', 'rollback', 'source-write'] as const)
+  test(`maintenance-only head equality does not forgive an unknown ${change}`, async (t) => {
+    const f = await lookupProofFixture(t);
+    const before = await prepareIntakeLookupIndices(f.db);
+    const token = preparedIntakeLookupReadToken(f.db)!;
+    rewriteLookupBuildHead(f);
+    const write = () =>
+      f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-unknown', 'changed');
+    if (change === 'source-write')
+      f.db.prepare('UPDATE source_files SET details_json=details_json WHERE id=?').run(f.source.id);
+    else if (change === 'rollback')
+      assert.throws(
+        () =>
+          transaction(f.db, () => {
+            write();
+            throw Error('fictional rollback');
+          }),
+        /fictional rollback/,
+      );
+    else {
+      write();
+      if (change === 'sql-aba')
+        f.db.prepare('DELETE FROM app_meta WHERE key=?').run('fictional-unknown');
+    }
+    assert.equal(nativeIntakeLookupCatalogHeadBindingsEqual(f.db, token, [f.source.id]), true);
+    assert.equal(preparedIntakeLookupReadToken(f.db), undefined);
+    assert.equal(preparedIntakeDiscoveryRevision(f.db), undefined);
+    assert.ok(
+      (await lookupSourceRows(f.db, async () => {
+        const result = await prepareIntakeLookupIndices(f.db);
+        assert.equal(result.discoveryRevision, before.discoveryRevision);
+      })) >= 2,
+    );
+    assert.notEqual(preparedIntakeLookupReadToken(f.db), token);
+    assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
+    assert.equal(retainedIntakeAcceptance(f.db, 'fictional-missing'), null);
+  });
+
+for (const change of ['source-order', 'source-hash', 'source-kind', 'source-delete'] as const)
+  test(`maintenance-only head equality refuses a changed ${change} binding`, async (t) => {
+    const f = await lookupProofFixture(t);
+    const token = preparedIntakeLookupReadToken(f.db)!;
+    rewriteLookupBuildHead(f);
+    if (change === 'source-order')
+      f.db.prepare('UPDATE source_files SET rowid=rowid+100 WHERE id=?').run(f.source.id);
+    else if (change === 'source-hash')
+      f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('b'.repeat(64), f.source.id);
+    else if (change === 'source-kind')
+      f.db.prepare('UPDATE source_files SET kind=? WHERE id=?').run('document', f.source.id);
+    else f.db.prepare('DELETE FROM source_files WHERE id=?').run(f.source.id);
+    assert.equal(nativeIntakeLookupCatalogHeadBindingsEqual(f.db, token, [f.source.id]), false);
+    assert.equal(preparedIntakeLookupReadToken(f.db), undefined);
+    assert.equal(preparedIntakeDiscoveryRevision(f.db), undefined);
+  });
+
+test('maintenance-only renewal does not preserve a changed logical receipt', async (t) => {
+  const f = await lookupProofFixture(t);
+  const before = await prepareIntakeLookupIndices(f.db);
+  const token = preparedIntakeLookupReadToken(f.db)!;
+  rewriteLookupBuildHead(f);
+  const reader = openIntakeCollectionEnvelope(f.db, f.source);
+  const intake = reader.child(reader.root(), 'intake')!;
+  const workflow = reader.child(intake, 'workflow')!;
+  const acceptance = reader.childAt(workflow, 'reportAcceptances', 0)!;
+  const receipt = reader.child(acceptance, 'receipt')!;
+  const operationId = randomUUID();
+  transaction(f.db, () =>
+    stageIntakeEnvelopeFieldMutation(
+      f.db,
+      f.source,
+      prepareIntakeEnvelopeFieldMutation(f.db, f.source, {
+        reader,
+        record: receipt,
+        field: 'operationId',
+        jsonText: '"fictional-after-maintenance"',
+        operationId,
+        requestDigest: createHash('sha256').update(operationId).digest('hex'),
+        domainVersion: 0,
+      }),
+    ),
+  );
+  assert.equal(nativeIntakeLookupCatalogHeadBindingsEqual(f.db, token, [f.source.id]), false);
+  assert.equal(preparedIntakeDiscoveryRevision(f.db), undefined);
+  assert.ok(
+    (await lookupSourceRows(f.db, async () => {
+      const after = await prepareIntakeLookupIndices(f.db);
+      assert.notEqual(after.discoveryRevision, before.discoveryRevision);
+    })) >= 2,
+  );
+  assert.equal(retainedIntakeAcceptance(f.db, 'fictional-proof'), null);
+  assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-after-maintenance'), {
+    receipt: { operationId: 'fictional-after-maintenance' },
+    marker: 'retained',
+  });
+});
+
+test('maintenance-only renewal retains its interval across the bounded head equality read', async (t) => {
+  const f = await lookupProofFixture(t);
+  rewriteLookupBuildHead(f);
+  const original = StatementSync.prototype.get;
+  let changed = false;
+  StatementSync.prototype.get = function (
+    this: StatementSync,
+    ...parameters: Parameters<StatementSync['get']>
+  ) {
+    const result = Reflect.apply(original, this, parameters);
+    if (
+      !changed &&
+      this.sourceSQL.startsWith(
+        'SELECT rowid source_order,id,kind,sha256,details_json FROM main.source_files',
+      )
+    ) {
+      changed = true;
+      f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-late-equality', 'changed');
+    }
+    return result;
+  } as typeof StatementSync.prototype.get;
+  try {
+    assert.ok((await lookupSourceRows(f.db, () => prepareIntakeLookupIndices(f.db))) >= 2);
+  } finally {
+    StatementSync.prototype.get = original;
+  }
+  assert.equal(changed, true);
+  assert.ok(preparedIntakeLookupReadToken(f.db));
+  assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
+  assert.equal(retainedIntakeAcceptance(f.db, 'fictional-missing'), null);
+});
+
 for (const change of [
   'main',
   'temp',
@@ -1203,8 +1381,10 @@ test('native point lookups have no workflow recount or auxiliary churn writes; l
   db.prepare('UPDATE __record_intake_lookup_sources SET identity_first=NULL WHERE source_id=?').run(
     source.id,
   );
-  assert.throws(() => maximumIntakeDiscoveryOrder(db), /native source projection binding/);
-  assert.throws(() => indexedIntakeIdentityConfirmations(db), /native source projection binding/);
+  // The projection event witness can refuse this forgery before native binding is read.
+  const forgedProjection = /native source projection binding|disposable projection mutation/;
+  assert.throws(() => maximumIntakeDiscoveryOrder(db), forgedProjection);
+  assert.throws(() => indexedIntakeIdentityConfirmations(db), forgedProjection);
   clearIntakeLookupCache(db);
   assert.equal(maximumIntakeDiscoveryOrder(db), 47);
   const reader = openIntakeCollectionEnvelope(db, source);

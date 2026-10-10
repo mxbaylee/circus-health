@@ -24,6 +24,7 @@ import { prepareCollectionPeopleIndex } from '../intake-people-collection.ts';
 import {
   clearCollectionReportQueues,
   clearCollectionQueueReviews,
+  checkedRetainedCollectionClinicalPolicyContext,
   openCollectionReportQueue,
   tryBorrowRetainedCollectionClinicalPolicy,
 } from '../intake-report-group-collection.ts';
@@ -150,6 +151,18 @@ for (const count of [4, 16] as const)
           stamp = reviewReadStamp(f.db);
         const selected = borrow(f);
         assert.ok(selected);
+        const checked = checkedRetainedCollectionClinicalPolicyContext(f.db, selected);
+        const foreign = new DatabaseSync(':memory:');
+        try {
+          assert.throws(
+            () => checkedRetainedCollectionClinicalPolicyContext(foreign, selected),
+            /Foreign retained clinical policy borrow/,
+          );
+        } finally {
+          foreign.close();
+        }
+        assert.equal('checked' in selected, false, 'private context is not a public borrow method');
+        assert.ok([...checked.verifiedArtifacts()].length >= 1);
         const borrowed = f.members.map((member) => {
           const record = selected.record(
             member.recordId,
@@ -157,11 +170,17 @@ for (const count of [4, 16] as const)
             member.candidateVersionId,
           );
           assert.ok(record);
+          assert.equal(
+            digest(checked.record(member.recordId, member.candidateId, member.candidateVersionId)),
+            digest(record),
+            'checked private record retains the same complete selected policy',
+          );
           assert.match(record.mapping.text!, /12\.00/, 'exact lexical original survived policy');
           return { record: digest(record), selectionToken: record.selectionReviewToken };
         });
         selected.assertCurrent();
         selected.close();
+        assert.throws(() => checked.assertAuthorityCurrent(), /Refresh|changed/i);
         assert.equal(reviewReadStamp(f.db), stamp, 'borrow never writes/rebaselines source SQL');
         assert.equal(
           intakeWorkCounters(f.db).warm.collectionQueuePolicyBorrowHits,
@@ -173,10 +192,15 @@ for (const count of [4, 16] as const)
           'borrow constructs no policy',
         );
         const afterBorrow = { ...intakeWorkCounters(f.db).warm };
-        assert.ok(afterBorrow.hashCalls > before.hashCalls, 'binding guard digests are counted');
-        assert.ok(
-          afterBorrow.hashedBytes > before.hashedBytes,
-          'exact binding input bytes are counted',
+        assert.equal(
+          afterBorrow.hashCalls,
+          before.hashCalls,
+          'an unchanged retained binding witness needs no new binding digest',
+        );
+        assert.equal(
+          afterBorrow.hashedBytes,
+          before.hashedBytes,
+          'warm borrowing does not reread binding input bytes',
         );
         const fresh = await prepareCollectionClinicalReviewAsync(
           f.db,

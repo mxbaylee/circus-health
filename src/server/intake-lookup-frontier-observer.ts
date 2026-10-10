@@ -22,7 +22,7 @@ interface ExpectedWrite {
   seen: number;
 }
 
-type AuxiliaryKind = 'ownership' | 'clinical-source';
+type AuxiliaryKind = 'ownership' | 'clinical-source' | 'duplicate-evidence';
 interface AuxiliaryPreparation {
   readonly kind: AuxiliaryKind;
   readonly beforeAttempts: number;
@@ -117,7 +117,11 @@ const writeActions = new Set([
   constants.SQLITE_DELETE,
 ]);
 const auxiliaryPrefix = (kind: AuxiliaryKind) =>
-  kind === 'ownership' ? '__ownership_decision_index' : '__clinical_source_fingerprint';
+  kind === 'ownership'
+    ? '__ownership_decision_index'
+    : kind === 'clinical-source'
+      ? '__clinical_source_fingerprint'
+      : '__duplicate_evidence_';
 
 function tempSchema(db: DatabaseSync): number | bigint {
   const value = db.prepare('PRAGMA temp.schema_version').get()?.schema_version;

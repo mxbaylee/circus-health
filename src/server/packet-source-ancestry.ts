@@ -6,6 +6,9 @@ import { disposableSqlite } from './disposable-sqlite.ts';
 /** Complete retained original/proposal ancestry. The temporary queue is an index,
  * never authority; original edges use the shared checked, uncapped walk. */
 export function* packetSourceAncestry(db: Database, ids: Iterable<string>) {
+  for (const step of packetSourceAncestryWork(db, ids)) if (step) yield step;
+}
+export function* packetSourceAncestryWork(db: Database, ids: Iterable<string>) {
   const profileId = String(
       db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value || '',
     ),
@@ -28,7 +31,11 @@ export function* packetSourceAncestry(db: Database, ids: Iterable<string>) {
         );
       return value;
     };
-    for (const id of ids) enqueue.run(id);
+    let work = 0;
+    for (const id of ids) {
+      enqueue.run(id);
+      if (++work % 64 === 0) yield undefined;
+    }
     for (;;) {
       const next = scratch.db
         .prepare('SELECT id FROM files WHERE seen=0 ORDER BY id LIMIT 1')
@@ -38,6 +45,7 @@ export function* packetSourceAncestry(db: Database, ids: Iterable<string>) {
         source = row(id);
       if (source.kind === 'intake_original') {
         for (const ancestor of iterateIntakeSourceAncestry(db, profileId, id)) {
+          if (++work % 64 === 0) yield undefined;
           const file = row(ancestor.id),
             prior = scratch.db.prepare('SELECT seen FROM files WHERE id=?').get(ancestor.id);
           // A completed earlier walk already checked the remaining chain. A
@@ -55,6 +63,7 @@ export function* packetSourceAncestry(db: Database, ids: Iterable<string>) {
         }
         scratch.db.exec('UPDATE files SET seen=2 WHERE seen=1');
       } else {
+        if (++work % 64 === 0) yield undefined;
         seen.run(id);
         if (typeof source.original === 'string') enqueue.run(source.original);
         if (typeof source.parent === 'string') enqueue.run(source.parent);

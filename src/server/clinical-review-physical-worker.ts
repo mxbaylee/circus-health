@@ -22,12 +22,19 @@ function boundedField(value: string): boolean {
   return Buffer.byteLength(value) <= FIELD_BYTES;
 }
 
-function checkedPage(items: readonly ClinicalPhysicalItem[]): void {
+export function clinicalPhysicalVerificationPages(
+  items: readonly ClinicalPhysicalItem[],
+): ClinicalPhysicalItem[][] {
   if (items.length < 1 || items.length > PAGE_ITEMS) throw invalid();
+  const pages: ClinicalPhysicalItem[][] = [];
+  let page: ClinicalPhysicalItem[] = [];
+  let bytes = 2;
   for (const item of items) {
     if (!isAbsolute(item.path) || !boundedField(item.path)) throw invalid();
+    let retained: ClinicalPhysicalItem;
     if (item.kind === 'identity') {
       if (!boundedField(item.expectedIdentity)) throw invalid();
+      retained = { kind: item.kind, path: item.path, expectedIdentity: item.expectedIdentity };
     } else if (item.kind === 'marker') {
       if (
         item.expected !== 'absent' &&
@@ -38,11 +45,27 @@ function checkedPage(items: readonly ClinicalPhysicalItem[]): void {
               item.expected.bytes > 4096)))
       )
         throw invalid();
+      retained = {
+        kind: item.kind,
+        path: item.path,
+        expected: item.expected === 'absent' ? 'absent' : { ...item.expected },
+      };
     } else if (item.kind === 'directory') {
       if (!boundedField(item.expectedIdentity)) throw invalid();
+      retained = { kind: item.kind, path: item.path, expectedIdentity: item.expectedIdentity };
     } else throw invalid();
+    const itemBytes = Buffer.byteLength(JSON.stringify(retained));
+    if (itemBytes + 2 > PAGE_BYTES) throw invalid();
+    if (bytes + itemBytes + (page.length ? 1 : 0) > PAGE_BYTES) {
+      pages.push(page);
+      page = [];
+      bytes = 2;
+    }
+    bytes += itemBytes + (page.length ? 1 : 0);
+    page.push(retained);
   }
-  if (Buffer.byteLength(JSON.stringify(items)) > PAGE_BYTES) throw invalid();
+  pages.push(page);
+  return pages;
 }
 
 export async function openClinicalPhysicalVerifier(signal?: AbortSignal): Promise<{
@@ -80,7 +103,7 @@ export async function openClinicalPhysicalVerifier(signal?: AbortSignal): Promis
     if (!ready) readyReject(error);
     pending?.reject(error);
     pending = undefined;
-    void worker.terminate();
+    if (ready) void worker.terminate();
   };
   const onAbort = () => fail(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
   signal?.addEventListener('abort', onAbort, { once: true });
@@ -96,6 +119,10 @@ export async function openClinicalPhysicalVerifier(signal?: AbortSignal): Promis
     if (!ready) {
       if (received.ready !== true) return fail(invalid());
       ready = true;
+      if (failed) {
+        void worker.terminate();
+        return;
+      }
       readyResolve();
       return;
     }
@@ -133,8 +160,7 @@ export async function openClinicalPhysicalVerifier(signal?: AbortSignal): Promis
   };
   return {
     async verifyPage(items) {
-      checkedPage(items);
-      await request(items);
+      for (const page of clinicalPhysicalVerificationPages(items)) await request(page);
     },
     async close() {
       if (failed) throw failure;

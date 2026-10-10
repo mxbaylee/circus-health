@@ -880,14 +880,31 @@ test(
     const records = view.children(root, 'records', { items: 16, bytes: 32768 });
     assert.equal(records.total, 8);
     assert.equal(records.complete, true);
+    const withPhysicalHead = <T>(name: string, readValue: () => T): T => {
+      const before = heads;
+      const value = readValue();
+      assert.ok(heads > before, `${name} checked physical accepted HEAD`);
+      return value;
+    };
     const inspect = () => {
       const values: string[] = [];
       for (const [index, record] of records.records.entries()) {
-        values.push([...fields.chunks(record, 'id')!].join(''));
-        values.push([...fields.chunks(record, 'amount')!].join(''));
-        values.push([...fields.chunks(record, 'nullable')!].join(''));
-        assert.equal(fields.chunks(record, 'missing'), undefined);
-        const page = view.fields(record, { items: 8, bytes: 32768 });
+        values.push(withPhysicalHead('id field', () => [...fields.chunks(record, 'id')!].join('')));
+        values.push(
+          withPhysicalHead('amount field', () => [...fields.chunks(record, 'amount')!].join('')),
+        );
+        values.push(
+          withPhysicalHead('nullable field', () =>
+            [...fields.chunks(record, 'nullable')!].join(''),
+          ),
+        );
+        assert.equal(
+          withPhysicalHead('missing field', () => fields.chunks(record, 'missing')),
+          undefined,
+        );
+        const page = withPhysicalHead('field page', () =>
+          view.fields(record, { items: 8, bytes: 32768 }),
+        );
         assert.equal(page.total, 3);
         assert.equal(page.complete, true);
         assert.deepEqual(page.fields.map((field) => field.name).sort(), [
@@ -897,7 +914,10 @@ test(
         ]);
         assert.deepEqual(values.slice(-3), ['"fictional-' + index + '"', '12.00', 'null']);
       }
-      assert.equal([...fields.chunks(root, 'giant')!].join(''), JSON.stringify(giant));
+      assert.equal(
+        withPhysicalHead('giant field', () => [...fields.chunks(root, 'giant')!].join('')),
+        JSON.stringify(giant),
+      );
       return createHash('sha256').update(values.join('|')).digest('hex');
     };
     const expected = inspect(),
@@ -908,14 +928,13 @@ test(
     const after = intakeWorkCounters(db),
       delta = (name: keyof typeof after.warm) => after.warm[name] - before.warm[name];
     // Each inspection has 49 present named fields (24 lexical values, 24 field
-    // list validations and the giant scalar) and eight missing fields. A present
-    // field now shares its four field-cell checks with its header proof; a missing
-    // field shares its one failed point lookup. Entry/final physical proofs and
-    // all original source, payload and generator checks remain: 1620 - 2*(49*4+8).
-    // Both complete lexical inspections and their exact output assertions remain.
+    // list validations and the giant scalar) and eight missing fields. Each
+    // operation above still observes physical HEAD; step-local authenticated
+    // reads share it within a step. Two warm inspections use 419 HEAD reads each.
+    // The exact lexical output and source/payload guards remain asserted.
     assert.equal(
       heads - headBefore,
-      1212,
+      838,
       'physical accepted HEAD includes both schema owner guards',
     );
     assert.ok(

@@ -1,6 +1,14 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { currentTransactionToken } from './database.ts';
-import { recordDurabilityStatus } from './record-versions.ts';
+import { currentTransactionToken, managedDatabaseMethodEpoch } from './database.ts';
+import {
+  recordDurabilityStatus,
+  discardRecordSourcePriorFields,
+  recordAuthorityWitnessIntervalCurrent,
+  recordIndexedPublicationCurrent,
+  recordIndexedPublicationWrites,
+  type RecordIndexedPublication,
+  type RecordSourcePriorFields,
+} from './record-versions.ts';
 import {
   HEAD_BYTES,
   intakeNamespace,
@@ -41,6 +49,7 @@ interface Candidate {
    * format transition; ordinary callers cannot request this with a Boolean. */
   legacyBridge?: IntakeLegacyBridgeProof;
   compactMetadata?: IntakeCompactMetadataProof;
+  assertCurrent?: () => void;
 }
 interface Publication {
   db: DatabaseSync;
@@ -61,12 +70,24 @@ interface Publication {
     target: string;
     sequence: number;
     stamp: IntakeCompactMetadataStamp;
+    priorFields: RecordSourcePriorFields;
   };
+  assertCurrent?: () => void;
   sourceStaged?: boolean;
   token?: object;
   mainSchema?: number;
   tempSchema?: number;
   verified?: boolean;
+  verifiedWrites?: number;
+  revision?: string;
+  clinicalRevision?: string;
+  startCapturedRows?: number;
+  closing?: {
+    main: ReturnType<DatabaseSync['prepare']>;
+    temp: ReturnType<DatabaseSync['prepare']>;
+    peer: ReturnType<DatabaseSync['prepare']>;
+    writes: ReturnType<DatabaseSync['prepare']>;
+  };
 }
 interface Retained {
   entries: Map<IntakeMaintenancePublication, Publication>;
@@ -145,6 +166,8 @@ function remove(capability: IntakeMaintenancePublication): void {
   const publication = publications.get(capability);
   if (!publication) return;
   publications.delete(capability);
+  if (publication.compactMetadata)
+    discardRecordSourcePriorFields(publication.compactMetadata.priorFields);
   const state = retained.get(publication.db);
   if (state?.entries.delete(capability)) state.bytes -= publication.bytes;
 }
@@ -152,7 +175,7 @@ function remove(capability: IntakeMaintenancePublication): void {
 export function clearIntakeMaintenancePublications(db: DatabaseSync): void {
   const state = retained.get(db);
   if (!state) return;
-  for (const capability of state.entries.keys()) publications.delete(capability);
+  for (const capability of state.entries.keys()) remove(capability);
   state.entries.clear();
   retained.delete(db);
 }
@@ -256,6 +279,7 @@ export function prepareIntakeMaintenancePublication(
     bytes: retainedBytes,
     bridgeCertified: candidate.legacyBridge !== undefined || compactMetadata !== undefined,
     compactMetadata,
+    assertCurrent: compactMetadata ? candidate.assertCurrent : undefined,
   };
   let state = retained.get(db);
   if (!state) {
@@ -320,6 +344,17 @@ export function beginIntakeMaintenancePublication(
   const readMeta = metadataReader(db);
   if (publication.token) fail('capability already entered');
   if (publication.compactMetadata) {
+    publication.revision = readMeta('revision');
+    publication.clinicalRevision = readMeta('clinical_review_revision');
+    publication.startCapturedRows = Number(
+      db.prepare('SELECT COUNT(*) AS n FROM __record_changed').get()!.n,
+    );
+    publication.closing = {
+      main: db.prepare('PRAGMA main.schema_version'),
+      temp: db.prepare('PRAGMA temp.schema_version'),
+      peer: db.prepare('PRAGMA main.data_version'),
+      writes: db.prepare('SELECT total_changes() AS n'),
+    };
     const status = recordDurabilityStatus(db);
     if (
       !status?.configured ||
@@ -358,6 +393,8 @@ export function beginIntakeMaintenancePublication(
     fail('accepted-row capture unavailable');
   publication.mainSchema = Number(db.prepare('PRAGMA main.schema_version').get()!.schema_version);
   publication.tempSchema = Number(db.prepare('PRAGMA temp.schema_version').get()!.schema_version);
+  if (publication.compactMetadata)
+    closePublication(db, publication, Number(publication.compactMetadata.stamp.writes));
 }
 
 /** Checks what actually changed, before transaction() writes revision bookkeeping. */
@@ -368,16 +405,44 @@ export function verifyIntakeMaintenancePublication(
   result: unknown,
 ): void {
   const publication = selected(db, capability);
+  verifyPublication(db, publication, token, result, false);
+}
+function verifyPublication(
+  db: DatabaseSync,
+  publication: Publication,
+  token: object,
+  result: unknown,
+  final: boolean,
+  indexed?: RecordIndexedPublication,
+): void {
+  const guarded: unknown = publication.assertCurrent?.();
+  if (
+    guarded &&
+    (typeof guarded === 'object' || typeof guarded === 'function') &&
+    'then' in guarded
+  )
+    fail('compact owner check must finish synchronously');
   const readMeta = metadataReader(db);
-  if (publication.token !== token || publication.verified) fail('transaction binding');
+  if (publication.token !== token || (final ? !publication.verified : publication.verified))
+    fail('transaction binding');
+  if (
+    final &&
+    Number(db.prepare('SELECT total_changes() AS n').get()!.n) !==
+      (indexed
+        ? recordIndexedPublicationWrites(db, indexed, publication.compactMetadata!.stamp.authority)
+        : publication.verifiedWrites! + 4 + 2 * Number(publication.clinicalRevision === undefined))
+  )
+    fail('late mutation after compact verification');
   if (publication.compactMetadata) {
-    const status = recordDurabilityStatus(db);
+    const status = indexed ? undefined : recordDurabilityStatus(db);
     if (
-      !status?.configured ||
-      status.dirty ||
-      status.conflicted ||
-      status.sequence !== publication.compactMetadata.sequence ||
-      !intakeCompactMetadataStampCurrent(db, publication.compactMetadata.stamp, false)
+      indexed
+        ? !recordIndexedPublicationCurrent(db, indexed, publication.compactMetadata.stamp.authority)
+        : !status?.configured ||
+          status.dirty ||
+          status.conflicted ||
+          status.sequence !== publication.compactMetadata.sequence ||
+          !intakeCompactMetadataStampCurrent(db, publication.compactMetadata.stamp, false)
     )
       fail('compact metadata authority changed during publication');
   }
@@ -392,7 +457,7 @@ export function verifyIntakeMaintenancePublication(
     sourceBinding(db, publication.identity, readMeta, publication.compactMetadata === undefined) !==
       publication.source ||
     readMeta(intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin ||
-    boundedJson(result, HEAD_BYTES) !== publication.result
+    (!final && boundedJson(result, HEAD_BYTES) !== publication.result)
   )
     fail('source or result changed');
   const seen = new Set<string>();
@@ -408,6 +473,18 @@ export function verifyIntakeMaintenancePublication(
     if (!Array.isArray(identity) || identity.length !== 1 || typeof identity[0] !== 'string')
       fail('captured row identity');
     const key = identity[0] as string;
+    if (
+      final &&
+      row.entity === 'app_meta' &&
+      (key === 'revision' || key === 'curation_revision' || key === 'clinical_review_revision')
+    ) {
+      const expected =
+        key === 'clinical_review_revision'
+          ? (publication.clinicalRevision ?? publication.revision)
+          : String(Number(publication.revision) + 1);
+      if (readMeta(key) !== expected) fail('late revision bookkeeping changed');
+      continue;
+    }
     if (row.entity === 'source_files' && publication.compactMetadata) {
       if (key !== publication.identity.intakeId || ++sourceRows !== 1 || !publication.sourceStaged)
         fail('unexpected compact metadata source row');
@@ -442,7 +519,79 @@ export function verifyIntakeMaintenancePublication(
   // above, with the same source metadata/pin. Ordinary checkpoints still need
   // the unchanged logical root/version check here.
   if (!publication.bridgeCertified) heads(publication.identity, publication.beforeHead, afterHead);
+  if (publication.compactMetadata) {
+    const expected = indexed
+      ? recordIndexedPublicationWrites(db, indexed, publication.compactMetadata.stamp.authority)
+      : final
+        ? publication.verifiedWrites! + 4 + 2 * Number(publication.clinicalRevision === undefined)
+        : Number(publication.compactMetadata.stamp.writes) +
+          publication.startCapturedRows! +
+          2 * (publication.writes.size + 1);
+    closePublication(db, publication, expected);
+  }
   publication.verified = true;
+  if (!final)
+    publication.verifiedWrites = publication.compactMetadata
+      ? Number(publication.compactMetadata.stamp.writes) +
+        publication.startCapturedRows! +
+        2 * (publication.writes.size + 1)
+      : undefined;
+}
+
+function closePublication(db: DatabaseSync, publication: Publication, writes: number): void {
+  const closing = publication.closing!,
+    proof = publication.compactMetadata!;
+  if (
+    !closing ||
+    closing.main.get()!.schema_version !== proof.stamp.mainSchema ||
+    closing.temp.get()!.schema_version !== proof.stamp.tempSchema ||
+    closing.peer.get()!.data_version !== proof.stamp.peer ||
+    Number(closing.writes.get()!.n) !== writes ||
+    managedDatabaseMethodEpoch(db) !== proof.stamp.methods ||
+    !recordAuthorityWitnessIntervalCurrent(db, proof.stamp.authority)
+  )
+    fail('compact publication closing SQL/method/physical seal');
+}
+
+/** Last proof action; no callback-capable read follows this seal. */
+export function sealIntakeMaintenancePriorFields(
+  db: DatabaseSync,
+  capability: IntakeMaintenancePublication,
+): number {
+  const publication = selected(db, capability);
+  if (
+    !publication.compactMetadata ||
+    !publication.verified ||
+    publication.token !== currentTransactionToken(db)
+  )
+    fail('compact closing token');
+  const writes =
+    publication.verifiedWrites! + 4 + 2 * Number(publication.clinicalRevision === undefined);
+  closePublication(db, publication, writes);
+  return writes;
+}
+/** Only a genuine fixed indexed transition may precede the accepted HEAD leaf. */
+export function renewIntakeMaintenanceAfterIndex(
+  db: DatabaseSync,
+  capability: IntakeMaintenancePublication,
+  indexed: RecordIndexedPublication,
+): void {
+  const publication = selected(db, capability);
+  if (!publication.compactMetadata) fail('indexed renewal requires compact proof');
+  verifyPublication(db, publication, currentTransactionToken(db)!, undefined, true, indexed);
+}
+
+/** Private durability renewal after callbacks and fixed revision bookkeeping. */
+export function consumeIntakeMaintenancePriorFields(
+  db: DatabaseSync,
+  capability: IntakeMaintenancePublication,
+): RecordSourcePriorFields | undefined {
+  const publication = selected(db, capability);
+  if (!publication.compactMetadata) return undefined;
+  const token = currentTransactionToken(db);
+  if (!token) fail('compact prior comparison outside transaction');
+  verifyPublication(db, publication, token!, undefined, true);
+  return publication.compactMetadata.priorFields;
 }
 
 /** Release retained preparation bytes on success or failure of this transaction. */
