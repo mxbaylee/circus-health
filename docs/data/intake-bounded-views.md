@@ -1110,6 +1110,12 @@ owner rather than waiting on a shared request queued behind that owner. Ordinary
 request-body completion is not a disconnect. These operation slots are admission
 queues, not long-lived SQL transactions or a server-wide HTTP lock.
 
+Queued clinical work retains the async request context from its own admission,
+including its original session authorization. Starting it when an earlier request
+finishes does not inherit that earlier request's context or renew either request's
+lifetime. Nested work still requires the immediate clinical owner, and cancellation
+and profile access are checked independently of queue order.
+
 Identity preparation can borrow a complete clinical policy already retained by
 an idle report-queue owner for the exact database, root, profile, intake and
 proposal. It pins that existing owner against eviction, checks its original

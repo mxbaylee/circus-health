@@ -271,7 +271,9 @@ export async function runExclusiveClinicalOperation<T>(
     const pending: Pending = {
       reject,
       dispose: () => options.signal?.removeEventListener('abort', abort),
-      start: () => {
+      // Queue completion runs in the previous request's async context. Retain
+      // this caller's session authorization and other request-local owners.
+      start: AsyncLocalStorage.bind(() => {
         const controller = new AbortController();
         selected.controller = controller;
         const frame: Frame = {
@@ -294,7 +296,7 @@ export async function runExclusiveClinicalOperation<T>(
             selected.active = false;
             pump(selected);
           });
-      },
+      }),
     };
     options.signal?.addEventListener('abort', abort, { once: true });
     selected.pending.push(pending);
