@@ -4,7 +4,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, StatementSync } from 'node:sqlite';
 import { openDatabase, transaction, clinicalReviewRevision, type Database } from '../database.ts';
 import {
   attachRecordDurability,
@@ -103,24 +103,25 @@ test('immutable staging makes one bounded collision read and one bounded readbac
   const unboundedReads = new Map<string, number>();
   const inserted = new Set<string>();
   const nativePrepare = db.prepare.bind(db);
+  const nativeGet = StatementSync.prototype.get;
   let staging = false;
-  t.mock.method(db, 'prepare', (sql: string) => {
-    const statement = nativePrepare(sql);
+  t.mock.method(StatementSync.prototype, 'get', function (this: StatementSync, ...args: unknown[]) {
+    const sql = this.sourceSQL;
     if (
       sql.startsWith('SELECT length(CAST(value AS BLOB))') ||
-      sql === 'SELECT value FROM app_meta WHERE key=?'
+      sql === 'SELECT value FROM main.app_meta WHERE key=?'
     ) {
       const reads = sql.startsWith('SELECT length(CAST(value AS BLOB))')
         ? boundedReads
         : unboundedReads;
-      const get = statement.get;
-      statement.get = (...args) => {
-        const key = args.at(-1);
-        if (staging && typeof key === 'string' && key.startsWith(nodePrefix))
-          reads.set(key, (reads.get(key) ?? 0) + 1);
-        return Reflect.apply(get, statement, args);
-      };
+      const key = args.at(-1);
+      if (staging && typeof key === 'string' && key.startsWith(nodePrefix))
+        reads.set(key, (reads.get(key) ?? 0) + 1);
     }
+    return Reflect.apply(nativeGet, this, args);
+  });
+  t.mock.method(db, 'prepare', (sql: string) => {
+    const statement = nativePrepare(sql);
     if (sql === 'INSERT INTO app_meta(key,value) VALUES(?,?)') {
       const run = statement.run;
       statement.run = (...args) => {
@@ -180,15 +181,18 @@ test('immutable staging reuses an existing equal node without counting a new wri
   let phase: 'setup' | 'rollback' | 'second' = 'setup';
   let equalKey = '';
   let equalReads = 0;
+  const nativeGet = StatementSync.prototype.get;
+  t.mock.method(StatementSync.prototype, 'get', function (this: StatementSync, ...args: unknown[]) {
+    if (
+      this.sourceSQL.startsWith('SELECT length(CAST(value AS BLOB))') &&
+      phase === 'second' &&
+      args.at(-1) === equalKey
+    )
+      equalReads++;
+    return Reflect.apply(nativeGet, this, args);
+  });
   t.mock.method(db, 'prepare', (sql: string) => {
     const statement = nativePrepare(sql);
-    if (sql.startsWith('SELECT length(CAST(value AS BLOB))')) {
-      const get = statement.get;
-      statement.get = (...args) => {
-        if (phase === 'second' && args.at(-1) === equalKey) equalReads++;
-        return Reflect.apply(get, statement, args);
-      };
-    }
     if (sql === 'INSERT INTO app_meta(key,value) VALUES(?,?)') {
       const run = statement.run;
       statement.run = (...args) => {
@@ -276,34 +280,37 @@ for (const failure of [
     const nodePrefix = intakeNamespace(identity) + 'node:';
     const inserted = new Set<string>();
     const nativePrepare = db.prepare.bind(db);
+    const nativeGet = StatementSync.prototype.get;
     let staging = false;
     let injected = false;
+    t.mock.method(
+      StatementSync.prototype,
+      'get',
+      function (this: StatementSync, ...args: unknown[]) {
+        const row = Reflect.apply(nativeGet, this, args);
+        if (!this.sourceSQL.startsWith('SELECT length(CAST(value AS BLOB))')) return row;
+        const key = args.at(-1);
+        if (!staging || injected || typeof key !== 'string' || !key.startsWith(nodePrefix))
+          return row;
+        if (failure === 'oversized collision row' && row === undefined) {
+          assert.equal(args[0], 32 * 1024);
+          injected = true;
+          return { bytes: 32 * 1024 + 1, value: undefined };
+        }
+        if (failure === 'different collision row' && row === undefined) {
+          assert.equal(args[0], 32 * 1024);
+          injected = true;
+          return { bytes: 19, value: 'different fictional' };
+        }
+        if (failure === 'changed readback' && inserted.has(key) && row) {
+          injected = true;
+          return { ...row, value: 'tampered fictional node' };
+        }
+        return row;
+      },
+    );
     t.mock.method(db, 'prepare', (sql: string) => {
       const statement = nativePrepare(sql);
-      if (sql.startsWith('SELECT length(CAST(value AS BLOB))')) {
-        const get = statement.get;
-        statement.get = (...args) => {
-          const row = Reflect.apply(get, statement, args);
-          const key = args.at(-1);
-          if (!staging || injected || typeof key !== 'string' || !key.startsWith(nodePrefix))
-            return row;
-          if (failure === 'oversized collision row' && row === undefined) {
-            assert.equal(args[0], 32 * 1024);
-            injected = true;
-            return { bytes: 32 * 1024 + 1, value: undefined };
-          }
-          if (failure === 'different collision row' && row === undefined) {
-            assert.equal(args[0], 32 * 1024);
-            injected = true;
-            return { bytes: 19, value: 'different fictional' };
-          }
-          if (failure === 'changed readback' && inserted.has(key) && row) {
-            injected = true;
-            return { ...row, value: 'tampered fictional node' };
-          }
-          return row;
-        };
-      }
       if (sql === 'INSERT INTO app_meta(key,value) VALUES(?,?)') {
         const run = statement.run;
         statement.run = (...args) => {
@@ -1331,20 +1338,19 @@ for (const inTransaction of [false, true])
       const prefix = intakeNamespace(identity) + 'node:';
       let probing = false;
       const reads = new Map<string, number>();
-      const prepare = db.prepare.bind(db);
-      t.mock.method(db, 'prepare', (sql: string) => {
-        const statement = prepare(sql);
-        if (sql.startsWith('SELECT length(CAST(value AS BLOB))')) {
-          const get = statement.get;
-          statement.get = (...args) => {
+      const nativeGet = StatementSync.prototype.get;
+      t.mock.method(
+        StatementSync.prototype,
+        'get',
+        function (this: StatementSync, ...args: unknown[]) {
+          if (this.sourceSQL.startsWith('SELECT length(CAST(value AS BLOB))')) {
             const key = args.at(-1);
             if (probing && typeof key === 'string' && key.startsWith(prefix))
               reads.set(key, (reads.get(key) ?? 0) + 1);
-            return Reflect.apply(get, statement, args);
-          };
-        }
-        return statement;
-      });
+          }
+          return Reflect.apply(nativeGet, this, args);
+        },
+      );
       const store = createIntakeStateStorage(db, identity).collections;
       for (let start = 0; start < 64 + unrelated; start += 64)
         mutate(
