@@ -84,6 +84,15 @@ two independent groups with an existing destination, and two groups creating one
 new destination. They do not qualify every clinical, name, link or report-selection
 combination, nor remove complete physical verification.
 
+Within one ownership preparation, fresh records with no prior issue authority can
+share an authenticated empty issue snapshot from the same original. Each record
+still receives complete current policy inspection and unchanged-policy checks;
+the reference retains its source binding, empty membership digest and current
+catalog validation. An empty report union can use that same reference. Nonempty
+sets and prior issue authority retain their separate preparation paths. Reuse
+avoids publishing another identical empty snapshot; it does not skip evidence
+verification or apply across preparation lifetimes.
+
 ## Current data and searchable history
 
 SQLite is a disposable, indexed projection containing both current records and retained version history. The current view selects the latest accepted version in committed order. Record history is a normal query, not an offline backup-restoration workflow. Index by profile, entity/record, version/sequence and time, with a field-change index or equivalent for queries such as **When did I change my birthday?**

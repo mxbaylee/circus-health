@@ -3,6 +3,7 @@ import {
   ownershipSourceAuthority,
 } from './record-ownership-authority.ts';
 import { setImmediate } from 'node:timers/promises';
+import { createHash } from 'node:crypto';
 import { latestOwnershipDecision } from './ownership-journal.ts';
 /** Ownership issue membership shares the checked immutable string-set codec. Its
  * wrapper identifies hashes as reviewed identity evidence, never source IDs. */
@@ -69,8 +70,31 @@ export async function prepareOwnershipIdentitySnapshots(
   },
 ) {
   sql.exec(
-    'CREATE TABLE IF NOT EXISTS ownership_identity_snapshots(intake TEXT,record TEXT,value TEXT,PRIMARY KEY(intake,record)); CREATE TABLE IF NOT EXISTS ownership_identity_union(value TEXT PRIMARY KEY); DELETE FROM ownership_identity_snapshots; DELETE FROM ownership_identity_union;',
+    'CREATE TABLE IF NOT EXISTS ownership_identity_snapshots(intake TEXT,record TEXT,value TEXT,PRIMARY KEY(intake,record)); CREATE TABLE IF NOT EXISTS ownership_identity_union(value TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS ownership_identity_empty(intake TEXT PRIMARY KEY,value TEXT NOT NULL); DELETE FROM ownership_identity_snapshots; DELETE FROM ownership_identity_union; DELETE FROM ownership_identity_empty;',
   );
+  const emptyDigest = createHash('sha256').update('[]').digest('hex');
+  const retainedEmpty = (intakeId: string) => {
+    const row = sql
+      .prepare('SELECT value FROM ownership_identity_empty WHERE intake=?')
+      .get(intakeId);
+    if (!row) return undefined;
+    const reference = JSON.parse(String(row.value)) as OwnershipIdentityIssuesReference;
+    if (
+      reference.format !== 'health-ownership-identity-issues-v1' ||
+      reference.snapshot.source.intakeId !== intakeId ||
+      reference.snapshot.count !== 0 ||
+      reference.snapshot.digest !== emptyDigest
+    )
+      throw Error('Invalid retained empty ownership issue snapshot');
+    assertOwnershipSourceSnapshot(db, reference.snapshot);
+    return reference;
+  };
+  const retainEmpty = (intakeId: string, reference: OwnershipIdentityIssuesReference) => {
+    if (reference.snapshot.count === 0 && reference.snapshot.digest === emptyDigest)
+      sql
+        .prepare('INSERT OR IGNORE INTO ownership_identity_empty VALUES(?,?)')
+        .run(intakeId, JSON.stringify(reference));
+  };
   for (const source of input.sources) {
     const prepared = !!sql
       .prepare('SELECT 1 FROM ownership_identity_snapshots WHERE intake=? AND record=?')
@@ -84,10 +108,18 @@ export async function prepareOwnershipIdentitySnapshots(
     const factory = input.factory(source.intakeId);
     const sorted = await prepareOwnershipIdentityIssues(record, () => factory.assertCurrent());
     try {
-      const values = () => sorted.distinctValues();
+      const values = () => sorted.distinctValues(),
+        empty = values().at(0) === undefined;
       let reference: OwnershipIdentityIssuesReference | undefined;
+      let reused = false;
       if (!prepared) {
-        reference = await prepareOwnershipIdentityIssueSnapshot(factory, values, previous, {
+        if (empty && previous === undefined) {
+          factory.assertCurrent();
+          reference = retainedEmpty(source.intakeId);
+          factory.assertCurrent();
+        }
+        reused = reference !== undefined;
+        reference ??= await prepareOwnershipIdentityIssueSnapshot(factory, values, previous, {
           deferMaintenance: true,
         });
       }
@@ -104,17 +136,23 @@ export async function prepareOwnershipIdentitySnapshots(
         }
         factory.assertCurrent();
       }
-      if (!prepared) await factory.finishMaintenance();
-      if (reference) factory.assertPublishedCurrent(reference.snapshot);
-      else factory.assertCurrent();
-      sorted.assertSame(() => {
-        if (reference) factory.assertPublishedCurrent(reference.snapshot);
+      if (!prepared && !reused) await factory.finishMaintenance();
+      const assertCurrent = () => {
+        if (reference && reused) {
+          factory.assertCurrent();
+          assertOwnershipSourceSnapshot(db, reference.snapshot);
+          factory.assertCurrent();
+        } else if (reference) factory.assertPublishedCurrent(reference.snapshot);
         else factory.assertCurrent();
-      });
-      if (reference)
+      };
+      assertCurrent();
+      sorted.assertSame(assertCurrent);
+      if (reference) {
         sql
           .prepare('INSERT INTO ownership_identity_snapshots VALUES(?,?,?)')
           .run(source.intakeId, source.recordId, JSON.stringify(reference));
+        if (empty) retainEmpty(source.intakeId, reference);
+      }
     } finally {
       sorted.close();
     }
@@ -127,8 +165,17 @@ export async function prepareOwnershipIdentitySnapshots(
       'groupId',
       input.report.groupId,
     )?.identityIssues;
-    report = await prepareOwnershipIdentityIssueSnapshot(
-      input.factory(input.report.intakeId),
+    const factory = input.factory(input.report.intakeId);
+    factory.assertCurrent();
+    if (
+      prior === undefined &&
+      !sql.prepare('SELECT 1 FROM ownership_identity_union LIMIT 1').get()
+    ) {
+      report = retainedEmpty(input.report.intakeId);
+      factory.assertCurrent();
+    }
+    report ??= await prepareOwnershipIdentityIssueSnapshot(
+      factory,
       function* () {
         let row = sql
           .prepare('SELECT value FROM ownership_identity_union ORDER BY value LIMIT 1')

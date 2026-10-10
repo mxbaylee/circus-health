@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
+import { openContributorRecordStorage } from '../contributor-record-storage.ts';
 import { uploadIntake, reviewIntake, importIntake } from '../intake.ts';
 import { createNote, getNote } from '../notes.ts';
 import {
@@ -418,24 +419,12 @@ test(
     const root = mkdtempSync(join(tmpdir(), 'fictional-native-report-ownership-')),
       profileId = 'fictional';
     const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-    const journalObjects = new Map<string, Buffer>();
-    const recordStorage = {
-      read(name: string) {
-        const value = journalObjects.get(name);
-        return value ? Buffer.from(value) : null;
-      },
-      writeImmutable(name: string, bytes: Uint8Array) {
-        assert.equal(journalObjects.has(name), false);
-        journalObjects.set(name, Buffer.from(bytes));
-      },
-      publishHead(bytes: Uint8Array) {
-        journalObjects.set('head', Buffer.from(bytes));
-      },
-    };
+    const recordStorage = openContributorRecordStorage(root, profileId, { initialize: true });
     attachPersonalDurability(db, { root, profileId, recordStorage });
     t.after(() => {
       clearNativeOwnershipPlans(db);
       db.close();
+      recordStorage.close();
       rmSync(root, { recursive: true, force: true });
     });
     const destination = createNote(db, {
@@ -583,10 +572,17 @@ test(
     assert.equal(receipt.moved, 12);
     assert.equal(receipt.pending, 6);
     assert.ok(journalWork.operation.maxSegmentReferencesBuffered <= 64);
-    const acceptedHead = JSON.parse(journalObjects.get('head')!.toString()),
-      acceptedCommit = JSON.parse(journalObjects.get(acceptedHead.name)!.toString());
+    const acceptedHead = JSON.parse(recordStorage.read('head')!.toString()),
+      acceptedCommit = JSON.parse(recordStorage.read(acceptedHead.name)!.toString());
+    assert.deepEqual(Object.keys(acceptedCommit.result).sort(), ['committed', 'destination']);
     assert.equal(acceptedCommit.result.outcomes, undefined);
-    assert.equal(acceptedCommit.result.outcomesIncluded, false);
+    assert.deepEqual(acceptedCommit.result.committed, receipt);
+    assert.equal(acceptedCommit.result.committed.outcomes, undefined);
+    assert.equal(acceptedCommit.result.committed.outcomesIncluded, false);
+    assert.deepEqual(acceptedCommit.result.destination, {
+      noteId: destination.id,
+      expectedVersion: getNote(db, destination.id).version,
+    });
     assert.ok(JSON.stringify(acceptedCommit.result).length < 2048);
     assert.throws(() => getRecordOwnershipReceipt(db, profileId, operationId), /paged outcomes/);
     assert.equal(

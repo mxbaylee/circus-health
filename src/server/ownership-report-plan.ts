@@ -1058,7 +1058,7 @@ export async function prepareOwnershipReportPlan(
               yield { relationshipId: String(row.id), withdraw: true };
           },
           async choose(input: unknown) {
-            return runExclusiveClinicalOperation(
+            return runReportReadOperation(
               db,
               async () => {
                 await withVerified(() => undefined, 'read-only');
@@ -1173,6 +1173,7 @@ export async function prepareOwnershipReportPlan(
                 }
               },
               { operation: currentClinicalOperation(db) },
+              returnedPlan,
             );
           },
           assertForTransaction() {
