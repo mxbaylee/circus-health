@@ -34,6 +34,19 @@ test(
     const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
+    const failureDetails = async () => {
+      return JSON.stringify({
+        pageErrors: errors,
+        dialogs: await page
+          .getByRole('dialog')
+          .allTextContents()
+          .catch(() => []),
+        alerts: await page
+          .getByRole('alert')
+          .allTextContents()
+          .catch(() => []),
+      });
+    };
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
     await page.goto(url);
     const seed = await page.evaluate(async () => {
@@ -126,7 +139,7 @@ test(
         .waitFor();
     } catch (cause) {
       throw new Error(
-        'Native ownership preview did not offer confirmation: ' + (await dialog.innerText()),
+        'Native ownership preview did not offer confirmation: ' + (await failureDetails()),
         { cause },
       );
     }
@@ -146,7 +159,13 @@ test(
       await route.abort('failed');
     });
     await dialog.getByRole('button', { name: 'Confirm person correction', exact: true }).click();
-    await page.getByRole('dialog', { name: 'Person correction saved' }).waitFor();
+    try {
+      await page.getByRole('dialog', { name: 'Person correction saved' }).waitFor();
+    } catch (cause) {
+      throw new Error('Native ownership save did not reconcile: ' + (await failureDetails()), {
+        cause,
+      });
+    }
     assert.ok(operationId);
     await page.unroute('**/record-ownership');
     const state = await page.evaluate(

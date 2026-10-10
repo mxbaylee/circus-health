@@ -50,6 +50,11 @@ test(
       host: '127.0.0.1',
       unavailableModelAlias: 'fictional-browser-alias',
     });
+    const journeyDiagnostics = runtime.captureDiagnostics();
+    t.after(async () => {
+      if (!completed)
+        console.error('Fictional profile runtime diagnostics', await journeyDiagnostics());
+    });
     const browser = await launchBrowser(t);
     t.after(async () => {
       await browser.close();
