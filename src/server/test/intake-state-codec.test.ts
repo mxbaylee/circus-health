@@ -6,15 +6,81 @@ import { intakeWorkCounters, withIntakeWork } from '../intake-work-accounting.ts
 import { chatDecodeBudget, ChatDecodeLimitError } from '../chat-journal-codec.ts';
 import {
   applyIntakeChanges,
+  applyIntakeChangesSteps,
   applyIntakeChangesIsolated,
   freezeValidatedIntakeJson,
+  freezeValidatedIntakeJsonSteps,
   cloneValidatedIntakeJson,
   intakeChanges,
   normalizeIntakeJson,
   serializeIntakeJson,
+  iterateSerializedIntakeJson,
   type IntakeChange,
   type IntakeJson,
 } from '../intake-state-codec.ts';
+
+test('chunked intake serialization preserves exact JSON bytes and bounded scalar pieces', () => {
+  const value = normalizeIntakeJson({
+    escaped: 'quote " slash \\ control \n lone \ud800 low \udc00',
+    boundary: `${'a'.repeat(4095)}\ud83d\ude03${'b'.repeat(4095)}`,
+    array: [null, -0, true, { '01': 'value', '1': 'next' }],
+  });
+  const pieces = [...iterateSerializedIntakeJson(value)];
+  assert.equal(pieces.join(''), serializeIntakeJson(value));
+  assert.ok(pieces.every((piece) => piece.length <= 4100));
+  assert.ok(pieces.length > 8);
+});
+
+test('cooperative delta application preserves the synchronous state and budget', () => {
+  const before = normalizeIntakeJson({ a: ['fictional', 1], b: { old: true } });
+  const after = normalizeIntakeJson({ b: { old: false }, a: ['fictional', 2, 3], c: 'new' });
+  const changes = [
+    ...intakeChanges(before, after),
+    ...Array.from({ length: 128 }, (_, index) => ({
+      op: 'set' as const,
+      path: [`extra${index}`],
+      value: index,
+    })),
+  ];
+  const syncBudget = chatDecodeBudget();
+  const cooperativeBudget = chatDecodeBudget();
+  const expected = applyIntakeChanges(normalizeIntakeJson(before), changes, syncBudget);
+  const steps = applyIntakeChangesSteps(normalizeIntakeJson(before), changes, cooperativeBudget);
+  let yields = 0;
+  for (;;) {
+    const next = steps.next();
+    if (next.done) {
+      assert.equal(serializeIntakeJson(next.value), serializeIntakeJson(expected));
+      break;
+    }
+    yields++;
+  }
+  assert.equal(yields, Math.floor(changes.length / 64));
+  assert.deepEqual(cooperativeBudget, syncBudget);
+});
+
+test('cooperative ownership freeze yields without changing retained-branch behavior', () => {
+  const shared = freezeValidatedIntakeJson(normalizeIntakeJson({ accepted: ['fictional'] }));
+  const root = { entries: Array.from({ length: 130 }, (_, index) => ({ index })), shared };
+  const steps = freezeValidatedIntakeJsonSteps(root);
+  let yields = 0;
+  for (;;) {
+    const next = steps.next();
+    if (next.done) {
+      assert.equal(next.value, root);
+      break;
+    }
+    yields++;
+  }
+  assert.ok(yields >= 2);
+  assert.ok(Object.isFrozen(root));
+  assert.ok(Object.isFrozen(root.entries));
+  assert.ok(root.entries.every(Object.isFrozen));
+  const detached = cloneValidatedIntakeJson(root).entries;
+  assert.ok(Array.isArray(detached));
+  assert.equal(detached.length, 130);
+  assert.equal(freezeValidatedIntakeJson(root), root);
+});
 
 test('owned subtree preparation preserves logical node/depth limits and refuses forged frozen data', () => {
   const owned = freezeValidatedIntakeJson(normalizeIntakeJson({ values: [1, 2, 3] }));

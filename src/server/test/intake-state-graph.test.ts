@@ -14,6 +14,7 @@ import {
   digest,
   frameIntakeChanges,
   reconstructIntakeEvidence,
+  reconstructIntakeEvidenceSteps,
 } from '../intake-state-evidence.ts';
 import { applyIntakeChanges, serializeIntakeJson } from '../intake-state-codec.ts';
 import { createIntakeTree } from '../intake-state-tree.ts';
@@ -708,6 +709,24 @@ test('tagged v3 bridge validates raw unknown evidence and literal legacy no-op r
     (key) => copied.rows.find((row) => row.key === key)?.value,
   );
   assert.deepEqual(legacy.value, { raw: f.raw });
+  const steps = reconstructIntakeEvidenceSteps(
+    { ...f.identity, profileId: 'fictional-bridge-target' },
+    limits(),
+    previous.head,
+    (key) => copied.rows.find((row) => row.key === key)?.value,
+  );
+  let turns = 0;
+  for (;;) {
+    const next = steps.next();
+    if (next.done) {
+      assert.equal(next.value.serialized, legacy.serialized);
+      assert.equal(next.value.fingerprint, legacy.fingerprint);
+      assert.deepEqual(next.value.value, legacy.value);
+      break;
+    }
+    turns++;
+  }
+  assert.ok(turns > 0, 'cold replay yields between frame and JSON/semantic work');
   assert.equal(
     copied.rows.some((row) => row.key.endsWith('operation:' + f.noop.result.operationId)),
     false,

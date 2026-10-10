@@ -5,7 +5,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase, transaction, clinicalReviewRevision } from '../database.ts';
-import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
+import {
+  consumeSelectedIntakeEnvelopeForBridge,
+  prepareInitialIntakeEnvelope,
+  readIntakeEnvelopeMaterializedForBuild,
+  type PreparedSelectedIntakeEnvelope,
+} from '../intake-authority.ts';
 import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state-storage.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
@@ -25,6 +30,12 @@ import {
 import { schemaKey, parseSchemaControl } from '../intake-envelope-schema.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { createReportSnapshotCatalog } from '../intake-report-snapshot-catalog.ts';
+import {
+  assertIntakeLegacyBridgeReadWitness,
+  captureIntakeLegacyBridgeReadWitness,
+  disposeIntakeLegacyBridgeReadWitness,
+} from '../intake-state-migration.ts';
+import { ensureIntakeFrontierObserver } from '../intake-lookup-frontier-observer.ts';
 function fixture(t: test.TestContext, input: Record<string, unknown> | string) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-envelope-schema-')),
     identity = {
@@ -61,6 +72,99 @@ function fixture(t: test.TestContext, input: Record<string, unknown> | string) {
     source: { id: identity.intakeId, kind: 'intake_original', sha256: identity.sourceHash },
   };
 }
+
+test('selected build proof is bound to its original read and consumed once', async (t) => {
+  const { db, source, identity } = fixture(t, { intake: { version: 7 } });
+  ensureIntakeFrontierObserver(db);
+  const witnesses: ReturnType<typeof captureIntakeLegacyBridgeReadWitness>[] = [];
+  t.after(() => witnesses.forEach(disposeIntakeLegacyBridgeReadWitness));
+  const mint = async () => {
+    const witness = captureIntakeLegacyBridgeReadWitness(db, source.id);
+    witnesses.push(witness);
+    const selected = await readIntakeEnvelopeMaterializedForBuild(db, source, witness);
+    const head = createIntakeStateStorage(db, identity).readMaterialization()!.selectedHead;
+    return { witness, selected, head };
+  };
+  const accepted = await mint();
+  assert.equal(
+    consumeSelectedIntakeEnvelopeForBridge(
+      db,
+      accepted.selected.selectedProof,
+      accepted.witness,
+      source.id,
+      accepted.head,
+    ).version,
+    7,
+  );
+  assert.throws(
+    () =>
+      consumeSelectedIntakeEnvelopeForBridge(
+        db,
+        accepted.selected.selectedProof,
+        accepted.witness,
+        source.id,
+        accepted.head,
+      ),
+    /foreign or expired selected intake proof/,
+  );
+  const other = fixture(t, { intake: { version: 7 } });
+  for (const mismatch of ['database', 'witness', 'id', 'head', 'disposed'] as const) {
+    const { witness, selected, head } = await mint();
+    if (mismatch === 'disposed') disposeIntakeLegacyBridgeReadWitness(witness);
+    assert.throws(
+      () =>
+        consumeSelectedIntakeEnvelopeForBridge(
+          mismatch === 'database' ? other.db : db,
+          selected.selectedProof,
+          mismatch === 'witness' ? ({} as typeof witness) : witness,
+          mismatch === 'id' ? source.id + '-other' : source.id,
+          mismatch === 'head' ? head + ' ' : head,
+        ),
+      /foreign or expired selected intake proof|original read authority changed/,
+    );
+  }
+  const { witness, head } = await mint();
+  assert.throws(
+    () =>
+      consumeSelectedIntakeEnvelopeForBridge(
+        db,
+        {} as PreparedSelectedIntakeEnvelope,
+        witness,
+        source.id,
+        head,
+      ),
+    /foreign or expired selected intake proof/,
+  );
+});
+
+test('a disposed original read cannot publish its prepared legacy bridge', async (t) => {
+  const { db, source, identity } = fixture(t, { intake: { version: 7 } });
+  ensureIntakeFrontierObserver(db);
+  const witness = captureIntakeLegacyBridgeReadWitness(db, source.id);
+  const selected = await readIntakeEnvelopeMaterializedForBuild(db, source, witness);
+  const beforeHead = createIntakeStateStorage(db, identity).readMaterialization()!.selectedHead;
+  const { collections } = selectedEnvelopeStore(db, source);
+  const operationId = randomUUID();
+  const prepared = await collections.prepareLegacyBridgeAsync(
+    {
+      operationId,
+      requestDigest: createHash('sha256').update(operationId).digest('hex'),
+      domainVersion: selected.version,
+    },
+    witness,
+    () => assertIntakeLegacyBridgeReadWitness(db, witness),
+    selected.selectedProof,
+  );
+  disposeIntakeLegacyBridgeReadWitness(witness);
+  assert.throws(
+    () => collections.commitMaintenance(prepared),
+    /foreign, expired or conflicting legacy bridge proof/,
+  );
+  assert.equal(
+    createIntakeStateStorage(db, identity).readMaterialization()!.selectedHead,
+    beforeHead,
+  );
+});
 
 test('snapshot catalog binding uses one bounded authenticated owner observation', async (t) => {
   const { db, source, authority } = fixture(t, { intake: { version: 1 } });
