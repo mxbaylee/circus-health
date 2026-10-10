@@ -83,20 +83,23 @@ export function* hashIntakeJsonScalarSteps(
       kind = 'string';
       take();
       update('"');
-      let high = '';
+      let decoded = '';
+      const flushDecoded = () => {
+        if (decoded) update(JSON.stringify(decoded).slice(1, -1));
+        decoded = '';
+      };
       const emit = (char: string) => {
         onStringUnit?.(char);
-        if (high) {
-          if (/^[\uDC00-\uDFFF]$/.test(char)) {
-            update(JSON.stringify(high + char).slice(1, -1));
-            high = '';
-            return;
-          }
-          update(JSON.stringify(high).slice(1, -1));
-          high = '';
+        decoded += char;
+        const code = char.charCodeAt(0);
+        // Carry a boundary high surrogate until its following decoded unit.
+        if (decoded.length >= 512 && !(code >= 0xd800 && code <= 0xdbff)) flushDecoded();
+        else if (decoded.length > 512) {
+          const high = decoded.slice(-1);
+          decoded = decoded.slice(0, -1);
+          flushDecoded();
+          decoded = high;
         }
-        if (/^[\uD800-\uDBFF]$/.test(char)) high = char;
-        else update(JSON.stringify(char).slice(1, -1));
       };
       while (true) {
         if (units >= 4096) {
@@ -133,7 +136,7 @@ export function* hashIntakeJsonScalarSteps(
         } else if (char.charCodeAt(0) < 32) fail();
         emit(char);
       }
-      if (high) update(JSON.stringify(high).slice(1, -1));
+      flushDecoded();
       update('"');
     } else if (['t', 'f', 'n'].includes(peek())) {
       const literal = peek() === 't' ? 'true' : peek() === 'f' ? 'false' : 'null';

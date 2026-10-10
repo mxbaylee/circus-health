@@ -92,7 +92,17 @@ test('large scalar hashing batches native updates in fixed-size pieces without c
   let calls = 0,
     largest = 0,
     observed = 0,
-    yields = 0;
+    yields = 0,
+    stringifications = 0,
+    largestString = 0;
+  const stringify = JSON.stringify;
+  t.mock.method(JSON, 'stringify', (...args: Parameters<typeof JSON.stringify>) => {
+    if (typeof args[0] === 'string') {
+      stringifications++;
+      largestString = Math.max(largestString, args[0].length);
+    }
+    return Reflect.apply(stringify, JSON, args);
+  });
   t.mock.method(prototype, 'update', function (this: unknown, piece: string, ...args: unknown[]) {
     calls++;
     largest = Math.max(largest, Buffer.byteLength(piece));
@@ -113,6 +123,18 @@ test('large scalar hashing batches native updates in fixed-size pieces without c
   assert.ok(yields >= Math.floor(raw.length / 8192));
   assert.ok(calls > 1);
   assert.ok(largest <= 4096);
+  assert.ok(stringifications <= Math.ceil(value.length / 511) + 1);
+  assert.ok(largestString <= 513);
+});
+
+test('scalar decoded batches preserve paired and lone surrogates at every flush boundary', () => {
+  for (const length of [510, 511, 512, 513])
+    for (const boundary of ['\ud800\udc00', '\ud800\ud800\udc00', '\ud800x', '\udc00', '\ud800']) {
+      const value = 'x'.repeat(length) + boundary + '\\\"\n'.repeat(600) + '\ud800';
+      const raw = JSON.stringify(value);
+      for (const width of [1, 7, 511, 4096])
+        assert.equal(hashIntakeJsonScalar(pieces(raw, width)).hash, digest(value));
+    }
 });
 
 test('abandoning buffered scalar work closes its source without consuming the suffix', () => {
