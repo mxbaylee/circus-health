@@ -268,7 +268,7 @@ async function open(
   const memberId = scalar<string>(view, groupRecord, 'memberId');
   const selectedMember = memberId && member(memberId);
   if (selectedMember) {
-    const child = identityChild(db, id, selectedMember);
+    const child = await identityChild(db, id, selectedMember, assertCurrent);
     if (child) {
       const methods = managedDatabaseMethodEpoch(db);
       const assertPreparation = () => {
@@ -466,22 +466,19 @@ async function open(
     assertCurrent,
   };
 }
-function identityChild(
+async function identityChild(
   db: DatabaseSync,
   id: string,
   member: { sourceHash: string; locator: string },
+  assertCurrent: () => void,
 ) {
+  const hash = await intakeLocatorKey(db, member.locator, assertCurrent);
+  assertCurrent();
   return db
     .prepare(
       "SELECT id FROM source_files WHERE sha256=? AND json_extract(details_json,'$.intake.parentSourceFileId')=? AND (json_extract(details_json,'$.intake.locator')=? OR (json_extract(details_json,'$.intake.locator.format')=? AND json_extract(details_json,'$.intake.locator.field')='locator' AND json_extract(details_json,'$.intake.locator.scalarHash')=?))",
     )
-    .get(
-      member.sourceHash,
-      id,
-      member.locator,
-      COMPACT_SCALAR_FORMAT,
-      locatorScalarHash(member.locator),
-    );
+    .get(member.sourceHash, id, member.locator, COMPACT_SCALAR_FORMAT, hash);
 }
 async function evidence(context: Context) {
   const { db, root, profileId, id, file, group, scope } = context;
@@ -495,8 +492,17 @@ async function evidence(context: Context) {
   if (group.memberId) {
     const member = context.member(group.memberId);
     if (!member) return reject('This package occurrence is not in the retained inventory');
-    const child = identityChild(db, id, member);
-    if (!child || !intakeFirstLocatorMatches(db, String(child.id), member.locator))
+    const child = await identityChild(db, id, member, context.assertCurrent);
+    const matches =
+      child &&
+      (await intakeFirstLocatorMatchesCooperatively(
+        db,
+        String(child.id),
+        member.locator,
+        context.assertCurrent,
+      ));
+    context.assertCurrent();
+    if (!child || !matches)
       return reject('Open and retain this exact package member before confirming its identity');
     evidenceId = String(child.id);
   } else if (file.mime_type === 'application/zip')
@@ -3279,6 +3285,6 @@ async function confirmNativeIntakeIdentityScopeInner(
     },
   );
 }
-import { intakeFirstLocatorMatches } from './intake-state-access.ts';
+import { intakeFirstLocatorMatchesCooperatively } from './intake-state-access.ts';
 import { COMPACT_SCALAR_FORMAT } from './intake-compact-scalar.ts';
-import { schemaKey as locatorScalarHash } from './intake-envelope-schema.ts';
+import { intakeLocatorKey } from './intake-locator-key.ts';

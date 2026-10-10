@@ -1,9 +1,31 @@
 /** Schema-directed record codec. Unknown evidence remains exact lexical cells. */
 import { createHash } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 export const ENVELOPE_SCHEMA = 'health-intake-record-envelope-v1';
 export const schemaHash = (value: string): string =>
   createHash('sha256').update(value).digest('hex');
 export const schemaKey = (...parts: unknown[]): string => schemaHash(JSON.stringify(parts));
+/** The exact single-string schema key, without serializing a whole large scalar. */
+export async function schemaStringKey(
+  value: string,
+  assertRunning: () => void = () => {},
+): Promise<string> {
+  assertRunning();
+  const hash = createHash('sha256').update('["');
+  for (let at = 0; at < value.length;) {
+    let end = Math.min(at + 4096, value.length);
+    // Keep surrogate pairs together so chunk boundaries cannot change JSON bytes.
+    if (end < value.length && /[\uD800-\uDBFF]/.test(value[end - 1]!)) end--;
+    hash.update(JSON.stringify(value.slice(at, end)).slice(1, -1));
+    at = end;
+    if (at < value.length) {
+      await setImmediate();
+      assertRunning();
+    }
+  }
+  assertRunning();
+  return hash.update('"]').digest('hex');
+}
 export const schemaOrdinal = (n: number): string => String(n).padStart(16, '0');
 export interface SchemaRecord {
   kind: string;

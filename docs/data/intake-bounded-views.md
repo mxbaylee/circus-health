@@ -1404,6 +1404,14 @@ and giant `$scope` inputs in the
 [alias-owner cases](../../src/server/test/intake-identity-snapshot-alias.test.ts)
 are synthetic owner fixtures; they do not establish a native policy/model path.
 
+Identity member-locator keys retain the exact single-string schema hash while
+serializing at most 4,096 UTF-16 code units per piece, keeping surrogate pairs
+together. Hashing yields between pieces under one original SQL, method and
+managed-physical interval; a write-attempt observer includes saved no-op statements
+and rollback attempts. Original caller checks bracket the hash, and downstream
+retained-original verification remains required. This bounds serialization and
+hash turns, not the already decoded locator string or its SQLite query binding.
+
 Current identity fragment consumers use source- and snapshot-bound authenticated continuation positions over the existing variable-length byte leaves. Their total leaf-read work scales with the full traversal plus bounded page-boundary lookahead, rather than rereading every preceding fragment. Byte counters include decoded lookahead leaves. Page reference sizing uses authenticated item lengths, while full question digest construction yields with current source and artifact checks. Numeric-only compatibility calls preserve arbitrary byte-offset semantics through a cooperative prefix scan; they retain the cumulative reread cost and are not a bounded-per-page access guarantee. A verified-original descriptor remains held through fragment work, and cancellation or same-byte physical replacement invalidates a resumed read.
 
 A cold preview that publishes a snapshot cannot certify its earlier response.

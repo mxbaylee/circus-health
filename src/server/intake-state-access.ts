@@ -36,6 +36,7 @@ import {
 } from './intake-compact-scalar.ts';
 import { parseIntakeFilenameFacts } from './intake-filename-facts.ts';
 import { schemaKey } from './intake-envelope-schema.ts';
+import { intakeLocatorKey } from './intake-locator-key.ts';
 import type { IntakeMetadataScalarReference } from '../shared/intake-summary.ts';
 import type {
   Intake,
@@ -253,33 +254,33 @@ export function intakeMetadataScalarReference(
   };
 }
 /** SQLite JSON extraction selects the first raw occurrence, unlike JSON.parse. */
-export function intakeFirstLocatorMatcher(
+function firstLocatorEvidence(
   db: DatabaseSync,
   id: string,
-): (exact: string) => boolean {
+): { literal: string } | { scalarHash: string } | undefined {
   const source = db
     .prepare(
       "SELECT id,kind,sha256,details_json,json_type(details_json,'$.intake.locator') locatorType,json_extract(details_json,'$.intake.locator') locator FROM main.source_files WHERE id=?",
     )
     .get(id);
-  if (!source || source.kind !== 'intake_original') return () => false;
+  if (!source || source.kind !== 'intake_original') return undefined;
   intakeEnvelopeAuthorityBinding(
     db,
     source as unknown as Parameters<typeof intakeEnvelopeAuthorityBinding>[1],
   );
-  if (typeof source.locator !== 'string') return () => false;
+  if (typeof source.locator !== 'string') return undefined;
   const native = hasIntakeCollectionEnvelope(
     db,
     source as unknown as Parameters<typeof openIntakeCollectionEnvelope>[1],
   );
-  if (!native) return (exact) => source.locatorType === 'text' && source.locator === exact;
+  if (!native) return source.locatorType === 'text' ? { literal: source.locator } : undefined;
   const view = openIntakeCollectionEnvelope(
     db,
     { id, sha256: source.sha256 as string },
     { fieldSelection: 'first' },
   );
   const intake = view.child(view.root(), 'intake');
-  if (!intake) return () => false;
+  if (!intake) return undefined;
   if (source.locatorType === 'text') {
     const selected = view.field(intake, 'locator', { bytes: 16384 });
     if (selected.kind === 'fragmented')
@@ -290,15 +291,15 @@ export function intakeFirstLocatorMatcher(
       );
     if (selected.kind !== 'value' || selected.value !== source.locator)
       throw Error('Source locator conflicts with exact first-occurrence evidence');
-    return (exact) => source.locator === exact;
+    return { literal: source.locator };
   }
-  if (source.locatorType !== 'object') return () => false;
-  if (view.child(intake, 'locator')) return () => false;
+  if (source.locatorType !== 'object') return undefined;
+  if (view.child(intake, 'locator')) return undefined;
   const selected = view.field(intake, 'locator', { bytes: 16384 });
   if (selected.kind === 'value' && selected.value !== null && typeof selected.value === 'object')
-    return () => false;
+    return undefined;
   const value: unknown = JSON.parse(source.locator);
-  if (!isIntakeCompactScalar(value) || value.field !== 'locator') return () => false;
+  if (!isIntakeCompactScalar(value) || value.field !== 'locator') return undefined;
   const cell = intakeEnvelopeFilenameCell(view, intake, 'locator');
   if (cell.facts === undefined)
     throw new HttpError(
@@ -313,10 +314,35 @@ export function intakeFirstLocatorMatcher(
     JSON.stringify(compactIntakeScalar('locator', facts)) !== JSON.stringify(value)
   )
     throw Error('Source locator conflicts with exact first-occurrence evidence');
-  return (exact) => facts.scalarHash === schemaKey(exact);
+  return { scalarHash: facts.scalarHash };
+}
+export function intakeFirstLocatorMatcher(
+  db: DatabaseSync,
+  id: string,
+): (exact: string) => boolean {
+  const evidence = firstLocatorEvidence(db, id);
+  return (exact) =>
+    !!evidence &&
+    ('literal' in evidence ? evidence.literal === exact : evidence.scalarHash === schemaKey(exact));
 }
 export function intakeFirstLocatorMatches(db: DatabaseSync, id: string, exact: string): boolean {
   return intakeFirstLocatorMatcher(db, id)(exact);
+}
+export async function intakeFirstLocatorMatchesCooperatively(
+  db: DatabaseSync,
+  id: string,
+  exact: string,
+  assertRunning: () => void,
+): Promise<boolean> {
+  const hash = await intakeLocatorKey(db, exact, assertRunning);
+  assertRunning();
+  // Read authority after the last yield, never reuse an earlier locator selection.
+  const evidence = firstLocatorEvidence(db, id);
+  assertRunning();
+  return (
+    !!evidence &&
+    ('literal' in evidence ? evidence.literal === exact : evidence.scalarHash === hash)
+  );
 }
 
 /** Public stale-tab version without hydrating a selected V4 workflow. The
