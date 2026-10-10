@@ -502,11 +502,8 @@ test('contributor copy compares exact streamed row multisets and publishes autho
 });
 
 // These are physical reads through the real filesystem, not cached path claims.
-test('authority reads retain every fresh native physical-path proof and current head bytes', (t) => {
+test('authority reads retain every fresh native physical-path proof and current head bytes', async (t) => {
   const { root, paths } = fixture(t);
-  const storage = openContributorRecordStorage(root, 'cedar', { initialize: true });
-  t.after(() => storage.close());
-  storage.publishHead(Buffer.from('first fictional head'));
   const head = resolve(contributorAuthorityPath(root, 'cedar'), 'head');
   const physical = realpathSync.native;
   const observed: string[] = [];
@@ -514,7 +511,17 @@ test('authority reads retain every fresh native physical-path proof and current 
     observed.push(String(args[0]));
     return physical(...args);
   });
+  let storage: ReturnType<typeof openContributorRecordStorage> | undefined;
   try {
+    // The real resolver is captured at factory-module initialization. This
+    // isolated reader observes that capture without making it mutable later.
+    const isolated: typeof import('../contributor-record-storage.ts') = await import(
+      new URL('../contributor-record-storage.ts?physical-path-proof', import.meta.url).href
+    );
+    storage = isolated.openContributorRecordStorage(root, 'cedar', { initialize: true });
+    const opened = storage;
+    t.after(() => opened.close());
+    storage.publishHead(Buffer.from('first fictional head'));
     for (const value of ['second fictional head', 'third fictional head']) {
       writeFileSync(head, value);
       observed.length = 0;
@@ -525,10 +532,12 @@ test('authority reads retain every fresh native physical-path proof and current 
     probe.mock.mockImplementation(() => {
       throw Error('fictional native resolver refusal');
     });
-    assert.throws(() => storage.read('head'), /native resolver refusal/);
+    assert.throws(() => opened.read('head'), /native resolver refusal/);
   } finally {
+    probe.mock.mockImplementation(physical);
     probe.mock.restore();
   }
+  assert.ok(storage);
   assert.equal(storage.read('head')?.toString(), 'third fictional head');
 });
 
