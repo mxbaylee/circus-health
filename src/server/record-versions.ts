@@ -3606,6 +3606,7 @@ export function attachRecordDurability(
         // The retained bytecode is transport only; acceptance still requires
         // authenticated predecessors, original physical proofs and a new token.
         preparation.terminal = prepareTerminalStatementsInTransaction(db, token!, {
+          recordMutationRecipe: preparation.recipe,
           statements: [
             ...new Set([
               ...preparation.recipe.sql(),
@@ -3614,6 +3615,7 @@ export function attachRecordDurability(
               'SELECT commit_json FROM __record_transactions WHERE sequence=?',
               'SELECT * FROM __record_transactions WHERE operation_id=?',
               'SELECT 1 FROM temp.__record_changed LIMIT 1',
+              'DELETE FROM temp.__record_changed',
               'SELECT 1 FROM main.source_files WHERE id IS ? AND kind IS ? AND path IS ? AND sha256 IS ? AND bytes IS ?',
               'SELECT total_changes() AS count',
               ...config.schema.flatMap((table) => [

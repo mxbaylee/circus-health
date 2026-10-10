@@ -1919,6 +1919,9 @@ export function createIntakeCollections(owner: {
             terminalStatement(
               db,
               'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+              undefined,
+              false,
+              'changes',
             ).run(headKey, data.after).changes === 1;
         } finally {
           finishIntakeFrontierMetaWrite(db, expectedHead, headWritten);

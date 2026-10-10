@@ -1,5 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { terminalStatement } from './database-terminal-statements.ts';
+import {
+  terminalStatement,
+  terminalRecordMutationNativeScopeActive,
+} from './database-terminal-statements.ts';
+import { recordMutationChangeset } from './record-mutation-recipe.ts';
 import { constants, DatabaseSync, StatementSync } from 'node:sqlite';
 import {
   managedDatabaseAuthorizerSetter,
@@ -677,6 +681,7 @@ export function clearIntakeFrontierRecordCapture(
       throw Error('Ordinary cleanup cannot consume terminal capture slots');
   }
   const prepared = capability && captureClears.get(capability);
+  const terminal = terminalRecordMutationNativeScopeActive(db);
   if (capability) {
     const token = currentTransactionToken(db);
     if (
@@ -693,8 +698,12 @@ export function clearIntakeFrontierRecordCapture(
       observer!.clearingCapture ||
       observer!.functionReplaced ||
       managedDatabaseMethodEpoch(db) !== prepared.methods ||
-      schemaValue(prepared.main) !== prepared.mainSchema ||
-      schemaValue(prepared.temp) !== prepared.tempSchema
+      (terminal
+        ? terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version
+        : schemaValue(prepared.main)) !== prepared.mainSchema ||
+      (terminal
+        ? terminalStatement(db, 'PRAGMA temp.schema_version').get()!.schema_version
+        : schemaValue(prepared.temp)) !== prepared.tempSchema
     )
       throw Error('Foreign, expired or replayed terminal capture cleanup');
     prepared.token = token;
@@ -713,7 +722,9 @@ export function clearIntakeFrontierRecordCapture(
     // Fresh bytecode must consume this slot. Rearming here would invalidate
     // every unrelated prepared statement twice per durable publication.
     return prepared
-      ? Reflect.apply(nativeRun, prepared.statement, []).changes
+      ? terminal
+        ? terminalStatement(db, 'DELETE FROM temp.__record_changed').run().changes
+        : Reflect.apply(nativeRun, prepared.statement, []).changes
       : db.prepare('DELETE FROM temp.__record_changed').run().changes;
   } finally {
     if (observer && !clearing.seen) revoke(observer, 'capture cleanup authorization missing');
@@ -942,8 +953,7 @@ export function applyObservedClinicalProjectionChangeset(
   db: DatabaseSync,
   changes: Uint8Array,
 ): boolean {
-  const apply = () =>
-    db.applyChangeset(changes, { onConflict: () => constants.SQLITE_CHANGESET_ABORT });
+  const apply = () => recordMutationChangeset(db, changes);
   const observer = observers.get(db);
   if (!observer || observer.revoked) return apply();
   if (

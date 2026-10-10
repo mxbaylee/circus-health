@@ -283,7 +283,7 @@ export function createIntakeStateStorage(
       if (old !== serialized) invalid('immutable collision');
       return false;
     }
-    terminalStatement(db, insertMeta.sourceSQL, insertMeta).run(key, serialized);
+    terminalStatement(db, insertMeta.sourceSQL, insertMeta, false, 'none').run(key, serialized);
     return true;
   }
   function cachedBasis(basis: Basis, selectedHead: string): CachedBasis {

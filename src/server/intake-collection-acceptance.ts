@@ -14,6 +14,7 @@ import {
   type TransactionOutcome,
 } from './database.ts';
 import { tryObservePreparedRecordPublication } from './record-versions.ts';
+import { recordMutationStatement } from './record-mutation-recipe.ts';
 import { canonicalLiteral, cloneLiteral } from './intake-format.ts';
 import {
   intakeWorkflowQuestionValue,
@@ -740,7 +741,8 @@ export async function prepareNativeIntakeAcceptance(
           // only from the checked review context and the actual projection. Keep
           // it inside the footprint so callers cannot authorize arbitrary SQL
           // merely by asking for acceptance-only revalidation.
-          db.prepare(
+          recordMutationStatement(
+            db,
             "UPDATE manual_batches SET status='verified',verified_at=?,coverage_json=?,notes=? WHERE id=?",
           ).run(
             at,
@@ -766,11 +768,11 @@ export async function prepareNativeIntakeAcceptance(
           let revisionWritten = false;
           try {
             revisionWritten =
-              db
-                .prepare(
-                  "INSERT INTO app_meta(key,value) VALUES('intake_mutation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                )
-                .run(String(revision(db) + 1)).changes === 1;
+              recordMutationStatement(
+                db,
+                "INSERT INTO app_meta(key,value) VALUES('intake_mutation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                'changes',
+              ).run(String(revision(db) + 1)).changes === 1;
           } finally {
             finishIntakeFrontierMetaWrite(db, expectedRevision, revisionWritten);
           }

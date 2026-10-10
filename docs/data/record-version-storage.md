@@ -43,6 +43,22 @@ version decoding on the second. Complete physical verification still runs.
 This private-path result does not establish public ownership, prerequisite or
 group integration, nor changed-only physical verification or general capacity.
 
+Preparatory recipes record both literal SQL and genuine native changeset effects,
+including their exact write counts. Before final physical verification, every
+retained literal replay statement is compiled again under the installed policy.
+The native changeset's recorded authorization sequence receives fresh policy
+evaluation before its final execution. If SQLite
+expires that bytecode during changeset application, final execution accepts only
+the same native statement's complete recorded authorization sequence; it does
+not call external policy or business callbacks inside publication. Changed
+methods, schemas, observer membership or authorization events refuse replay.
+The business callback runs only in preparation, which rolls back; the final
+transaction recreates its frozen effects. Disposal releases unused statement
+authorization receipts. This does not make arbitrary SQL enrollable. Changeset
+authorization observers run during preparation, and changes to their membership
+refuse replay; their mutable closure behavior is not freshly reevaluated during
+changeset preflight or final replay.
+
 ## Current data and searchable history
 
 SQLite is a disposable, indexed projection containing both current records and retained version history. The current view selects the latest accepted version in committed order. Record history is a normal query, not an offline backup-restoration workflow. Index by profile, entity/record, version/sequence and time, with a field-change index or equivalent for queries such as **When did I change my birthday?**

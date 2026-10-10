@@ -1,5 +1,19 @@
 import { createHmac, randomBytes } from 'node:crypto';
-import { DatabaseSync, StatementSync, type SQLInputValue } from 'node:sqlite';
+import { DatabaseSync, StatementSync, constants, type SQLInputValue } from 'node:sqlite';
+import {
+  captureRecordChangesetInvocation,
+  prepareRecordChangesetInvocation,
+  replayRecordChangesetInvocation,
+  closeRecordChangesetInvocation,
+  type RecordChangesetInvocation,
+} from './database.ts';
+import {
+  refreshTerminalRecordMutationStatements,
+  disposeTerminalRecordMutationStatements,
+  terminalRecordMutationReprepareActive,
+  readTerminalRecordMutationCount,
+  runTerminalRecordMutationStatement,
+} from './database-terminal-statements.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { captureRecordHeadPhysical } from './record-head-physical.ts';
 import { dirname } from 'node:path';
@@ -17,6 +31,7 @@ type Argument = { kind: string; value: string | Uint8Array | null };
 export type RecordMutationOutput = 'none' | 'changes' | 'rowid';
 interface RecipeRow {
   sequence: number;
+  kind: 'statement' | 'changeset';
   sql: string;
   arguments: number;
   changes: string;
@@ -26,6 +41,7 @@ interface RecipeRow {
 }
 interface Capture {
   statement(sql: string, output: RecordMutationOutput): StatementSync;
+  changeset(bytes: Uint8Array): boolean;
 }
 const active = new WeakMap<DatabaseSync, Capture>();
 const recipes = new WeakMap<object, DatabaseSync>();
@@ -77,8 +93,18 @@ export function recordMutationStatement(
   db: DatabaseSync,
   sql: string,
   output: RecordMutationOutput = 'none',
+  cached?: StatementSync,
 ): StatementSync {
-  return active.get(db)?.statement(sql, output) ?? db.prepare(sql);
+  return active.get(db)?.statement(sql, output) ?? cached ?? db.prepare(sql);
+}
+
+/** Only the actual fixed native apply owns enrollment; callbacks cannot provide
+ * a result or transcript as permission to replay different changes. */
+export function recordMutationChangeset(db: DatabaseSync, bytes: Uint8Array): boolean {
+  return (
+    active.get(db)?.changeset(bytes) ??
+    db.applyChangeset(bytes, { onConflict: () => constants.SQLITE_CHANGESET_ABORT })
+  );
 }
 
 /** Ordered changed-scope SQL/arguments, never a table or document snapshot.
@@ -97,9 +123,10 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
     expectedWrites = 0n;
   let replayPhysical: ReturnType<typeof captureRecordHeadPhysical> | undefined;
   let replayVerified = false;
+  const changesets = new Map<number, RecordChangesetInvocation>();
   try {
     scratch.db.exec(
-      'CREATE TABLE recipe(sequence INTEGER PRIMARY KEY,sql TEXT NOT NULL,arguments INTEGER NOT NULL,changes TEXT NOT NULL,rowid TEXT,delta TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE arguments(sequence INTEGER NOT NULL,position INTEGER NOT NULL,kind TEXT NOT NULL,value,PRIMARY KEY(sequence,position));',
+      'CREATE TABLE recipe(sequence INTEGER PRIMARY KEY,kind TEXT NOT NULL,sql TEXT NOT NULL,arguments INTEGER NOT NULL,changes TEXT NOT NULL,rowid TEXT,delta TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE arguments(sequence INTEGER NOT NULL,position INTEGER NOT NULL,kind TEXT NOT NULL,value,PRIMARY KEY(sequence,position));',
     );
     const stamp = scratch.db.prepare('SELECT total_changes() AS n'),
       peer = scratch.db.prepare('PRAGMA data_version'),
@@ -113,7 +140,7 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
     const read = (statement: StatementSync) => Reflect.apply(get, statement, []);
     const originalPeer = read(peer)!.data_version,
       originalSchema = read(schema)!.schema_version,
-      insert = scratch.db.prepare('INSERT INTO recipe VALUES(?,?,?,?,?,?,?)'),
+      insert = scratch.db.prepare('INSERT INTO recipe VALUES(?,?,?,?,?,?,?,?)'),
       insertArgument = scratch.db.prepare('INSERT INTO arguments VALUES(?,?,?,?)'),
       rows = scratch.db.prepare('SELECT * FROM recipe ORDER BY sequence'),
       argumentsFor = scratch.db.prepare(
@@ -173,6 +200,7 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
                 after = Reflect.apply(get, sourceStamp, []).n as bigint,
                 row = {
                   sequence: count,
+                  kind: 'statement' as const,
                   sql: statement.sourceSQL,
                   arguments: args.length,
                   changes: String(result.changes),
@@ -192,6 +220,7 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
               if (
                 Reflect.apply(run, insert, [
                   count,
+                  row.kind,
                   row.sql,
                   args.length,
                   row.changes,
@@ -235,6 +264,57 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
           },
         }) as unknown as StatementSync;
       },
+      changeset(bytes) {
+        current();
+        if (!capturing || sealed || executing || active.get(db) !== capture) fail();
+        const args = [argument(bytes)],
+          copied = value(args[0]!) as Uint8Array;
+        executing = true;
+        try {
+          const before = Reflect.apply(get, sourceStamp, []).n as bigint,
+            invocation = captureRecordChangesetInvocation(db, copied, before),
+            after = Reflect.apply(get, sourceStamp, []).n as bigint,
+            row = {
+              sequence: count,
+              kind: 'changeset' as const,
+              sql: '',
+              arguments: 1,
+              changes: 'true',
+              rowid: null,
+              delta: String(after - before),
+            };
+          changesets.set(count, invocation);
+          current();
+          if (
+            Reflect.apply(run, insertArgument, [count, 0, args[0]!.kind, args[0]!.value])
+              .changes !== 1
+          )
+            fail();
+          expectedWrites++;
+          if (
+            Reflect.apply(run, insert, [
+              count,
+              row.kind,
+              row.sql,
+              row.arguments,
+              row.changes,
+              row.rowid,
+              row.delta,
+              sign(row, args),
+            ]).changes !== 1
+          )
+            fail();
+          expectedWrites++;
+          count++;
+          current();
+          return true;
+        } catch (error) {
+          failed = true;
+          throw error;
+        } finally {
+          executing = false;
+        }
+      },
     };
     const probe = Reflect.apply(iterate, rows, []),
       next = descriptor(Object.getPrototypeOf(probe), 'next')?.value,
@@ -258,7 +338,15 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
           const { signature, ...header } = row;
           if (
             row.sequence !== visited++ ||
+            (row.kind !== 'statement' && row.kind !== 'changeset') ||
             args.length !== row.arguments ||
+            (row.kind === 'changeset' &&
+              (!changesets.has(row.sequence) ||
+                args.length !== 1 ||
+                args[0]!.kind !== 'blob' ||
+                row.sql !== '' ||
+                row.changes !== 'true' ||
+                row.rowid !== null)) ||
             (authenticate && sign(header, args) !== signature)
           )
             fail();
@@ -298,7 +386,7 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
       },
       *sql(): Generator<string> {
         if (!sealed || used) fail();
-        for (const { row } of checked()) yield row.sql;
+        for (const { row } of checked()) if (row.kind === 'statement') yield row.sql;
       },
       writes(): bigint {
         if (!sealed || used) fail();
@@ -318,6 +406,15 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
         Reflect.apply(readBigInts, sourceStamp, [true]);
         Reflect.apply(get, sourceStamp, []);
         current();
+        for (const { row } of checked()) {
+          if (row.kind !== 'changeset') continue;
+          const before = Reflect.apply(get, sourceStamp, []).n;
+          prepareRecordChangesetInvocation(db, changesets.get(row.sequence)!);
+          if (Reflect.apply(get, sourceStamp, []).n !== before) fail();
+        }
+        const beforeRefresh = Reflect.apply(get, sourceStamp, []).n;
+        refreshTerminalRecordMutationStatements(db, recipe);
+        if (Reflect.apply(get, sourceStamp, []).n !== beforeRefresh) fail();
         const path = Reflect.apply(location, scratch.db, []) as string;
         if (!path) fail();
         replayPhysical = captureRecordHeadPhysical([path], [dirname(path)]);
@@ -362,14 +459,37 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
       replay(resolve: (sql: string) => StatementSync): void {
         if (!sealed || used || !db.isTransaction || (replayPhysical && !replayVerified)) fail();
         used = true;
+        const protectedNative = terminalRecordMutationReprepareActive(db, recipe),
+          sourceChanges = () =>
+            protectedNative
+              ? readTerminalRecordMutationCount(db, recipe)
+              : (Reflect.apply(get, sourceStamp, []).n as bigint);
         for (const { row, args } of checked(!replayPhysical)) {
-          const before = Reflect.apply(get, sourceStamp, []).n as bigint,
-            statement = resolve(row.sql);
-          // This native accessor also rejects non-native resolver facades.
-          if (Reflect.apply(nativeSourceSql, statement, []) !== row.sql) fail();
+          if (row.kind === 'changeset') {
+            const before = sourceChanges();
+            if (
+              !replayRecordChangesetInvocation(
+                db,
+                changesets.get(row.sequence)!,
+                args[0] as Uint8Array,
+              ) ||
+              String(sourceChanges() - before) !== row.delta
+            )
+              fail();
+            continue;
+          }
+          const before = sourceChanges();
           current();
-          const result = Reflect.apply(run, statement, args),
-            after = Reflect.apply(get, sourceStamp, []).n as bigint;
+          let result: ReturnType<StatementSync['run']>;
+          if (protectedNative)
+            result = runTerminalRecordMutationStatement(db, recipe, row.sql, args);
+          else {
+            const statement = resolve(row.sql);
+            // This native accessor also rejects non-native resolver facades.
+            if (Reflect.apply(nativeSourceSql, statement, []) !== row.sql) fail();
+            result = Reflect.apply(run, statement, args);
+          }
+          const after = sourceChanges();
           if (
             String(result.changes) !== row.changes ||
             (row.rowid !== null && String(result.lastInsertRowid) !== row.rowid) ||
@@ -381,10 +501,13 @@ export function createRecordMutationRecipe(db: DatabaseSync) {
       close() {
         if (closed) return;
         if (capturing || executing) fail();
+        disposeTerminalRecordMutationStatements(db, recipe);
         closed = true;
         recipes.delete(recipe);
         if (active.get(db) === capture) active.delete(db);
         key.fill(0);
+        for (const invocation of changesets.values()) closeRecordChangesetInvocation(invocation);
+        changesets.clear();
         try {
           replayPhysical?.close();
         } finally {

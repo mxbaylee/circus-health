@@ -1,4 +1,5 @@
-import { DatabaseSync, constants, type SQLOutputValue } from 'node:sqlite';
+import { DatabaseSync, StatementSync, constants, type SQLOutputValue } from 'node:sqlite';
+import { createHmac, randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +40,7 @@ import {
   terminalStatement,
   terminalExecution,
   terminalStatementsActive,
+  terminalNativeStatementOwned,
 } from './database-terminal-statements.ts';
 import { ensureSourceDetailsSearchFunction } from './source-details-search.ts';
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -57,6 +59,7 @@ interface ManagedAuthorization {
   callbackDepth: number;
   dispatchDepth: number;
   protectCallbacks: boolean;
+  dispatch: Authorizer;
 }
 const managedAuthorizers = new WeakMap<DatabaseSync, ManagedAuthorization>();
 const managedMethodEpochs = new WeakMap<DatabaseSync, object>();
@@ -71,6 +74,411 @@ const nativeDatabaseMethods = new Map(
     nativeOwnDescriptor(databasePrototype, name)?.value,
   ]),
 );
+type ChangesetAuthorizationEvent = {
+  readonly args: Parameters<Authorizer>;
+  readonly answer: number;
+};
+declare const changesetInvocationBrand: unique symbol;
+export interface RecordChangesetInvocation {
+  readonly [changesetInvocationBrand]: true;
+}
+interface ChangesetInvocation {
+  readonly db: DatabaseSync;
+  readonly authorization: ManagedAuthorization;
+  readonly methods: object;
+  readonly observers: readonly AuthorizationObserver[];
+  readonly policyChanges: readonly (() => void)[];
+  readonly policy: Authorizer | null;
+  readonly bytes: Buffer;
+  readonly key: Buffer;
+  total: StatementSync;
+  main: StatementSync;
+  temp: StatementSync;
+  peer: StatementSync;
+  readonly mainSchema: unknown;
+  readonly tempSchema: unknown;
+  readonly dataVersion: unknown;
+  readonly tape: ChangesetAuthorizationEvent[];
+  signature?: string;
+  prepared: boolean;
+  used: boolean;
+  failed: boolean;
+  failure?: unknown;
+  statement?: StatementSync;
+}
+const changesetInvocations = new WeakMap<RecordChangesetInvocation, ChangesetInvocation>();
+const terminalNativeAuthorizations = new WeakMap<StatementSync, ChangesetInvocation>();
+const terminalNativeIterators = new WeakMap<
+  Iterator<unknown>,
+  { readonly statement: StatementSync; readonly item: ChangesetInvocation }
+>();
+const changesetAuthorizationScopes = new WeakMap<
+  DatabaseSync,
+  {
+    readonly item: ChangesetInvocation;
+    readonly mode: 'capture' | 'prepare' | 'replay';
+    cursor: number;
+  }
+>();
+const changesetTotalReads = new WeakMap<
+  DatabaseSync,
+  { readonly item: ChangesetInvocation; readonly statement: StatementSync; cursor: number }
+>();
+const changesetPrepare = DatabaseSync.prototype.prepare,
+  changesetGet = StatementSync.prototype.get,
+  changesetReadBigInts = StatementSync.prototype.setReadBigInts,
+  changesetApply = DatabaseSync.prototype.applyChangeset;
+const terminalNativeGet = StatementSync.prototype.get,
+  terminalNativeAll = StatementSync.prototype.all,
+  terminalNativeRun = StatementSync.prototype.run,
+  terminalNativeColumns = StatementSync.prototype.columns,
+  terminalNativeIterate = StatementSync.prototype.iterate;
+let terminalIteratorNext: ((...args: unknown[]) => IteratorResult<unknown>) | undefined,
+  terminalIteratorReturn: ((...args: unknown[]) => IteratorResult<unknown>) | undefined;
+function prepareTerminalIteratorMethods(): void {
+  if (terminalIteratorNext && terminalIteratorReturn) return;
+  const probeDb = new DatabaseSync(':memory:');
+  try {
+    const probe = Reflect.apply(
+      terminalNativeIterate,
+      Reflect.apply(changesetPrepare, probeDb, ['SELECT 1']),
+      [],
+    );
+    const prototype = Object.getPrototypeOf(probe);
+    terminalIteratorNext = Object.getOwnPropertyDescriptor(prototype, 'next')?.value;
+    terminalIteratorReturn = Object.getOwnPropertyDescriptor(prototype, 'return')?.value;
+    if (typeof terminalIteratorNext !== 'function' || typeof terminalIteratorReturn !== 'function')
+      changesetFailure();
+    Reflect.apply(terminalIteratorReturn, probe, []);
+  } finally {
+    probeDb.close();
+  }
+}
+// Bind iterator intrinsics before application policy callbacks can replace them.
+prepareTerminalIteratorMethods();
+function changesetFailure(item?: ChangesetInvocation, reason?: string): never {
+  const error = Error(
+    reason
+      ? `Record changeset invocation refused ${reason}`
+      : 'Record changeset invocation changed, escaped or was already consumed',
+  );
+  if (item) {
+    item.failed = true;
+    item.failure ??= error;
+  }
+  throw error;
+}
+/** SQLite may expire this counter's bytecode inside its changeset PRAGMAs.
+ * Only this issuer-created native handle can enter the fixed builtin read slot. */
+function readChangesetTotal(item: ChangesetInvocation): bigint {
+  if (
+    item.failed ||
+    managedAuthorizers.get(item.db) !== item.authorization ||
+    managedDatabaseMethodEpoch(item.db) !== item.methods ||
+    managedDatabaseDataMethod(item.db, 'applyChangeset') !== changesetApply ||
+    changesetAuthorizationScopes.get(item.db)?.item !== item ||
+    item.authorization.dispatchDepth !== 1 ||
+    changesetTotalReads.has(item.db)
+  )
+    changesetFailure(item, 'foreign or recursive write-count read');
+  const slot = { item, statement: item.total, cursor: 0 };
+  changesetTotalReads.set(item.db, slot);
+  try {
+    const result = Reflect.apply(changesetGet, slot.statement, []).n;
+    if ((slot.cursor !== 0 && slot.cursor !== 2) || typeof result !== 'bigint')
+      changesetFailure(item, 'incomplete write-count authorization');
+    return result;
+  } catch (error) {
+    item.failed = true;
+    throw item.failure ?? error;
+  } finally {
+    changesetTotalReads.delete(item.db);
+  }
+}
+function changesetCurrent(item: ChangesetInvocation): void {
+  const same = <T>(actual: Set<T>, expected: readonly T[]) =>
+    actual.size === expected.length &&
+    [...actual].every((entry, index) => entry === expected[index]);
+  if (
+    item.failed ||
+    !item.db.isOpen ||
+    managedAuthorizers.get(item.db) !== item.authorization ||
+    managedDatabaseMethodEpoch(item.db) !== item.methods ||
+    managedDatabaseDataMethod(item.db, 'applyChangeset') !== changesetApply ||
+    item.authorization.policy !== item.policy ||
+    !same(item.authorization.observers, item.observers) ||
+    !same(item.authorization.policyChanges, item.policyChanges) ||
+    (!item.statement &&
+      (Reflect.apply(changesetGet, item.main, []).schema_version !== item.mainSchema ||
+        Reflect.apply(changesetGet, item.temp, []).schema_version !== item.tempSchema ||
+        Reflect.apply(changesetGet, item.peer, []).data_version !== item.dataVersion))
+  )
+    changesetFailure(item);
+}
+function changesetSignature(item: ChangesetInvocation): string {
+  return createHmac('sha256', item.key)
+    .update(item.bytes)
+    .update(JSON.stringify(item.tape))
+    .digest('hex');
+}
+function changesetScope<T>(
+  item: ChangesetInvocation,
+  mode: 'capture' | 'prepare' | 'replay',
+  run: () => T,
+): T {
+  changesetCurrent(item);
+  if (changesetAuthorizationScopes.has(item.db) || item.authorization.dispatchDepth)
+    changesetFailure(item);
+  const scope = { item, mode, cursor: 0 };
+  changesetAuthorizationScopes.set(item.db, scope);
+  try {
+    const result = run();
+    changesetCurrent(item);
+    if (scope.cursor !== item.tape.length && !(item.statement && scope.cursor === 0))
+      changesetFailure(item);
+    return result;
+  } catch (error) {
+    item.failed = true;
+    throw item.failure ?? error;
+  } finally {
+    changesetAuthorizationScopes.delete(item.db);
+  }
+}
+/** The native invocation alone issues this transport. No caller-selected
+ * filter, conflict handler or authorization transcript can create one. */
+export function captureRecordChangesetInvocation(
+  db: DatabaseSync,
+  bytes: Uint8Array,
+  originalChanges: bigint,
+): RecordChangesetInvocation {
+  if (!db.isTransaction) changesetFailure();
+  const item = createNativeAuthorizationInvocation(db, bytes, originalChanges);
+  try {
+    if (
+      !changesetScope(item, 'capture', () =>
+        Reflect.apply(changesetApply, db, [
+          item.bytes,
+          { onConflict: () => constants.SQLITE_CHANGESET_ABORT },
+        ]),
+      )
+    )
+      changesetFailure(item);
+    item.signature = changesetSignature(item);
+    const capability = Object.freeze({}) as RecordChangesetInvocation;
+    changesetInvocations.set(capability, item);
+    return capability;
+  } catch (error) {
+    item.key.fill(0);
+    item.bytes.fill(0);
+    throw error;
+  }
+}
+function createNativeAuthorizationInvocation(
+  db: DatabaseSync,
+  bytes: Uint8Array,
+  originalChanges: bigint,
+): ChangesetInvocation {
+  const authorization = managedAuthorizers.get(db),
+    methods = managedDatabaseMethodEpoch(db);
+  if (
+    !authorization ||
+    !methods ||
+    authorization.dispatchDepth ||
+    callbackBarriers.has(db) ||
+    changesetAuthorizationScopes.has(db) ||
+    managedDatabaseDataMethod(db, 'applyChangeset') !== changesetApply
+  )
+    changesetFailure();
+  prepareManagedDatabaseCallbackBarrier(db);
+  const total = Reflect.apply(changesetPrepare, db, ['SELECT total_changes() AS n']),
+    main = Reflect.apply(changesetPrepare, db, ['PRAGMA main.schema_version']),
+    temp = Reflect.apply(changesetPrepare, db, ['PRAGMA temp.schema_version']),
+    peer = Reflect.apply(changesetPrepare, db, ['PRAGMA main.data_version']);
+  Reflect.apply(changesetReadBigInts, total, [true]);
+  if (Reflect.apply(changesetGet, total, []).n !== originalChanges) changesetFailure();
+  return {
+    db,
+    authorization: authorization!,
+    methods: methods!,
+    observers: [...authorization!.observers],
+    policyChanges: [...authorization!.policyChanges],
+    policy: authorization!.policy,
+    bytes: Buffer.from(bytes),
+    key: randomBytes(32),
+    total,
+    main,
+    temp,
+    peer,
+    mainSchema: Reflect.apply(changesetGet, main, []).schema_version,
+    tempSchema: Reflect.apply(changesetGet, temp, []).schema_version,
+    dataVersion: Reflect.apply(changesetGet, peer, []).data_version,
+    tape: [],
+    prepared: false,
+    used: false,
+    failed: false,
+  };
+}
+
+/** A native literal is freshly compiled under the installed policy. The
+ * terminal issuer must separately bind this exact handle to its recipe owner. */
+export function prepareTerminalAuthorizedStatement(
+  db: DatabaseSync,
+  sql: string,
+  bigInts: boolean,
+  originalChanges: bigint,
+): StatementSync {
+  prepareTerminalIteratorMethods();
+  const item = createNativeAuthorizationInvocation(db, Buffer.from(sql), originalChanges);
+  try {
+    const statement = changesetScope(item, 'capture', () =>
+      Reflect.apply(changesetPrepare, db, [sql]),
+    );
+    if (statement.sourceSQL.trim() !== sql.trim()) changesetFailure(item);
+    Reflect.apply(changesetReadBigInts, statement, [bigInts]);
+    item.statement = statement;
+    item.signature = changesetSignature(item);
+    item.prepared = true;
+    terminalNativeAuthorizations.set(statement, item);
+    return statement;
+  } catch (error) {
+    item.key.fill(0);
+    item.bytes.fill(0);
+    throw error;
+  }
+}
+function currentTerminalNativeAuthorization(db: DatabaseSync, statement: StatementSync) {
+  const item = terminalNativeAuthorizations.get(statement);
+  if (
+    !item ||
+    item.db !== db ||
+    item.statement !== statement ||
+    !item.prepared ||
+    !callbackBarriers.has(db) ||
+    !terminalNativeStatementOwned(db, statement) ||
+    changesetSignature(item) !== item.signature
+  )
+    changesetFailure(item);
+  changesetCurrent(item!);
+  return item!;
+}
+/** Fixed native invocation only; no caller callback or replacement method can
+ * enter the freshly authorized exact-handle recompile slot. */
+export function invokeTerminalAuthorizedStatement(
+  db: DatabaseSync,
+  statement: StatementSync,
+  method: 'get' | 'all' | 'run' | 'columns',
+  args: readonly unknown[],
+): unknown {
+  const item = currentTerminalNativeAuthorization(db, statement);
+  const native = {
+    get: terminalNativeGet,
+    all: terminalNativeAll,
+    run: terminalNativeRun,
+    columns: terminalNativeColumns,
+  }[method];
+  if (!native) changesetFailure(item);
+  return changesetScope(item, 'replay', () => Reflect.apply(native, statement, args));
+}
+export function iterateTerminalAuthorizedStatement(
+  db: DatabaseSync,
+  statement: StatementSync,
+  args: readonly unknown[],
+): Iterator<unknown> {
+  const item = currentTerminalNativeAuthorization(db, statement);
+  if (!terminalIteratorNext || !terminalIteratorReturn) changesetFailure(item);
+  const iterator = changesetScope(item, 'replay', () =>
+    Reflect.apply(terminalNativeIterate, statement, args),
+  );
+  terminalNativeIterators.set(iterator, { statement, item });
+  return iterator;
+}
+export function stepTerminalAuthorizedIterator(
+  db: DatabaseSync,
+  iterator: Iterator<unknown>,
+  method: 'next' | 'return',
+): IteratorResult<unknown> {
+  const retained = terminalNativeIterators.get(iterator);
+  if (!retained) changesetFailure();
+  const item = currentTerminalNativeAuthorization(db, retained!.statement);
+  if (item !== retained!.item) changesetFailure(item);
+  const native =
+    method === 'next'
+      ? terminalIteratorNext
+      : method === 'return'
+        ? terminalIteratorReturn
+        : undefined;
+  if (!native) changesetFailure(item);
+  const result = changesetScope(item, 'replay', () => Reflect.apply(native!, iterator, []));
+  return result;
+}
+export function closeTerminalAuthorizedStatement(statement: StatementSync): void {
+  const item = terminalNativeAuthorizations.get(statement);
+  if (!item) return;
+  terminalNativeAuthorizations.delete(statement);
+  item.failed = true;
+  item.key.fill(0);
+  item.bytes.fill(0);
+}
+/** Refresh the installed policy before the final physical proof. Its managed
+ * dispatch context refuses nested SQL and preserves the genuine event tuples. */
+export function prepareRecordChangesetInvocation(
+  db: DatabaseSync,
+  capability: RecordChangesetInvocation,
+): void {
+  const item = changesetInvocations.get(capability);
+  if (!item || item.db !== db || item.used || item.prepared) changesetFailure(item);
+  changesetCurrent(item!);
+  if (changesetSignature(item!) !== item!.signature) changesetFailure(item);
+  // Callback-barrier arming expires old bytecode. Refresh every native witness
+  // before authorizing the transcript and before the final physical closure.
+  item!.total = Reflect.apply(changesetPrepare, db, ['SELECT total_changes() AS n']);
+  Reflect.apply(changesetReadBigInts, item!.total, [true]);
+  item!.main = Reflect.apply(changesetPrepare, db, ['PRAGMA main.schema_version']);
+  item!.temp = Reflect.apply(changesetPrepare, db, ['PRAGMA temp.schema_version']);
+  item!.peer = Reflect.apply(changesetPrepare, db, ['PRAGMA main.data_version']);
+  changesetScope(item!, 'prepare', () => {
+    for (const event of item!.tape) item!.authorization.dispatch(...event.args);
+  });
+  item!.prepared = true;
+}
+/** Every actual internal SQLite compilation event must match its freshly
+ * authorized native transcript. No external callback runs in this final slot. */
+export function replayRecordChangesetInvocation(
+  db: DatabaseSync,
+  capability: RecordChangesetInvocation,
+  bytes: Uint8Array,
+): boolean {
+  const item = changesetInvocations.get(capability);
+  if (
+    !item ||
+    item.db !== db ||
+    !item.prepared ||
+    item.used ||
+    !db.isTransaction ||
+    !callbackBarriers.has(db) ||
+    !terminalStatementsActive(db) ||
+    !item.bytes.equals(bytes) ||
+    changesetSignature(item) !== item.signature
+  )
+    changesetFailure(item);
+  item!.used = true;
+  return changesetScope(item!, 'replay', () =>
+    Reflect.apply(changesetApply, db, [
+      item!.bytes,
+      {
+        onConflict: () => constants.SQLITE_CHANGESET_ABORT,
+      },
+    ]),
+  );
+}
+export function closeRecordChangesetInvocation(capability: RecordChangesetInvocation): void {
+  const item = changesetInvocations.get(capability);
+  if (!item) return;
+  changesetInvocations.delete(capability);
+  item.failed = true;
+  item.key.fill(0);
+  item.bytes.fill(0);
+}
 /** Identity only: never evaluate an accessor on the public database surface. */
 export function managedDatabaseDataMethod(
   db: DatabaseSync,
@@ -284,6 +692,7 @@ export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
     callbackDepth: 0,
     dispatchDepth: 0,
     protectCallbacks: false,
+    dispatch: undefined as unknown as Authorizer,
   };
   const notify = (callback: () => void) => {
     state.callbackDepth++;
@@ -303,15 +712,66 @@ export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
   } as DatabaseSync['setAuthorizer'];
   state.setter = setter;
   const dispatch: Authorizer = (...args) => {
+    const totalRead = changesetTotalReads.get(db);
+    if (totalRead) {
+      const { item } = totalRead,
+        expected: Parameters<Authorizer> =
+          totalRead.cursor === 0
+            ? [constants.SQLITE_SELECT, null, null, null, null]
+            : [constants.SQLITE_FUNCTION, null, 'total_changes', null, null];
+      if (
+        item.failed ||
+        state !== item.authorization ||
+        state.dispatchDepth !== 1 ||
+        changesetAuthorizationScopes.get(db)?.item !== item ||
+        totalRead.statement !== item.total ||
+        totalRead.cursor >= 2 ||
+        JSON.stringify(args) !== JSON.stringify(expected)
+      )
+        changesetFailure(item, 'unexpected write-count authorization');
+      totalRead.cursor++;
+      return constants.SQLITE_OK;
+    }
+    const scope = changesetAuthorizationScopes.get(db);
+    if (scope) {
+      const { item } = scope;
+      if (state !== item.authorization || state.dispatchDepth)
+        changesetFailure(item, 'nested authorization');
+      if (scope.mode !== 'capture') {
+        const event = item.tape[scope.cursor];
+        if (!event || JSON.stringify(args) !== JSON.stringify(event.args)) changesetFailure(item);
+        if (scope.mode === 'replay') {
+          scope.cursor++;
+          return event!.answer;
+        }
+      }
+    }
     assertManagedDatabaseCallbackAllowed(db);
     state.dispatchDepth++;
     try {
-      for (const observer of state.observers) notify(() => observer(...args));
-      return state.policy?.(...args) ?? constants.SQLITE_OK;
+      const before = scope && readChangesetTotal(scope.item);
+      if (scope?.mode !== 'prepare')
+        for (const observer of state.observers) notify(() => observer(...args));
+      const answer = state.policy?.(...args) ?? constants.SQLITE_OK;
+      if (scope) {
+        if (readChangesetTotal(scope.item) !== before)
+          changesetFailure(scope.item, 'authorization callback writes');
+        if (scope.mode === 'capture')
+          scope.item.tape.push(
+            Object.freeze({ args: Object.freeze([...args]) as Parameters<Authorizer>, answer }),
+          );
+        else if (answer !== scope.item.tape[scope.cursor]?.answer) changesetFailure(scope.item);
+        scope.cursor++;
+      }
+      return answer;
+    } catch (error) {
+      if (scope) scope.item.failure ??= error;
+      throw error;
     } finally {
       state.dispatchDepth--;
     }
   };
+  state.dispatch = dispatch;
   state.refresh = () =>
     nativeSetter.call(
       db,
