@@ -564,7 +564,7 @@ test(
       () => {
         if (!completed && !failureDiagnosticsPrinted) {
           failureDiagnosticsPrinted = true;
-          console.error('Fictional holdout interrupted', requestDiagnostics());
+          console.error('Fictional holdout interrupted', JSON.stringify(requestDiagnostics()));
         }
       },
       { once: true },
@@ -574,7 +574,7 @@ test(
       if (!completed) {
         if (!failureDiagnosticsPrinted) {
           failureDiagnosticsPrinted = true;
-          console.error('Fictional holdout final step', requestDiagnostics());
+          console.error('Fictional holdout final step', JSON.stringify(requestDiagnostics()));
         }
         if (pageForDiagnostics && !pageForDiagnostics.isClosed()) {
           try {

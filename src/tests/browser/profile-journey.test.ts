@@ -28,6 +28,16 @@ test(
   // isolated profile form one host journey. Browser action deadlines stay at 5s.
   { timeout: 180000 },
   async (t) => {
+    const started = performance.now();
+    let phase = 'runtime startup',
+      completed = false;
+    t.after(() => {
+      if (!completed)
+        console.error(
+          'Fictional profile journey interrupted',
+          JSON.stringify({ phase, elapsedMs: Math.round(performance.now() - started) }),
+        );
+    });
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-'));
     const visuals = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
     mkdirSync(visuals, { recursive: true });
@@ -81,6 +91,7 @@ test(
       await fixtureNativeFeedReady(page, prefix, () => page.reload());
     }
 
+    phase = 'first profile creation';
     await page.goto(url);
     await page.getByRole('button', { name: 'Create profile', exact: true }).click();
     await page
@@ -138,6 +149,7 @@ test(
       }
       await setupDialog.waitFor({ state: 'hidden' });
     }
+    phase = 'assistant connection';
     await page.getByRole('button', { name: 'Open assistant' }).click();
     const assistant = page.getByRole('dialog', { name: 'Moxie the Assistant' });
     const connection = assistant.getByRole('button', { name: 'Connection: unavailable' });
@@ -174,6 +186,7 @@ test(
     assert.equal(await page.getByText('Annual Planning', { exact: true }).count(), 1);
     await page.goto(url);
     await page.getByPlaceholder('Name shown throughout the app').waitFor();
+    phase = 'profile editing and restoration';
     const saveNow = page.getByRole('button', { name: 'Save now', exact: true });
     assert.equal(await saveNow.isDisabled(), true, 'unchanged Self has nothing to save');
     for (const theme of ['light', 'dark'])
@@ -275,6 +288,7 @@ test(
     }
 
     await page.goto(url + '/#/import');
+    phase = 'first record import';
     const envelope = {
       format: 'health-record-v1',
       id: 'browser-result',
@@ -327,6 +341,7 @@ test(
     // Newly accepted prescriptions are inactive until this profile owner enables
     // one. A repeated import must keep that personal selection.
     await page.goto(url + '/#/import');
+    phase = 'prescription import and activation';
     const prescriptionEnvelope = {
       format: 'health-record-v1',
       id: 'browser-prescription',
@@ -434,6 +449,7 @@ test(
     // Similar dates/labels only offer paired evidence; the explicit decision
     // retains both conflicting assertions and both original downloads.
     await page.goto(url + '/#/import');
+    phase = 'related record import and review';
     const secondEnvelope = {
       ...envelope,
       id: 'browser-second-result',
@@ -508,12 +524,19 @@ test(
         );
       },
     );
+    phase = 'related record acceptance and reload';
     await saveOneRecord('Confirm and save record');
     await page.getByText('This exact record was saved to your profile.', { exact: true }).waitFor();
-    await page.reload();
+    await fixtureNativeRecordReady(
+      page,
+      prefix,
+      { intakeId: selectedIntake, recordId: selectedId },
+      () => page.reload(),
+    );
     await page
       .getByText('This exact record is already saved to your profile.', { exact: true })
       .waitFor();
+    phase = 'retained comparison reads';
     const retained = (
       await (
         await fetchFixtureApi(page.request, `${url}/api/profiles/${profile.id}/intakes`)
@@ -541,6 +564,7 @@ test(
     await page.goto(url);
     await page.getByLabel('Pronouns', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Fictional Browser Person', exact: true }).click();
+    phase = 'encrypted lock and recovery';
     await page.getByRole('button', { name: 'Lock profile', exact: true }).click();
     await page.getByRole('button', { name: 'Choose profile', exact: true }).click();
     await page.getByRole('button', { name: /Fictional Browser Person.*Locked/ }).click();
@@ -574,6 +598,7 @@ test(
       .getByRole('dialog')
       .getByLabel('Display name', { exact: true })
       .fill('Second Fictional Person');
+    phase = 'second profile creation';
     await profileCreation.getByLabel('Your name').fill('Second Fictional Person');
     await profileCreation.getByLabel('Date of birth', { exact: true }).fill('1982-04-17');
     await page.getByRole('button', { name: 'Continue to recovery key' }).click();
@@ -582,7 +607,21 @@ test(
     await page.getByLabel('I have saved my recovery key').check();
     await page.getByRole('button', { name: 'Verify recovery key', exact: true }).click();
     await page.getByLabel('Recovery key').fill(secondRecovery);
+    const secondOpened = fixtureBrowserResponse(page, (response) => {
+      const path = new URL(response.url()).pathname;
+      return (
+        response.request().method() === 'POST' &&
+        path.startsWith('/api/profile-setups/') &&
+        path.endsWith('/verify')
+      );
+    });
     await page.getByRole('button', { name: 'Open profile' }).click();
+    phase = 'second profile verification response';
+    const secondOpenedResponse = await secondOpened;
+    assert.equal(secondOpenedResponse.status(), 201, await secondOpenedResponse.text());
+    assert.equal(await secondOpenedResponse.finished(), null);
+    assert.notEqual((await secondOpenedResponse.json()).data.id, profile.id);
+    phase = 'second profile onboarding';
     await recoveryChoice.getByRole('button', { name: 'Add passkey', exact: true }).waitFor();
     await recoveryChoice.getByRole('button', { name: 'Skip', exact: true }).click();
     {
@@ -601,6 +640,7 @@ test(
     await page.goto(url + '/#/sources');
     await page.getByRole('heading', { name: 'Sources', exact: true }).waitFor();
     assert.equal(await page.getByText('fictional-results.jsonl', { exact: true }).count(), 0);
+    phase = 'second profile isolation';
     const allProfiles = (await (await fetchFixtureApi(page.request, url + '/api/profiles')).json())
       .data;
     const second = allProfiles.find(
@@ -615,5 +655,6 @@ test(
       0,
     );
     assert.deepEqual(errors, []);
+    completed = true;
   },
 );
