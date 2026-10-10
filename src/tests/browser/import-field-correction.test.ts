@@ -15,7 +15,7 @@ import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import type { Browser, Locator } from 'playwright';
+import type { Browser, Locator, Request } from 'playwright';
 import type { ClinicalImportCorrectionHistoryPage } from '../../shared/clinical-import-corrections.ts';
 import type { readReviewDraftHistoryPage } from '../../server/intake-review-draft-state.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
@@ -31,6 +31,51 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
     // Three durable corrections, reloads and history reads share this host hang guard.
     { timeout: scenario === 'partial' ? 120000 : 60000 },
     async (t) => {
+      const started = performance.now();
+      let phase = 'runtime startup',
+        completed = false,
+        omittedRequests = 0;
+      type RequestDiagnostic = {
+        endpoint: string;
+        method: string;
+        startedMs: number;
+        status?: number;
+      };
+      const pending = new Map<Request, RequestDiagnostic>(),
+        ledger: Array<{
+          elapsedMs: number;
+          event: string;
+          phase: string;
+          request?: RequestDiagnostic;
+        }> = [];
+      const elapsedMs = () => Math.round(performance.now() - started);
+      const recordDiagnostic = (event: string, request?: RequestDiagnostic) => {
+        if (ledger.length === 32) ledger.shift();
+        ledger.push({
+          elapsedMs: elapsedMs(),
+          event,
+          phase,
+          ...(request ? { request: { ...request } } : {}),
+        });
+      };
+      const enterPhase = (next: string) => {
+        phase = next;
+        recordDiagnostic('phase');
+      };
+      t.after(() => {
+        if (!completed)
+          console.error(
+            'Fictional import correction interrupted',
+            JSON.stringify({
+              scenario,
+              phase,
+              elapsedMs: elapsedMs(),
+              omittedRequests,
+              pending: [...pending.values()],
+              ledger,
+            }),
+          );
+      });
       const partial = scenario === 'partial';
       const wrongKind = scenario === 'document' || scenario === 'unclassified';
       const dateAndValue = scenario === 'date-and-value' || wrongKind;
@@ -53,6 +98,30 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       });
       browser = await launchBrowser(t);
       const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
+      page.on('request', (request) => {
+        const path = new URL(request.url()).pathname;
+        if (!path.startsWith('/api/')) return;
+        const endpoint =
+          path.match(
+            /\/(import-feed|review-record|review-draft|report-acceptance|review-history|record-import-corrections)(?:\/|$)/,
+          )?.[1] ?? 'other-api';
+        const diagnostic = { endpoint, method: request.method(), startedMs: elapsedMs() };
+        recordDiagnostic('request', diagnostic);
+        if (pending.size < 16) pending.set(request, diagnostic);
+        else omittedRequests++;
+      });
+      page.on('response', (response) => {
+        const diagnostic = pending.get(response.request());
+        if (diagnostic) diagnostic.status = response.status();
+      });
+      const finishRequest = (event: 'requestfinished' | 'requestfailed', request: Request) => {
+        const diagnostic = pending.get(request);
+        if (!diagnostic) return;
+        recordDiagnostic(event, diagnostic);
+        pending.delete(request);
+      };
+      page.on('requestfinished', (request) => finishRequest('requestfinished', request));
+      page.on('requestfailed', (request) => finishRequest('requestfailed', request));
       const errors: string[] = [];
       page.on('pageerror', (error) => errors.push(error.message));
       const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
@@ -62,6 +131,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       );
       const pdf = await pdfPage.pdf({ printBackground: true, preferCSSPageSize: true });
       await pdfPage.close();
+      enterPhase('profile setup and upload');
       await page.goto(url);
       async function request(path: string, body?: unknown) {
         const r = await fetchFixtureApi(page.request, url + path, {
@@ -104,6 +174,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       });
       assert.equal(upload.status(), 201);
       const intake = await stopFixtureImport(page, url, prefix, (await upload.json()).data.id);
+      enterPhase('proposal creation');
       await request(`${prefix}/intakes/${intake.id}/proposals`, {
         version: intake.version,
         summary: 'Fictional controlled correction fixture',
@@ -211,6 +282,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         ].join('\n'),
       });
       await page.goto(url + '/#/import');
+      enterPhase('initial feed');
       const displayedFeed = await fixtureNativeFeedReady(page, prefix, () => page.reload());
       assert.equal(displayedFeed.records.length, 1);
       const selectedRecord = displayedFeed.records[0]!;
@@ -229,6 +301,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
         );
       }
+      enterPhase('initial record review');
       await fixtureNativeRecordReady(
         page,
         prefix,
@@ -243,6 +316,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       assert.equal(new URL(page.url()).hash, '#/import');
       const inline = page.locator('.import-record-accordion');
       const awaitFeedRefresh = async (action: () => Promise<unknown>) => {
+        enterPhase('feed refresh');
         const feed = await fixtureNativeFeedWindowReady(page, prefix, action);
         const row = feed.records.find(
           (row) => row.intakeId === intake.id && row.proposalId === selectedRecord.proposalId,
@@ -257,6 +331,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       };
       const updateCorrection = () =>
         awaitFeedRefresh(async () => {
+          enterPhase('correction save');
           const saved = fixtureBrowserResponse(
             page,
             (response) =>
@@ -297,6 +372,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         await page.setViewportSize({ width: 1280, height: 900 });
       }
       if (partial) {
+        enterPhase('name correction');
         await inline.getByRole('textbox', { name: 'Test name', exact: true }).fill('Potassium');
         await updateCorrection();
         await awaitFeedRefresh(() => page.reload());
@@ -305,12 +381,14 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
         );
         await fixtureAssertNoAccepted(request, prefix, intake.id);
+        enterPhase('reopen after name correction');
         await page.getByRole('button', { name: 'Review', exact: true }).click();
         await inline.getByRole('textbox', { name: 'Result', exact: true }).waitFor();
         for (const label of ['Test name', 'Result', 'Unit', 'Date'])
           assert.equal(await inline.getByLabel(label, { exact: true }).count(), 1);
       }
       if (dateAndValue) {
+        enterPhase('date correction');
         await inline.getByLabel('Date', { exact: true }).fill('2032-03-04');
         await inline
           .getByRole('textbox', { name: 'Correction reason' })
@@ -320,10 +398,12 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         assert(
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
         );
+        enterPhase('reopen after date correction');
         await page.getByRole('button', { name: 'Review', exact: true }).click();
         await inline.getByRole('textbox', { name: 'Result', exact: true }).waitFor();
         assert.equal(await inline.getByLabel('Date', { exact: true }).inputValue(), '2032-03-04');
       }
+      enterPhase('result correction');
       await inline.getByRole('textbox', { name: 'Result', exact: true }).fill('4.1');
       if (screenshots && dateAndValue)
         await inline.screenshot({ path: resolve(screenshots, 'potassium-correction-reason.png') });
@@ -335,6 +415,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
         );
         await fixtureAssertNoAccepted(request, prefix, intake.id);
+        enterPhase('reopen for unit correction');
         await page.getByRole('button', { name: 'Review', exact: true }).click();
         await inline.getByRole('textbox', { name: 'Unit', exact: true }).waitFor();
         for (const label of ['Test name', 'Result', 'Unit', 'Date'])
@@ -342,6 +423,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         await inline.getByRole('textbox', { name: 'Unit', exact: true }).fill('mmol/L');
         await updateCorrection();
       }
+      enterPhase('corrected result reload');
       await page.getByText(/^4\.1\s*mmol\/L$/).waitFor();
       const reloadedFeed = await awaitFeedRefresh(() => page.reload());
       await page.getByText(/^4\.1\s*mmol\/L$/).waitFor();
@@ -352,6 +434,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         ),
       );
       if (!partial) {
+        enterPhase('reopen corrected record by link');
         const feed = reloadedFeed;
         assert.equal(feed.format, 'health-intake-import-feed-v2');
         const selected = feed.records.find((row) => row.intakeId === intake.id);
@@ -422,6 +505,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           'none',
         );
       }
+      enterPhase('reopen for acceptance');
       await page.getByRole('button', { name: 'Review', exact: true }).click();
       await inline.waitFor();
       const acceptedResponse = fixtureBrowserResponse(
@@ -441,6 +525,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           response.request().timing().startTime >= acknowledgement.request().timing().startTime
         );
       });
+      enterPhase('report acceptance');
       await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
       const accepted = await acceptedResponse;
       assert.equal(accepted.status(), 200, await accepted.text());
@@ -453,7 +538,9 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       assert.equal(result.receipt.receipts.length, 1);
       assert.equal(result.receipt.receipts[0]!.intakeId, intake.id);
       assert.equal(result.receipt.receipts[0]!.records.length, 1);
+      enterPhase('accepted feed response');
       const savedFeed = await savedFeedResponse;
+      enterPhase('accepted feed and destinations');
       assert.equal(savedFeed.status(), 200, await savedFeed.text());
       assert.equal(await savedFeed.finished(), null);
       assert.equal((await savedFeed.json()).data.format, 'health-intake-import-feed-v2');
@@ -469,6 +556,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       assert.equal(destinations.length, 1);
       const saved = destinations[0]!;
       const observation = await request(prefix + '/tests/' + encodeURIComponent(saved.entityId));
+      enterPhase('accepted correction history API');
       assert.deepEqual(observation.extra.import.correctionHistorySource, {
         format: 'health-accepted-contribution-corrections-v1',
       });
@@ -531,6 +619,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         assert.equal(corrections[2]!.after.unit, 'mmol/L');
       }
       const assertImportHistoryUI = async (container: Locator) => {
+        enterPhase('accepted correction history UI');
         await container.waitFor();
         if (!(await container.evaluate((element) => (element as HTMLDetailsElement).open)))
           await container.locator(':scope > summary').click();
@@ -580,6 +669,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       await page.getByText('Modified during import').first().waitFor();
       await page.getByText('Meadowglass Laboratory', { exact: true }).first().waitFor();
       if (scenario === 'value') {
+        enterPhase('saved record correction');
         await page.getByRole('button', { name: 'More entry actions' }).click();
         await page.getByRole('button', { name: 'Correct saved record', exact: true }).click();
         const correction = page.getByRole('dialog', { name: 'Correct saved record' });
@@ -621,5 +711,6 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         await assertImportHistoryUI(recordedHistory);
       }
       assert.deepEqual(errors, []);
+      completed = true;
     },
   );
