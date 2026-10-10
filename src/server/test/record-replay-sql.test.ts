@@ -7,7 +7,14 @@ import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { openDatabase, transaction, type Database } from '../database.ts';
-import { rebuildRecordDatabase, queryRecordHistory } from '../record-versions.ts';
+import {
+  rebuildRecordDatabase,
+  queryRecordHistory,
+  iterateRecordCommitSegments,
+  type RecordObjectReference,
+  type RecordCommitV2,
+  type RecordStorage,
+} from '../record-versions.ts';
 import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 
@@ -167,15 +174,26 @@ for (const count of [4, 64])
         }),
       );
       assert.equal(measuredScratch.ancestry.inserts, work.reconstruction.ancestryReferencesSpooled);
-      assert.equal(measuredScratch.segments.inserts, work.reconstruction.segmentReferencesSpooled);
-      for (const kind of ['ancestry', 'segments'] as const) {
-        assert.ok(measuredScratch[kind].inserts > 0);
-        assert.equal(
-          measuredScratch[kind].outsideTransaction,
-          0,
-          kind + ': ordering-index inserts share one private transaction per traversal',
-        );
-      }
+      assert.ok(measuredScratch.ancestry.inserts > 0);
+      assert.equal(
+        measuredScratch.ancestry.outsideTransaction,
+        0,
+        'ancestry ordering-index inserts share one private transaction per traversal',
+      );
+      assert.deepEqual(
+        measuredScratch.segments,
+        { inserts: 0, outsideTransaction: 0, connections: 0 },
+        'complete authenticated single pages do not create a segment ordering index',
+      );
+      assert.equal(work.reconstruction.segmentOrderingScratchOpened, 0);
+      assert.ok(work.reconstruction.segmentIndexPagesRead > 0);
+      assert.ok(work.reconstruction.segmentReferencesSpooled > 0);
+      assert.equal(
+        work.reconstruction.segmentReferencesSpooled,
+        work.reconstruction.segmentReferencesReplayed,
+        'the bounded authenticated page spool still replays every reference',
+      );
+      assert.ok(work.reconstruction.maxSegmentReferencesBuffered <= 64);
       assert.deepEqual(
         prepared,
         { remove: 4, insert: 3 },
@@ -183,6 +201,105 @@ for (const count of [4, 64])
       );
     }
   });
+
+test('multipart segment ordering retains actual private-transaction SQL and disposes scratch', (t) => {
+  const objects = new Map<string, Buffer>(),
+    reads: string[] = [],
+    profileId = 'fictional-multipart-replay-sql',
+    operationId = randomUUID();
+  const store = (value: unknown): RecordObjectReference => {
+    const bytes = Buffer.from(JSON.stringify(value) + '\n'),
+      name = 'objects/' + randomUUID();
+    objects.set(name, bytes);
+    return { name, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
+  };
+  const segments = Array.from({ length: 65 }, (_, ordinal) => store({ fictional: ordinal })),
+    page = (firstSegment: number, previous: RecordObjectReference | null) =>
+      store({
+        format: 'health-record-segment-page-v1',
+        profileId,
+        schemaVersion: 1,
+        sequence: 1,
+        operationId,
+        firstSegment,
+        previous,
+        segments: segments.slice(firstSegment, firstSegment + 64),
+      }),
+    first = page(0, null),
+    head = page(64, first),
+    commit: RecordCommitV2 = {
+      format: 'health-record-versions-v2',
+      profileId,
+      schemaVersion: 1,
+      sequence: 1,
+      revision: 1,
+      previous: null,
+      operationId,
+      fingerprint: null,
+      result: null,
+      recordedAt: '2026-01-01T00:00:00Z',
+      records: segments.length,
+      segments: { format: 'health-record-segment-index-v1', head, count: segments.length },
+    },
+    storage: RecordStorage = {
+      read(name) {
+        reads.push(name);
+        const value = objects.get(name);
+        return value ? Buffer.from(value) : null;
+      },
+      writeImmutable() {
+        throw Error('Ordering must not modify accepted evidence');
+      },
+      publishHead() {
+        throw Error('Ordering must not publish accepted evidence');
+      },
+    },
+    work = createRecordVersionWorkCounters(),
+    prepare = DatabaseSync.prototype.prepare;
+  let prepared = 0,
+    inserts = 0,
+    outsideTransaction = 0;
+  const connections: Array<{ db: DatabaseSync; path: string }> = [],
+    probe = t.mock.method(
+      DatabaseSync.prototype,
+      'prepare',
+      function (this: DatabaseSync, sql: string) {
+        const statement = prepare.call(this, sql);
+        if (sql === 'INSERT INTO segments VALUES(?,?)') {
+          prepared++;
+          const connection = this,
+            run = statement.run;
+          connections.push({ db: connection, path: connection.location()! });
+          statement.run = (...args: unknown[]) => {
+            inserts++;
+            if (!connection.isTransaction) outsideTransaction++;
+            return Reflect.apply(run, statement, args) as ReturnType<typeof run>;
+          };
+        }
+        return statement;
+      },
+    );
+  try {
+    assert.deepEqual(
+      withRecordVersionWork(work, () => [...iterateRecordCommitSegments(storage, commit)]),
+      segments,
+    );
+  } finally {
+    probe.mock.restore();
+  }
+  assert.equal(prepared, 1);
+  assert.equal(inserts, 65);
+  assert.equal(inserts, work.operation.segmentReferencesSpooled);
+  assert.equal(outsideTransaction, 0);
+  assert.equal(work.operation.segmentOrderingScratchOpened, 1);
+  assert.equal(work.operation.segmentIndexPagesRead, 2);
+  assert.equal(work.operation.segmentReferencesReplayed, 65);
+  assert.equal(work.operation.maxSegmentReferencesBuffered, 64);
+  assert.deepEqual(reads, [head.name, first.name]);
+  assert.equal(connections.length, 1);
+  assert.equal(connections[0]!.db.isOpen, false);
+  assert.equal(existsSync(connections[0]!.path), false);
+});
 
 /** Count actual SQL preparation and execution, not a producer-reported estimate. */
 function recordSqlProbe(t: TestContext) {

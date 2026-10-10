@@ -153,7 +153,11 @@ test('approved ownership groups publish distinct children under the retained par
   const afterSequence = Number(
     f.db.prepare('SELECT sequence FROM __record_state WHERE singleton=1').get()!.sequence,
   );
-  assert.ok(afterSequence - beforeSequence > groups.length);
+  assert.equal(
+    afterSequence - beforeSequence,
+    groups.length,
+    'each child accepts once without publishing fresh empty issue snapshots',
+  );
 });
 
 test('approved groups create one new destination and reuse its accepted version', async (t) => {
