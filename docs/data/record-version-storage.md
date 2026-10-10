@@ -28,6 +28,8 @@ Fictional journal tests cover hundreds of segments, exact forward row order, v1 
 
 SQLite is a disposable, indexed projection containing both current records and retained version history. The current view selects the latest accepted version in committed order. Record history is a normal query, not an offline backup-restoration workflow. Index by profile, entity/record, version/sequence and time, with a field-change index or equivalent for queries such as **When did I change my birthday?**
 
+Association-owner history indexes contain only link or attachment versions, including their removal versions. Unrelated record versions add no entries to these two indexes. Attaching an older cache rebuilds these disposable indexes once without changing accepted objects, projected versions or the profile revision; this upgrade still scans retained versions. Subsequent attachment reuses the matching definitions.
+
 Both changes in A → B → A remain searchable. Returning to an earlier value does not deduplicate away the intervening edit. A network retry of the same operation must not create a second version; a distinct accepted edit is a different operation even if some contents repeat. Changed-field summaries can be derived from adjacent versions but must retain links to their full contents and attribution.
 
 Restoration appends a new version referencing the selected prior version or versions; it does not rewrite the past or remove newer history. The history UI groups editing sessions and previews selected fields and removed associations before restoring them through revision-checked operations.

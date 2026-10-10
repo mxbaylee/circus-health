@@ -278,6 +278,36 @@ function tables(db: Database): TableSchema[] {
     return { name, columns: columns.map((c) => c.name), pk };
   });
 }
+function setupAssociationIndexes(db: Database): void {
+  const definitions = [
+    [
+      '__record_link_owner',
+      "CREATE INDEX __record_link_owner ON __record_versions(profile_id,entity,json_extract(contents_json,'$.note_id'),sequence DESC) WHERE entity='note_links'",
+    ],
+    [
+      '__record_attachment_owner',
+      "CREATE INDEX __record_attachment_owner ON __record_versions(profile_id,entity,json_extract(contents_json,'$.owner_type'),json_extract(contents_json,'$.owner_id'),sequence DESC) WHERE entity='attachments'",
+    ],
+  ] as const;
+  const changed = definitions.filter(
+    ([name, sql]) =>
+      db.prepare("SELECT sql FROM main.sqlite_schema WHERE type='index' AND name=?").get(name)
+        ?.sql !== sql,
+  );
+  if (!changed.length) return;
+  // Upgrade only disposable indexes; accepted objects and projected rows stay intact.
+  db.exec('SAVEPOINT record_association_indexes');
+  try {
+    for (const [name, sql] of changed) {
+      db.exec(`DROP INDEX IF EXISTS main.${q(name)}`);
+      db.exec(sql);
+    }
+    db.exec('RELEASE record_association_indexes');
+  } catch (error) {
+    db.exec('ROLLBACK TO record_association_indexes; RELEASE record_association_indexes');
+    throw error;
+  }
+}
 function setup(db: Database): void {
   const saved = db
     .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='__record_state'")
@@ -324,13 +354,12 @@ function setup(db: Database): void {
     CREATE TABLE IF NOT EXISTS __record_versions (version_id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, entity TEXT NOT NULL, record_id TEXT NOT NULL, sequence INTEGER NOT NULL, recorded_at TEXT NOT NULL, previous_version TEXT, operation_id TEXT NOT NULL, deleted INTEGER NOT NULL, contents_json TEXT NOT NULL, metadata_json TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS __record_history ON __record_versions(profile_id,entity,record_id,sequence DESC);
     CREATE INDEX IF NOT EXISTS __record_time ON __record_versions(profile_id,recorded_at,sequence);
-    CREATE INDEX IF NOT EXISTS __record_link_owner ON __record_versions(profile_id,entity,json_extract(contents_json,'$.note_id'),sequence DESC);
-    CREATE INDEX IF NOT EXISTS __record_attachment_owner ON __record_versions(profile_id,entity,json_extract(contents_json,'$.owner_type'),json_extract(contents_json,'$.owner_id'),sequence DESC);
     CREATE TABLE IF NOT EXISTS __record_current (entity TEXT NOT NULL, record_id TEXT NOT NULL, version_id TEXT NOT NULL, PRIMARY KEY(entity,record_id));
     CREATE TABLE IF NOT EXISTS __record_fields (version_id TEXT NOT NULL, profile_id TEXT NOT NULL, entity TEXT NOT NULL, record_id TEXT NOT NULL, field TEXT NOT NULL, sequence INTEGER NOT NULL, before_version TEXT, before_present INTEGER NOT NULL, after_present INTEGER NOT NULL, PRIMARY KEY(version_id,field));
     CREATE INDEX IF NOT EXISTS __record_field_history ON __record_fields(profile_id,entity,record_id,field,sequence DESC);
     CREATE TEMP TABLE IF NOT EXISTS __record_changed (entity TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY(entity,record_id));
   `);
+  setupAssociationIndexes(db);
 }
 function captureTriggers(db: Database, schema: TableSchema[]): void {
   for (const table of schema) {
