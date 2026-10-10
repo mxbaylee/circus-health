@@ -14,6 +14,12 @@ import {
 import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state-storage.ts';
 import { clearPackageSourceSession, packageSourceSessionWork } from '../intake-package-session.ts';
 import {
+  captureIntakeFrontierAttempts,
+  ensureIntakeFrontierObserver,
+  intakeFrontierAttemptCounts,
+  readIntakeFrontierAttempts,
+} from '../intake-lookup-frontier-observer.ts';
+import {
   buildDurablePackageInventory,
   readDurablePackageInventory,
   rebindCopiedPackageInventory,
@@ -205,6 +211,17 @@ test('legacy v3 bridge preserves original envelope and review before publishing 
   assert.equal(readIntakeEnvelopeMaterialized(f.context.db, source).text, before);
   assert.equal(clinicalReviewRevision(f.context.db), revision);
   assert.equal(f.store.binding(f.store.openView())!.logical.domainVersion, 7);
+});
+
+test('inventory admission never renews an existing revoked frontier', async (t) => {
+  const f = fixture(t, [{ name: 'fictional.txt', data: 'fictional' }], true);
+  ensureIntakeFrontierObserver(f.context.db);
+  const original = captureIntakeFrontierAttempts(f.context.db);
+  assert.ok(original);
+  f.context.db.function('__fictional_other_function', () => null);
+  assert.equal(intakeFrontierAttemptCounts(f.context.db)?.revoked, true);
+  await assert.rejects(buildDurablePackageInventory(f.context));
+  assert.equal(readIntakeFrontierAttempts(f.context.db, original), undefined);
 });
 
 test('unrelated auxiliary checkpoints preserve inventory but mutations of pinned collections revoke checked members', async (t) => {

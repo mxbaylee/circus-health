@@ -33,6 +33,11 @@ import { setImmediate } from 'node:timers/promises';
 import { runExclusiveClinicalOperation } from '../clinical-operation.ts';
 import { createAssistant } from '../assistant.ts';
 import { resolveIntakeDraftRepairContext } from '../intake-draft-repair.ts';
+import { recordDurabilityStatus } from '../record-versions.ts';
+import {
+  ensureIntakeFrontierObserver,
+  intakeFrontierAttemptCounts,
+} from '../intake-lookup-frontier-observer.ts';
 
 const filename = 'fictional-' + '\uD83C\uDF3F"\\'.repeat(60000) + '.mp3';
 const durability = { pending: false, mutationRevision: 0, persistedRevision: 0, error: null };
@@ -194,6 +199,26 @@ async function forkFacts(
   ]);
   return { collections, prepared, cell };
 }
+function admitRestoredLegacyFixture(
+  db: ReturnType<typeof openDatabase>,
+  source: { id: string },
+  detailsJson: string,
+  acceptedHead: Buffer | undefined,
+) {
+  assert.equal(
+    db.prepare('SELECT details_json FROM source_files WHERE id=?').get(source.id)?.details_json,
+    detailsJson,
+  );
+  const status = recordDurabilityStatus(db);
+  assert.ok(status?.configured && !status.dirty && !status.conflicted);
+  const head = db
+    .prepare('SELECT head_json FROM __record_state WHERE singleton=1')
+    .get()?.head_json;
+  assert.equal(typeof head, 'string');
+  assert.deepEqual(acceptedHead, Buffer.from(head + '\n'));
+  assert.equal(intakeFrontierAttemptCounts(db)?.revoked, true);
+  ensureIntakeFrontierObserver(db);
+}
 test('cold and revised giant-name summaries use bounded facts and preserve exact fragments', async (t) => {
   const { db, source, directory, authority, identity } = fixture(t);
   await buildIntakeCollectionEnvelope(db, source);
@@ -303,13 +328,14 @@ test('cold and revised giant-name summaries use bounded facts and preserve exact
   }
 });
 test('older native filenames upgrade cooperatively, cancel without partial proof, and refuse forged facts', async (t) => {
-  const { db, source, directory, identity, legacyDetailsJson } = fixture(t);
+  const { db, source, directory, identity, legacyDetailsJson, authority } = fixture(t);
   await buildIntakeCollectionEnvelope(db, source);
   transaction(db, () =>
     db
       .prepare('UPDATE source_files SET details_json=? WHERE id=?')
       .run(legacyDetailsJson, source.id),
   );
+  admitRestoredLegacyFixture(db, source, legacyDetailsJson, authority.objects.get('head'));
   const old = await forkFacts(db, source);
   await old.collections.certifySchemaAdoptionAsync(old.prepared);
   old.collections.commitMaintenance(old.prepared);
@@ -384,13 +410,14 @@ test('older native filenames upgrade cooperatively, cancel without partial proof
 });
 
 test('an old-native repair context stays native and prepares its name before refusing changed drafts', async (t) => {
-  const { db, source, directory, identity, legacyDetailsJson } = fixture(t);
+  const { db, source, directory, identity, legacyDetailsJson, authority } = fixture(t);
   await buildIntakeCollectionEnvelope(db, source);
   transaction(db, () =>
     db
       .prepare('UPDATE source_files SET details_json=? WHERE id=?')
       .run(legacyDetailsJson, source.id),
   );
+  admitRestoredLegacyFixture(db, source, legacyDetailsJson, authority.objects.get('head'));
   const old = await forkFacts(db, source);
   await old.collections.certifySchemaAdoptionAsync(old.prepared);
   old.collections.commitMaintenance(old.prepared);

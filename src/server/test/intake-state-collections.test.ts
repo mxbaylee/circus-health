@@ -9,8 +9,13 @@ import { openDatabase, transaction, clinicalReviewRevision, type Database } from
 import {
   attachRecordDurability,
   rebuildRecordDatabase,
+  recordDurabilityStatus,
   type RecordStorage,
 } from '../record-versions.ts';
+import {
+  ensureIntakeFrontierObserver,
+  intakeFrontierAttemptCounts,
+} from '../intake-lookup-frontier-observer.ts';
 import {
   createIntakeStateStorage,
   clearIntakeStateCache,
@@ -69,6 +74,7 @@ function fixture(t: test.TestContext) {
     db,
     identity,
     rebuild,
+    acceptedHead: () => objects.get('head'),
     ambiguous: () => {
       ambiguous = true;
     },
@@ -866,7 +872,7 @@ test('oversized inline metadata refuses before serialization and escaped overflo
 
 for (const raw of [false, true]) {
   test(`supported v3 ${raw ? 'raw duplicate' : 'normalized unknown'} evidence bridges without changing clinical revision or legacy reads`, (t) => {
-    const { db, identity, rebuild } = fixture(t);
+    const { db, identity, rebuild, acceptedHead } = fixture(t);
     const full = createIntakeStateStorage(db, identity),
       store = full.collections;
     const input = raw
@@ -888,6 +894,20 @@ for (const raw of [false, true]) {
       );
       full.stage(initial.state, originalOperation);
     });
+    assert.equal(
+      db.prepare('SELECT details_json FROM source_files WHERE id=?').get(identity.intakeId)
+        ?.details_json,
+      initial.detailsJson,
+    );
+    const status = recordDurabilityStatus(db);
+    assert.ok(status?.configured && !status.dirty && !status.conflicted);
+    const head = db
+      .prepare('SELECT head_json FROM __record_state WHERE singleton=1')
+      .get()?.head_json;
+    assert.equal(typeof head, 'string');
+    assert.deepEqual(acceptedHead(), Buffer.from(head + '\n'));
+    assert.equal(intakeFrontierAttemptCounts(db), undefined);
+    ensureIntakeFrontierObserver(db);
     const source = { id: identity.intakeId, kind: 'intake_original', sha256: identity.sourceHash };
     const before = readIntakeEnvelopeMaterialized(db, source);
     const oldReceipt = db

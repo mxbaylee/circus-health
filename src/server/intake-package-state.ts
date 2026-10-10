@@ -20,6 +20,10 @@ import {
 } from './intake-package-index.ts';
 import { withPackageSessionSource } from './intake-package-session.ts';
 import { emptyPackageSourceVerificationWork } from './intake-package-source-lease.ts';
+import {
+  ensureIntakeFrontierObserver,
+  intakeFrontierAttemptCounts,
+} from './intake-lookup-frontier-observer.ts';
 import { PackageInspectionError } from './intake-package-worker.ts';
 import { packageMemberUnit } from './intake-plan.ts';
 import { workflowHash } from './intake-workflow.ts';
@@ -361,6 +365,11 @@ export async function buildDurablePackageInventory(
     }) => void;
   } = {},
 ) {
+  context.assertRunning?.();
+  // A cold legacy package builder needs the fixed observer before its first
+  // selected-source read. Never renew an observer owned by a parent operation.
+  if (!intakeFrontierAttemptCounts(context.db)) ensureIntakeFrontierObserver(context.db);
+  context.assertRunning?.();
   const binding = selectedSource(context),
     store = open(context, binding);
   const format = context.db

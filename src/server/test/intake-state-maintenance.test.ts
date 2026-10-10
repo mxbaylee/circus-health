@@ -16,6 +16,7 @@ import {
 import {
   attachRecordDurability,
   rebuildRecordDatabase,
+  recordDurabilityStatus,
   type RecordStorage,
 } from '../record-versions.ts';
 import {
@@ -31,6 +32,7 @@ import { readIntakeEnvelopeMaterialized } from '../intake-authority.ts';
 import { reviewIntake, uploadIntake } from '../intake.ts';
 import { intakeSourceVersion } from '../intake-state-access.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { ensureIntakeFrontierObserver } from '../intake-lookup-frontier-observer.ts';
 import {
   clearIntakeMaintenancePublications,
   prepareIntakeMaintenancePublication,
@@ -383,6 +385,11 @@ test('a real pending clinical review keeps its exact token across the legacy bri
   const clinical = clinicalReviewRevision(db);
   const identity = { profileId, intakeId: source.id, sourceHash: source.sha256 };
   const store = createIntakeStateStorage(db, identity).collections;
+  const status = recordDurabilityStatus(db);
+  assert.ok(status?.configured && !status.dirty && !status.conflicted);
+  assert.ok(db.prepare('SELECT head_json FROM __record_state WHERE singleton=1').get());
+  // The completed review and this direct bridge are separate operations.
+  ensureIntakeFrontierObserver(db);
   const envelope = readIntakeEnvelopeMaterialized(db, { id: source.id }).value as {
     intake: { version: number };
   };
