@@ -231,7 +231,20 @@ function nativeBrowserReads(page: Page, prefix: string) {
         matches(new URL(selected.url()));
       const selected =
         observed.find(predicate) || (await page.waitForResponse(predicate, { timeout: 0 }));
-      assert.equal(selected.status(), 200);
+      let diagnostic: string | undefined;
+      if (selected.status() !== 200) {
+        const body = await selected.json().catch(() => undefined);
+        const error = body?.error;
+        diagnostic = JSON.stringify({
+          route:
+            new URL(selected.url()).pathname.match(
+              /\/(import-feed|report-queue|identity-review|report-sources|review-record)(?:\/|$)/,
+            )?.[1] ?? 'other-native-intake',
+          code: typeof error?.code === 'string' ? error.code.slice(0, 128) : undefined,
+          message: typeof error?.message === 'string' ? error.message.slice(0, 512) : undefined,
+        });
+      }
+      assert.equal(selected.status(), 200, diagnostic);
       assert.equal(await selected.finished(), null);
       return selected;
     },
