@@ -38,18 +38,50 @@ test('closing clinical ownership never invokes caller cancellation accessors or 
               callbacks++;
             },
           });
+          Object.defineProperty(controller.signal, 'reason', {
+            configurable: true,
+            get() {
+              callbacks++;
+              return Error('untrusted reason');
+            },
+          });
           assertClinicalOperation(db, owner);
           assert.equal(callbacks, 0);
           controller.abort();
-          assert.throws(() => assertClinicalOperation(db, owner), /no longer active/);
+          assert.throws(() => assertClinicalOperation(db, owner), { name: 'AbortError' });
           assert.equal(callbacks, 0);
           Reflect.deleteProperty(controller.signal, 'aborted');
           Reflect.deleteProperty(controller.signal, 'throwIfAborted');
+          Reflect.deleteProperty(controller.signal, 'reason');
         },
         { signal: controller.signal },
       ),
       /abort/i,
     );
+  } finally {
+    db.close();
+  }
+});
+test('closing clinical ownership preserves the exact native custom cancellation reason', async () => {
+  const db = new DatabaseSync(':memory:'),
+    controller = new AbortController(),
+    reason = Error('fictional subscriber cancellation');
+  try {
+    await assert.rejects(
+      runExclusiveClinicalOperation(
+        db,
+        async (owner) => {
+          controller.abort(reason);
+          assert.throws(
+            () => assertClinicalOperation(db, owner),
+            (error) => error === reason,
+          );
+        },
+        { signal: controller.signal },
+      ),
+      (error) => error === reason,
+    );
+    await runExclusiveClinicalOperation(db, async (owner) => assertClinicalOperation(db, owner));
   } finally {
     db.close();
   }
