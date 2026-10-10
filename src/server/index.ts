@@ -20,7 +20,11 @@ import { recordOwner } from './record-owner.ts';
 import { clinicalImportCorrectionHistory } from './clinical-import-corrections.ts';
 import { readProfileRegistry, recoverProfileDeletions } from './profile-registry.ts';
 import { diagnosticRoute } from '../shared/import-diagnostic-route.ts';
-import { createProfileLifecycle } from './profile-lifecycle.ts';
+import {
+  createProfileLifecycle,
+  profileLifecycleAvailable,
+  type ProfileLifecycle,
+} from './profile-lifecycle.ts';
 import { disposePdfEvidenceSessions } from './intake-pdf-session.ts';
 import { visibilityState, setVisibility } from './visibility.ts';
 import { clinicalRedirect } from './clinical-references.ts';
@@ -39,6 +43,7 @@ import { exportImportAttribution } from './intake-attribution.ts';
 import { prepareIntakeAttributionSources } from './intake-attribution-source.ts';
 import { randomBytes, randomUUID } from 'node:crypto';
 import type { Database } from './database.ts';
+import { authorizationSignalAborted } from './authorization-signal.ts';
 import type { LinkTargetType } from '../shared/api.ts';
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -166,6 +171,28 @@ function serveOriginal(
     'Cache-Control': 'no-store',
   });
   createReadStream(path).pipe(res);
+}
+const requestFilenameAssertions = new WeakMap<
+  () => void,
+  {
+    db: Database;
+    databases: Map<string, Database>;
+    profileId: string;
+    signal: AbortSignal;
+    lifecycle: ProfileLifecycle;
+  }
+>();
+const nativeDatabaseMapGet = Map.prototype.get;
+/** Only actual filename-read request closures are registered by this module. */
+export function requestFilenameAssertionCurrent(assertion: () => void, db: Database): boolean {
+  const owner = requestFilenameAssertions.get(assertion);
+  return (
+    !!owner &&
+    owner.db === db &&
+    !authorizationSignalAborted(owner.signal) &&
+    Reflect.apply(nativeDatabaseMapGet, owner.databases, [owner.profileId]) === db &&
+    profileLifecycleAvailable(owner.lifecycle, owner.profileId)
+  );
 }
 export interface AppOptions {
   root?: string;
@@ -353,16 +380,25 @@ export function createApp({
         input: Parameters<typeof prepareIntakeReadFilenames>[2],
       ) => {
         const lifetime = intakeIdentityRequestLifetime(req, res);
+        const assertRunning = () => {
+          lifetime.signal.throwIfAborted();
+          if (dbs.get(profileId) !== db || lifecycle.isLocked(profileId))
+            throw new HttpError(409, 'PROFILE_BUSY', 'The selected profile changed');
+        };
+        requestFilenameAssertions.set(assertRunning, {
+          db,
+          databases: dbs,
+          profileId,
+          signal: lifetime.signal,
+          lifecycle,
+        });
         try {
           await prepareIntakeReadFilenames(db, profileId, input, {
-            assertRunning() {
-              lifetime.signal.throwIfAborted();
-              if (dbs.get(profileId) !== db || lifecycle.isLocked(profileId))
-                throw new HttpError(409, 'PROFILE_BUSY', 'The selected profile changed');
-            },
+            assertRunning,
           });
           lifetime.signal.throwIfAborted();
         } finally {
+          requestFilenameAssertions.delete(assertRunning);
           lifetime.dispose();
         }
       };

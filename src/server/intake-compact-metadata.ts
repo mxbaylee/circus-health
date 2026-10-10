@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
-import type { Database } from './database.ts';
+import { prepareManagedDatabaseCallbackBarrier, type Database } from './database.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
 import { INTAKE_COMPACT_ENVELOPE_FORMAT } from './intake-authority.ts';
 import { createIntakeStateStorage } from './intake-state-storage.ts';
@@ -37,6 +37,7 @@ export async function prepareIntakeCompactMetadata(
     db,
     async (operation) => {
       ensureIntakeFrontierObserver(db);
+      prepareManagedDatabaseCallbackBarrier(db);
       const profileId = db
         .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")
         .get()?.value;
@@ -71,15 +72,28 @@ export async function prepareIntakeCompactMetadata(
           changes: [],
         });
       try {
-        if (!(await collections.certifyCompactMetadataAsync(prepared, { assertRunning })))
+        if (
+          !(await collections.certifyCompactMetadataAsync(prepared, {
+            assertRunning,
+            deferredTerminal: true,
+          }))
+        )
           return { changed: false };
         assertRunning();
-        collections.commitMaintenance(prepared, { assertCurrent: assertPublicationCurrent });
+        await collections.commitCompactMaintenanceAsync(prepared, {
+          assertCurrent: assertPublicationCurrent,
+        });
         return { changed: true };
       } finally {
         collections.disposePreparation(prepared);
       }
     },
-    { operation: currentClinicalOperation(db), assertRunning: options.assertRunning },
+    {
+      operation: currentClinicalOperation(db),
+      assertRunning: options.assertRunning,
+      publicationAssertions: options.assertPublicationCurrent
+        ? [options.assertPublicationCurrent]
+        : [],
+    },
   );
 }

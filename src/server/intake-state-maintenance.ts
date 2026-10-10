@@ -1,5 +1,10 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { currentTransactionToken, managedDatabaseMethodEpoch } from './database.ts';
+import { terminalStatement } from './database-terminal-statements.ts';
+import {
+  currentTransactionToken,
+  installTransactionTerminalGuard,
+  managedDatabaseMethodEpoch,
+} from './database.ts';
 import {
   recordDurabilityStatus,
   discardRecordSourcePriorFields,
@@ -8,7 +13,12 @@ import {
   recordIndexedPublicationWrites,
   type RecordIndexedPublication,
   type RecordSourcePriorFields,
+  prepareRecordCompactTerminal,
+  withRecordCompactTerminal,
+  prepareRecordCompactReadmission,
+  type RecordCompactReadmission,
 } from './record-versions.ts';
+import { currentClinicalOperation, assertClinicalOperation } from './clinical-operation.ts';
 import {
   HEAD_BYTES,
   intakeNamespace,
@@ -20,13 +30,17 @@ import {
 import { intakeSourcePinKey } from './intake-source-pin.ts';
 import {
   verifyIntakeLegacyBridgeProof,
+  legacyBridgeStampCurrent,
   type IntakeLegacyBridgeProof,
+  type IntakeLegacyBridgeStamp,
   consumeIntakeCompactMetadataProof,
   type IntakeCompactMetadataProof,
   intakeCompactSourceRowsEqual,
   intakeCompactMetadataStampCurrent,
   type IntakeCompactMetadataStamp,
 } from './intake-state-migration.ts';
+import { sourceTextAuthorityDirtyRow } from './source-text-projection.ts';
+import { readIntakeFrontierOwnedLookupDirtyWrite } from './intake-lookup-frontier-observer.ts';
 
 declare const maintenanceBrand: unique symbol;
 /** Host-owned, single-use permission for one exact auxiliary publication. */
@@ -65,6 +79,9 @@ interface Publication {
   fingerprint: string;
   bytes: number;
   bridgeCertified: boolean;
+  legacyStamp?: IntakeLegacyBridgeStamp;
+  legacyStartWrites?: number;
+  legacyBeforeDirty?: ReturnType<typeof sourceTextAuthorityDirtyRow>;
   compactMetadata?: {
     sourceRow: Readonly<Record<string, unknown>>;
     target: string;
@@ -95,6 +112,38 @@ interface Retained {
 }
 const publications = new WeakMap<IntakeMaintenancePublication, Publication>();
 const retained = new WeakMap<DatabaseSync, Retained>();
+/** Capture before the terminal transaction disposes its original preparation. */
+export function prepareIntakeCompactReadmission(
+  db: DatabaseSync,
+  capability: IntakeMaintenancePublication,
+): RecordCompactReadmission {
+  const publication = selected(db, capability);
+  if (!publication.compactMetadata) fail('compact readmission requires private source proof');
+  return prepareRecordCompactReadmission(db, publication.compactMetadata!.priorFields);
+}
+/** Only a certified compact source plan may enter the finite terminal path. */
+export async function prepareIntakeCompactTerminalPublication(
+  db: DatabaseSync,
+  capability: IntakeMaintenancePublication,
+): Promise<boolean> {
+  const publication = selected(db, capability),
+    operation = currentClinicalOperation(db);
+  if (!publication.compactMetadata || !operation || publication.token)
+    fail('compact terminal publication preparation');
+  publication.assertCurrent?.();
+  // Capture the genuine operation token, not the generic preparation callback.
+  publication.assertCurrent = () => assertClinicalOperation(db, operation);
+  return prepareRecordCompactTerminal(db, publication.compactMetadata!.priorFields);
+}
+export function withIntakeCompactTerminalPublication<T>(
+  db: DatabaseSync,
+  capability: IntakeMaintenancePublication,
+  run: () => T,
+): T {
+  const publication = selected(db, capability);
+  if (!publication.compactMetadata) fail('foreign compact terminal publication');
+  return withRecordCompactTerminal(db, publication.compactMetadata!.priorFields, run);
+}
 const MAX_WRITES = 4096;
 const MAX_ROW_BYTES = 32 * 1024;
 const MAX_WRITE_BYTES = 8 * 1024 * 1024;
@@ -116,13 +165,14 @@ function metadataReader(db: DatabaseSync) {
   let readSize: ReturnType<DatabaseSync['prepare']> | undefined;
   let readValue: ReturnType<DatabaseSync['prepare']> | undefined;
   return (key: string, limit = HEAD_BYTES): string | undefined => {
-    readSize ??= db.prepare(
+    readSize ??= terminalStatement(
+      db,
       'SELECT length(CAST(value AS BLOB)) AS bytes FROM app_meta WHERE key=?',
     );
     const size = readSize.get(key)?.bytes;
     if (size === undefined) return undefined;
     if (typeof size !== 'number' || size > limit) fail('metadata budget');
-    readValue ??= db.prepare('SELECT value FROM app_meta WHERE key=?');
+    readValue ??= terminalStatement(db, 'SELECT value FROM app_meta WHERE key=?');
     const value = readValue.get(key)?.value;
     if (typeof value !== 'string') fail('metadata representation');
     return value;
@@ -136,18 +186,18 @@ function sourceBinding(
 ): string {
   if (!db.isOpen) fail('closed database');
   if (readMeta('owner_profile_id') !== identity.profileId) fail('database owner');
-  const size = db
-    .prepare('SELECT length(CAST(details_json AS BLOB)) AS bytes FROM source_files WHERE id=?')
-    .get(identity.intakeId)?.bytes;
+  const size = terminalStatement(
+    db,
+    'SELECT length(CAST(details_json AS BLOB)) AS bytes FROM source_files WHERE id=?',
+  ).get(identity.intakeId)?.bytes;
   if (typeof size !== 'number' || (includeDetails && size > MAX_WRITE_BYTES))
     fail('source metadata budget');
-  const row = db
-    .prepare(
-      includeDetails
-        ? 'SELECT kind,sha256,details_json FROM source_files WHERE id=?'
-        : 'SELECT kind,sha256 FROM main.source_files WHERE id=?',
-    )
-    .get(identity.intakeId);
+  const row = terminalStatement(
+    db,
+    includeDetails
+      ? 'SELECT kind,sha256,details_json FROM source_files WHERE id=?'
+      : 'SELECT kind,sha256 FROM main.source_files WHERE id=?',
+  ).get(identity.intakeId);
   if (!row || row.kind !== 'intake_original' || row.sha256 !== identity.sourceHash)
     fail('original source');
   return JSON.stringify(row);
@@ -208,18 +258,23 @@ export function prepareIntakeMaintenancePublication(
     beforeHead: candidate.beforeHead,
     afterHead: candidate.afterHead,
     sourcePin,
-    detailsJson: db
-      .prepare('SELECT details_json FROM source_files WHERE id=?')
-      .get(identity.intakeId)!.details_json as string,
+    detailsJson: terminalStatement(db, 'SELECT details_json FROM source_files WHERE id=?').get(
+      identity.intakeId,
+    )!.details_json as string,
     writes: candidate.writes,
   };
   const compactMetadata =
     candidate.compactMetadata === undefined
       ? undefined
       : consumeIntakeCompactMetadataProof(db, candidate.compactMetadata, proofBinding);
-  if (candidate.legacyBridge !== undefined) {
-    verifyIntakeLegacyBridgeProof(candidate.legacyBridge, db, proofBinding);
-  } else if (!compactMetadata) heads(identity, candidate.beforeHead, candidate.afterHead);
+  const legacyStamp =
+    candidate.legacyBridge === undefined
+      ? undefined
+      : verifyIntakeLegacyBridgeProof(candidate.legacyBridge, db, proofBinding);
+  if (candidate.legacyBridge !== undefined && !compactMetadata && !legacyStamp)
+    fail('legacy bridge original proof unavailable');
+  if (candidate.legacyBridge === undefined && !compactMetadata)
+    heads(identity, candidate.beforeHead, candidate.afterHead);
   if (!candidate.writes.length || candidate.writes.length > MAX_WRITES) fail('write count');
   const writes = new Map<string, string>();
   const seen = new Set<string>();
@@ -278,6 +333,7 @@ export function prepareIntakeMaintenancePublication(
     fingerprint: candidate.fingerprint,
     bytes: retainedBytes,
     bridgeCertified: candidate.legacyBridge !== undefined || compactMetadata !== undefined,
+    legacyStamp: compactMetadata ? undefined : legacyStamp,
     compactMetadata,
     assertCurrent: compactMetadata ? candidate.assertCurrent : undefined,
   };
@@ -319,17 +375,19 @@ export function stageIntakeCompactMetadataPublication(
     !intakeCompactMetadataStampCurrent(db, proof.stamp, false) ||
     metadataReader(db)(item.headKey) !== item.afterHead ||
     !intakeCompactSourceRowsEqual(
-      db
-        .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
-        .get(item.identity.intakeId),
+      terminalStatement(
+        db,
+        'SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?',
+      ).get(item.identity.intakeId),
       proof.sourceRow,
     )
   )
     fail('compact metadata staging scope');
   const before = proof.sourceRow as { details_json: string };
-  const update = db
-    .prepare('UPDATE main.source_files SET details_json=? WHERE id=? AND details_json IS ?')
-    .run(proof.target, item.identity.intakeId, before.details_json);
+  const update = terminalStatement(
+    db,
+    'UPDATE main.source_files SET details_json=? WHERE id=? AND details_json IS ?',
+  ).run(proof.target, item.identity.intakeId, before.details_json);
   if (Number(update.changes) !== 1) fail('compact metadata exact update');
   item.sourceStaged = true;
 }
@@ -347,13 +405,13 @@ export function beginIntakeMaintenancePublication(
     publication.revision = readMeta('revision');
     publication.clinicalRevision = readMeta('clinical_review_revision');
     publication.startCapturedRows = Number(
-      db.prepare('SELECT COUNT(*) AS n FROM __record_changed').get()!.n,
+      terminalStatement(db, 'SELECT COUNT(*) AS n FROM __record_changed').get()!.n,
     );
     publication.closing = {
-      main: db.prepare('PRAGMA main.schema_version'),
-      temp: db.prepare('PRAGMA temp.schema_version'),
-      peer: db.prepare('PRAGMA main.data_version'),
-      writes: db.prepare('SELECT total_changes() AS n'),
+      main: terminalStatement(db, 'PRAGMA main.schema_version'),
+      temp: terminalStatement(db, 'PRAGMA temp.schema_version'),
+      peer: terminalStatement(db, 'PRAGMA main.data_version'),
+      writes: terminalStatement(db, 'SELECT total_changes() AS n'),
     };
     const status = recordDurabilityStatus(db);
     if (
@@ -364,6 +422,21 @@ export function beginIntakeMaintenancePublication(
       !intakeCompactMetadataStampCurrent(db, publication.compactMetadata.stamp, true)
     )
       fail('compact metadata authority changed before publication');
+  }
+  if (publication.legacyStamp) {
+    if (!legacyBridgeStampCurrent(db, publication.legacyStamp, true))
+      fail('legacy bridge original authority changed before publication');
+    publication.legacyStartWrites = Number(publication.legacyStamp.writes);
+    publication.startCapturedRows = Number(
+      terminalStatement(db, 'SELECT COUNT(*) AS n FROM __record_changed').get()!.n,
+    );
+    publication.legacyBeforeDirty = sourceTextAuthorityDirtyRow(
+      db,
+      publication.identity.intakeId,
+      publication.headKey,
+    );
+    if (!legacyBridgeStampCurrent(db, publication.legacyStamp, true))
+      fail('legacy bridge original authority changed during admission');
   }
   publication.token = token;
   if (
@@ -377,22 +450,28 @@ export function beginIntakeMaintenancePublication(
       publication.source ||
     (publication.compactMetadata &&
       !intakeCompactSourceRowsEqual(
-        db
-          .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
-          .get(publication.identity.intakeId),
+        terminalStatement(
+          db,
+          'SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?',
+        ).get(publication.identity.intakeId),
         publication.compactMetadata.sourceRow,
       )) ||
     readMeta(intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin
   )
     fail('stale authority or source binding');
   if (
-    !db
-      .prepare("SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='__record_changed'")
-      .get()
+    !terminalStatement(
+      db,
+      "SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='__record_changed'",
+    ).get()
   )
     fail('accepted-row capture unavailable');
-  publication.mainSchema = Number(db.prepare('PRAGMA main.schema_version').get()!.schema_version);
-  publication.tempSchema = Number(db.prepare('PRAGMA temp.schema_version').get()!.schema_version);
+  publication.mainSchema = Number(
+    terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version,
+  );
+  publication.tempSchema = Number(
+    terminalStatement(db, 'PRAGMA temp.schema_version').get()!.schema_version,
+  );
   if (publication.compactMetadata)
     closePublication(db, publication, Number(publication.compactMetadata.stamp.writes));
 }
@@ -406,6 +485,74 @@ export function verifyIntakeMaintenancePublication(
 ): void {
   const publication = selected(db, capability);
   verifyPublication(db, publication, token, result, false);
+  if (publication.legacyStamp) {
+    const stamp = publication.legacyStamp;
+    const frontier = stamp.frontier;
+    if (!frontier) fail('legacy bridge original frontier unavailable');
+    const beforeDirty = publication.legacyBeforeDirty;
+    const afterDirty = sourceTextAuthorityDirtyRow(
+      db,
+      publication.identity.intakeId,
+      publication.headKey,
+    );
+    if (
+      !Number.isSafeInteger(publication.legacyStartWrites) ||
+      !Number.isSafeInteger(publication.startCapturedRows) ||
+      (beforeDirty?.authority ?? null) !== (afterDirty?.authority ?? null) ||
+      (beforeDirty?.dirty && !afterDirty?.dirty)
+    )
+      fail('legacy bridge source-text tracking changed');
+    const dirtyWrite = beforeDirty && !beforeDirty.dirty && afterDirty?.dirty ? 1 : 0;
+    const lookupDirtyWrite = readIntakeFrontierOwnedLookupDirtyWrite(
+      db,
+      frontier,
+      token,
+      publication.identity.intakeId,
+      publication.headKey,
+    );
+    if (lookupDirtyWrite === undefined) fail('legacy bridge lookup dirty authority changed');
+    const expected =
+      publication.legacyStartWrites! +
+      publication.startCapturedRows! +
+      2 * publication.writes.size +
+      dirtyWrite +
+      lookupDirtyWrite;
+    const total = () => Number(terminalStatement(db, 'SELECT total_changes() AS n').get()!.n);
+    const check = () => {
+      if (
+        total() !== expected ||
+        readIntakeFrontierOwnedLookupDirtyWrite(
+          db,
+          frontier,
+          token,
+          publication.identity.intakeId,
+          publication.headKey,
+        ) !== lookupDirtyWrite ||
+        !legacyBridgeStampCurrent(db, stamp, false)
+      )
+        fail('legacy bridge unowned publication write');
+      const readMeta = metadataReader(db);
+      if (
+        sourceBinding(db, publication.identity, readMeta) !== publication.source ||
+        readMeta(intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin ||
+        readMeta(publication.headKey) !== publication.afterHead ||
+        sourceTextAuthorityDirtyRow(db, publication.identity.intakeId, publication.headKey)
+          ?.dirty !== afterDirty?.dirty ||
+        total() !== expected ||
+        readIntakeFrontierOwnedLookupDirtyWrite(
+          db,
+          frontier,
+          token,
+          publication.identity.intakeId,
+          publication.headKey,
+        ) !== lookupDirtyWrite ||
+        !legacyBridgeStampCurrent(db, stamp, false)
+      )
+        fail('legacy bridge terminal authority changed');
+    };
+    check();
+    installTransactionTerminalGuard(db, token, check);
+  }
 }
 function verifyPublication(
   db: DatabaseSync,
@@ -427,7 +574,7 @@ function verifyPublication(
     fail('transaction binding');
   if (
     final &&
-    Number(db.prepare('SELECT total_changes() AS n').get()!.n) !==
+    Number(terminalStatement(db, 'SELECT total_changes() AS n').get()!.n) !==
       (indexed
         ? recordIndexedPublicationWrites(db, indexed, publication.compactMetadata!.stamp.authority)
         : publication.verifiedWrites! + 4 + 2 * Number(publication.clinicalRevision === undefined))
@@ -447,9 +594,9 @@ function verifyPublication(
       fail('compact metadata authority changed during publication');
   }
   if (
-    Number(db.prepare('PRAGMA main.schema_version').get()!.schema_version) !==
+    Number(terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version) !==
       publication.mainSchema ||
-    Number(db.prepare('PRAGMA temp.schema_version').get()!.schema_version) !==
+    Number(terminalStatement(db, 'PRAGMA temp.schema_version').get()!.schema_version) !==
       publication.tempSchema
   )
     fail('capture/schema changed during publication');
@@ -462,7 +609,10 @@ function verifyPublication(
     fail('source or result changed');
   const seen = new Set<string>();
   let sourceRows = 0;
-  for (const row of db.prepare('SELECT entity,record_id FROM __record_changed').iterate()) {
+  for (const row of terminalStatement(
+    db,
+    'SELECT entity,record_id FROM __record_changed',
+  ).iterate()) {
     if (typeof row.record_id !== 'string') fail('unexpected accepted row');
     let identity: unknown;
     try {
@@ -494,9 +644,10 @@ function verifyPublication(
       };
       if (
         !intakeCompactSourceRowsEqual(
-          db
-            .prepare('SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?')
-            .get(key),
+          terminalStatement(
+            db,
+            'SELECT CAST(rowid AS TEXT) AS __rowid,* FROM main.source_files WHERE id=?',
+          ).get(key),
           expected,
         )
       )

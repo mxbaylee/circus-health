@@ -31,6 +31,29 @@ export interface PackageSourceLease {
   /** Fixed own-publication liveness; full source authority still guards bytes and handoff. */
   assertPublicationCurrent(): void;
 }
+const leaseAssertions = new WeakMap<() => void, () => boolean>();
+export interface PackageSourceOriginalPhysical {
+  readonly sourceFd: number;
+  readonly path: string;
+  readonly acceptedPath: string;
+  readonly parentRealpath: string;
+  readonly parentKind: 'directory' | 'symlink';
+  readonly parentIdentity: string;
+  readonly statIdentity: string;
+  readonly binding: Readonly<PackageSourceBinding>;
+}
+const leaseOriginals = new WeakMap<() => void, PackageSourceOriginalPhysical>();
+
+/** Read-only lexical liveness for an assertion issued by this lease owner. */
+export function packageSourceLeaseAssertionCurrent(assertion: () => void): boolean {
+  return leaseAssertions.get(assertion)?.() ?? false;
+}
+/** Original open-time identity; the terminal worker must reverify it. */
+export function packageSourceLeaseOriginalPhysical(
+  assertion: () => void,
+): PackageSourceOriginalPhysical | undefined {
+  return packageSourceLeaseAssertionCurrent(assertion) ? leaseOriginals.get(assertion) : undefined;
+}
 export function createPackageSourceLeaseOwner({
   profileId,
   root,
@@ -58,13 +81,25 @@ export function createPackageSourceLeaseOwner({
   const changed = (): never => {
     throw new HttpError(409, 'SOURCE_CHANGED', 'The retained original changed');
   };
+  const statKey = (s: {
+    dev: bigint;
+    ino: bigint;
+    size: bigint;
+    mtimeNs: bigint;
+    ctimeNs: bigint;
+  }) => [s.dev, s.ino, s.size, s.mtimeNs, s.ctimeNs].join(':');
+  const parentState = (path: string) => {
+    const parent = lstatSync(path, { bigint: true });
+    const kind = parent.isDirectory() ? 'directory' : parent.isSymbolicLink() ? 'symlink' : null;
+    if (!kind) return changed();
+    return { kind, identity: [parent.dev, parent.ino, parent.mode].join(':') } as const;
+  };
   // BigInt nanosecond stats are the actual verification cache identity.
   const statIdentity = (fd: number, path: string) => {
     const opened = fstatSync(fd, { bigint: true }),
       named = lstatSync(path, { bigint: true });
-    const key = (s: typeof opened) => [s.dev, s.ino, s.size, s.mtimeNs, s.ctimeNs].join(':');
-    if (!opened.isFile() || !named.isFile() || key(opened) !== key(named)) changed();
-    return key(opened);
+    if (!opened.isFile() || !named.isFile() || statKey(opened) !== statKey(named)) changed();
+    return statKey(opened);
   };
   return {
     work,
@@ -78,7 +113,7 @@ export function createPackageSourceLeaseOwner({
       verified.clear();
     },
     async withSource<T>(
-      source: PackageSourceBinding & { path: string },
+      source: PackageSourceBinding & { path: string; acceptedPath?: string },
       consume: (lease: PackageSourceLease) => Promise<T>,
       assertRunning?: () => void,
       assertPublicationRunning?: () => void,
@@ -95,14 +130,21 @@ export function createPackageSourceLeaseOwner({
       )
         throw new HttpError(403, 'PROFILE_BOUNDARY', 'Invalid retained source binding');
       const path = resolve(source.path),
-        parent = realpathSync(dirname(path)),
+        parentPath = dirname(path),
+        parent = realpathSync(parentPath),
+        parentProof = parentState(parentPath),
         location = relative(managedRoot, parent);
+      const parentCurrent = () => {
+        const value = parentState(parentPath);
+        return value.kind === parentProof.kind && value.identity === parentProof.identity;
+      };
       if (location === '..' || location.startsWith('../') || location.startsWith('/'))
         throw new HttpError(403, 'PROFILE_BOUNDARY', 'Source escaped its managed root');
       const before = lstatSync(path, { bigint: true });
       if (!before.isFile() || before.size !== BigInt(source.bytes)) changed();
       const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
       const epoch = generation;
+      let active = true;
       const cacheKey = JSON.stringify([
         profileId,
         source.intakeId,
@@ -117,7 +159,8 @@ export function createPackageSourceLeaseOwner({
           assertRunning?.();
           if (
             epoch !== generation ||
-            realpathSync(dirname(path)) !== parent ||
+            realpathSync(parentPath) !== parent ||
+            !parentCurrent() ||
             statIdentity(fd, path) !== expectedIdentity
           ) {
             verified.delete(cacheKey);
@@ -130,13 +173,34 @@ export function createPackageSourceLeaseOwner({
           (assertPublicationRunning ?? assertRunning)?.();
           if (
             epoch !== generation ||
-            realpathSync(dirname(path)) !== parent ||
+            realpathSync(parentPath) !== parent ||
+            !parentCurrent() ||
             statIdentity(fd, path) !== expectedIdentity
           ) {
             verified.delete(cacheKey);
             changed();
           }
         };
+        const leaseCurrent = () => active && !closed && epoch === generation;
+        const originalPhysical = Object.freeze({
+          sourceFd: fd,
+          path,
+          acceptedPath: source.acceptedPath ?? source.path,
+          parentRealpath: parent,
+          parentKind: parentProof.kind,
+          parentIdentity: parentProof.identity,
+          statIdentity: expectedIdentity,
+          binding: Object.freeze({
+            profileId,
+            intakeId: source.intakeId,
+            sourceHash: source.sourceHash,
+            bytes: source.bytes,
+          }),
+        });
+        leaseAssertions.set(assertCurrent, leaseCurrent);
+        leaseAssertions.set(assertPublicationCurrent, leaseCurrent);
+        leaseOriginals.set(assertCurrent, originalPhysical);
+        leaseOriginals.set(assertPublicationCurrent, originalPhysical);
         assertCurrent();
         if (verified.get(cacheKey) === expectedIdentity) {
           verified.delete(cacheKey);
@@ -200,6 +264,7 @@ export function createPackageSourceLeaseOwner({
         verified.delete(cacheKey);
         throw error;
       } finally {
+        active = false;
         closeSync(fd);
       }
     },

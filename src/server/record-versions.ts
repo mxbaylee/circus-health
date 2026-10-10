@@ -1,4 +1,25 @@
 import {
+  terminalStatement,
+  terminalExecution,
+  terminalStatementsActive,
+  prepareTerminalStatements,
+  withTerminalStatements,
+  type PreparedTerminalStatements,
+} from './database-terminal-statements.ts';
+import {
+  compactTerminalSql,
+  compactTerminalBigIntSql,
+  compactTerminalExecutions,
+} from './intake-compact-terminal-sql.ts';
+import {
+  currentClinicalOperation,
+  assertClinicalOperation,
+  clinicalOperationCallerAssertions,
+  type ClinicalOperation,
+} from './clinical-operation.ts';
+import type { VaultCompactAuthorization } from './vault-app.ts';
+import type { PackageSourceOriginalPhysical } from './intake-package-source-lease.ts';
+import {
   parseRecordJson,
   stringifyRecordJson,
   recordVersionWork,
@@ -58,15 +79,25 @@ import {
   type Database,
   type SqliteRow,
   type TransactionOperation,
+  type TransactionDurabilityHooks,
+  prepareTerminalTransactionCallbacks,
+  terminalTransactionCallbacksCurrent,
+  type TerminalTransactionCallbacks,
 } from './database.ts';
-import type { SQLInputValue, SQLOutputValue } from 'node:sqlite';
+import { DatabaseSync, StatementSync, type SQLInputValue, type SQLOutputValue } from 'node:sqlite';
 import {
   expectIntakeFrontierMetaWrite,
   expectIntakeFrontierStateWrite,
   finishIntakeFrontierMetaWrite,
   intakeFrontierOwnedMetadataKeys,
   clearIntakeFrontierRecordCapture,
+  prepareIntakeFrontierCaptureClear,
+  type IntakeFrontierCaptureClear,
 } from './intake-lookup-frontier-observer.ts';
+
+const ownDescriptor = Object.getOwnPropertyDescriptor;
+const readmissionPrepare = DatabaseSync.prototype.prepare;
+const readmissionGet = StatementSync.prototype.get;
 
 interface RecordBookkeeping {
   writes: bigint;
@@ -250,6 +281,26 @@ const encode = (value: unknown): Buffer => {
   return bytes;
 };
 const state = new WeakMap<Database, RecordConfig>();
+interface RecordCapture {
+  token: object;
+  empty: boolean;
+  bookkeeping?: RecordBookkeeping;
+}
+const recordParticipants = new WeakMap<Database, TransactionDurabilityHooks<RecordCapture>>();
+const selectionAttempts = new WeakSet<object>();
+/** Cleanup disposition only: an attempted selection cannot be called a
+ * prepublication refusal, even when a later SQL COMMIT or participant fails. */
+export function recordTerminalSelectionAttempted(token: object): boolean {
+  return selectionAttempts.has(token);
+}
+function markSelectionAttempt(db: Database): void {
+  const token = currentTransactionToken(db);
+  if (token) selectionAttempts.add(token);
+}
+/** Only this attached record owner's frozen lexical hooks qualify. */
+export function recordTerminalDurabilityParticipant(db: Database, participant: unknown): boolean {
+  return state.has(db) && recordParticipants.get(db) === participant;
+}
 const fail = (message: string): never => {
   throw new Error('Record journal: ' + message);
 };
@@ -258,7 +309,7 @@ const internalKey = (key: string): boolean =>
   (key.startsWith('personal_') && !/^personal_(restore|assistant)_/.test(key)) ||
   key === 'curation_revision';
 const meta = (db: Database, key: string): SQLOutputValue | undefined =>
-  db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
+  terminalStatement(db, 'SELECT value FROM app_meta WHERE key=?').get(key)?.value;
 function tables(db: Database): TableSchema[] {
   return (
     db
@@ -407,14 +458,31 @@ function readObject(storage: RecordStorage, ref: unknown): Buffer {
     fail('missing, partial or corrupt committed object');
   return bytes as Buffer;
 }
-function readHead(storage: RecordStorage): RecordObjectReference | null {
+function readHead(
+  storage: RecordStorage,
+  read: RecordStorage['read'] = storage.read,
+): RecordObjectReference | null {
   recordVersionWork('headReadCalls');
-  const bytes = storage.read('head');
+  const bytes = Reflect.apply(read, storage, ['head']);
   if (Buffer.isBuffer(bytes)) recordVersionWork('headReadBytes', bytes.length);
   if (bytes === null || bytes === undefined) return null;
   const ref = parseRecordJson(bytes as unknown as string) as unknown;
   if (!refValid(ref)) fail('invalid head');
   return ref as RecordObjectReference;
+}
+function readConfiguredHead(db: Database, config: RecordConfig): RecordObjectReference | null {
+  const terminal = activeCompactTerminal.get(db),
+    authority = terminal && authorityWitnesses.get(terminal.prior.authority);
+  if (!terminalStatementsActive(db)) return readHead(config.storage);
+  if (
+    !authority?.staging ||
+    authority.config !== config ||
+    !recordAuthorityWitnessIntervalCurrent(db, terminal!.prior.authority)
+  )
+    fail('compact accepted head owner changed');
+  // Only the registered actual-vault staging owner reaches this branch. Its
+  // captured original head reader is lexical manifest memory, not an adapter callback.
+  return readHead(config.storage, authority!.read);
 }
 function writeObject(
   storage: RecordStorage,
@@ -683,23 +751,28 @@ function current(
   prior?: SourcePriorData,
 ): CurrentVersionRow | undefined {
   if (prior && entity === 'source_files' && id === prior.recordId) {
-    const row = db
-      .prepare(
-        'SELECT v.version_id,v.deleted FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?',
-      )
-      .get(entity, id);
+    const row = terminalStatement(
+      db,
+      'SELECT v.version_id,v.deleted FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?',
+    ).get(entity, id);
     if (!row || row.version_id !== prior.versionId || row.deleted !== 0)
       fail('prepared prior version changed');
     return row as CurrentVersionRow;
   }
+  const sql =
+    'SELECT v.* FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?';
+  if (terminalStatementsActive(db))
+    return terminalStatement(db, sql).get(entity, id) as CurrentVersionRow | undefined;
   let statement = currentStatements.get(db);
   if (!statement) {
-    statement = db.prepare(
+    statement = terminalStatement(
+      db,
       'SELECT v.* FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?',
     );
     currentStatements.set(db, statement);
   }
-  return statement.get(entity, id) as CurrentVersionRow | undefined;
+  return terminalStatement(db, statement.sourceSQL, statement).get(entity, id) as
+    CurrentVersionRow | undefined;
 }
 function identity(table: TableSchema, row: Record<string, unknown>): string {
   return stringifyRecordJson(table.pk.map((key) => row[key]));
@@ -784,7 +857,7 @@ function indexTransaction(
     metadataOnly: true,
   };
   if (prior) prior.indexedWrites = 0;
-  const indexed = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as
+  const indexed = terminalStatement(db, 'SELECT * FROM __record_state WHERE singleton=1').get() as
     RecordStateRow | undefined;
   if (
     commit.sequence !== (indexed?.sequence ?? 0) + 1 ||
@@ -792,9 +865,10 @@ function indexTransaction(
   )
     fail('commit sequence gap or cache ancestry mismatch');
   if (indexed) {
-    const previous = db
-      .prepare('SELECT commit_json FROM __record_transactions WHERE sequence=?')
-      .get(indexed.sequence) as (SqliteRow & { commit_json: string }) | undefined;
+    const previous = terminalStatement(
+      db,
+      'SELECT commit_json FROM __record_transactions WHERE sequence=?',
+    ).get(indexed.sequence) as (SqliteRow & { commit_json: string }) | undefined;
     if (
       !previous ||
       commit.revision !== parseRecordJson<RecordCommit>(previous.commit_json).revision + 1
@@ -804,8 +878,12 @@ function indexTransaction(
   if (indexed && commit.revision !== revision(db))
     fail('projection revision differs from committed transaction');
   const identities = versionIdentityIndex(),
-    insertVersion = db.prepare('INSERT INTO __record_versions VALUES(?,?,?,?,?,?,?,?,?,?,?)'),
-    selectVersion = db.prepare(
+    insertVersion = terminalStatement(
+      db,
+      'INSERT INTO __record_versions VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+    ),
+    selectVersion = terminalStatement(
+      db,
       'INSERT INTO __record_current VALUES(?,?,?) ON CONFLICT(entity,record_id) DO UPDATE SET version_id=excluded.version_id',
     );
   // Only SQL bytecode is shared within this indexing call. Keep at most 32
@@ -864,7 +942,8 @@ function indexTransaction(
             const rows = fields.length / 9;
             let insert = fieldStatements.get(rows);
             if (!insert) {
-              insert = db.prepare(
+              insert = terminalStatement(
+                db,
                 'INSERT INTO __record_fields VALUES' +
                   Array(rows).fill('(?,?,?,?,?,?,?,?,?)').join(','),
               );
@@ -911,7 +990,8 @@ function indexTransaction(
           const rows = fields.length / 9;
           let insert = fieldStatements.get(rows);
           if (!insert) {
-            insert = db.prepare(
+            insert = terminalStatement(
+              db,
               'INSERT INTO __record_fields VALUES' +
                 Array(rows).fill('(?,?,?,?,?,?,?,?,?)').join(','),
             );
@@ -961,15 +1041,16 @@ function indexTransaction(
   } finally {
     identities.close();
   }
-  const transactionWrite = db
-    .prepare('INSERT INTO __record_transactions VALUES(?,?,?,?,?)')
-    .run(
-      commit.operationId,
-      commit.sequence,
-      commit.fingerprint as SQLInputValue,
-      stringifyRecordJson(commit.result),
-      stringifyRecordJson(commit),
-    );
+  const transactionWrite = terminalStatement(
+    db,
+    'INSERT INTO __record_transactions VALUES(?,?,?,?,?)',
+  ).run(
+    commit.operationId,
+    commit.sequence,
+    commit.fingerprint as SQLInputValue,
+    stringifyRecordJson(commit.result),
+    stringifyRecordJson(commit),
+  );
   if (prior) {
     if (transactionWrite.changes !== 1) fail('indexed transaction write count');
     prior.indexedWrites!++;
@@ -980,15 +1061,13 @@ function indexTransaction(
   let wroteState = false;
   try {
     wroteState =
-      db
-        .prepare('INSERT OR REPLACE INTO __record_state VALUES(1,?,?,?,?,?)')
-        .run(
-          config.profileId,
-          PROJECTION,
-          config.schemaVersion,
-          commit.sequence,
-          stringifyRecordJson(ref),
-        ).changes === 1;
+      terminalStatement(db, 'INSERT OR REPLACE INTO __record_state VALUES(1,?,?,?,?,?)').run(
+        config.profileId,
+        PROJECTION,
+        config.schemaVersion,
+        commit.sequence,
+        stringifyRecordJson(ref),
+      ).changes === 1;
   } finally {
     finishIntakeFrontierMetaWrite(db, expectedState, wroteState);
   }
@@ -1017,17 +1096,19 @@ function* collect(
   const keys = baseline
     ? (function* () {
         for (const table of config.schema)
-          for (const row of db
-            .prepare(`SELECT * FROM ${q(table.name)} ORDER BY ${table.pk.map(q).join(',')}`)
-            .iterate())
+          for (const row of terminalStatement(
+            db,
+            `SELECT * FROM ${q(table.name)} ORDER BY ${table.pk.map(q).join(',')}`,
+          ).iterate())
             yield {
               entity: table.name,
               record_id: identity(table, row as Record<string, unknown>),
             };
       })()
-    : (db.prepare('SELECT * FROM __record_changed ORDER BY entity,record_id').iterate() as Iterable<
-        SqliteRow & { entity: string; record_id: string }
-      >);
+    : (terminalStatement(
+        db,
+        'SELECT * FROM __record_changed ORDER BY entity,record_id',
+      ).iterate() as Iterable<SqliteRow & { entity: string; record_id: string }>);
   // A new traversal owns these statements, bounded by the configured tables.
   // Never memoize rows: even a deletion or an unchanged field must read the
   // current transaction's row and predecessor again.
@@ -1038,7 +1119,8 @@ function* collect(
     if (entity === 'app_meta' && internalKey(id[0] as string)) continue;
     let read = readers.get(table!);
     if (!read) {
-      read = db.prepare(
+      read = terminalStatement(
+        db,
         `SELECT * FROM ${q(entity)} WHERE ${table!.pk.map((key) => q(key) + '=?').join(' AND ')}`,
       );
       readers.set(table!, read);
@@ -1104,13 +1186,15 @@ function publish(
       {
         ref: plan.ref,
         commit: plan.commit,
-        versions: readSegmentVersions(config.storage, plan.commit),
+        versions: plan.versions,
       },
       prior,
     );
     prepareVaultRecordHead(staging!);
     renewIntakeMaintenanceAfterIndex(db, operation.intakeMaintenance!, prior.indexed!);
+    markSelectionAttempt(db);
     installVaultRecordHead(staging!, encode(plan.ref), prior.indexed!);
+    indexedPublications.get(prior.indexed!)!.installed = true;
     // The actual lexical installer authenticates HEAD readback itself. Do not
     // re-enter a storage callback after the final publication/continuation seal.
     return {
@@ -1226,10 +1310,15 @@ function publish(
     const staging = authorityWitnesses.get(prior.authority)?.staging;
     if (staging) prepareVaultRecordHead(staging);
     renewIntakeMaintenanceAfterIndex(db, operation.intakeMaintenance!, prior.indexed!);
+    markSelectionAttempt(db);
     if (staging) installVaultRecordHead(staging, encode(ref));
     else config.storage.publishHead(encode(ref));
-  } else config.storage.publishHead(encode(ref));
+  } else {
+    markSelectionAttempt(db);
+    config.storage.publishHead(encode(ref));
+  }
   if (!eq(readHead(config.storage), ref)) fail('head publication failed verification');
+  if (prior) indexedPublications.get(prior.indexed!)!.installed = true;
   return { sequence, operationId, records: count, bookkeeping };
 }
 function applyVersions(
@@ -1452,11 +1541,10 @@ export function attachRecordDurability(
     const expected = expectIntakeFrontierMetaWrite(db, 'curation_revision', ['insert', 'update']);
     let written = false;
     try {
-      const result = db
-        .prepare(
-          "INSERT INTO app_meta(key,value) VALUES('curation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        )
-        .run(String(revision(db)));
+      const result = terminalStatement(
+        db,
+        "INSERT INTO app_meta(key,value) VALUES('curation_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      ).run(String(revision(db)));
       written = result.changes === 1;
       return result;
     } finally {
@@ -1464,12 +1552,14 @@ export function attachRecordDurability(
     }
   };
   markPersisted();
-  db.exec('DELETE FROM __record_changed');
-  registerTransactionDurability(db, {
+  terminalExecution(db, 'DELETE FROM __record_changed');
+  const participant: TransactionDurabilityHooks<RecordCapture> = {
     begin(operation) {
-      const indexed = db.prepare('SELECT * FROM __record_state WHERE singleton=1').get() as
-        RecordStateRow | undefined;
-      if (!eq(readHead(storage), parseRecordJson(indexed!.head_json)))
+      const indexed = terminalStatement(
+        db,
+        'SELECT * FROM __record_state WHERE singleton=1',
+      ).get() as RecordStateRow | undefined;
+      if (!eq(readConfiguredHead(db, config), parseRecordJson(indexed!.head_json)))
         fail('cache is behind accepted history; reopen before writing');
       if (hasChanges(db, config))
         fail('uncommitted direct writes bypassed the transaction boundary');
@@ -1485,9 +1575,10 @@ export function attachRecordDurability(
             'INVALID_OPERATION',
             'Stable operation ID requires a request fingerprint',
           );
-        const prior = db
-          .prepare('SELECT * FROM __record_transactions WHERE operation_id=?')
-          .get(operation.operationId as SQLInputValue) as
+        const prior = terminalStatement(
+          db,
+          'SELECT * FROM __record_transactions WHERE operation_id=?',
+        ).get(operation.operationId as SQLInputValue) as
           (SqliteRow & { fingerprint: string; result_json: string }) | undefined;
         if (prior) {
           if (prior.fingerprint !== operation.fingerprint)
@@ -1509,12 +1600,12 @@ export function attachRecordDurability(
     capture() {
       maintenanceBookkeeping.delete(db);
       const token = currentTransactionToken(db)!;
-      const empty = !db.prepare('SELECT 1 FROM temp.__record_changed LIMIT 1').get();
-      const cleared = clearIntakeFrontierRecordCapture(db);
+      const empty = !terminalStatement(db, 'SELECT 1 FROM temp.__record_changed LIMIT 1').get();
+      const cleared = clearIntakeFrontierRecordCapture(db, activeCompactTerminal.get(db)?.capture);
       return {
         token,
         empty: empty && cleared === 0,
-        bookkeeping: undefined as RecordBookkeeping | undefined,
+        bookkeeping: undefined,
       };
     },
     markDirty: markPersisted,
@@ -1554,9 +1645,10 @@ export function attachRecordDurability(
       let exact = !!(captured.empty && keys && bookkeeping?.metadataOnly);
       if (exact) {
         const expected = new Set([...keys!].map((key) => JSON.stringify([key])));
-        for (const row of db
-          .prepare('SELECT entity,record_id FROM temp.__record_changed')
-          .iterate()) {
+        for (const row of terminalStatement(
+          db,
+          'SELECT entity,record_id FROM temp.__record_changed',
+        ).iterate()) {
           if (row.entity !== 'app_meta' || !expected.delete(row.record_id as string)) {
             exact = false;
             break;
@@ -1568,14 +1660,17 @@ export function attachRecordDurability(
           indexed.size === bookkeeping!.metadataKeys.size &&
           [...indexed].every((key) => bookkeeping!.metadataKeys.has(key));
       }
-      const cleared = clearIntakeFrontierRecordCapture(db);
+      const cleared = clearIntakeFrontierRecordCapture(db, activeCompactTerminal.get(db)?.capture);
       if (exact && BigInt(cleared) === BigInt(keys!.size))
         maintenanceBookkeeping.set(db, {
           token: captured.token,
           writes: bookkeeping!.writes + 2n * BigInt(keys!.size),
         });
     },
-  });
+  };
+  Object.freeze(participant);
+  recordParticipants.set(db, participant);
+  registerTransactionDurability(db, participant);
   const status = recordDurabilityStatus(db)!;
   // Only this successfully attached accepted-record owner may relax cache sync.
   // publish() still verifies and durably publishes immutable records and HEAD
@@ -1593,10 +1688,11 @@ const statusStatements = new WeakMap<
 >();
 function readStatusRow(db: Database): RecordStateRow {
   const sql = 'SELECT * FROM __record_state WHERE singleton=1';
+  if (terminalStatementsActive(db)) return terminalStatement(db, sql).get() as RecordStateRow;
   let cached = statusStatements.get(db);
-  if (cached?.busy) return db.prepare(sql).get() as RecordStateRow;
+  if (cached?.busy) return terminalStatement(db, sql).get() as RecordStateRow;
   if (!cached) {
-    const entry = { statement: db.prepare(sql), busy: false };
+    const entry = { statement: terminalStatement(db, sql), busy: false };
     observeDatabaseClose(db, () => {
       if (statusStatements.get(db) === entry) statusStatements.delete(db);
     });
@@ -1604,7 +1700,7 @@ function readStatusRow(db: Database): RecordStateRow {
   }
   cached.busy = true;
   try {
-    return cached.statement.get() as RecordStateRow;
+    return terminalStatement(db, sql, cached.statement).get() as RecordStateRow;
   } finally {
     cached.busy = false;
   }
@@ -1612,7 +1708,7 @@ function readStatusRow(db: Database): RecordStateRow {
 export function recordDurabilityStatus(db: Database): RecordDurabilityStatus | null {
   if (!state.has(db)) return null;
   const row = readStatusRow(db);
-  const behind = !eq(readHead(state.get(db)!.storage), parseRecordJson(row.head_json));
+  const behind = !eq(readConfiguredHead(db, state.get(db)!), parseRecordJson(row.head_json));
   return {
     configured: true,
     format: FORMAT,
@@ -1640,6 +1736,7 @@ const indexedPublications = new WeakMap<
     commit: RecordCommit;
     token: object;
     backingConsumed?: boolean;
+    installed?: boolean;
   }
 >();
 /** Read-only consumption of the private, exactly indexed preparation. No SQL,
@@ -1712,9 +1809,10 @@ export function recordIndexedPublicationCurrent(
     indexed.head_json !== stringifyRecordJson(data.ref)
   )
     return false;
-  const transaction = db
-    .prepare('SELECT * FROM __record_transactions WHERE sequence=?')
-    .get(data.commit.sequence);
+  const transaction = terminalStatement(
+    db,
+    'SELECT * FROM __record_transactions WHERE sequence=?',
+  ).get(data.commit.sequence);
   if (
     !transaction ||
     transaction.operation_id !== data.commit.operationId ||
@@ -1723,12 +1821,13 @@ export function recordIndexedPublicationCurrent(
     transaction.commit_json !== stringifyRecordJson(data.commit)
   )
     return false;
-  const selected = db
-    .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
-    .get('source_files', data.prior.recordId);
-  const version = db
-    .prepare('SELECT * FROM __record_versions WHERE version_id=?')
-    .get(expected.versionId);
+  const selected = terminalStatement(
+    db,
+    'SELECT version_id FROM __record_current WHERE entity=? AND record_id=?',
+  ).get('source_files', data.prior.recordId);
+  const version = terminalStatement(db, 'SELECT * FROM __record_versions WHERE version_id=?').get(
+    expected.versionId,
+  );
   if (
     selected?.version_id !== expected.versionId ||
     !version ||
@@ -1745,7 +1844,7 @@ export function recordIndexedPublicationCurrent(
   )
     return false;
   return (
-    eq(readHead(data.config.storage), authority.head) &&
+    eq(readConfiguredHead(db, data.config), authority.head) &&
     recordAuthorityWitnessIntervalCurrent(db, original)
   );
 }
@@ -1773,9 +1872,325 @@ interface SourcePriorData {
     commit: RecordCommitV2;
     operation: { operationId: string; fingerprint: string; result: unknown };
     consumed: boolean;
+    deferredTerminal?: boolean;
   };
 }
 const sourcePriorFields = new WeakMap<RecordSourcePriorFields, SourcePriorData>();
+declare const compactReadmissionBrand: unique symbol;
+export interface RecordCompactReadmission {
+  readonly [compactReadmissionBrand]: true;
+}
+const compactReadmissions = new WeakMap<RecordCompactReadmission, SourcePriorData>();
+/** Retain the exact privately prepared successor across preparation disposal.
+ * This does not admit any operation until its lexical HEAD installation succeeds. */
+export function prepareRecordCompactReadmission(
+  db: Database,
+  capability: RecordSourcePriorFields,
+): RecordCompactReadmission {
+  const prior = sourcePriorFields.get(capability),
+    authority = prior && authorityWitnesses.get(prior.authority);
+  if (!prior || prior.db !== db || !authority || prior.consumed || prior.plan?.consumed)
+    fail('compact readmission preparation unavailable');
+  const proof = Object.freeze({}) as RecordCompactReadmission;
+  compactReadmissions.set(proof, prior!);
+  return proof;
+}
+/** A new-operation readback, not continuation credit for the revoked old proof.
+ * Its caller must independently watch all attempts throughout observer installation. */
+export function assertRecordCompactReadmission(
+  db: Database,
+  proof: RecordCompactReadmission,
+): void {
+  const prior = compactReadmissions.get(proof),
+    authority = prior && authorityWitnesses.get(prior.authority),
+    indexed = prior?.indexed && indexedPublications.get(prior.indexed),
+    expected = prior?.newSource;
+  const identity = () => {
+    const read = authority && ownDescriptor(authority.config.storage, 'read');
+    if (
+      !prior ||
+      !authority ||
+      !indexed ||
+      !expected ||
+      prior.db !== db ||
+      !db.isOpen ||
+      db.isTransaction ||
+      state.get(db) !== authority.config ||
+      !indexed.installed ||
+      (authority.staging && (!prior.plan?.consumed || !indexed.backingConsumed)) ||
+      indexed.prior !== prior ||
+      (prior.plan && (indexed.commit !== prior.plan.commit || indexed.ref !== prior.plan.ref)) ||
+      !read ||
+      !('value' in read) ||
+      read.value !== authority.read
+    )
+      fail('committed compact readmission unavailable');
+  };
+  identity();
+  const commit = indexed!.commit,
+    ref = indexed!.ref;
+  const get = (sql: string, ...args: SQLInputValue[]) =>
+    Reflect.apply(readmissionGet, Reflect.apply(readmissionPrepare, db, [sql]), args) as
+      SqliteRow | undefined;
+  const status = get('SELECT * FROM main.__record_state WHERE singleton=1'),
+    transaction = get('SELECT * FROM main.__record_transactions WHERE sequence=?', commit.sequence),
+    selected = get(
+      'SELECT version_id FROM main.__record_current WHERE entity=? AND record_id=?',
+      'source_files',
+      prior!.recordId,
+    ),
+    version = get('SELECT * FROM main.__record_versions WHERE version_id=?', expected!.versionId),
+    source = get(
+      'SELECT * FROM main.source_files WHERE id=?',
+      parseRecordJson<SQLInputValue[]>(prior!.recordId)[0]!,
+    );
+  if (
+    status?.profile_id !== authority!.config.profileId ||
+    status.projection !== PROJECTION ||
+    status.schema_version !== authority!.config.schemaVersion ||
+    status.sequence !== commit.sequence ||
+    status.head_json !== stringifyRecordJson(ref) ||
+    transaction?.operation_id !== commit.operationId ||
+    transaction.fingerprint !== commit.fingerprint ||
+    transaction.result_json !== stringifyRecordJson(commit.result) ||
+    transaction.commit_json !== stringifyRecordJson(commit) ||
+    selected?.version_id !== expected!.versionId ||
+    version?.profile_id !== authority!.config.profileId ||
+    version.entity !== 'source_files' ||
+    version.record_id !== prior!.recordId ||
+    version.sequence !== commit.sequence ||
+    version.recorded_at !== commit.recordedAt ||
+    version.previous_version !== prior!.versionId ||
+    version.operation_id !== commit.operationId ||
+    version.deleted !== 0 ||
+    version.contents_json !== expected!.contents ||
+    version.metadata_json !== expected!.metadata ||
+    !source ||
+    stringifyRecordJson(source) !== expected!.contents ||
+    !eq(readHead(authority!.config.storage, authority!.read), ref)
+  )
+    fail('committed compact readmission changed');
+  identity();
+}
+interface CompactTerminal {
+  readonly prior: SourcePriorData;
+  readonly statements: PreparedTerminalStatements;
+  readonly callbacks: TerminalTransactionCallbacks;
+  readonly capture: IntakeFrontierCaptureClear;
+  readonly owner: RecordCompactTerminalOwner;
+}
+declare const terminalOwnerBrand: unique symbol;
+export interface RecordCompactTerminalOwner {
+  readonly [terminalOwnerBrand]: true;
+}
+const compactTerminalOwners = new WeakMap<
+  RecordCompactTerminalOwner,
+  {
+    db: Database;
+    profileId: string;
+    operation: ClinicalOperation;
+    staging: VaultRecordStagingWitness;
+    assertions: readonly (() => void)[];
+    authorization?: VaultCompactAuthorization;
+    issuers: {
+      request: typeof import('./index.ts').requestFilenameAssertionCurrent;
+      assistant: typeof import('./assistant.ts').assistantCompactAssertionPrerequisites;
+      session: typeof import('./intake-package-session.ts').packageSessionAssertionPrerequisites;
+      originalSource: typeof import('./intake-package-session.ts').packageSessionOriginalPhysicalSource;
+      authorization: typeof import('./vault-app.ts').vaultCompactAuthorizationCurrent;
+    };
+  }
+>();
+/** Genuine issuer state only; no callback/SQL/storage reads at the last worker. */
+export function recordCompactTerminalOwnerCurrent(
+  owner: RecordCompactTerminalOwner,
+  db: Database,
+  staging: VaultRecordStagingWitness,
+): boolean {
+  const proof = compactTerminalOwners.get(owner);
+  if (!proof || proof.db !== db || proof.staging !== staging) return false;
+  try {
+    assertClinicalOperation(db, proof.operation);
+  } catch {
+    return false;
+  }
+  if (proof.authorization && !proof.issuers.authorization(proof.authorization, db, proof.profileId))
+    return false;
+  const visiting = new Set<() => void>();
+  const current = (assertion: () => void): boolean => {
+    if (visiting.has(assertion)) return false;
+    if (proof.issuers.request(assertion, db)) return true;
+    const prerequisites =
+      proof.issuers.assistant(assertion, db) ?? proof.issuers.session(assertion, db);
+    if (!prerequisites) return false;
+    visiting.add(assertion);
+    try {
+      for (let index = 0; index < prerequisites.length; index++)
+        if (!current(prerequisites[index]!)) return false;
+      return true;
+    } finally {
+      visiting.delete(assertion);
+    }
+  };
+  for (let index = 0; index < proof.assertions.length; index++)
+    if (!current(proof.assertions[index]!)) return false;
+  return true;
+}
+const activeCompactTerminal = new WeakMap<Database, CompactTerminal>();
+/** Original open-time evidence is transported only from genuine active issuers. */
+export function* recordCompactTerminalOriginalSources(
+  owner: RecordCompactTerminalOwner,
+  db: Database,
+  staging: VaultRecordStagingWitness,
+): Generator<PackageSourceOriginalPhysical> {
+  if (!recordCompactTerminalOwnerCurrent(owner, db, staging))
+    fail('compact original source owner expired');
+  const proof = compactTerminalOwners.get(owner)!;
+  const visited = new Set<() => void>();
+  function* visit(assertion: () => void): Generator<PackageSourceOriginalPhysical> {
+    if (visited.has(assertion)) return;
+    visited.add(assertion);
+    const source = proof.issuers.originalSource(assertion, db);
+    if (source) {
+      if (source.binding.profileId !== proof.profileId)
+        fail('compact original source profile differs');
+      yield source;
+    }
+    const prerequisites =
+      proof.issuers.assistant(assertion, db) ?? proof.issuers.session(assertion, db);
+    if (prerequisites)
+      for (let index = 0; index < prerequisites.length; index++)
+        yield* visit(prerequisites[index]!);
+  }
+  for (let index = 0; index < proof.assertions.length; index++) {
+    yield* visit(proof.assertions[index]!);
+    if (!recordCompactTerminalOwnerCurrent(owner, db, staging))
+      fail('compact original source issuer changed');
+  }
+}
+const preparedCompactTerminals = new WeakMap<RecordSourcePriorFields, CompactTerminal>();
+/** The accepted record owner selects the finite inventory; caller statement
+ * capabilities cannot authorize a compact publication. */
+export async function prepareRecordCompactTerminal(
+  db: Database,
+  capability: RecordSourcePriorFields,
+): Promise<boolean> {
+  const prior = sourcePriorFields.get(capability)!,
+    plan = prior?.plan,
+    authority = prior && authorityWitnesses.get(prior.authority),
+    staging = authority?.staging,
+    operation = currentClinicalOperation(db);
+  if (!prior || prior.db !== db || prior.consumed || !authority)
+    fail('foreign compact terminal preparation');
+  if (!staging) return false;
+  if (!operation || !plan?.deferredTerminal || preparedCompactTerminals.has(capability))
+    fail('compact terminal preparation lifetime');
+  // Application issuers load only on this async path, not record/database startup.
+  prior.assertCurrent();
+  const requestIssuer = await import('./index.ts'),
+    assistantIssuer = await import('./assistant.ts'),
+    sessionIssuer = await import('./intake-package-session.ts'),
+    authorizationIssuer = await import('./vault-app.ts');
+  prior.assertCurrent();
+  assertClinicalOperation(db, operation);
+  if (sourcePriorFields.get(capability) !== prior || prior.consumed || prior.plan !== plan)
+    fail('compact terminal preparation changed while loading issuers');
+  const owner = Object.freeze({}) as RecordCompactTerminalOwner;
+  compactTerminalOwners.set(owner, {
+    db,
+    profileId: authority.config.profileId,
+    operation: operation!,
+    staging,
+    assertions: clinicalOperationCallerAssertions(db, operation!),
+    authorization: authorizationIssuer.currentVaultCompactAuthorization(
+      db,
+      authority.config.profileId,
+    ),
+    issuers: {
+      request: requestIssuer.requestFilenameAssertionCurrent,
+      assistant: assistantIssuer.assistantCompactAssertionPrerequisites,
+      session: sessionIssuer.packageSessionAssertionPrerequisites,
+      originalSource: sessionIssuer.packageSessionOriginalPhysicalSource,
+      authorization: authorizationIssuer.vaultCompactAuthorizationCurrent,
+    },
+  });
+  if (!recordCompactTerminalOwnerCurrent(owner, db, staging))
+    fail('compact publication requires a genuine current owner issuer');
+  const dynamic = ['source_files', 'app_meta'].map((entity) => {
+    const table = authority.config.schema.find((item) => item.name === entity)!;
+    return `SELECT * FROM ${q(entity)} WHERE ${table.pk.map((key) => q(key) + '=?').join(' AND ')}`;
+  });
+  const authorityQuery = DatabaseSync.prototype.prepare.call(
+    db,
+    "SELECT 1 FROM sqlite_temp_schema WHERE type='table' AND name='__intake_lookup_authorities'",
+  );
+  if (Reflect.apply(StatementSync.prototype.get, authorityQuery, []))
+    dynamic.push(
+      'SELECT source_id FROM temp.__intake_lookup_authorities WHERE authority_key=? LIMIT 2',
+      'SELECT 1 FROM temp.__intake_lookup_dirty WHERE source_id=?',
+    );
+  const statements = prepareTerminalStatements(db, {
+    statements: [
+      ...compactTerminalSql.map((sql) => ({ sql })),
+      ...dynamic.map((sql) => ({ sql })),
+      ...Array.from({ length: 32 }, (_, index) => ({
+        sql:
+          'INSERT INTO __record_fields VALUES' +
+          Array(index + 1)
+            .fill('(?,?,?,?,?,?,?,?,?)')
+            .join(','),
+      })),
+      ...compactTerminalBigIntSql.map((sql) => ({ sql, bigInts: true })),
+    ],
+    executions: compactTerminalExecutions,
+  });
+  const capture = prepareIntakeFrontierCaptureClear(db),
+    callbacks = prepareTerminalTransactionCallbacks(db);
+  // All compilation/caller effects precede verification of the ORIGINAL roster.
+  prior.assertCurrent();
+  assertClinicalOperation(db, operation);
+  await finishVaultRecordStagingPreparation(staging, owner);
+  assertClinicalOperation(db, operation);
+  if (
+    !terminalTransactionCallbacksCurrent(db, callbacks) ||
+    !recordCompactTerminalOwnerCurrent(owner, db, staging) ||
+    sourcePriorFields.get(capability) !== prior ||
+    prior.consumed ||
+    prior.plan !== plan
+  )
+    fail('compact terminal owner changed during worker');
+  preparedCompactTerminals.set(capability, { prior, statements, callbacks, capture, owner });
+  return true;
+}
+export function withRecordCompactTerminal<T>(
+  db: Database,
+  capability: RecordSourcePriorFields,
+  run: () => T,
+): T {
+  const terminal = preparedCompactTerminals.get(capability)!;
+  preparedCompactTerminals.delete(capability);
+  if (
+    !terminal ||
+    terminal.prior.db !== db ||
+    sourcePriorFields.get(capability) !== terminal.prior ||
+    activeCompactTerminal.has(db) ||
+    !terminalTransactionCallbacksCurrent(db, terminal.callbacks)
+  )
+    fail('foreign or expired compact terminal publication');
+  activeCompactTerminal.set(db, terminal);
+  try {
+    return withTerminalStatements(db, terminal.statements, () => {
+      if (!terminalTransactionCallbacksCurrent(db, terminal.callbacks))
+        fail('compact transaction participants changed');
+      const staging = authorityWitnesses.get(terminal.prior.authority)?.staging;
+      if (!staging || !recordCompactTerminalOwnerCurrent(terminal.owner, db, staging))
+        fail('compact publication owner expired');
+      return run();
+    });
+  } finally {
+    activeCompactTerminal.delete(db);
+  }
+}
 /** This prepares changed immutable objects only. The issuing maintenance proof
  * must still admit the exact SQL transition and consume this private plan. */
 export async function prepareRecordCompactPublication(
@@ -1793,6 +2208,7 @@ export async function prepareRecordCompactPublication(
     result: unknown;
   },
   assertRunning: () => void,
+  deferredTerminal = false,
 ): Promise<void> {
   const found = sourcePriorFields.get(capability),
     prior = found!,
@@ -1965,7 +2381,7 @@ export async function prepareRecordCompactPublication(
   };
   const ref = await stage(encode(commit));
   await prepareVaultRecordBackingAdvance(staging, encode(ref).toString('utf8'), versions);
-  await finishVaultRecordStagingPreparation(staging);
+  if (!deferredTerminal) await finishVaultRecordStagingPreparation(staging);
   check();
   prior.plan = {
     pending,
@@ -1978,6 +2394,7 @@ export async function prepareRecordCompactPublication(
       result: structuredClone(input.result),
     },
     consumed: false,
+    deferredTerminal,
   };
 }
 function* sourcePreimagePieces(contents: Record<string, unknown>): Generator<string> {
@@ -2245,11 +2662,10 @@ function consumeRecordSourcePriorFields(
     (authorityWitnesses.get(data.authority)?.staging && !data.plan) ||
     !recordAuthorityWitnessCurrent(db, data.authority) ||
     managedDatabaseMethodEpoch(db) !== data.methods ||
-    !db
-      .prepare(
-        'SELECT 1 FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=? AND v.version_id=? AND v.contents_json IS ? AND v.deleted=0',
-      )
-      .get('source_files', data.recordId, data.versionId, data.contents)
+    !terminalStatement(
+      db,
+      'SELECT 1 FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=? AND v.version_id=? AND v.contents_json IS ? AND v.deleted=0',
+    ).get('source_files', data.recordId, data.versionId, data.contents)
   )
     fail('foreign, expired or changed prior source comparison');
   data!.consumed = true;
@@ -2299,7 +2715,7 @@ export function recordAuthorityWitnessCurrent(
   if (!recordAuthorityWitnessIntervalCurrent(db, witness)) return false;
   return (
     stringifyRecordJson(readStatusRow(db)) === proof!.row &&
-    eq(readHead(proof!.config.storage), proof!.head) &&
+    eq(readConfiguredHead(db, proof!.config), proof!.head) &&
     recordAuthorityWitnessIntervalCurrent(db, witness)
   );
 }
@@ -2309,12 +2725,15 @@ export function recordAuthorityWitnessIntervalCurrent(
   witness: RecordAuthorityWitness,
 ): boolean {
   const proof = authorityWitnesses.get(witness);
+  const read = proof && ownDescriptor(proof.config.storage, 'read');
   return (
     !!proof &&
     proof.db === db &&
     db.isOpen &&
     state.get(db) === proof.config &&
-    proof.config.storage.read === proof.read &&
+    !!read &&
+    'value' in read &&
+    read.value === proof.read &&
     (proof.staging
       ? vaultRecordStagingCurrent(proof.staging)
       : managedPhysicalEpochCurrent(proof.epoch))

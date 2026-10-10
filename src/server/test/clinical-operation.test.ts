@@ -6,6 +6,8 @@ import { reviewPreparationStamp } from '../clinical-review-maintenance.ts';
 import {
   assertClinicalOperation,
   currentClinicalOperation,
+  clinicalOperationCallerAssertions,
+  clinicalOperationHasCallerAssertions,
   runExclusiveClinicalOperation,
 } from '../clinical-operation.ts';
 
@@ -16,6 +18,55 @@ function gate() {
   });
   return { promise, resolve };
 }
+test('clinical publication provenance retains original ancestor and extra assertions without invoking them', async () => {
+  const db = new DatabaseSync(':memory:');
+  let calls = 0;
+  const parentAssertion = () => {
+      calls++;
+    },
+    childAssertion = () => {
+      calls++;
+    },
+    publicationAssertion = () => {
+      calls++;
+    };
+  try {
+    await runExclusiveClinicalOperation(
+      db,
+      async (parent) => {
+        await runExclusiveClinicalOperation(
+          db,
+          async (child) => {
+            const before = calls;
+            const assertions = clinicalOperationCallerAssertions(db, child);
+            assert.deepEqual(assertions, [childAssertion, publicationAssertion, parentAssertion]);
+            assert.equal(Object.isFrozen(assertions), true);
+            assert.equal(clinicalOperationHasCallerAssertions(db, child), true);
+            assert.equal(calls, before, 'provenance inspection must not call assertions');
+          },
+          {
+            operation: parent,
+            assertRunning: childAssertion,
+            publicationAssertions: [publicationAssertion],
+          },
+        );
+      },
+      { assertRunning: parentAssertion },
+    );
+    await runExclusiveClinicalOperation(db, async (parent) => {
+      await runExclusiveClinicalOperation(
+        db,
+        async (child) => {
+          assert.deepEqual(clinicalOperationCallerAssertions(db, child), []);
+          assert.equal(clinicalOperationHasCallerAssertions(db, child), false);
+        },
+        { operation: parent },
+      );
+    });
+  } finally {
+    db.close();
+  }
+});
 test('closing clinical ownership never invokes caller cancellation accessors or methods', async () => {
   const db = new DatabaseSync(':memory:'),
     controller = new AbortController();

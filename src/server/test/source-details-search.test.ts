@@ -30,10 +30,44 @@ import {
   clearSourceTextProjectionCache,
 } from '../source-text-projection.ts';
 import {
+  assertSourceDetailsSearchFunctionReady,
   createSourceDetailsSearch,
   clearSourceDetailsSearchCache,
   sourceDetailsSearchCounters,
 } from '../source-details-search.ts';
+
+test('fixed source search registration refuses later same-name overloads and setter replacement', (t) => {
+  const upper = fixture(t);
+  assert.doesNotThrow(() => assertSourceDetailsSearchFunctionReady(upper.db));
+  upper.db.function('__SOURCE_DETAILS_SEARCH_MATCH', () => 0);
+  assert.throws(
+    () => assertSourceDetailsSearchFunctionReady(upper.db),
+    /registration changed|prerequisite is unavailable/,
+  );
+
+  const failed = fixture(t);
+  assert.throws(() => failed.db.function('__SOURCE_DETAILS_SEARCH_MATCH', null as never));
+  assert.throws(
+    () => assertSourceDetailsSearchFunctionReady(failed.db),
+    /registration changed|prerequisite is unavailable/,
+  );
+
+  const overload = fixture(t);
+  overload.db.function('__SOURCE_DETAILS_SEARCH_MATCH', { varargs: true }, () => 0);
+  assert.throws(
+    () => assertSourceDetailsSearchFunctionReady(overload.db),
+    /registration changed|prerequisite is unavailable/,
+  );
+
+  const replaced = fixture(t);
+  const original = replaced.db.function;
+  replaced.db.function = ((...args: Parameters<typeof original>) =>
+    Reflect.apply(original, replaced.db, args)) as typeof original;
+  assert.throws(
+    () => assertSourceDetailsSearchFunctionReady(replaced.db),
+    /prerequisite is unavailable/,
+  );
+});
 
 function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-search-'));

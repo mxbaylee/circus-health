@@ -1,9 +1,15 @@
 /** Explicit supported-v3 bridge proof. This is one-time compatibility work,
  * never a V4 point-read path or a license to reset retained evidence. */
 import { setImmediate } from 'node:timers/promises';
+import { constants } from 'node:sqlite';
+import { terminalStatement } from './database-terminal-statements.ts';
 import { createHash } from 'node:crypto';
 import type { Database } from './database.ts';
-import { managedDatabaseMethodEpoch } from './database.ts';
+import {
+  currentTransactionToken,
+  managedDatabaseMethodEpoch,
+  observeManagedDatabaseAuthorization,
+} from './database.ts';
 import {
   HEAD_BYTES,
   intakeNamespace,
@@ -46,7 +52,14 @@ import {
   type RecordSourcePriorFields,
 } from './record-versions.ts';
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
-import { protectedIntakeLookupTempShadow } from './intake-lookup-frontier-observer.ts';
+import {
+  captureIntakeFrontierAttempts,
+  readIntakeFrontierAttempts,
+  readIntakeFrontierOwnedSourceEquality,
+  readIntakeFrontierSourceEquality,
+  protectedIntakeLookupTempShadow,
+  type IntakeFrontierAttemptSnapshot,
+} from './intake-lookup-frontier-observer.ts';
 
 declare const proofBrand: unique symbol;
 export interface IntakeLegacyBridgeProof {
@@ -83,10 +96,13 @@ export function intakeCompactMetadataStampCurrent(
     recordAuthorityWitnessCurrent(db, stamp.authority) &&
     managedDatabaseMethodEpoch(db) === stamp.methods &&
     !protectedIntakeLookupTempShadow(db) &&
-    db.prepare('PRAGMA main.schema_version').get()!.schema_version === stamp.mainSchema &&
-    db.prepare('PRAGMA temp.schema_version').get()!.schema_version === stamp.tempSchema &&
-    db.prepare('PRAGMA main.data_version').get()!.data_version === stamp.peer &&
-    (!beforeWrites || db.prepare('SELECT total_changes() AS writes').get()!.writes === stamp.writes)
+    terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version ===
+      stamp.mainSchema &&
+    terminalStatement(db, 'PRAGMA temp.schema_version').get()!.schema_version ===
+      stamp.tempSchema &&
+    terminalStatement(db, 'PRAGMA main.data_version').get()!.data_version === stamp.peer &&
+    (!beforeWrites ||
+      terminalStatement(db, 'SELECT total_changes() AS writes').get()!.writes === stamp.writes)
   );
 }
 const compactProofs = new WeakMap<IntakeCompactMetadataProof, CompactProofData>();
@@ -103,6 +119,163 @@ interface ProofData {
   db: Database;
   binding: string;
   detailsJson: string;
+  stamp?: IntakeLegacyBridgeStamp;
+}
+declare const legacyReadBrand: unique symbol;
+export interface IntakeLegacyBridgeReadWitness {
+  readonly [legacyReadBrand]: true;
+}
+const legacyReads = new WeakMap<
+  IntakeLegacyBridgeReadWitness,
+  {
+    db: Database;
+    sourceId: string;
+    stamp: IntakeLegacyBridgeStamp;
+    stop: () => void;
+    active: boolean;
+  }
+>();
+const legacyAttemptWatches = new WeakMap<IntakeLegacyBridgeStamp, { current: () => boolean }>();
+export interface IntakeLegacyBridgeStamp {
+  readonly authority: RecordAuthorityWitness;
+  readonly methods: object;
+  readonly mainSchema: unknown;
+  readonly tempSchema: unknown;
+  readonly peer: unknown;
+  readonly writes: unknown;
+  readonly frontier?: IntakeFrontierAttemptSnapshot;
+  readonly sourceId?: string;
+}
+function captureLegacyBridgeStamp(db: Database, sourceId?: string): IntakeLegacyBridgeStamp {
+  const methods = managedDatabaseMethodEpoch(db);
+  if (!methods) invalid('legacy bridge managed method unavailable');
+  const captured = sourceId === undefined ? undefined : captureIntakeFrontierAttempts(db);
+  const frontier = captured && Object.freeze({ ...captured });
+  if (sourceId !== undefined && !frontier) invalid('legacy bridge original frontier unavailable');
+  const stamp = Object.freeze({
+    authority: captureRecordAuthorityWitness(db),
+    methods,
+    mainSchema: terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version,
+    tempSchema: terminalStatement(db, 'PRAGMA temp.schema_version').get()!.schema_version,
+    peer: terminalStatement(db, 'PRAGMA main.data_version').get()!.data_version,
+    writes: terminalStatement(db, 'SELECT total_changes() AS n').get()!.n,
+    frontier,
+    sourceId,
+  });
+  if (!legacyBridgeStampCurrent(db, stamp, true))
+    invalid('legacy bridge original authority unavailable');
+  return stamp;
+}
+export function captureIntakeLegacyBridgeReadWitness(
+  db: Database,
+  sourceId: string,
+): IntakeLegacyBridgeReadWitness {
+  if (!sourceId || db.isTransaction) invalid('legacy bridge original read scope');
+  let attempted = false;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, _detail, database) => {
+      if (
+        database === 'main' &&
+        name === 'source_files' &&
+        (action === constants.SQLITE_INSERT ||
+          action === constants.SQLITE_UPDATE ||
+          action === constants.SQLITE_DELETE)
+      )
+        attempted = true;
+    },
+    () => {
+      attempted = true;
+    },
+  );
+  if (!stop) invalid('legacy bridge original authorizer unavailable');
+  try {
+    const stamp = captureLegacyBridgeStamp(db, sourceId);
+    if (attempted) invalid('legacy bridge original source attempt');
+    const witness = Object.freeze({}) as IntakeLegacyBridgeReadWitness;
+    const data = { db, sourceId, stamp, stop, active: true };
+    legacyAttemptWatches.set(stamp, { current: () => data.active && !attempted });
+    legacyReads.set(witness, data);
+    return witness;
+  } catch (error) {
+    if (db.isOpen) stop();
+    throw error;
+  }
+}
+export function disposeIntakeLegacyBridgeReadWitness(witness: IntakeLegacyBridgeReadWitness): void {
+  const original = legacyReads.get(witness);
+  if (!original || !original.active) return;
+  original.active = false;
+  if (original.db.isOpen) original.stop();
+}
+export function assertIntakeLegacyBridgeReadWitness(
+  db: Database,
+  witness: IntakeLegacyBridgeReadWitness,
+): void {
+  const original = legacyReads.get(witness);
+  if (
+    !original ||
+    original.db !== db ||
+    !original.active ||
+    !legacyBridgeStampCurrent(db, original.stamp, true)
+  )
+    invalid('legacy bridge original read authority changed');
+}
+export function legacyBridgeStampCurrent(
+  db: Database,
+  stamp: IntakeLegacyBridgeStamp,
+  beforeWrites: boolean,
+): boolean {
+  const frontier = stamp.frontier;
+  const interval = frontier
+    ? db.isTransaction
+      ? (() => {
+          const token = currentTransactionToken(db);
+          return token && readIntakeFrontierOwnedSourceEquality(db, frontier, token);
+        })()
+      : beforeWrites
+        ? readIntakeFrontierAttempts(db, frontier)
+        : readIntakeFrontierSourceEquality(db, frontier)
+    : undefined;
+  return (
+    (legacyAttemptWatches.get(stamp)?.current() ?? true) &&
+    (!frontier ||
+      (interval !== undefined &&
+        (beforeWrites ||
+          (interval.headSourceIds.length <= 1 &&
+            interval.headSourceIds.every((id) => id === stamp.sourceId))))) &&
+    recordAuthorityWitnessCurrent(db, stamp.authority) &&
+    managedDatabaseMethodEpoch(db) === stamp.methods &&
+    terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version ===
+      stamp.mainSchema &&
+    terminalStatement(db, 'PRAGMA temp.schema_version').get()!.schema_version ===
+      stamp.tempSchema &&
+    terminalStatement(db, 'PRAGMA main.data_version').get()!.data_version === stamp.peer &&
+    (!beforeWrites ||
+      terminalStatement(db, 'SELECT total_changes() AS n').get()!.n === stamp.writes) &&
+    recordAuthorityWitnessCurrent(db, stamp.authority) &&
+    (!frontier ||
+      (beforeWrites
+        ? db.isTransaction
+          ? (() => {
+              const token = currentTransactionToken(db);
+              const closing = token && readIntakeFrontierOwnedSourceEquality(db, frontier, token);
+              return closing !== undefined && closing?.attempts === 0;
+            })()
+          : readIntakeFrontierAttempts(db, frontier) !== undefined
+        : (() => {
+            const token = db.isTransaction ? currentTransactionToken(db) : undefined;
+            const closing = token
+              ? readIntakeFrontierOwnedSourceEquality(db, frontier, token)
+              : readIntakeFrontierSourceEquality(db, frontier);
+            return (
+              closing !== undefined &&
+              closing.headSourceIds.length <= 1 &&
+              closing.headSourceIds.every((id) => id === stamp.sourceId)
+            );
+          })())) &&
+    (legacyAttemptWatches.get(stamp)?.current() ?? true)
+  );
 }
 const proofs = new WeakMap<IntakeLegacyBridgeProof, ProofData>();
 const retained = new WeakMap<Database, Set<IntakeLegacyBridgeProof>>();
@@ -193,6 +366,7 @@ export async function prepareIntakeCompactMetadataProofAsync(
   options: {
     assertRunning?: () => void;
     publication?: { operationId: string; fingerprint: string; result: unknown };
+    deferredTerminal?: boolean;
   } = {},
 ): Promise<IntakeCompactMetadataProof | undefined> {
   const source = db
@@ -320,6 +494,7 @@ export async function prepareIntakeCompactMetadataProofAsync(
           ...options.publication,
         },
         assertCurrent,
+        options.deferredTerminal === true,
       );
     assertCurrent();
     const finalSource = db
@@ -439,8 +614,18 @@ export function intakeCompactSourceRowsEqual(
 export function prepareIntakeLegacyBridgeProof(
   db: Database,
   candidate: Pick<IntakeLegacyBridgeBinding, 'identity' | 'beforeHead' | 'afterHead' | 'writes'>,
+  originalRead?: IntakeLegacyBridgeReadWitness,
 ): IntakeLegacyBridgeProof {
   return withIntakeWork(db, 'reconstruction', () => {
+    const original = originalRead && legacyReads.get(originalRead);
+    if (
+      originalRead &&
+      (!original || original.db !== db || original.sourceId !== candidate.identity.intakeId)
+    )
+      invalid('foreign legacy bridge original read witness');
+    const stamp = original?.stamp ?? captureLegacyBridgeStamp(db, candidate.identity.intakeId);
+    if (!legacyBridgeStampCurrent(db, stamp, true))
+      invalid('legacy bridge original read authority changed');
     const { identity, beforeHead, afterHead, writes } = candidate;
     const prefix = intakeNamespace(identity),
       headKey = prefix + 'head';
@@ -549,7 +734,9 @@ export function prepareIntakeLegacyBridgeProof(
       proofs.delete(old);
     }
     entries.add(proof);
-    proofs.set(proof, { db, binding, detailsJson: source.details_json as string });
+    if (!legacyBridgeStampCurrent(db, stamp, true))
+      invalid('legacy bridge original authority changed during preparation');
+    proofs.set(proof, { db, binding, detailsJson: source.details_json as string, stamp });
     return proof;
   });
 }
@@ -559,7 +746,7 @@ export function verifyIntakeLegacyBridgeProof(
   proof: IntakeLegacyBridgeProof,
   db: Database,
   binding: IntakeLegacyBridgeBinding,
-): void {
+): IntakeLegacyBridgeStamp | undefined {
   const retainedProof = proofs.get(proof);
   proofs.delete(proof);
   retained.get(db)?.delete(proof);
@@ -567,9 +754,11 @@ export function verifyIntakeLegacyBridgeProof(
     !retainedProof ||
     retainedProof.db !== db ||
     retainedProof.binding !== certificate(binding) ||
-    retainedProof.detailsJson !== binding.detailsJson
+    retainedProof.detailsJson !== binding.detailsJson ||
+    (retainedProof.stamp && !legacyBridgeStampCurrent(db, retainedProof.stamp, true))
   )
     invalid('foreign, expired or conflicting legacy bridge proof');
+  return retainedProof.stamp;
 }
 
 /** Final format-only adoption. The caller supplies a private prepared candidate;
@@ -614,11 +803,12 @@ function* prepareIntakeSchemaAdoptionProofSteps(
   compactSameData = false,
   compactSourceRow?: Readonly<Record<string, unknown>>,
 ): Generator<void, IntakeLegacyBridgeProof> {
-  let work = 0;
   const { identity, beforeHead, afterHead, writes } = candidate,
+    bridgeStamp = compactSameData ? undefined : captureLegacyBridgeStamp(db, identity.intakeId),
     prefix = intakeNamespace(identity),
     headKey = prefix + 'head',
     readMeta = db.prepare('SELECT value FROM app_meta WHERE key=?');
+  let work = 0;
   const get = (key: string) => readMeta.get(key)?.value;
   if (
     db.isTransaction ||
@@ -833,6 +1023,13 @@ function* prepareIntakeSchemaAdoptionProofSteps(
     proofs.delete(old);
   }
   entries.add(proof);
-  proofs.set(proof, { db, binding, detailsJson: source.details_json as string });
+  if (bridgeStamp && !legacyBridgeStampCurrent(db, bridgeStamp, true))
+    invalid('schema adoption original authority changed during preparation');
+  proofs.set(proof, {
+    db,
+    binding,
+    detailsJson: source.details_json as string,
+    stamp: bridgeStamp,
+  });
   return proof;
 }

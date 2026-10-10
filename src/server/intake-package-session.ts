@@ -1,12 +1,16 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { resolve } from 'node:path';
 import { HttpError } from './database.ts';
+import { assertAuthorizationSignalRunning } from './authorization-signal.ts';
 import { assertClinicalOperation, currentClinicalOperation } from './clinical-operation.ts';
 import { profileOriginal, profilePaths } from './profile-storage.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
   createPackageSourceLeaseOwner,
+  packageSourceLeaseAssertionCurrent,
+  packageSourceLeaseOriginalPhysical,
   type PackageSourceLease,
+  type PackageSourceOriginalPhysical,
 } from './intake-package-source-lease.ts';
 
 type Owner = ReturnType<typeof createPackageSourceLeaseOwner>;
@@ -16,6 +20,48 @@ interface Session {
   owner: Owner;
 }
 const sessions = new WeakMap<DatabaseSync, Session>();
+const sessionAssertions = new WeakMap<
+  () => void,
+  {
+    db: DatabaseSync;
+    session: Session;
+    profileId: string;
+    operation: ReturnType<typeof currentClinicalOperation>;
+    signal?: AbortSignal;
+    active: () => boolean;
+    prerequisites: readonly (() => void)[];
+  }
+>();
+
+/** Exact active session issuer plus its original caller dependencies, not an approval. */
+export function packageSessionAssertionPrerequisites(
+  assertion: () => void,
+  db: DatabaseSync,
+): readonly (() => void)[] | undefined {
+  const proof = sessionAssertions.get(assertion);
+  if (
+    !proof ||
+    proof.db !== db ||
+    !db.isOpen ||
+    sessions.get(db) !== proof.session ||
+    proof.session.profileId !== proof.profileId ||
+    !proof.active() ||
+    !packageSourceLeaseAssertionCurrent(assertion)
+  )
+    return undefined;
+  if (proof.signal) assertAuthorizationSignalRunning(proof.signal);
+  if (proof.operation) assertClinicalOperation(db, proof.operation);
+  return proof.prerequisites;
+}
+/** Transport of the genuine lease's open-time source, not physical approval. */
+export function packageSessionOriginalPhysicalSource(
+  assertion: () => void,
+  db: DatabaseSync,
+): PackageSourceOriginalPhysical | undefined {
+  return packageSessionAssertionPrerequisites(assertion, db)
+    ? packageSourceLeaseOriginalPhysical(assertion)
+    : undefined;
+}
 interface SourceRow {
   id: string;
   kind: string;
@@ -107,18 +153,48 @@ export async function withPackageSessionSource<T>(
     }),
   };
   if (!existing) sessions.set(db, session);
-  return session.owner.withSource(
-    { profileId, intakeId: id, sourceHash: source.sha256, bytes: source.bytes, path },
-    writer,
-    check,
-    () => {
-      signal?.throwIfAborted();
-      if (operation) assertClinicalOperation(db, operation);
-      if (assertPublicationCurrent) assertPublicationCurrent();
-      else assertRunning?.();
-      assertSessionOwner(db, profileId);
-      if (JSON.stringify(query.get(id)) !== sourceIdentity)
-        throw new HttpError(409, 'SOURCE_CHANGED', 'Retained source binding changed');
-    },
-  );
+  let active = true;
+  try {
+    return await session.owner.withSource(
+      {
+        profileId,
+        intakeId: id,
+        sourceHash: source.sha256,
+        bytes: source.bytes,
+        path,
+        acceptedPath: source.path,
+      },
+      async (lease) => {
+        const prerequisites = Object.freeze(
+          [assertRunning, assertPublicationCurrent].filter(
+            (assertion): assertion is () => void => assertion !== undefined,
+          ),
+        );
+        const proof = {
+          db,
+          session,
+          profileId,
+          operation,
+          signal,
+          active: () => active,
+          prerequisites,
+        };
+        sessionAssertions.set(lease.assertCurrent, proof);
+        sessionAssertions.set(lease.assertPublicationCurrent, proof);
+        return writer(lease);
+      },
+      check,
+      () => {
+        signal?.throwIfAborted();
+        if (operation) assertClinicalOperation(db, operation);
+        if (assertPublicationCurrent) assertPublicationCurrent();
+        else assertRunning?.();
+        assertSessionOwner(db, profileId);
+        if (JSON.stringify(query.get(id)) !== sourceIdentity)
+          throw new HttpError(409, 'SOURCE_CHANGED', 'Retained source binding changed');
+      },
+    );
+  } finally {
+    active = false;
+  }
 }

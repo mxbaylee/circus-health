@@ -1,6 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
 import { authorizationSignalAborted } from './authorization-signal.ts';
+import { assistantCompactOwnerCurrent, type AssistantCompactOwner } from './assistant.ts';
 import { createApp, type AppOptions } from './index.ts';
 import { vaultStorageTotals } from './vault-storage-totals.ts';
 import {
@@ -57,6 +60,91 @@ interface Session {
   id: string;
   profiles: Set<string>;
 }
+declare const compactAuthorizationBrand: unique symbol;
+export interface VaultCompactAuthorization {
+  readonly [compactAuthorizationBrand]: true;
+}
+const compactAuthorizationContext = new AsyncLocalStorage<VaultCompactAuthorization>();
+const nativeMapGet = Map.prototype.get;
+const nativeSetHas = Set.prototype.has;
+const compactAuthorizations = new WeakMap<
+  VaultCompactAuthorization,
+  {
+    db: DatabaseSync;
+    profileId: string;
+    sessions: Map<string, Session>;
+    client: Session;
+    profiles: Set<string>;
+    opened: Map<string, unknown>;
+    state: object;
+    lifecycle: { closed: boolean };
+    signal?: AbortSignal;
+    request?: { active: boolean };
+    job?: AssistantCompactOwner;
+    isOpen: () => unknown;
+  }
+>();
+/** These checks retain real issuer state, not caller closures or storage reads. */
+export function vaultCompactAuthorizationCurrent(
+  authorization: VaultCompactAuthorization,
+  db: DatabaseSync,
+  profileId: string,
+): boolean {
+  const data = compactAuthorizations.get(authorization);
+  return (
+    !!data &&
+    data.db === db &&
+    data.profileId === profileId &&
+    !data.lifecycle.closed &&
+    (!data.signal || !authorizationSignalAborted(data.signal)) &&
+    (!data.request || data.request.active) &&
+    (!data.job || assistantCompactOwnerCurrent(data.job, db, profileId)) &&
+    Reflect.apply(data.isOpen, db, []) === true &&
+    Reflect.apply(nativeMapGet, data.sessions, [data.client.id]) === data.client &&
+    Reflect.apply(nativeSetHas, data.profiles, [profileId]) &&
+    Reflect.apply(nativeMapGet, data.opened, [profileId]) === data.state
+  );
+}
+/** Capture only a token minted at the real authenticated HTTP dispatch. */
+export function currentVaultCompactAuthorization(
+  db: DatabaseSync,
+  profileId: string,
+): VaultCompactAuthorization | undefined {
+  const authorization = compactAuthorizationContext.getStore();
+  if (authorization && !vaultCompactAuthorizationCurrent(authorization, db, profileId))
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+  return authorization;
+}
+const assistantAuthorizations = new WeakMap<AssistantCompactOwner, VaultCompactAuthorization>();
+/** A separate background lifetime is issued before the initiating response,
+ * only for an actual assistant job already installed in its private active map. */
+export function captureVaultAssistantAuthorization(
+  owner: AssistantCompactOwner,
+  db: DatabaseSync,
+  profileId: string,
+): void {
+  if (!assistantCompactOwnerCurrent(owner, db, profileId) || assistantAuthorizations.has(owner))
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Assistant owner changed');
+  const original = currentVaultCompactAuthorization(db, profileId);
+  if (!original) return;
+  const data = compactAuthorizations.get(original)!;
+  const authorization = Object.freeze({}) as VaultCompactAuthorization;
+  compactAuthorizations.set(authorization, {
+    ...data,
+    signal: undefined,
+    request: undefined,
+    job: owner,
+  });
+  assistantAuthorizations.set(owner, authorization);
+}
+export function withVaultAssistantAuthorization<T>(owner: AssistantCompactOwner, run: () => T): T {
+  const authorization = assistantAuthorizations.get(owner);
+  if (!authorization) return compactAuthorizationContext.exit(run);
+  const data = compactAuthorizations.get(authorization)!;
+  if (!vaultCompactAuthorizationCurrent(authorization, data.db, data.profileId))
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Assistant access changed');
+  return compactAuthorizationContext.run(authorization, run);
+}
 const sessionUnlockAuthorizations = new WeakMap<
   object,
   {
@@ -106,6 +194,7 @@ export function createVaultApp({
   let closed = false,
     activation: Promise<unknown> = Promise.resolve();
   const lifecycle = { closed: false };
+  const openedProfiles = manager.opened;
   const sessionUnlockAuthorization = (client: Session, scope: string, signal: AbortSignal) => {
     if (closed || sessions.get(client.id) !== client || signal.aborted)
       throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
@@ -505,7 +594,41 @@ export function createVaultApp({
         }
         return Reflect.apply(writeHead, this, [status, ...args]) as typeof this;
       };
-      state.app!.server.emit('request', req, res);
+      const controller = new AbortController();
+      const requestLifetime = { active: true };
+      const abort = () =>
+        controller.abort(new HttpError(409, 'REQUEST_CANCELLED', 'The request stopped'));
+      req.once('aborted', abort);
+      const close = () => {
+        requestLifetime.active = false;
+        if (!res.writableEnded) abort();
+      };
+      res.once('close', close);
+      res.once('finish', () => {
+        requestLifetime.active = false;
+        req.off('aborted', abort);
+        res.off('close', close);
+      });
+      const descriptor = Object.getOwnPropertyDescriptor(state.db, 'isOpen');
+      if (!descriptor?.get || descriptor.configurable)
+        throw new HttpError(423, 'PROFILE_LOCKED', 'Profile owner is unavailable');
+      const authorization = Object.freeze({}) as VaultCompactAuthorization;
+      compactAuthorizations.set(authorization, {
+        db: state.db,
+        profileId: id,
+        sessions,
+        client,
+        profiles: client.profiles,
+        opened: openedProfiles,
+        state,
+        lifecycle,
+        signal: controller.signal,
+        request: requestLifetime,
+        isOpen: descriptor.get,
+      });
+      compactAuthorizationContext.run(authorization, () =>
+        state.app!.server.emit('request', req, res),
+      );
     } catch (caught) {
       const e = caught as Error & { status?: number; code?: string };
       if (res.headersSent) {

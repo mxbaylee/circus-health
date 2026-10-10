@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { observeTransactionOutcome } from './database.ts';
+import {
+  managedDatabaseFunctionSetter,
+  managedDatabaseMethodSerial,
+  observeManagedDatabaseFunctionRegistration,
+} from './database.ts';
+import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
 import {
   consumeSourceTextProjection,
   prepareReadOnlySourceTextSearch,
@@ -11,6 +16,8 @@ import {
 import { createSourceDetailsLikeMatcher } from './source-details-like.ts';
 
 const FUNCTION = '__source_details_search_match';
+const outcomes = createTransactionOutcomeIssuer();
+export const sourceDetailsTerminalOutcome = outcomes.recognizes;
 
 export interface SourceDetailsSearchLimits {
   maxEvaluations: number;
@@ -71,6 +78,17 @@ interface Connection {
 }
 const connections = new WeakMap<DatabaseSync, Connection>();
 const registered = new WeakSet<DatabaseSync>();
+const registrationRevoked = new WeakSet<DatabaseSync>();
+
+/** Envelope builds require installation before their first authority witness. */
+export function assertSourceDetailsSearchFunctionReady(db: DatabaseSync): void {
+  if (
+    !registered.has(db) ||
+    registrationRevoked.has(db) ||
+    db.function !== managedDatabaseFunctionSetter(db)
+  )
+    throw Error('Source details search prerequisite is unavailable');
+}
 
 function connectionFor(db: DatabaseSync): Connection {
   const old = connections.get(db);
@@ -141,6 +159,102 @@ export function recordSourceDetailsSearchDTORead(db: DatabaseSync, raw: unknown)
   if (typeof raw === 'string') connection.counters.dtoDetailsBytes += Buffer.byteLength(raw);
 }
 
+/** Install the fixed dispatcher before an envelope build pins its method witness. */
+export function ensureSourceDetailsSearchFunction(db: DatabaseSync): boolean {
+  if (registrationRevoked.has(db))
+    throw Error('Source details search function registration changed');
+  const managedFunction = managedDatabaseFunctionSetter(db);
+  if (!managedFunction || db.function !== managedFunction)
+    throw Error('Source details search function registration was replaced');
+  if (registered.has(db)) return false;
+  const beforeSerial = managedDatabaseMethodSerial(db);
+  if (beforeSerial === undefined)
+    throw Error('Source details search function registration is unmanaged');
+  try {
+    db.function(FUNCTION, (pathMatch, token, sourceId, pattern) => {
+      const current = connections.get(db);
+      const scope = current?.active;
+      if (!scope || token !== scope.token)
+        throw Error('Source details search request is no longer active');
+      current.counters.evaluations++;
+      try {
+        if (scope.evaluating) throw Error('Reentrant source details search');
+        if (++scope.evaluations > scope.limits.maxEvaluations)
+          throw Error('Source details search evaluation limit exceeded');
+        scope.evaluating = true;
+        current.counters.bindingReads++;
+        if (
+          !db
+            .prepare("SELECT 1 FROM app_meta WHERE key='owner_profile_id' AND value=?")
+            .get(scope.profile)
+        )
+          throw Error('Source details search profile binding changed');
+        if (typeof sourceId !== 'string') throw Error('Invalid source search identity');
+        if (pattern !== scope.pattern) throw Error('Source details search pattern binding changed');
+        sourceTextProjectionReadOnly(db);
+        if (pathMatch === 1) return 1;
+        const matcher = createSourceDetailsLikeMatcher(scope.pattern);
+        current.counters.peakMatcherBytes = Math.max(
+          current.counters.peakMatcherBytes,
+          matcher.retainedBytes,
+        );
+        const before = sourceTextProjectionCounters(db);
+        const reads = {
+          rows: before.projectionRowsRead,
+          bytes: before.projectionReadBytes,
+          authorityReads: before.authorityReads,
+          authorityBytes: before.authorityBytes,
+        };
+        try {
+          consumeSourceTextProjection(db, sourceId, (text) => {
+            const size = Buffer.byteLength(text);
+            current.counters.streamedFragments++;
+            current.counters.streamedUtf16Units += text.length;
+            current.counters.streamedBytes += size;
+            current.counters.peakTextBytes = Math.max(current.counters.peakTextBytes, size);
+            scope.units += text.length;
+            scope.bytes += size;
+            if (
+              scope.units > scope.limits.maxReconstructedUtf16Units ||
+              scope.bytes > scope.limits.maxReconstructedBytes
+            )
+              throw Error('Source details search reconstruction limit exceeded');
+            matcher.write(text);
+          });
+        } finally {
+          const after = sourceTextProjectionCounters(db);
+          current.counters.queryProjectionRowsRead += after.projectionRowsRead - reads.rows;
+          current.counters.queryProjectionReadBytes += after.projectionReadBytes - reads.bytes;
+          current.counters.queryAuthorityReads += after.authorityReads - reads.authorityReads;
+          current.counters.queryAuthorityBytes += after.authorityBytes - reads.authorityBytes;
+        }
+        return matcher.finish() ? 1 : 0;
+      } catch (error) {
+        scope.failed = true;
+        throw error;
+      } finally {
+        scope.evaluating = false;
+      }
+    });
+  } catch (error) {
+    registrationRevoked.add(db);
+    throw error;
+  }
+  if (db.function !== managedFunction || managedDatabaseMethodSerial(db) !== beforeSerial + 1n) {
+    registrationRevoked.add(db);
+    throw Error('Source details search function registration changed');
+  }
+  const unobserve = observeManagedDatabaseFunctionRegistration(db, (name) => {
+    if (typeof name === 'string' && name.toLowerCase() === FUNCTION) registrationRevoked.add(db);
+  });
+  if (!unobserve) {
+    registrationRevoked.add(db);
+    throw Error('Source details search function registration is unmanaged');
+  }
+  registered.add(db);
+  return true;
+}
+
 /** SQLite evaluates path LIKE; the checked ordered source stream uses the same
  * default LIKE grammar and TEXT transport semantics. Query work has no corpus
  * size product limit. Optional diagnostic limits fail the entire request.
@@ -172,77 +286,7 @@ export function createSourceDetailsSearch(
     // Native conversion retains an original raw SQL witness. Its concurrent
     // search consumes checked authority directly and defers disposable repair.
     if (!prepareReadOnlySourceTextSearch(db)) reconcileSourceTextProjection(db);
-    if (!registered.has(db)) {
-      db.function(FUNCTION, (pathMatch, token, sourceId, pattern) => {
-        const current = connections.get(db);
-        const scope = current?.active;
-        if (!scope || token !== scope.token)
-          throw Error('Source details search request is no longer active');
-        current.counters.evaluations++;
-        try {
-          if (scope.evaluating) throw Error('Reentrant source details search');
-          if (++scope.evaluations > scope.limits.maxEvaluations)
-            throw Error('Source details search evaluation limit exceeded');
-          scope.evaluating = true;
-          current.counters.bindingReads++;
-          if (
-            !db
-              .prepare("SELECT 1 FROM app_meta WHERE key='owner_profile_id' AND value=?")
-              .get(scope.profile)
-          )
-            throw Error('Source details search profile binding changed');
-          if (typeof sourceId !== 'string') throw Error('Invalid source search identity');
-          if (pattern !== scope.pattern)
-            throw Error('Source details search pattern binding changed');
-          // Validate the request even when the path already matches. An SQL OR
-          // before the dispatcher would bypass token/profile invalidation.
-          sourceTextProjectionReadOnly(db);
-          if (pathMatch === 1) return 1;
-          const matcher = createSourceDetailsLikeMatcher(scope.pattern);
-          current.counters.peakMatcherBytes = Math.max(
-            current.counters.peakMatcherBytes,
-            matcher.retainedBytes,
-          );
-          const before = sourceTextProjectionCounters(db);
-          const reads = {
-            rows: before.projectionRowsRead,
-            bytes: before.projectionReadBytes,
-            authorityReads: before.authorityReads,
-            authorityBytes: before.authorityBytes,
-          };
-          try {
-            consumeSourceTextProjection(db, sourceId, (text) => {
-              const size = Buffer.byteLength(text);
-              current.counters.streamedFragments++;
-              current.counters.streamedUtf16Units += text.length;
-              current.counters.streamedBytes += size;
-              current.counters.peakTextBytes = Math.max(current.counters.peakTextBytes, size);
-              scope.units += text.length;
-              scope.bytes += size;
-              if (
-                scope.units > scope.limits.maxReconstructedUtf16Units ||
-                scope.bytes > scope.limits.maxReconstructedBytes
-              )
-                throw Error('Source details search reconstruction limit exceeded');
-              matcher.write(text);
-            });
-          } finally {
-            const after = sourceTextProjectionCounters(db);
-            current.counters.queryProjectionRowsRead += after.projectionRowsRead - reads.rows;
-            current.counters.queryProjectionReadBytes += after.projectionReadBytes - reads.bytes;
-            current.counters.queryAuthorityReads += after.authorityReads - reads.authorityReads;
-            current.counters.queryAuthorityBytes += after.authorityBytes - reads.authorityBytes;
-          }
-          return matcher.finish() ? 1 : 0;
-        } catch (error) {
-          scope.failed = true;
-          throw error;
-        } finally {
-          scope.evaluating = false;
-        }
-      });
-      registered.add(db);
-    }
+    ensureSourceDetailsSearchFunction(db);
   } catch (error) {
     connection.counters.failedRequests++;
     throw error;
@@ -264,7 +308,7 @@ export function createSourceDetailsSearch(
   };
   connection.active = scope;
   connection.counters.activeRequests = 1;
-  scope.unobserve = observeTransactionOutcome(db, () => clearSourceDetailsSearchCache(db));
+  scope.unobserve = outcomes.observe(db, () => clearSourceDetailsSearchCache(db));
   return {
     joins: '',
     predicate: `${FUNCTION}(f.path LIKE ?,?,f.id,?)=1`,

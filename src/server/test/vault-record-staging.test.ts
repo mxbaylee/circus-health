@@ -149,6 +149,31 @@ test('vault staging refuses changed methods and redirected parents without adopt
   );
 });
 
+test('vault staging rejects public method accessors without invoking them', (t) => {
+  const { storage, capture } = fixture(t);
+  for (const name of ['read', 'writeImmutable', 'publishHead'] as const) {
+    const witness = capture(),
+      descriptor = Object.getOwnPropertyDescriptor(storage, name)!;
+    let calls = 0;
+    Object.defineProperty(storage, name, {
+      configurable: true,
+      get() {
+        calls++;
+        return descriptor.value;
+      },
+    });
+    try {
+      assert.equal(vaultRecordStagingCurrent(witness), false);
+      assert.throws(capture, /owner changed/);
+      assert.equal(calls, 0, 'a getter must not run inside an authority check');
+    } finally {
+      Object.defineProperty(storage, name, descriptor);
+      discardVaultRecordStaging(witness);
+    }
+  }
+  assert.equal(storage.read('head'), null);
+});
+
 test('vault staging refuses a deterministic no-replace race without overwriting the competing ciphertext', (t) => {
   const { root, db, storage, capture, retained } = fixture(t);
   const bytes = Buffer.from('Independently fictional racing immutable object.'),

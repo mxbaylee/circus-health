@@ -13,6 +13,9 @@ type Frame = {
   controller: AbortController;
   active: boolean;
   assertRunning?: () => void;
+  callerAssertions: boolean;
+  callerAssertion?: () => void;
+  publicationAssertions?: readonly (() => void)[];
   signal?: AbortSignal;
   child?: Promise<unknown>;
   parent?: Frame;
@@ -53,6 +56,31 @@ export function assertClinicalOperation(db: DatabaseSync, operation?: ClinicalOp
   // Caller assertions may themselves assert ownership. Liveness checks here
   // must not recursively invoke those caller callbacks.
   for (let value: Frame | undefined = frame; value; value = value.parent) check(value, false);
+}
+/** Read-only provenance, not authorization. Derived parent checks are not
+ * caller assertions; every original caller assertion remains visible. */
+export function clinicalOperationHasCallerAssertions(
+  db: DatabaseSync,
+  operation: ClinicalOperation,
+): boolean {
+  assertClinicalOperation(db, operation);
+  const owner = frames.get(operation)!;
+  for (let value: Frame | undefined = owner; value; value = value.parent)
+    if (value.callerAssertions) return true;
+  return false;
+}
+/** Exact original assertions only. This exposes provenance, never approval. */
+export function clinicalOperationCallerAssertions(
+  db: DatabaseSync,
+  operation: ClinicalOperation,
+): readonly (() => void)[] {
+  assertClinicalOperation(db, operation);
+  const assertions: Array<() => void> = [];
+  for (let value: Frame | undefined = frames.get(operation); value; value = value.parent) {
+    if (value.callerAssertion) assertions.push(value.callerAssertion);
+    if (value.publicationAssertions) assertions.push(...value.publicationAssertions);
+  }
+  return Object.freeze(assertions);
 }
 function pump(lane: Lane) {
   if (lane.active || lane.closed) return;
@@ -102,6 +130,7 @@ export async function runExclusiveClinicalOperation<T>(
     operation?: ClinicalOperation;
     signal?: AbortSignal;
     assertRunning?: () => void;
+    publicationAssertions?: readonly (() => void)[];
     onDiscardResult?: (value: T) => void;
   } = {},
 ): Promise<T> {
@@ -122,6 +151,10 @@ export async function runExclusiveClinicalOperation<T>(
       active: true,
       parent,
       signal: options.signal,
+      callerAssertions:
+        options.assertRunning !== undefined || !!options.publicationAssertions?.length,
+      callerAssertion: options.assertRunning,
+      publicationAssertions: Object.freeze([...(options.publicationAssertions ?? [])]),
       assertRunning: () => {
         check(parent!);
         options.assertRunning?.();
@@ -174,6 +207,10 @@ export async function runExclusiveClinicalOperation<T>(
           active: true,
           signal: options.signal,
           assertRunning: options.assertRunning,
+          callerAssertions:
+            options.assertRunning !== undefined || !!options.publicationAssertions?.length,
+          callerAssertion: options.assertRunning,
+          publicationAssertions: Object.freeze([...(options.publicationAssertions ?? [])]),
         };
         void runFrame(frame, work, options.onDiscardResult)
           .then(resolve, reject)

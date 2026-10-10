@@ -5,8 +5,10 @@ import {
   observeDatabaseClose,
   observeManagedDatabaseAuthorization,
   observeManagedDatabaseFunctionRegistration,
-  observeTransactionOutcome,
 } from './database.ts';
+import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
+const outcomes = createTransactionOutcomeIssuer();
+export const intakeProjectionTerminalOutcome = outcomes.recognizes;
 
 const names = ['state', 'sources', 'groups', 'acceptances', 'identities', 'payloads'] as const;
 interface Witness {
@@ -207,7 +209,7 @@ export function ensureIntakeProjectionWitness(db: DatabaseSync): void {
       witness.sealed = undefined;
     }
   });
-  const stopOutcome = observeTransactionOutcome(db, (outcome) => {
+  const stopOutcome = outcomes.observe(db, (outcome) => {
     if (witness && !outcome.succeeded) {
       witness.authorizationVersion++;
       witness.sealed = undefined;

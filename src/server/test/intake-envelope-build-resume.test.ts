@@ -4,10 +4,17 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import nodeFs, { mkdtempSync, rmSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, constants } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDatabase, transaction, clinicalReviewRevision, type Database } from '../database.ts';
+import {
+  openDatabase,
+  transaction,
+  clinicalReviewRevision,
+  observeTransactionBeforePublication,
+  observeManagedDatabaseAuthorization,
+  type Database,
+} from '../database.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
@@ -159,7 +166,7 @@ function fixture(
     authority.attach(rebuilt);
     return rebuilt;
   }
-  return { db, source, identity, initial, text, rebuild, writes, directory };
+  return { db, source, identity, initial, text, rebuild, writes, directory, authority };
 }
 function selectedProgress(db: Database, source: { id: string }) {
   const { collections } = selectedEnvelopeStore(db, source);
@@ -928,6 +935,125 @@ test('conversion search does not credit unrelated SQL, TEMP or rolled-back write
       peer?.close();
     }
   }
+});
+
+test('conversion refuses a precompiled foreign dirty-row write before its selected head trigger', async (t) => {
+  const f = fixture(t, 3, 0);
+  exactSearch(f.db, f.text, 'same-public-id');
+  const insert = f.db.prepare(
+    'INSERT OR IGNORE INTO temp.__source_text_dirty(source_id) VALUES(?)',
+  );
+  const acceptedHead = f.authority.storage.read('head');
+  let injected = false;
+  const remove = observeTransactionBeforePublication(f.db, () => {
+    if (injected) return;
+    injected = true;
+    insert.run(f.source.id);
+  });
+  try {
+    await assert.rejects(
+      buildIntakeCollectionEnvelope(f.db, f.source),
+      /original frontier authority unavailable|legacy bridge unowned publication write/,
+    );
+  } finally {
+    remove();
+  }
+  assert.equal(injected, true);
+  assert.deepEqual(f.authority.storage.read('head'), acceptedHead);
+  assert.equal(hasIntakeCollectionEnvelope(f.db, f.source), false);
+});
+
+test('conversion refuses a foreign TEMP write during its legacy bridge before resume admission', async (t) => {
+  const f = fixture(t, 3, 0);
+  f.db.exec('CREATE TEMP TABLE fictional_bridge_foreign(value TEXT)');
+  const foreign = f.db.prepare("INSERT INTO temp.fictional_bridge_foreign VALUES('unowned')");
+  let injected = false;
+  const remove = observeTransactionBeforePublication(f.db, () => {
+    if (injected) return;
+    injected = true;
+    foreign.run();
+  });
+  try {
+    await assert.rejects(
+      buildIntakeCollectionEnvelope(f.db, f.source),
+      /legacy bridge|unowned|authority changed/,
+    );
+  } finally {
+    remove();
+  }
+  assert.equal(injected, true);
+  assert.equal(hasIntakeCollectionEnvelope(f.db, f.source), false);
+});
+
+test('conversion refuses a source write attempt after its legacy read and before bridge preparation', async (t) => {
+  for (const noOp of [false, true]) {
+    const f = fixture(t, 3, 0);
+    const acceptedHead = f.authority.storage.read('head');
+    const beforeChanges = Number(f.db.prepare('SELECT total_changes() AS n').get()!.n);
+    let sourceRead = false;
+    let injected = false;
+    let injectedChanges = -1;
+    let afterInjectionChanges = -1;
+    let injectionStack = '';
+    const read = f.authority.storage.read;
+    f.authority.storage.read = (name) => {
+      const value = read(name);
+      if (name !== 'head' || !sourceRead || injected) return value;
+      injected = true;
+      injectionStack = new Error('legacy read callback').stack ?? '';
+      injectedChanges = Number(
+        f.db
+          .prepare(
+            'UPDATE source_files SET details_json=details_json WHERE id=?' + (noOp ? ' AND 0' : ''),
+          )
+          .run(f.source.id).changes,
+      );
+      afterInjectionChanges = Number(f.db.prepare('SELECT total_changes() AS n').get()!.n);
+      return value;
+    };
+    const stop = observeManagedDatabaseAuthorization(
+      f.db,
+      (action, name, detail, database) => {
+        if (action !== constants.SQLITE_READ || database !== 'main') return;
+        if (name === 'source_files' && detail === 'details_json') sourceRead = true;
+      },
+      () => {},
+    );
+    let refusal: unknown;
+    try {
+      await buildIntakeCollectionEnvelope(f.db, f.source);
+    } catch (error) {
+      refusal = error;
+    } finally {
+      stop?.();
+      f.authority.storage.read = read;
+    }
+    assert.equal(sourceRead, true);
+    assert.equal(injected, true);
+    assert.match(injectionStack, /hasIntakeCollectionEnvelope/);
+    assert.equal(injectedChanges, noOp ? 0 : 1);
+    assert.ok(afterInjectionChanges > beforeChanges, 'the attempted source write is tracked');
+    assert.match(String(refusal), /legacy bridge original read authority changed/);
+    assert.deepEqual(f.authority.storage.read('head'), acceptedHead);
+    assert.equal(
+      Number(f.db.prepare('SELECT total_changes() AS n').get()!.n),
+      afterInjectionChanges,
+    );
+    assert.equal(hasIntakeCollectionEnvelope(f.db, f.source), false);
+  }
+});
+
+test('conversion refuses a matching-name source-text trigger with foreign body', async (t) => {
+  const f = fixture(t, 3, 0);
+  exactSearch(f.db, f.text, 'same-public-id');
+  f.db.exec('DROP TRIGGER temp.__source_text_authority_UPDATE');
+  f.db.exec(`CREATE TEMP TRIGGER __source_text_authority_UPDATE AFTER UPDATE ON main.app_meta
+    BEGIN SELECT 1; END`);
+  await assert.rejects(
+    buildIntakeCollectionEnvelope(f.db, f.source),
+    /authority changed|tracking trigger changed|source-text/,
+  );
+  assert.equal(hasIntakeCollectionEnvelope(f.db, f.source), false);
 });
 
 test('conversion search refuses preexisting bad authority outside path matches and candidate filters without SQL mutation', async (t) => {

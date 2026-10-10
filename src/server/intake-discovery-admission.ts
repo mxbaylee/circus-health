@@ -4,9 +4,11 @@ import { setImmediate } from 'node:timers/promises';
 import {
   currentTransactionToken,
   observeDatabaseClose,
-  observeTransactionOutcome,
   rejectCurrentTransaction,
 } from './database.ts';
+import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
+const outcomes = createTransactionOutcomeIssuer();
+export const intakeDiscoveryTerminalOutcome = outcomes.recognizes;
 import { assertClinicalOperation, currentClinicalOperation } from './clinical-operation.ts';
 import { intakeEnvelopeAuthorityBinding, type IntakeEnvelopeSource } from './intake-authority.ts';
 import { identityGroundingGeneration } from './intake-identity-grounding.ts';
@@ -163,7 +165,7 @@ export async function prepareIntakeDiscoveryAdmission(
     admissions.delete(token);
   };
   state.removeClose = observeDatabaseClose(db, dispose);
-  state.removeOutcome = observeTransactionOutcome(db, dispose);
+  state.removeOutcome = outcomes.observe(db, dispose);
   try {
     if (preparedIntakeDiscoveryRevision(db) === expected) {
       assertProof(db, proof, readRaw, state, options.assertRunning);

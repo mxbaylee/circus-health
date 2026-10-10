@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync, renameSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, renameSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createPackageSourceLeaseOwner } from '../intake-package-source-lease.ts';
+import {
+  createPackageSourceLeaseOwner,
+  packageSourceLeaseOriginalPhysical,
+} from '../intake-package-source-lease.ts';
 import { createIntakeFileWorkCounters, withIntakeFileWork } from '../intake-file-work.ts';
 
 test('cold verification yields after bounded work and profile close revokes it before consumption', async (t) => {
@@ -189,5 +192,46 @@ test('publication liveness retains a direct caller cancellation guard by default
     ),
     /request cancelled/,
   );
+  owner.close();
+});
+
+test('source lease pins an in-root alias parent and refuses its same-target replacement', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-package-parent-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const physical = join(root, 'physical');
+  mkdirSync(physical);
+  const alias = join(root, 'alias');
+  symlinkSync(physical, alias);
+  const bytes = Buffer.from('fictional retained source');
+  writeFileSync(join(physical, 'source.zip'), bytes);
+  const owner = createPackageSourceLeaseOwner({
+    profileId: 'fictional',
+    root,
+    assertAuthorized() {},
+  });
+  let consumed = false;
+  await assert.rejects(
+    owner.withSource(
+      {
+        profileId: 'fictional',
+        intakeId: 'original',
+        path: join(alias, 'source.zip'),
+        bytes: bytes.length,
+        sourceHash: createHash('sha256').update(bytes).digest('hex'),
+      },
+      async (lease) => {
+        consumed = true;
+        const original = packageSourceLeaseOriginalPhysical(lease.assertPublicationCurrent);
+        assert.equal(original?.parentKind, 'symlink');
+        assert.equal(original?.parentRealpath, physical);
+        const replacement = join(root, 'replacement-alias');
+        symlinkSync(physical, replacement);
+        renameSync(replacement, alias);
+        assert.throws(() => lease.assertPublicationCurrent(), { code: 'SOURCE_CHANGED' });
+      },
+    ),
+    { code: 'SOURCE_CHANGED' },
+  );
+  assert.equal(consumed, true);
   owner.close();
 });

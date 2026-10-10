@@ -3,11 +3,13 @@ import type { DatabaseSync } from 'node:sqlite';
 import {
   json,
   observeDatabaseClose,
-  observeTransactionOutcome,
   currentTransactionToken,
   rejectCurrentTransaction,
   type Database,
 } from './database.ts';
+import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
+const outcomes = createTransactionOutcomeIssuer();
+export const intakeLookupTerminalOutcome = outcomes.recognizes;
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
   intakeEnvelopeAuthorityBinding,
@@ -165,7 +167,7 @@ function create(db: DatabaseSync): Connection {
       nativeReceiptRowsWritten: 0,
     },
   };
-  const stopOutcome = observeTransactionOutcome(db, (outcome) => {
+  const stopOutcome = outcomes.observe(db, (outcome) => {
     if (!outcome.succeeded) {
       clearPayloadMemo(connection);
       connection.schema = -1;

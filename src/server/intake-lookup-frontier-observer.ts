@@ -1,15 +1,25 @@
 import { randomUUID } from 'node:crypto';
-import { constants, type DatabaseSync, type StatementSync } from 'node:sqlite';
+import { terminalStatement } from './database-terminal-statements.ts';
+import { constants, DatabaseSync, StatementSync } from 'node:sqlite';
 import {
   managedDatabaseAuthorizerSetter,
   managedDatabaseFunctionSetter,
+  managedDatabaseMethodEpoch,
+  managedDatabaseDataMethod,
+  managedDatabaseAuthorizationNestedCallbackActive,
   currentTransactionToken,
   observeManagedDatabaseAuthorization,
   observeManagedDatabaseFunctionRegistration,
-  observeTransactionOutcome,
-  observeTransactionStart,
   rearmManagedDatabaseAuthorization,
 } from './database.ts';
+import {
+  createTransactionOutcomeIssuer,
+  createTransactionStartIssuer,
+} from './transaction-observer-issuer.ts';
+const starts = createTransactionStartIssuer();
+const outcomes = createTransactionOutcomeIssuer();
+export const intakeFrontierTerminalStart = starts.recognizes;
+export const intakeFrontierTerminalOutcome = outcomes.recognizes;
 import { intakeClinicalCachePin } from './intake-clinical-cache-pin.ts';
 import { consumeRecordMaintenanceBookkeeping } from './record-versions.ts';
 
@@ -57,8 +67,12 @@ interface Observer {
   activeAttempts?: number;
   activeMetadata?: Set<string>;
   activeLookupDirtyWrites: bigint;
+  activeLookupDirtyHeadKey?: string;
   captureClearCount: number;
   clearingCapture?: { seen: boolean };
+  compilingCapture?: object;
+  terminalCapture?: { capability: IntakeFrontierCaptureClear; token: object };
+  captureSchemaSequence: bigint;
   changesetPragma?: { phase: 0 | 1 | 2 };
   expected?: ExpectedWrite;
   auxiliary?: AuxiliaryPreparation;
@@ -82,11 +96,88 @@ export interface IntakeFrontierAttemptSnapshot {
 }
 
 const observers = new WeakMap<DatabaseSync, Observer>();
+const blockedReadmissions = new WeakSet<DatabaseSync>();
+const nativePrepare = DatabaseSync.prototype.prepare,
+  nativeGet = StatementSync.prototype.get,
+  nativeRun = StatementSync.prototype.run;
+const schemaValue = (statement: StatementSync) =>
+  Reflect.apply(nativeGet, statement, [])!.schema_version;
 
 /** Only the issuer's bounded memory-only event can run in a closing SQL seal. */
 export function intakeFrontierTerminalEvent(db: DatabaseSync, callback: unknown): boolean {
   const observer = observers.get(db);
   return !!observer && !observer.functionReplaced && observer.event === callback;
+}
+declare const captureClearBrand: unique symbol;
+export interface IntakeFrontierCaptureClear {
+  readonly [captureClearBrand]: true;
+}
+const captureClears = new WeakMap<
+  IntakeFrontierCaptureClear,
+  {
+    db: DatabaseSync;
+    observer: Observer;
+    identity: object;
+    schemaSequence: bigint;
+    methods: object;
+    main: StatementSync;
+    temp: StatementSync;
+    mainSchema: unknown;
+    tempSchema: unknown;
+    statement: StatementSync;
+    phase: number;
+    token?: object;
+  }
+>();
+
+/** Fixed cleanup transport only, not permission to accept any captured row. */
+export function prepareIntakeFrontierCaptureClear(db: DatabaseSync): IntakeFrontierCaptureClear {
+  const observer = observers.get(db),
+    methods = managedDatabaseMethodEpoch(db);
+  if (!observer || !methods || db.isTransaction || observer.functionReplaced)
+    throw Error('Terminal capture cleanup requires its original idle observer');
+  if (observer.compilingCapture) throw Error('Nested terminal capture compilation');
+  const main = nativePrepare.call(db, 'PRAGMA main.schema_version'),
+    temp = nativePrepare.call(db, 'PRAGMA temp.schema_version');
+  const identity = observer.identity,
+    schemaSequence = observer.captureSchemaSequence,
+    revoked = observer.revoked,
+    mainSchema = schemaValue(main),
+    tempSchema = schemaValue(temp);
+  let statement: StatementSync;
+  observer.compilingCapture = Object.freeze({});
+  try {
+    statement = nativePrepare.call(db, 'DELETE FROM temp.__record_changed');
+  } finally {
+    observer.compilingCapture = undefined;
+  }
+  if (
+    observers.get(db) !== observer ||
+    observer.identity !== identity ||
+    observer.revoked !== revoked ||
+    observer.captureSchemaSequence !== schemaSequence ||
+    managedDatabaseMethodEpoch(db) !== methods ||
+    schemaValue(main) !== mainSchema ||
+    schemaValue(temp) !== tempSchema ||
+    observer.captureSchemaSequence !== schemaSequence ||
+    managedDatabaseMethodEpoch(db) !== methods
+  )
+    throw Error('Terminal capture compilation changed its original owner');
+  const capability = Object.freeze({}) as IntakeFrontierCaptureClear;
+  captureClears.set(capability, {
+    db,
+    observer,
+    identity,
+    schemaSequence,
+    methods,
+    main,
+    temp,
+    statement,
+    mainSchema,
+    tempSchema,
+    phase: 0,
+  });
+  return capability;
 }
 function revoke(observer: Observer, reason: string): void {
   if (!observer.revoked) observer.firstRevocation = reason;
@@ -137,28 +228,28 @@ const auxiliaryPrefix = (kind: AuxiliaryKind) =>
       : '__duplicate_evidence_';
 
 function tempSchema(db: DatabaseSync): number | bigint {
-  const value = db.prepare('PRAGMA temp.schema_version').get()?.schema_version;
+  const value = terminalStatement(db, 'PRAGMA temp.schema_version').get()?.schema_version;
   if (typeof value !== 'number' && typeof value !== 'bigint')
     throw Error('Intake frontier TEMP schema is unavailable');
   return value;
 }
 
 function mainSchema(db: DatabaseSync): number | bigint {
-  const value = db.prepare('PRAGMA main.schema_version').get()?.schema_version;
+  const value = terminalStatement(db, 'PRAGMA main.schema_version').get()?.schema_version;
   if (typeof value !== 'number' && typeof value !== 'bigint')
     throw Error('Intake frontier main schema is unavailable');
   return value;
 }
 
 function dataVersion(db: DatabaseSync): number | bigint {
-  const value = db.prepare('PRAGMA data_version').get()?.data_version;
+  const value = terminalStatement(db, 'PRAGMA data_version').get()?.data_version;
   if (typeof value !== 'number' && typeof value !== 'bigint')
     throw Error('Intake frontier peer revision is unavailable');
   return value;
 }
 
 function totalChanges(db: DatabaseSync): bigint {
-  const statement = db.prepare('SELECT total_changes() AS count');
+  const statement = terminalStatement(db, 'SELECT total_changes() AS count', undefined, true);
   statement.setReadBigInts(true);
   const value = statement.get()?.count;
   if (typeof value !== 'bigint') throw Error('Intake frontier write count is unavailable');
@@ -177,11 +268,10 @@ function settleUnrelatedChanges(db: DatabaseSync, observer: Observer): boolean {
 }
 
 export function protectedIntakeLookupTempShadow(db: DatabaseSync): boolean {
-  return !!db
-    .prepare(
-      "SELECT 1 FROM sqlite_temp_schema WHERE type IN ('table','view') AND (lower(name) IN ('source_files','app_meta','__record_state') OR lower(name) GLOB '__record_intake_lookup_*') LIMIT 1",
-    )
-    .get();
+  return !!terminalStatement(
+    db,
+    "SELECT 1 FROM sqlite_temp_schema WHERE type IN ('table','view') AND (lower(name) IN ('source_files','app_meta','__record_state','__record_current','__record_versions','__record_transactions','__record_fields') OR lower(name) GLOB '__record_intake_lookup_*') LIMIT 1",
+  ).get();
 }
 
 function ownTriggersIntact(db: DatabaseSync, observer: Observer): boolean {
@@ -200,6 +290,8 @@ function classify(value: unknown): string | null | undefined {
 
 /** Observation is private and monotonic; it does not authorize a lookup by itself. */
 export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
+  if (blockedReadmissions.has(db))
+    throw Error('Intake frontier compact readmission is unavailable');
   if (!db.isOpen || db.isTransaction)
     throw Error('Intake frontier observer requires an open idle DB');
   const existing = observers.get(db);
@@ -228,6 +320,8 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
       return;
     existing.revoked = true;
     if (existing.functionReplaced || !ownTriggersIntact(db, existing)) existing.reinstall();
+    if (!rearmManagedDatabaseAuthorization(db))
+      throw Error('Intake frontier database authorizer was replaced');
     existing.identity = {};
     existing.attempts = 0;
     existing.ownedWrites = 0;
@@ -353,6 +447,7 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
     event,
     activeLookupDirtyWrites: 0n,
     captureClearCount: 0,
+    captureSchemaSequence: 0n,
     identity: {},
     functionName,
     triggerNames,
@@ -385,10 +480,21 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
     db,
     (action, name, detail, _database, origin) => {
       if (observer) {
+        if (
+          schemaActions.has(action) ||
+          (action === constants.SQLITE_PRAGMA &&
+            detail !== null &&
+            !readOnlyArgumentPragmas.has(name ?? ''))
+        )
+          observer.captureSchemaSequence++;
         const captureDelete =
           action === constants.SQLITE_DELETE && _database === 'temp' && name === '__record_changed';
         const ownedCaptureDelete =
           captureDelete && observer.clearingCapture && !observer.clearingCapture.seen;
+        const ownedCaptureCompile =
+          captureDelete &&
+          observer.compilingCapture &&
+          !managedDatabaseAuthorizationNestedCallbackActive(db);
         if (ownedCaptureDelete) observer.clearingCapture!.seen = true;
         if (
           _database === 'temp' &&
@@ -396,11 +502,23 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
           writeActions.has(action) &&
           !(
             ownedCaptureDelete ||
+            ownedCaptureCompile ||
             (action === constants.SQLITE_INSERT &&
               /^__record_capture_[a-z_]+_(INSERT|UPDATE|DELETE)$/.test(origin ?? ''))
           )
         )
           revoke(observer, 'unowned accepted-row capture write');
+        if (
+          _database === 'temp' &&
+          writeActions.has(action) &&
+          (name === '__source_text_dirty' || name === '__source_text_authorities') &&
+          !(
+            name === '__source_text_dirty' &&
+            action === constants.SQLITE_INSERT &&
+            /^__source_text_authority_(INSERT|UPDATE|DELETE)$/.test(origin ?? '')
+          )
+        )
+          revoke(observer, 'unowned source-text tracking write');
         if (
           writeActions.has(action) &&
           ((_database === 'main' && name?.startsWith('__record_intake_lookup_')) ||
@@ -465,7 +583,7 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
     },
   );
   if (!observed) observer.revoked = true;
-  observeTransactionStart(db, (token) => {
+  starts.observe(db, (token) => {
     if (!observer || observer.revoked) return;
     if (observer.auxiliary) revoke(observer, 'transaction during auxiliary');
     const changes = totalChanges(db);
@@ -477,9 +595,10 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
     observer.activeAttempts = observer.attempts;
     observer.activeMetadata = new Set();
     observer.activeLookupDirtyWrites = 0n;
+    observer.activeLookupDirtyHeadKey = undefined;
     observer.captureClearCount = 0;
   });
-  observeTransactionOutcome(db, (outcome) => {
+  outcomes.observe(db, (outcome) => {
     if (!observer || observer.revoked) return;
     if (
       observer.activeToken !== outcome.token ||
@@ -523,6 +642,14 @@ export function ensureIntakeFrontierObserver(db: DatabaseSync): void {
   });
 }
 
+/** A committed compact write may leave only a failed next-operation admission. */
+export function blockIntakeFrontierReadmission(db: DatabaseSync): void {
+  blockedReadmissions.add(db);
+  const observer = observers.get(db);
+  if (!observer) return;
+  revoke(observer, 'compact readmission failed');
+}
+
 /** Read only genuine, original protected events for this exact transaction. */
 export function intakeFrontierOwnedMetadataKeys(
   db: DatabaseSync,
@@ -534,20 +661,56 @@ export function intakeFrontierOwnedMetadataKeys(
 }
 
 /** The capture owner alone runs this fixed cleanup statement, never a callback. */
-export function clearIntakeFrontierRecordCapture(db: DatabaseSync): number | bigint {
+export function clearIntakeFrontierRecordCapture(
+  db: DatabaseSync,
+  capability?: IntakeFrontierCaptureClear,
+): number | bigint {
   const observer = observers.get(db);
+  const currentToken = currentTransactionToken(db);
+  if (observer?.terminalCapture) {
+    if (observer.terminalCapture.token !== currentToken) observer.terminalCapture = undefined;
+    else if (observer.terminalCapture.capability !== capability)
+      throw Error('Ordinary cleanup cannot consume terminal capture slots');
+  }
+  const prepared = capability && captureClears.get(capability);
+  if (capability) {
+    const token = currentTransactionToken(db);
+    if (
+      !prepared ||
+      prepared.db !== db ||
+      prepared.observer !== observer ||
+      prepared.identity !== observer!.identity ||
+      prepared.schemaSequence !== observer!.captureSchemaSequence ||
+      !token ||
+      (!db.isTransaction && prepared.phase !== 1) ||
+      prepared.phase >= 2 ||
+      (prepared.token && prepared.token !== token) ||
+      observer!.captureClearCount !== prepared.phase ||
+      observer!.clearingCapture ||
+      observer!.functionReplaced ||
+      managedDatabaseMethodEpoch(db) !== prepared.methods ||
+      schemaValue(prepared.main) !== prepared.mainSchema ||
+      schemaValue(prepared.temp) !== prepared.tempSchema
+    )
+      throw Error('Foreign, expired or replayed terminal capture cleanup');
+    prepared.token = token;
+    prepared.phase++;
+    observer!.terminalCapture = { capability, token };
+  }
   if (observer?.clearingCapture) revoke(observer, 'reentrant accepted-row cleanup');
   if (observer) {
     if (!observer.activeToken || observer.captureClearCount >= 2)
       revoke(observer, 'accepted-row cleanup phase');
     observer.captureClearCount++;
   }
-  const clearing = { seen: false };
+  const clearing = { seen: !!prepared };
   if (observer) observer.clearingCapture = clearing;
   try {
     // Fresh bytecode must consume this slot. Rearming here would invalidate
     // every unrelated prepared statement twice per durable publication.
-    return db.prepare('DELETE FROM temp.__record_changed').run().changes;
+    return prepared
+      ? Reflect.apply(nativeRun, prepared.statement, []).changes
+      : db.prepare('DELETE FROM temp.__record_changed').run().changes;
   } finally {
     if (observer && !clearing.seen) revoke(observer, 'capture cleanup authorization missing');
     if (observer) observer.clearingCapture = undefined;
@@ -557,6 +720,7 @@ export function clearIntakeFrontierRecordCapture(db: DatabaseSync): number | big
 export function captureIntakeFrontierAttempts(
   db: DatabaseSync,
 ): IntakeFrontierAttemptSnapshot | undefined {
+  if (blockedReadmissions.has(db)) return undefined;
   const observer = observers.get(db);
   if (
     !db.isOpen ||
@@ -565,9 +729,9 @@ export function captureIntakeFrontierAttempts(
     observer.expected ||
     observer.auxiliary ||
     protectedIntakeLookupTempShadow(db) ||
-    db.function !== observer.managedFunction ||
-    db.setAuthorizer !== observer.managedAuthorizer ||
-    db.applyChangeset !== observer.nativeApplyChangeset ||
+    managedDatabaseDataMethod(db, 'function') !== observer.managedFunction ||
+    managedDatabaseDataMethod(db, 'setAuthorizer') !== observer.managedAuthorizer ||
+    managedDatabaseDataMethod(db, 'applyChangeset') !== observer.nativeApplyChangeset ||
     observer.activeToken !== undefined ||
     totalChanges(db) !== observer.settledChanges
   )
@@ -613,9 +777,9 @@ function readAttempts(
     observer.expected ||
     observer.auxiliary ||
     protectedIntakeLookupTempShadow(db) ||
-    db.function !== observer.managedFunction ||
-    db.setAuthorizer !== observer.managedAuthorizer ||
-    db.applyChangeset !== observer.nativeApplyChangeset ||
+    managedDatabaseDataMethod(db, 'function') !== observer.managedFunction ||
+    managedDatabaseDataMethod(db, 'setAuthorizer') !== observer.managedAuthorizer ||
+    managedDatabaseDataMethod(db, 'applyChangeset') !== observer.nativeApplyChangeset ||
     observer.activeToken !== undefined ||
     !settleUnrelatedChanges(db, observer) ||
     (mode === 'strict' && observer.unrelatedChanges !== snapshot.unrelatedChanges) ||
@@ -677,6 +841,86 @@ export function readIntakeFrontierSourceEquality(
     : undefined;
 }
 
+/** Read the original source attempt interval while its exact maintenance transaction
+ * is active. The caller separately proves the transaction's literal total_changes. */
+export function readIntakeFrontierOwnedSourceEquality(
+  db: DatabaseSync,
+  snapshot: IntakeFrontierAttemptSnapshot,
+  token: object,
+): { attempts: number; ownedWrites: number; headSourceIds: readonly string[] } | undefined {
+  const observer = observers.get(db);
+  const current = () =>
+    db.isOpen &&
+    !!observer &&
+    observer.identity === snapshot.identity &&
+    !observer.revoked &&
+    !observer.expected &&
+    !observer.auxiliary &&
+    observer.activeToken === token &&
+    currentTransactionToken(db) === token &&
+    observer.attempts >= snapshot.attempts &&
+    snapshot.attempts >= observer.headFloorAttempts &&
+    observer.ownedWrites >= snapshot.ownedWrites &&
+    observer.unrelatedChanges === snapshot.unrelatedChanges &&
+    observer.outcomeSequence === snapshot.outcomeSequence &&
+    observer.auxiliarySequence === snapshot.auxiliarySequence &&
+    managedDatabaseDataMethod(db, 'function') === observer.managedFunction &&
+    managedDatabaseDataMethod(db, 'setAuthorizer') === observer.managedAuthorizer &&
+    managedDatabaseDataMethod(db, 'applyChangeset') === observer.nativeApplyChangeset &&
+    !observer.revoked &&
+    observer.attempts >= snapshot.attempts &&
+    observer.ownedWrites >= snapshot.ownedWrites;
+  if (!current() || protectedIntakeLookupTempShadow(db)) return undefined;
+  const main = mainSchema(db),
+    temp = tempSchema(db),
+    peer = dataVersion(db);
+  if (
+    !current() ||
+    main !== snapshot.mainSchema ||
+    temp !== snapshot.tempSchema ||
+    peer !== snapshot.dataVersion
+  )
+    return undefined;
+  const attempts = observer!.attempts - snapshot.attempts,
+    ownedWrites = observer!.ownedWrites - snapshot.ownedWrites,
+    headSourceIds = [...observer!.headChanges]
+      .filter(([, attempt]) => attempt > snapshot.attempts)
+      .map(([sourceId]) => sourceId);
+  return current() && attempts === ownedWrites && headSourceIds.length <= MAX_HEAD_SOURCES
+    ? { attempts, ownedWrites, headSourceIds }
+    : undefined;
+}
+
+/** One selected-head dirty insertion certified by the original fixed writer. */
+export function readIntakeFrontierOwnedLookupDirtyWrite(
+  db: DatabaseSync,
+  snapshot: IntakeFrontierAttemptSnapshot,
+  token: object,
+  sourceId: string,
+  headKey: string,
+): 0 | 1 | undefined {
+  const interval = readIntakeFrontierOwnedSourceEquality(db, snapshot, token);
+  const observer = observers.get(db);
+  if (
+    !interval ||
+    !observer ||
+    interval.headSourceIds.some((id) => id !== sourceId) ||
+    (observer.activeLookupDirtyWrites === 1n && !interval.headSourceIds.includes(sourceId)) ||
+    (observer.activeLookupDirtyWrites === 1n && observer.activeLookupDirtyHeadKey !== headKey) ||
+    (observer.activeLookupDirtyWrites !== 0n && observer.activeLookupDirtyWrites !== 1n)
+  )
+    return undefined;
+  const count = Number(observer.activeLookupDirtyWrites) as 0 | 1;
+  const closing = readIntakeFrontierOwnedSourceEquality(db, snapshot, token);
+  return closing &&
+    closing.headSourceIds.every((id) => id === sourceId) &&
+    (count === 0 || closing.headSourceIds.includes(sourceId)) &&
+    (count === 0 || observer.activeLookupDirtyHeadKey === headKey) &&
+    observer.activeLookupDirtyWrites === BigInt(count)
+    ? count
+    : undefined;
+}
+
 export function intakeFrontierAttemptCounts(db: DatabaseSync) {
   const observer = observers.get(db);
   return observer
@@ -704,7 +948,7 @@ export function applyObservedClinicalProjectionChangeset(
     observer.auxiliary ||
     !observer.activeToken ||
     currentTransactionToken(db) !== observer.activeToken ||
-    db.applyChangeset !== observer.nativeApplyChangeset
+    managedDatabaseDataMethod(db, 'applyChangeset') !== observer.nativeApplyChangeset
   ) {
     revoke(observer, 'clinical changeset ownership');
     return apply();
@@ -745,21 +989,20 @@ export function expectIntakeFrontierMetaWrite(
   let insertsLookupDirty = false;
   if (
     headSourceId &&
-    db
-      .prepare(
-        "SELECT 1 FROM sqlite_temp_schema WHERE type='table' AND name='__intake_lookup_authorities'",
-      )
-      .get()
+    terminalStatement(
+      db,
+      "SELECT 1 FROM sqlite_temp_schema WHERE type='table' AND name='__intake_lookup_authorities'",
+    ).get()
   ) {
-    const authorities = db
-      .prepare(
-        'SELECT source_id FROM temp.__intake_lookup_authorities WHERE authority_key=? LIMIT 2',
-      )
-      .all(key);
+    const authorities = terminalStatement(
+      db,
+      'SELECT source_id FROM temp.__intake_lookup_authorities WHERE authority_key=? LIMIT 2',
+    ).all(key);
     if (authorities.length === 1 && authorities[0]!.source_id === headSourceId)
-      insertsLookupDirty = !db
-        .prepare('SELECT 1 FROM temp.__intake_lookup_dirty WHERE source_id=?')
-        .get(headSourceId);
+      insertsLookupDirty = !terminalStatement(
+        db,
+        'SELECT 1 FROM temp.__intake_lookup_dirty WHERE source_id=?',
+      ).get(headSourceId);
     else if (authorities.length) revoke(observer, 'lookup dirty authority binding');
   }
   const expected = {
@@ -808,7 +1051,10 @@ export function finishIntakeFrontierMetaWrite(
         .get(expected.headSourceId)
     )
       revoke(observer, 'lookup dirty insertion missing');
-    else observer.activeLookupDirtyWrites++;
+    else {
+      observer.activeLookupDirtyWrites++;
+      observer.activeLookupDirtyHeadKey = expected.key;
+    }
   }
   observer.expected = undefined;
 }

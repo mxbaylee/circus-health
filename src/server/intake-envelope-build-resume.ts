@@ -3,7 +3,7 @@
  * The private SQL mirror reconstructs parser-local duplicate/precedence facts. */
 import { createHash } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
-import type { Database } from './database.ts';
+import { managedDatabaseMethodSerial, type Database } from './database.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { holdReadOnlySourceTextProjection } from './source-text-projection.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
@@ -14,6 +14,15 @@ import type { IntakeCollectionChange } from './intake-state-storage.ts';
 import { intakeSourcePinKey } from './intake-source-pin.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 import { FILENAME_FACTS_FORMAT } from './intake-filename-facts.ts';
+import {
+  captureIntakeFrontierAttempts,
+  readIntakeFrontierAttempts,
+  readIntakeFrontierSourceEquality,
+} from './intake-lookup-frontier-observer.ts';
+import type { IntakeCollectionResult } from './intake-state-evidence.ts';
+import { intakeNamespace } from './intake-state-evidence.ts';
+import { recordDurabilityStatus } from './record-versions.ts';
+import { sourceTextAuthorityDirtyRow } from './source-text-projection.ts';
 
 const FORMAT = 'health-intake-envelope-build-resume-v1';
 const COLLECTION = 'schema.resume';
@@ -41,6 +50,7 @@ export function prepareEnvelopeBuildResume(
 ) {
   if (db.isTransaction) fail('prepare outside a transaction');
   const selected = selectedEnvelopeStore(db, source);
+  const selectedHeadKey = `${intakeNamespace(selected.identity)}head`;
   if (selected.binding.logicalHead === undefined) fail('missing legacy bridge');
   const sourcePin = () =>
     db.prepare('SELECT value FROM app_meta WHERE key=?').get(intakeSourcePinKey(source.id))?.value;
@@ -58,6 +68,8 @@ export function prepareEnvelopeBuildResume(
   });
   const build = 'schema.' + hash(binding);
   const { collections } = selected;
+  let sequence = collections.binding(collections.openView())?.storageSequence;
+  if (!Number.isSafeInteger(sequence)) fail('missing selected storage sequence');
   let accepted = collections.get(collections.openView(), 'builds', COLLECTION, build);
   if (accepted !== undefined && typeof accepted !== 'string') fail('fragmented progress');
   const initial = accepted === undefined ? undefined : (JSON.parse(accepted) as Progress);
@@ -103,6 +115,10 @@ export function prepareEnvelopeBuildResume(
       generation = intakeCollectionCacheGeneration(db),
       count = 0,
       prefixVerified = prefixCount === 0;
+    const methods = managedDatabaseMethodSerial(db);
+    let frontier = captureIntakeFrontierAttempts(db);
+    if (methods === undefined || !frontier) fail('original frontier authority unavailable');
+    let checkpointDirty: ReturnType<typeof sourceTextAuthorityDirtyRow> | undefined;
     const transcript = createHash('sha256');
     const work = {
       replayedOperations: 0,
@@ -132,14 +148,17 @@ export function prepareEnvelopeBuildResume(
       work[key] += amount;
       withIntakeWork(db, 'warm', () => recordIntakeWork(metrics[key], amount));
     };
+    const assertMethods = () => {
+      if (methods === undefined) return;
+      if (managedDatabaseMethodSerial(db) !== methods)
+        fail('method authority changed during preparation');
+    };
     const assertWitness = () => {
+      assertMethods();
       if (stamp() !== witness || intakeCollectionCacheGeneration(db) !== generation)
         fail('authority changed during preparation');
     };
-    const assertCurrent = () => {
-      options.assertRunning?.();
-      if (db.isTransaction) fail('prepare outside a transaction');
-      assertWitness();
+    const assertSelectedBinding = () => {
       const current = selectedEnvelopeStore(db, source);
       if (
         JSON.stringify(current.identity) !== JSON.stringify(selected.identity) ||
@@ -148,9 +167,32 @@ export function prepareEnvelopeBuildResume(
         hash(JSON.stringify([sourcePin() ?? null])) !== pinHash
       )
         fail('source binding changed');
+    };
+    const assertQuietFrontier = () => {
+      if (!frontier) return false;
+      const interval = readIntakeFrontierAttempts(db, frontier);
+      if (
+        !interval ||
+        interval.attempts !== 0 ||
+        interval.ownedWrites !== 0 ||
+        interval.headSourceIds.length ||
+        interval.ordinaryTokens.length
+      )
+        fail('source authority changed during preparation');
+      return true;
+    };
+    const assertCurrent = () => {
+      options.assertRunning?.();
+      if (db.isTransaction) fail('prepare outside a transaction');
+      assertWitness();
+      const durability = recordDurabilityStatus(db);
+      if (!durability?.configured || durability.dirty || durability.conflicted)
+        fail('accepted physical head changed during preparation');
+      if (!assertQuietFrontier()) assertSelectedBinding();
       // The physical accepted-head reader may itself observe another writer.
       // Compare the original baseline after its final observation, too.
       assertWitness();
+      assertQuietFrontier();
     };
     const assertProgress = () => {
       assertCurrent();
@@ -231,17 +273,88 @@ export function prepareEnvelopeBuildResume(
           }),
         };
       },
-      committed(progress: IntakeCollectionChange) {
+      beginCheckpoint() {
+        if (checkpointDirty !== undefined) fail('overlapping checkpoint');
+        assertCurrent();
+        checkpointDirty = sourceTextAuthorityDirtyRow(db, source.id, selectedHeadKey);
+        assertCurrent();
+      },
+      committed(
+        progress: IntakeCollectionChange,
+        result: IntakeCollectionResult,
+        operationId: string,
+      ) {
         if (progress.op !== 'put') fail('invalid progress publication');
-        // No await/callback may run between the owner's successful commit and
-        // this refresh. Foreign changes can never become an admitted baseline.
+        const beforeDirty = checkpointDirty;
+        checkpointDirty = undefined;
+        if (beforeDirty === undefined) fail('missing checkpoint admission');
+        const readCheckpointInterval = () => {
+          if (!frontier) return undefined;
+          const strict = readIntakeFrontierAttempts(db, frontier);
+          if (strict) return strict;
+          if (!beforeDirty || beforeDirty.dirty) return undefined;
+          const afterDirty = sourceTextAuthorityDirtyRow(db, source.id, selectedHeadKey);
+          const current = captureIntakeFrontierAttempts(db);
+          if (
+            !afterDirty?.dirty ||
+            afterDirty.authority !== beforeDirty.authority ||
+            !current ||
+            current.identity !== frontier.identity ||
+            current.unrelatedChanges !== frontier.unrelatedChanges + 1n
+          )
+            return undefined;
+          const equality = readIntakeFrontierSourceEquality(db, frontier);
+          return equality && { ...equality, ordinaryTokens: [] };
+        };
+        const interval = readCheckpointInterval();
+        if (
+          frontier &&
+          (!interval ||
+            interval.attempts !== interval.ownedWrites ||
+            interval.ordinaryTokens.length !== 0 ||
+            interval.headSourceIds.length !== 1 ||
+            interval.headSourceIds[0] !== source.id)
+        )
+          fail('unowned checkpoint transition');
+        if (
+          result.format !== 'health-intake-state-result-v4' ||
+          result.intakeId !== source.id ||
+          result.operationId !== operationId ||
+          result.changed !== false ||
+          result.storageSequence !== sequence! + 1 ||
+          JSON.stringify(result.logical) !== selected.binding.logicalHead ||
+          JSON.stringify(collections.replay(operationId, hash(operationId))) !==
+            JSON.stringify(result)
+        )
+          fail('unrecognized checkpoint result');
+        if (!frontier) assertSelectedBinding();
+        if (collections.get(collections.openView(), 'builds', COLLECTION, build) !== progress.value)
+          fail('checkpoint progress differs');
+        if (frontier) {
+          const after = readCheckpointInterval();
+          if (
+            !after ||
+            after.attempts !== interval!.attempts ||
+            after.ownedWrites !== interval!.ownedWrites ||
+            JSON.stringify(after.headSourceIds) !== JSON.stringify(interval!.headSourceIds) ||
+            after.ordinaryTokens.length
+          )
+            fail('checkpoint changed during verification');
+          const next = captureIntakeFrontierAttempts(db);
+          if (!next) fail('checkpoint observer unavailable');
+          frontier = next;
+        }
+        // Only this exact accepted owner outcome may advance the read witness.
         accepted = progress.value;
+        sequence = result.storageSequence;
         witness = stamp();
         generation = intakeCollectionCacheGeneration(db);
         assertProgress();
       },
       finish() {
         if (!prefixVerified || count < prefixCount) fail('prefix exceeds complete transcript');
+        assertProgress();
+        assertSelectedBinding();
         assertProgress();
       },
       close() {

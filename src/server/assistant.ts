@@ -1,4 +1,8 @@
 import { readNativeAssistantSourceHeader } from './assistant-intake-header.ts';
+import {
+  captureVaultAssistantAuthorization,
+  withVaultAssistantAuthorization,
+} from './vault-app.ts';
 import { intakeFilenameSummaryPrepared } from './intake-summary-name.ts';
 import { readStoredIntakeDetails } from './intake-state-access.ts';
 import { isIntakeSummary } from '../shared/intake-summary.ts';
@@ -597,6 +601,75 @@ interface ActiveState {
   assertAuthorized?: (operation: 'dispatch' | 'publish') => void;
 }
 
+declare const compactOwnerBrand: unique symbol;
+export interface AssistantCompactOwner {
+  readonly [compactOwnerBrand]: true;
+}
+const compactOwners = new WeakMap<
+  AssistantCompactOwner,
+  {
+    db: Database;
+    databases: Map<string, Database>;
+    profileId: string;
+    active: Map<string, ActiveState>;
+    state: ActiveState;
+  }
+>();
+const compactAssertions = new WeakMap<
+  () => void,
+  {
+    owner: AssistantCompactOwner;
+    generation: number;
+    authorized?: ActiveState['assertAuthorized'];
+    prerequisites: readonly (() => void)[];
+  }
+>();
+const compactStateOwners = new WeakMap<ActiveState, AssistantCompactOwner>();
+const nativeActiveGet = Map.prototype.get;
+function bindCompactAssertion(
+  assertion: () => void,
+  owner: AssistantCompactOwner,
+  generation: number,
+): void {
+  const authorized = compactOwners.get(owner)!.state.assertAuthorized;
+  compactAssertions.set(assertion, {
+    owner,
+    generation,
+    authorized,
+    prerequisites: Object.freeze(authorized ? [authorized as unknown as () => void] : []),
+  });
+}
+/** The active job identity is minted only by this module's real run entry. */
+export function assistantCompactOwnerCurrent(
+  owner: AssistantCompactOwner,
+  db: Database,
+  profileId: string,
+): boolean {
+  const job = compactOwners.get(owner);
+  return (
+    !!job &&
+    job.db === db &&
+    job.profileId === profileId &&
+    Reflect.apply(nativeActiveGet, job.databases, [profileId]) === job.db &&
+    Reflect.apply(nativeActiveGet, job.active, [profileId]) === job.state
+  );
+}
+/** A generation seal does not approve an additional caller authorization closure. */
+export function assistantCompactAssertionPrerequisites(
+  assertion: () => void,
+  db: Database,
+): readonly (() => void)[] | undefined {
+  const proof = compactAssertions.get(assertion),
+    job = proof && compactOwners.get(proof.owner);
+  if (
+    !job ||
+    !assistantCompactOwnerCurrent(proof!.owner, db, job.profileId) ||
+    job.state.generation !== proof!.generation ||
+    job.state.assertAuthorized !== proof!.authorized
+  )
+    return undefined;
+  return proof!.prerequisites;
+}
 function observedHashValuesCurrent(db: Database, state: ActiveState): boolean {
   if (!state.observedSourceHashes?.size) return false;
   for (const [key, observed] of state.observedSourceHashes) {
@@ -2260,6 +2333,8 @@ export function createAssistant({
     assertRunning();
     const db = dbFor(profileId),
       args = params.arguments;
+    const compactOwner = compactStateOwners.get(state);
+    if (compactOwner) bindCompactAssertion(assertRunning, compactOwner, generation);
     if (
       state.checkpoint &&
       chat.reading &&
@@ -4145,6 +4220,9 @@ export function createAssistant({
         required(intake, 'This conversion is no longer linked to the selected delivery'),
       );
     active.set(profileId, state);
+    const compactJob = Object.freeze({}) as AssistantCompactOwner;
+    compactOwners.set(compactJob, { db: dbFor(profileId), databases, profileId, active, state });
+    compactStateOwners.set(state, compactJob);
     const diagnosticContext = {
       profileId,
       // A background conversion outlives the initiating HTTP/browser action.
@@ -4277,8 +4355,7 @@ export function createAssistant({
         'time_limit',
       );
     }, READING_SLICE_MS);
-    const startModelTurn = async () => {
-      const generation = ++state.generation;
+    const runModelTurn = async (generation: number) => {
       const reconcilingCoverage = state.coverageReconciliationPending === true;
       state.coverageReconciliationPending = false;
       // Unacknowledged reads remain durable pending scopes; a fresh model context
@@ -4297,6 +4374,7 @@ export function createAssistant({
             if (active.get(profileId) !== state || state.generation !== generation)
               throw new Error('Draft repair stopped');
           };
+          bindCompactAssertion(assertRunning, compactJob, generation);
           chat.context.intakeRepair = await prepareIntakeDraftRepairScope(
             dbFor(profileId),
             root,
@@ -4317,6 +4395,7 @@ export function createAssistant({
           )
             throw new Error('Conversion stopped');
         };
+        bindCompactAssertion(assertPreparationRunning, compactJob, generation);
         if (conversionFilenamePending(profileId, chat)) {
           await prepareIntakeReadFilenames(
             preparationDb,
@@ -5504,6 +5583,20 @@ export function createAssistant({
                     error.origin === 'slice' ? 'time_limit' : 'context_limit',
                   )
                 : finish('failed', errorMessage(error));
+      }
+    };
+    let compactAuthorizationCaptured = false;
+    const startModelTurn = async () => {
+      const generation = ++state.generation;
+      try {
+        if (!compactAuthorizationCaptured) {
+          captureVaultAssistantAuthorization(compactJob, dbFor(profileId), profileId);
+          compactAuthorizationCaptured = true;
+        }
+        return await withVaultAssistantAuthorization(compactJob, () => runModelTurn(generation));
+      } catch (error) {
+        if (active.get(profileId) === state && state.generation === generation)
+          finish('failed', errorMessage(error));
       }
     };
     void diagnostics.run(diagnosticContext, startModelTurn);

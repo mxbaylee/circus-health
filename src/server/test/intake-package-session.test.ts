@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync, renameSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
@@ -9,6 +10,8 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import { attachRecordDurability, type RecordStorage } from '../record-versions.ts';
 import {
   clearPackageSourceSession,
+  packageSessionAssertionPrerequisites,
+  packageSessionOriginalPhysicalSource,
   packageSourceSessionWork,
   withPackageSessionSource,
 } from '../intake-package-session.ts';
@@ -50,6 +53,103 @@ function fixture(t: test.TestContext) {
   });
   return { context: { db, root, profileId, id }, bytes, storage };
 }
+
+test('terminal session issuer exposes only active exact lease assertions and original dependencies', async (t) => {
+  const { context, storage } = fixture(t);
+  attachRecordDurability(context.db, { profileId: context.profileId, storage });
+  let runningChecks = 0;
+  let publicationChecks = 0;
+  const assertRunning = () => {
+    runningChecks++;
+  };
+  const assertPublicationCurrent = () => {
+    publicationChecks++;
+  };
+  let expired: (() => void) | undefined;
+  await assert.rejects(
+    withPackageSessionSource(
+      { ...context, assertRunning, assertPublicationCurrent },
+      async (lease) => {
+        expired = lease.assertPublicationCurrent;
+        const checks = [runningChecks, publicationChecks];
+        assert.deepEqual(packageSessionAssertionPrerequisites(lease.assertCurrent, context.db), [
+          assertRunning,
+          assertPublicationCurrent,
+        ]);
+        assert.deepEqual(
+          packageSessionAssertionPrerequisites(lease.assertPublicationCurrent, context.db),
+          [assertRunning, assertPublicationCurrent],
+        );
+        assert.deepEqual([runningChecks, publicationChecks], checks);
+        const original = packageSessionOriginalPhysicalSource(
+          lease.assertPublicationCurrent,
+          context.db,
+        );
+        assert.ok(original);
+        assert.equal(original.sourceFd, lease.sourceFd);
+        assert.equal(
+          original.acceptedPath,
+          context.db.prepare('SELECT path FROM source_files WHERE id=?').get(context.id)?.path,
+        );
+        assert.notEqual(original.path, original.acceptedPath);
+        assert.equal(original.binding.sourceHash, lease.binding.sourceHash);
+        assert.equal(Object.isFrozen(original), true);
+        assert.equal(Object.isFrozen(original.binding), true);
+        assert.equal(
+          packageSessionOriginalPhysicalSource(lease.assertCurrent, context.db),
+          original,
+        );
+        assert.equal(
+          packageSessionAssertionPrerequisites(() => lease.assertPublicationCurrent(), context.db),
+          undefined,
+        );
+        const foreign = new DatabaseSync(':memory:');
+        try {
+          assert.equal(
+            packageSessionAssertionPrerequisites(lease.assertPublicationCurrent, foreign),
+            undefined,
+          );
+        } finally {
+          foreign.close();
+        }
+        clearPackageSourceSession(context.db);
+        assert.equal(
+          packageSessionAssertionPrerequisites(lease.assertPublicationCurrent, context.db),
+          undefined,
+        );
+        assert.equal(
+          packageSessionOriginalPhysicalSource(lease.assertPublicationCurrent, context.db),
+          undefined,
+        );
+      },
+    ),
+    { code: 'PROFILE_LOCKED' },
+  );
+  assert.equal(packageSessionAssertionPrerequisites(expired!, context.db), undefined);
+});
+
+test('session physical transport never recaptures a same-byte rewritten original', async (t) => {
+  const { context, storage, bytes } = fixture(t);
+  attachRecordDurability(context.db, { profileId: context.profileId, storage });
+  const row = context.db.prepare('SELECT path FROM source_files WHERE id=?').get(context.id)!;
+  const path = join(context.root, String(row.path));
+  await assert.rejects(
+    withPackageSessionSource(context, async (lease) => {
+      const original = packageSessionOriginalPhysicalSource(
+        lease.assertPublicationCurrent,
+        context.db,
+      );
+      assert.ok(original);
+      writeFileSync(path, bytes);
+      assert.equal(
+        packageSessionOriginalPhysicalSource(lease.assertPublicationCurrent, context.db),
+        original,
+      );
+      assert.throws(() => lease.assertPublicationCurrent(), { code: 'SOURCE_CHANGED' });
+    }),
+    { code: 'SOURCE_CHANGED' },
+  );
+});
 
 test('session cache survives accepted metadata edits but rejects changed source and scoped owner/lifecycle reuse', async (t) => {
   const { context, bytes, storage } = fixture(t);

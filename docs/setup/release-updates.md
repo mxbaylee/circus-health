@@ -30,6 +30,15 @@ it and requires a new authenticated cold proof. The frontier is disposable and
 does not change accepted formats or require an operator setting. Complete
 physical namespace sweeps, metadata-only integration and repeated-source release
 qualification remain gates, not a permitted authority downgrade.
+Its final compact publication now uses a private finite statement inventory
+authorized by the installed prepare-time policy before original physical
+verification. Unknown callback-only owner conditions, SQL, method replacement
+or reprepare refuse rather than bypass that policy. Package-source leases also
+retain their original FD/path and structural parent identity in that worker,
+including the no-workspace adapter path. Existing in-root aliases must remain
+the same original alias; cold vault and full-workspace symlink rules are unchanged.
+These checks need no operator setting or accepted-format
+migration; integrated compatibility and release validation remain open.
 Contributor and portable compatibility writes also check their source preimage
 against immutable accepted history, not mutually matching cache rows. A refused
 altered cache must be reconstructed from its unchanged accepted record storage;

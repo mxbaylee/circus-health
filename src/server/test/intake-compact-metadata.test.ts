@@ -1,12 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { openDatabase, transaction, observeTransactionBeforePublication } from '../database.ts';
+import { Worker } from 'node:worker_threads';
+import { withPackageSessionSource } from '../intake-package-session.ts';
+import {
+  openDatabase,
+  transaction,
+  observeTransactionBeforePublication,
+  observeTransactionOutcome,
+} from '../database.ts';
 import {
   attachRecordDurability,
+  recordDurabilityStatus,
   rebuildRecordDatabase,
   type RecordStorage,
   type DurableRecordVersion,
@@ -15,6 +23,11 @@ import { constants } from 'node:sqlite';
 import { openVault } from '../vault-store.ts';
 import { freshKey } from '../vault-crypto.ts';
 import { withManagedPhysicalMutation } from '../clinical-review-physical-epoch.ts';
+import {
+  captureIntakeFrontierAttempts,
+  ensureIntakeFrontierObserver,
+  readIntakeFrontierAttempts,
+} from '../intake-lookup-frontier-observer.ts';
 import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
 import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
@@ -28,6 +41,7 @@ import {
   intakeSourceMetadata,
   intakeMetadataScalarReference,
   intakeFirstLocatorMatches,
+  intakeFirstLocatorMatchesCooperatively,
 } from '../intake-state-access.ts';
 import { prepareIntakeCompactMetadata } from '../intake-compact-metadata.ts';
 import { intakeCompactSourceRowsEqual } from '../intake-state-migration.ts';
@@ -206,9 +220,53 @@ test(
       .details_json as string;
     assert.ok(Buffer.byteLength(first) < 2048);
     assert.equal(JSON.parse(first).intakeAuthority.format, INTAKE_COMPACT_ENVELOPE_FORMAT);
+    ensureIntakeFrontierObserver(db);
+    const beforeRestore = captureIntakeFrontierAttempts(db);
+    assert.ok(beforeRestore);
     transaction(db, () =>
       db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(initial.detailsJson, id),
     );
+    assert.equal(readIntakeFrontierAttempts(db, beforeRestore), undefined);
+    assert.equal(
+      db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)?.details_json,
+      initial.detailsJson,
+    );
+    const restoredStatus = recordDurabilityStatus(db);
+    assert.equal(restoredStatus?.configured, true);
+    assert.equal(restoredStatus?.dirty, false);
+    assert.equal(restoredStatus?.conflicted, false);
+    assert.equal(db.prepare('SELECT 1 FROM temp.__record_changed LIMIT 1').get(), undefined);
+    assert.equal(
+      authority.storage.read('head')?.toString('utf8'),
+      String(
+        db.prepare('SELECT head_json FROM __record_state WHERE singleton=1').get()?.head_json,
+      ) + '\n',
+    );
+    // The direct low-level collection phase starts after an accepted source rewrite.
+    ensureIntakeFrontierObserver(db);
+    assert.ok(captureIntakeFrontierAttempts(db));
+    let setupRestores = 0,
+      identicalSetupSkips = 0;
+    const restoreInitialDetails = () => {
+      const current = db
+        .prepare('SELECT details_json FROM source_files WHERE id=?')
+        .get(id)?.details_json;
+      if (current === initial.detailsJson) {
+        const status = recordDurabilityStatus(db);
+        assert.equal(status?.configured, true);
+        assert.equal(status?.dirty, false);
+        assert.equal(status?.conflicted, false);
+        assert.equal(db.prepare('SELECT 1 FROM temp.__record_changed LIMIT 1').get(), undefined);
+        identicalSetupSkips++;
+        return;
+      }
+      transaction(db, () =>
+        db
+          .prepare('UPDATE source_files SET details_json=? WHERE id=?')
+          .run(initial.detailsJson, id),
+      );
+      setupRestores++;
+    };
     const collections = selectedEnvelopeStore(db, source).collections;
     const cells = new Set<string>();
     for (const fieldSelection of ['first', 'last'] as const) {
@@ -326,6 +384,15 @@ test(
       false,
       'SQL first occurrence is not JSON.parse last occurrence',
     );
+    assert.equal(
+      await intakeFirstLocatorMatchesCooperatively(db, id, firstLocator, () => {}),
+      true,
+    );
+    assert.equal(
+      await intakeFirstLocatorMatchesCooperatively(db, id, locator, () => {}),
+      false,
+      'cooperative lookup retains SQL first-occurrence semantics',
+    );
 
     const contracted = String(
       db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!.details_json,
@@ -340,11 +407,7 @@ test(
     assert.throws(() => intakeSourceMetadata(db, id), /conflicts with exact evidence/);
 
     for (const mutation of ['cancel', 'function', 'authorizer', 'rowid'] as const) {
-      transaction(db, () =>
-        db
-          .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-          .run(initial.detailsJson, id),
-      );
+      restoreInitialDetails();
       const collections = createIntakeStateStorage(db, {
         profileId,
         intakeId: id,
@@ -376,31 +439,9 @@ test(
       );
       assert.equal(JSON.stringify(collections.binding(collections.openView())), headBefore);
     }
-    transaction(db, () =>
-      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(initial.detailsJson, id),
-    );
-    const acceptedMime = db
-      .prepare('SELECT mime_type FROM source_files WHERE id=?')
-      .get(id)!.mime_type;
-    db.prepare('UPDATE source_files SET mime_type=? WHERE id=?').run('fictional/unaccepted', id);
-    try {
-      await assert.rejects(
-        prepareIntakeCompactMetadata(db, source),
-        /differs from its accepted prior version/,
-      );
-      assert.equal(
-        db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!.details_json,
-        initial.detailsJson,
-      );
-    } finally {
-      db.prepare('UPDATE source_files SET mime_type=? WHERE id=?').run(acceptedMime, id);
-    }
+    restoreInitialDetails();
     for (const mutation of ['sourceABA', 'extraRow'] as const) {
-      transaction(db, () =>
-        db
-          .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-          .run(initial.detailsJson, id),
-      );
+      restoreInitialDetails();
       let called = false;
       const remove = observeTransactionBeforePublication(db, () => {
         if (called) return;
@@ -432,9 +473,7 @@ test(
         undefined,
       );
     }
-    transaction(db, () =>
-      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(initial.detailsJson, id),
-    );
+    restoreInitialDetails();
     const readObject = authority.storage.read,
       writeObject = authority.storage.writeImmutable,
       originalSequence = db.prepare('SELECT sequence FROM __record_state WHERE singleton=1').get()!
@@ -496,6 +535,34 @@ test(
     assert.ok(
       Buffer.byteLength(JSON.stringify(getIntakeEvidenceHeader(db, root, profileId, id))) < 2048,
     );
+    restoreInitialDetails();
+    const acceptedMime = db
+      .prepare('SELECT mime_type FROM source_files WHERE id=?')
+      .get(id)!.mime_type;
+    const acceptedHead = authority.storage.read('head');
+    // Raw byte restoration is not accepted recovery; leave this dirty-cache probe last.
+    db.prepare('UPDATE source_files SET mime_type=? WHERE id=?').run('fictional/unaccepted', id);
+    try {
+      await assert.rejects(
+        prepareIntakeCompactMetadata(db, source),
+        /differs from its accepted prior version/,
+      );
+      assert.equal(
+        db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!.details_json,
+        initial.detailsJson,
+      );
+      assert.deepEqual(authority.storage.read('head'), acceptedHead);
+    } finally {
+      db.prepare('UPDATE source_files SET mime_type=? WHERE id=?').run(acceptedMime, id);
+    }
+    assert.throws(
+      () => transaction(db, () => undefined),
+      /uncommitted direct writes bypassed the transaction boundary/,
+    );
+    assert.deepEqual(authority.storage.read('head'), acceptedHead);
+    assert.ok(setupRestores >= 1);
+    assert.ok(identicalSetupSkips >= 1);
+    t.diagnostic(JSON.stringify({ setupRestores, identicalSetupSkips }));
   },
 );
 
@@ -568,6 +635,113 @@ test(
     }
   },
 );
+
+test('committed compact result survives a failed new-summary readmission', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-compact-readmission-'));
+  const profileId = 'fictional-compact-readmission',
+    id = 'fictional-readmission-intake';
+  const paths = ensureProfileDirectories(root, profileId);
+  const db = openDatabase(paths.database, profileId);
+  const authority = memoryRecordAuthority(db);
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const original = Buffer.from('Independently fictional readmission source.');
+  const sourceHash = createHash('sha256').update(original).digest('hex');
+  const path = profilePaths(root, profileId).relativeRoot + '/sources/fictional.pdf';
+  writeFileSync(join(root, path), original);
+  const initial = prepareInitialIntakeEnvelope({
+    intake: {
+      version: 1,
+      originalName: 'fictional-' + 'retained-long-name-'.repeat(1500) + '.pdf',
+      state: 'ready',
+      proposals: [],
+      importHistory: [],
+    },
+  });
+  transaction(db, () => {
+    db.prepare(
+      'INSERT INTO source_files(id,path,sha256,bytes,kind,mime_type,details_json) VALUES(?,?,?,?,?,?,?)',
+    ).run(
+      id,
+      path,
+      sourceHash,
+      original.length,
+      'intake_original',
+      'application/pdf',
+      initial.detailsJson,
+    );
+    createIntakeStateStorage(db, { profileId, intakeId: id, sourceHash }).stage(
+      initial.state,
+      randomUUID(),
+    );
+  });
+  const source = { id, sha256: sourceHash };
+  await buildIntakeCollectionEnvelope(db, source);
+  transaction(db, () =>
+    db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(initial.detailsJson, id),
+  );
+  let committedReadmission = false,
+    denyReadmission = false,
+    deniedReadmission = false;
+  const stopOutcome = observeTransactionOutcome(db, (outcome) => {
+    if (!outcome.committed || !outcome.succeeded || !outcome.intakeMaintenance) return;
+    const details = db
+      .prepare('SELECT details_json FROM source_files WHERE id=?')
+      .get(id)?.details_json;
+    if (
+      typeof details === 'string' &&
+      details.startsWith('{"intakeAuthority":{"format":"' + INTAKE_COMPACT_ENVELOPE_FORMAT)
+    ) {
+      committedReadmission = true;
+      denyReadmission = true;
+    }
+  });
+  db.setAuthorizer((action, table) => {
+    if (
+      denyReadmission &&
+      !db.isTransaction &&
+      action === constants.SQLITE_READ &&
+      table === '__record_state'
+    ) {
+      denyReadmission = false;
+      deniedReadmission = true;
+      return constants.SQLITE_DENY;
+    }
+    return constants.SQLITE_OK;
+  });
+  const beforeHead = authority.storage.read('head')!.toString('utf8');
+  const beforeVersion = db
+    .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
+    .get('source_files', JSON.stringify([id]))!.version_id;
+  try {
+    assert.equal((await prepareIntakeCompactMetadata(db, source)).changed, true);
+  } finally {
+    stopOutcome();
+  }
+  assert.equal(committedReadmission, true);
+  assert.equal(deniedReadmission, true);
+  assert.notEqual(authority.storage.read('head')!.toString('utf8'), beforeHead);
+  assert.notEqual(
+    db
+      .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
+      .get('source_files', JSON.stringify([id]))!.version_id,
+    beforeVersion,
+  );
+  assert.equal(
+    JSON.parse(
+      String(db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!.details_json),
+    ).intakeAuthority.format,
+    INTAKE_COMPACT_ENVELOPE_FORMAT,
+  );
+  assert.equal(captureIntakeFrontierAttempts(db), undefined);
+  assert.throws(() => ensureIntakeFrontierObserver(db), /compact readmission is unavailable/);
+  await assert.rejects(
+    buildIntakeCollectionEnvelope(db, source),
+    /compact readmission is unavailable/,
+  );
+});
 
 test(
   'actual encrypted compact publication retains the original authority through owned staging and late HEAD callbacks',
@@ -707,7 +881,16 @@ test(
       .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
       .get('source_files', JSON.stringify([id]))!.version_id;
     const head = storage.read('head')!.toString('utf8');
-    assert.equal((await prepareIntakeCompactMetadata(db, source)).changed, true);
+    assert.equal(
+      (
+        await withPackageSessionSource({ db, root, profileId, id }, (lease) =>
+          prepareIntakeCompactMetadata(db, source, {
+            assertPublicationCurrent: lease.assertPublicationCurrent,
+          }),
+        )
+      ).changed,
+      true,
+    );
     assert.notEqual(storage.read('head')!.toString('utf8'), head);
     const current = db
       .prepare(
@@ -726,6 +909,48 @@ test(
       db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(initial.detailsJson, id),
     );
     const beforeRefusal = storage.read('head')!.toString('utf8');
+    let plaintextMutation = false;
+    const originalEmit = Worker.prototype.emit;
+    Worker.prototype.emit = function (event: string | symbol, ...args: unknown[]) {
+      const message = args[0] as { checkpoint?: boolean; phase?: string; mode?: string };
+      if (
+        !plaintextMutation &&
+        event === 'message' &&
+        message?.checkpoint &&
+        message.mode === 'verify' &&
+        message.phase === 'leased-source'
+      ) {
+        plaintextMutation = true;
+        const changed = Buffer.from(original);
+        changed[0] = changed[0]! ^ 1;
+        writeFileSync(join(root, path), changed);
+        writeFileSync(join(root, path), original);
+      }
+      return Reflect.apply(originalEmit, this, [event, ...args]);
+    };
+    try {
+      await assert.rejects(
+        withPackageSessionSource({ db, root, profileId, id }, (lease) =>
+          prepareIntakeCompactMetadata(db, source, {
+            assertPublicationCurrent: lease.assertPublicationCurrent,
+          }),
+        ),
+        /Vault original backing verification refused/,
+      );
+    } finally {
+      Worker.prototype.emit = originalEmit;
+    }
+    assert.equal(
+      plaintextMutation,
+      true,
+      'raw same-byte rewrite at the original source worker page',
+    );
+    assert.equal(storage.read('head')!.toString('utf8'), beforeRefusal);
+    assert.deepEqual(readFileSync(join(root, path)), original);
+    assert.equal(
+      db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!.details_json,
+      initial.detailsJson,
+    );
     consumedRecordPath = join(
       paths.root,
       'vault/versions',
@@ -827,11 +1052,14 @@ test(
     // rollback boundary. Reconstruct from accepted evidence for the next trial.
     restoreAcceptedProjection();
     mutateIndexed = true;
-    await assert.rejects(prepareIntakeCompactMetadata(db, source), /late mutation|closing SQL/);
+    await assert.rejects(
+      prepareIntakeCompactMetadata(db, source),
+      /late mutation|closing SQL|compact metadata source\/head\/physical authority changed/,
+    );
     assert.equal(
       indexedMutation,
       true,
-      'a supported policy callback during private indexing was exercised',
+      'a supported policy callback compiling private indexing was exercised',
     );
     assert.equal(storage.read('head')!.toString('utf8'), beforeRefusal);
     assert.equal(
@@ -843,7 +1071,7 @@ test(
     mutateIndexedRawPhysical = true;
     await assert.rejects(
       prepareIntakeCompactMetadata(db, source),
-      /physical|authority|publication|callback/i,
+      /physical|authority|publication|callback|Vault original backing verification refused/i,
     );
     assert.equal(
       indexedRawPhysicalMutation,
@@ -855,7 +1083,7 @@ test(
     mutateIndexedPhysical = true;
     await assert.rejects(
       prepareIntakeCompactMetadata(db, source),
-      /Immutable record head preparation expired/,
+      /Immutable record head preparation expired|compact metadata source\/head\/physical authority changed/,
     );
     assert.equal(indexedPhysicalMutation, true);
     assert.equal(storage.read('head')!.toString('utf8'), beforeRefusal);
@@ -878,6 +1106,123 @@ test(
     assert.equal(storage.read('head')!.toString('utf8'), beforeRefusal);
     assert.equal(
       db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!.details_json,
+      initial.detailsJson,
+    );
+  },
+);
+
+test(
+  'actual warm no-workspace compact lease preserves its original parent alias and refuses replacement',
+  { timeout: 30000 },
+  async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-compact-parent-alias-')),
+      profileId = 'fictional-parent-alias',
+      ids = ['fictional-cold-source', 'fictional-alias-positive', 'fictional-alias-negative'],
+      paths = ensureProfileDirectories(root, profileId),
+      db = openDatabase(paths.database, profileId),
+      key = freshKey(),
+      vault = openVault({ directory: paths.root, profileId, key, initialize: true });
+    t.after(() => {
+      db.close();
+      vault.close();
+      key.fill(0);
+      rmSync(root, { recursive: true, force: true });
+    });
+    const sourceDirectory = join(paths.root, 'sources'),
+      targetDirectory = join(paths.root, 'original-target');
+    const bytes = Buffer.from('Independently fictional alias original.'),
+      hash = createHash('sha256').update(bytes).digest('hex'),
+      storage = vault.recordStorage();
+    const sourcePath = (id: string) => paths.relativeRoot + '/sources/' + id + '.pdf';
+    for (const id of ids) {
+      writeFileSync(join(root, sourcePath(id)), bytes);
+      vault.storeFile(sourcePath(id), bytes);
+    }
+    vault.publish();
+    attachRecordDurability(db, { profileId, storage });
+    const initial = prepareInitialIntakeEnvelope({
+      intake: {
+        version: 1,
+        originalName: 'fictional-alias-' + 'retained-name-'.repeat(3000) + '.pdf',
+        state: 'ready',
+        proposals: [],
+        importHistory: [],
+      },
+    });
+    transaction(db, () => {
+      for (const id of ids) {
+        db.prepare(
+          'INSERT INTO source_files(id,path,sha256,bytes,kind,mime_type,details_json) VALUES(?,?,?,?,?,?,?)',
+        ).run(
+          id,
+          sourcePath(id),
+          hash,
+          bytes.length,
+          'intake_original',
+          'application/pdf',
+          initial.detailsJson,
+        );
+        createIntakeStateStorage(db, { profileId, intakeId: id, sourceHash: hash }).stage(
+          initial.state,
+          randomUUID(),
+        );
+      }
+    });
+    for (const id of ids) await buildIntakeCollectionEnvelope(db, { id, sha256: hash });
+    transaction(db, () => {
+      for (const id of ids)
+        db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(
+          initial.detailsJson,
+          id,
+        );
+    });
+    const prepare = (id: string) =>
+      withPackageSessionSource({ db, root, profileId, id }, (lease) =>
+        prepareIntakeCompactMetadata(
+          db,
+          { id, sha256: hash },
+          {
+            assertPublicationCurrent: lease.assertPublicationCurrent,
+          },
+        ),
+      );
+    // Cold vault opening still rejects profile-tree symlinks. The certificate
+    // frontier is first authenticated against the original ordinary tree.
+    assert.equal((await prepare(ids[0]!)).changed, true);
+    renameSync(sourceDirectory, targetDirectory);
+    symlinkSync(targetDirectory, sourceDirectory);
+    assert.equal((await prepare(ids[1]!)).changed, true, 'warm original alias is supported');
+    const head = storage.read('head')!,
+      manifest = readFileSync(join(paths.root, 'vault/manifest.enc')),
+      emit = Worker.prototype.emit;
+    let replaced = false;
+    Worker.prototype.emit = function (event: string | symbol, ...args: unknown[]) {
+      const message = args[0] as { checkpoint?: boolean; mode?: string; phase?: string };
+      if (
+        !replaced &&
+        event === 'message' &&
+        message?.checkpoint &&
+        message.mode === 'verify' &&
+        message.phase === 'leased-source'
+      ) {
+        replaced = true;
+        const replacement = sourceDirectory + '.replacement';
+        symlinkSync(targetDirectory, replacement);
+        renameSync(replacement, sourceDirectory);
+      }
+      return Reflect.apply(emit, this, [event, ...args]);
+    };
+    try {
+      await assert.rejects(prepare(ids[2]!), /Vault original backing verification refused/);
+    } finally {
+      Worker.prototype.emit = emit;
+    }
+    assert.equal(replaced, true);
+    assert.deepEqual(storage.read('head'), head);
+    assert.deepEqual(readFileSync(join(paths.root, 'vault/manifest.enc')), manifest);
+    assert.deepEqual(readFileSync(join(root, sourcePath(ids[2]!))), bytes);
+    assert.equal(
+      db.prepare('SELECT details_json FROM source_files WHERE id=?').get(ids[2]!)!.details_json,
       initial.detailsJson,
     );
   },

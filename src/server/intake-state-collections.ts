@@ -1,6 +1,10 @@
 /** V4 bounded collections owned and staged by intake-state-storage. */
+import { constants } from 'node:sqlite';
+import { terminalStatement } from './database-terminal-statements.ts';
 import {
   currentTransactionToken,
+  managedDatabaseMethodEpoch,
+  observeManagedDatabaseAuthorization,
   rejectCurrentTransaction,
   transaction,
   type Database,
@@ -8,13 +12,22 @@ import {
 import {
   prepareIntakeMaintenancePublication,
   stageIntakeCompactMetadataPublication,
+  prepareIntakeCompactReadmission,
+  prepareIntakeCompactTerminalPublication,
+  withIntakeCompactTerminalPublication,
 } from './intake-state-maintenance.ts';
+import { currentClinicalOperation, assertClinicalOperation } from './clinical-operation.ts';
 import {
+  blockIntakeFrontierReadmission,
+  captureIntakeFrontierAttempts,
+  ensureIntakeFrontierObserver,
   expectIntakeFrontierMetaWrite,
   finishIntakeFrontierMetaWrite,
 } from './intake-lookup-frontier-observer.ts';
+import { assertRecordCompactReadmission } from './record-versions.ts';
 import {
   prepareIntakeLegacyBridgeProof,
+  type IntakeLegacyBridgeReadWitness,
   prepareIntakeSchemaAdoptionProof,
   prepareIntakeSchemaAdoptionProofAsync,
   validateIntakeLegacyBridgeControl,
@@ -410,8 +423,8 @@ export function createIntakeCollections(owner: {
   let readEpoch: object = {};
   const readWitness = () => {
     recordIntakeWork('collectionReadWitnessQueries', 2);
-    const stamp = readGeneration.get()!,
-      temp = readTempGeneration.get()!;
+    const stamp = terminalStatement(db, readGeneration.sourceSQL, readGeneration, true).get()!,
+      temp = terminalStatement(db, readTempGeneration.sourceSQL, readTempGeneration, true).get()!;
     return `${stamp.changes}:${stamp.external}:${stamp.schema}:${temp.schema_version}`;
   };
   const get = (key: string) => owner.get(key, key === headKey ? HEAD_BYTES : 32 * 1024);
@@ -951,11 +964,14 @@ export function createIntakeCollections(owner: {
     return { chunks, bytes, complete, after: complete ? null : after };
   };
   const api = {
-    prepareLegacyBridge(input: {
-      operationId: string;
-      requestDigest: string;
-      domainVersion: number;
-    }): PreparedIntakeCollectionMutation {
+    prepareLegacyBridge(
+      input: {
+        operationId: string;
+        requestDigest: string;
+        domainVersion: number;
+      },
+      originalRead?: IntakeLegacyBridgeReadWitness,
+    ): PreparedIntakeCollectionMutation {
       return run(() => {
         const raw = get(headKey);
         const legacy = parseIntakeHead(raw, identity, limits());
@@ -968,18 +984,22 @@ export function createIntakeCollections(owner: {
           legacy,
         });
         try {
-          return api.prepare(view, {
-            ...input,
-            changes: [
-              {
-                area: 'logical',
-                collection: 'envelope.control',
-                op: 'put',
-                key: 'representation',
-                value: INTAKE_LEGACY_BRIDGE_CONTROL,
-              },
-            ],
-          });
+          return api.prepare(
+            view,
+            {
+              ...input,
+              changes: [
+                {
+                  area: 'logical',
+                  collection: 'envelope.control',
+                  op: 'put',
+                  key: 'representation',
+                  value: INTAKE_LEGACY_BRIDGE_CONTROL,
+                },
+              ],
+            },
+            originalRead,
+          );
         } finally {
           registryFor(db).views.delete(view);
         }
@@ -1350,6 +1370,7 @@ export function createIntakeCollections(owner: {
     prepare(
       view: IntakeCollectionView,
       input: IntakeCollectionMutation,
+      originalRead?: IntakeLegacyBridgeReadWitness,
     ): PreparedIntakeCollectionMutation {
       // Do not inherit a caller's optimistic read, even if an input getter
       // starts this preparation from another read. Existing page-cache bounds
@@ -1702,12 +1723,16 @@ export function createIntakeCollections(owner: {
           discard(registry.preparations.keys().next().value!);
         registry.preparedBytes += size;
         const legacyBridge = before.legacy
-          ? prepareIntakeLegacyBridgeProof(db, {
-              identity,
-              beforeHead: before.raw!,
-              afterHead: after,
-              writes,
-            })
+          ? prepareIntakeLegacyBridgeProof(
+              db,
+              {
+                identity,
+                beforeHead: before.raw!,
+                afterHead: after,
+                writes,
+              },
+              originalRead,
+            )
           : undefined;
         registry.preparations.set(prepared, {
           prefix,
@@ -1797,11 +1822,10 @@ export function createIntakeCollections(owner: {
         let headWritten = false;
         try {
           headWritten =
-            db
-              .prepare(
-                'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-              )
-              .run(headKey, data.after).changes === 1;
+            terminalStatement(
+              db,
+              'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+            ).run(headKey, data.after).changes === 1;
         } finally {
           finishIntakeFrontierMetaWrite(db, expectedHead, headWritten);
         }
@@ -1848,7 +1872,7 @@ export function createIntakeCollections(owner: {
     },
     async certifyCompactMetadataAsync(
       prepared: PreparedIntakeCollectionMutation,
-      options: { assertRunning?: () => void } = {},
+      options: { assertRunning?: () => void; deferredTerminal?: boolean } = {},
     ): Promise<boolean> {
       const data = run(() => inspect(prepared));
       if (data.before === undefined || data.legacyBridge || data.compactMetadata)
@@ -1877,6 +1901,101 @@ export function createIntakeCollections(owner: {
         data.compactMetadata = proof;
       });
       return true;
+    },
+    async commitCompactMaintenanceAsync(
+      prepared: PreparedIntakeCollectionMutation,
+      options: { assertCurrent?: () => void } = {},
+    ): Promise<IntakeCollectionResult> {
+      const operation = currentClinicalOperation(db),
+        stage = api.stage,
+        data = run(() => inspect(prepared));
+      if (!operation || !data.compactMetadata || data.legacyBridge || data.before === undefined)
+        invalid('compact terminal collection preparation');
+      options.assertCurrent?.();
+      const fingerprint = prefix + data.requestDigest,
+        capability = prepareIntakeMaintenancePublication(db, {
+          identity,
+          beforeHead: data.before!,
+          afterHead: data.after,
+          writes: data.writes,
+          result: data.result,
+          operationId: data.result.operationId,
+          fingerprint,
+          compactMetadata: data.compactMetadata,
+          assertCurrent: options.assertCurrent,
+        });
+      const readmission = prepareIntakeCompactReadmission(db, capability);
+      const terminal = await prepareIntakeCompactTerminalPublication(db, capability);
+      const assertCurrent = () => assertClinicalOperation(db, operation);
+      const commit = () =>
+        transaction(
+          db,
+          () => {
+            assertCurrent();
+            bridgeTransaction = currentTransactionToken(db);
+            try {
+              const result = stage(prepared, { assertCurrent });
+              stageIntakeCompactMetadataPublication(db, capability);
+              return result;
+            } finally {
+              bridgeTransaction = undefined;
+            }
+          },
+          {
+            operationId: data.result.operationId,
+            fingerprint,
+            actor: 'intake-state',
+            intakeMaintenance: capability,
+          },
+        );
+      const result = terminal
+        ? withIntakeCompactTerminalPublication(db, capability, commit)
+        : commit();
+      let attempted = false;
+      let admitted = false;
+      let stop: ReturnType<typeof observeManagedDatabaseAuthorization>;
+      try {
+        const methods = managedDatabaseMethodEpoch(db);
+        stop = observeManagedDatabaseAuthorization(
+          db,
+          (action, name, detail) => {
+            const readOnlyPragma =
+              action === constants.SQLITE_PRAGMA &&
+              (name === 'schema_version' || name === 'data_version') &&
+              detail == null;
+            if (
+              action !== constants.SQLITE_READ &&
+              action !== constants.SQLITE_SELECT &&
+              action !== constants.SQLITE_FUNCTION &&
+              !readOnlyPragma
+            )
+              attempted = true;
+          },
+          () => {
+            attempted = true;
+          },
+        );
+        if (!methods || !stop || attempted) throw Error('compact readmission unavailable');
+        assertRecordCompactReadmission(db, readmission);
+        if (attempted || managedDatabaseMethodEpoch(db) !== methods)
+          throw Error('compact readmission changed');
+        admitted = true;
+        ensureIntakeFrontierObserver(db);
+        if (!captureIntakeFrontierAttempts(db)) throw Error('compact frontier unavailable');
+        assertRecordCompactReadmission(db, readmission);
+        if (attempted || managedDatabaseMethodEpoch(db) !== methods)
+          throw Error('compact readmission changed');
+      } catch {
+        admitted = false;
+      } finally {
+        try {
+          stop?.();
+        } catch {
+          admitted = false;
+        }
+      }
+      if (!admitted) blockIntakeFrontierReadmission(db);
+      return result;
     },
     commitMaintenance(
       prepared: PreparedIntakeCollectionMutation,

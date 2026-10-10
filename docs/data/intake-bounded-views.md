@@ -366,6 +366,29 @@ The compact workspace path instead compares the workspace against the accepted
 manifest in its worker; it does not invoke the ordinary workspace callback again
 or authorize arbitrary publication callbacks.
 
+The actual compact path compiles a finite native SQL inventory through the
+installed prepare-time policy before its last physical worker, then reuses only
+those private statements in the fixed synchronous transaction. Unknown SQL,
+callback re-entry, automatic reprepare and changed method/schema ownership refuse
+the publication; they do not receive policy approval. No main SQL transaction
+spans the worker. Genuine request, assistant and source-session liveness must
+retain their original callback prerequisites; an unrelated caller condition is
+not authorized by a session token.
+When a package source is consumed, its original lease FD, file/path identity and
+source binding join the signed disk proof even without a configured workspace.
+The final worker checks the same originals, including raw same-byte rewrites.
+After a successful compact commit, new summary work obtains a separate checked
+admission; it never revives the original proof. If that admission fails, the
+accepted result and HEAD remain valid, but the connection refuses further
+selected work until it is reopened. In-place observer renewal is not recovery.
+Original in-root parent aliases retain their exact kind, dev/ino/mode and
+canonical target; this is structural parent binding, not complete directory
+membership. Complete vault/workspace membership remains a separate proof.
+Lease aliases do not relax cold vault-opening or full-workspace symlink refusal.
+Acknowledged bounded worker checkpoints retain current ownership without letting
+the worker run ahead of a checkpoint. Integrated caller, alias and final
+publication qualification remains an open release gate.
+
 The actual vault's first compatibility proof reconstructs accepted profile
 history and retains a private disk-backed certificate index for all current
 source and metadata predecessors. Authenticated point paths prove both membership

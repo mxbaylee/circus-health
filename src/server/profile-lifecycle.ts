@@ -139,6 +139,18 @@ export interface ProfileLifecycle {
   close(): void;
 }
 type SaveProfileNote = (db: Database, id: string, input: Record<string, unknown>) => unknown;
+const lifecycleOwners = new WeakMap<
+  ProfileLifecycle,
+  { locks: Set<string>; lifetime: { closed: boolean } }
+>();
+const nativeLockHas = Set.prototype.has;
+/** Only lifecycle instances constructed here carry private lock provenance. */
+export function profileLifecycleAvailable(lifecycle: ProfileLifecycle, profileId: string): boolean {
+  const owner = lifecycleOwners.get(lifecycle);
+  return (
+    !!owner && !owner.lifetime.closed && !Reflect.apply(nativeLockHas, owner.locks, [profileId])
+  );
+}
 const nameOf = (input: unknown): string => {
   if (
     typeof input !== 'string' ||
@@ -696,13 +708,17 @@ export function createProfileLifecycle({
       if (!existsSync(receipt)) locks.delete(id);
     }
   }
-  return {
+  const lifetime = { closed: false };
+  const lifecycle: ProfileLifecycle = {
     list,
     create,
     remove,
     isLocked: (id: string) => locks.has(id),
     close() {
       closed = true;
+      lifetime.closed = true;
     },
   };
+  lifecycleOwners.set(lifecycle, { locks, lifetime });
+  return lifecycle;
 }

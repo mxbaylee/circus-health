@@ -7,11 +7,13 @@ import { DatabaseSync, constants } from 'node:sqlite';
 import {
   installManagedDatabaseAuthorization,
   installManagedDatabaseFunctionRegistration,
+  currentTransactionToken,
   transaction,
 } from '../database.ts';
 import {
   applyObservedClinicalProjectionChangeset,
   beginIntakeFrontierAuxiliaryPreparation,
+  blockIntakeFrontierReadmission,
   captureIntakeFrontierAttempts,
   ensureIntakeFrontierObserver,
   execIntakeFrontierAuxiliarySQL,
@@ -20,8 +22,10 @@ import {
   finishIntakeFrontierAuxiliaryPreparation,
   prepareIntakeFrontierAuxiliaryInsert,
   finishIntakeFrontierMetaWrite,
+  intakeFrontierAttemptCounts,
   readIntakeFrontierAttempts,
   readIntakeFrontierAcceptedTransition,
+  readIntakeFrontierOwnedLookupDirtyWrite,
   readIntakeFrontierSourceEquality,
   runIntakeFrontierAuxiliaryInsert,
 } from '../intake-lookup-frontier-observer.ts';
@@ -87,6 +91,26 @@ test('frontier observer preserves a previously installed deny policy', (t) => {
     f.db.prepare("SELECT value FROM app_meta WHERE key='other/head'").get()?.value,
     'retained',
   );
+});
+
+test('failed compact readmission cannot renew a revoked frontier', (t) => {
+  const f = fixture(t);
+  blockIntakeFrontierReadmission(f.db);
+  assert.equal(readIntakeFrontierAttempts(f.db, f.captured), undefined);
+  assert.equal(captureIntakeFrontierAttempts(f.db), undefined);
+  assert.throws(() => ensureIntakeFrontierObserver(f.db), /compact readmission is unavailable/);
+});
+
+test('failed compact readmission cannot install a frontier later', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    blockIntakeFrontierReadmission(db);
+    installManagedDatabaseAuthorization(db);
+    installManagedDatabaseFunctionRegistration(db);
+    assert.throws(() => ensureIntakeFrontierObserver(db), /compact readmission is unavailable/);
+  } finally {
+    db.close();
+  }
 });
 
 test('frontier observer sees DDL prepared before listener installation', (t) => {
@@ -383,6 +407,34 @@ test('frontier observer renews one function and trigger set before a new cold pr
   assert.equal(result.ordinaryTokens.length, 1);
 });
 
+test('renewing a frontier rearms precompiled direct source-text tracking writes', (t) => {
+  const f = fixture(t, (db) =>
+    db.exec('CREATE TEMP TABLE __source_text_dirty(source_id TEXT PRIMARY KEY)'),
+  );
+  const direct = f.db.prepare(
+    "INSERT OR IGNORE INTO temp.__source_text_dirty(source_id) VALUES('selected')",
+  );
+  assert.equal(readIntakeFrontierAttempts(f.db, f.captured), undefined);
+  ensureIntakeFrontierObserver(f.db);
+  const renewed = captureIntakeFrontierAttempts(f.db);
+  assert.ok(renewed);
+  assert.equal(direct.run().changes, 1);
+  assert.equal(readIntakeFrontierAttempts(f.db, renewed), undefined);
+  assert.equal(
+    intakeFrontierAttemptCounts(f.db)?.firstRevocation,
+    'unowned source-text tracking write',
+  );
+  ensureIntakeFrontierObserver(f.db);
+  const repeated = captureIntakeFrontierAttempts(f.db);
+  assert.ok(repeated);
+  assert.equal(direct.run().changes, 0);
+  assert.equal(readIntakeFrontierAttempts(f.db, repeated), undefined);
+  assert.equal(
+    intakeFrontierAttemptCounts(f.db)?.firstRevocation,
+    'unowned source-text tracking write',
+  );
+});
+
 test('frontier observer counts only one fixed owned write, including preprepared SQL', (t) => {
   const f = fixture(t);
   transaction(f.db, f.ownerWrite, { actor: 'source-text' });
@@ -393,6 +445,87 @@ test('frontier observer counts only one fixed owned write, including preprepared
   assert.deepEqual(result.headSourceIds, []);
   assert.equal(result.ordinaryTokens.length, 1);
 });
+
+test('selected lookup dirty credit requires the original fixed head write and key', (t) => {
+  const f = fixture(t, (db) => {
+    db.exec(`CREATE TEMP TABLE __intake_lookup_authorities(authority_key TEXT PRIMARY KEY,source_id TEXT);
+      CREATE TEMP TABLE __intake_lookup_dirty(source_id TEXT PRIMARY KEY);
+      INSERT INTO temp.__intake_lookup_authorities VALUES('selected/head','selected');
+      CREATE TEMP TRIGGER __intake_lookup_authority_UPDATE AFTER UPDATE ON main.app_meta BEGIN
+        INSERT INTO __intake_lookup_dirty SELECT source_id FROM __intake_lookup_authorities
+          WHERE authority_key=NEW.key AND NOT EXISTS(
+            SELECT 1 FROM __intake_lookup_dirty WHERE source_id='selected');
+      END;`);
+  });
+  transaction(
+    f.db,
+    () => {
+      const token = currentTransactionToken(f.db);
+      assert.ok(token);
+      assert.equal(
+        readIntakeFrontierOwnedLookupDirtyWrite(
+          f.db,
+          f.captured,
+          token,
+          'selected',
+          'selected/head',
+        ),
+        0,
+      );
+      const expected = expectIntakeFrontierMetaWrite(f.db, 'selected/head', ['update'], 'selected');
+      assert.ok(expected);
+      const result = f.preprepared.run('after', 'selected/head');
+      finishIntakeFrontierMetaWrite(f.db, expected, result.changes === 1);
+      assert.equal(
+        readIntakeFrontierOwnedLookupDirtyWrite(
+          f.db,
+          f.captured,
+          token,
+          'selected',
+          'selected/head',
+        ),
+        1,
+      );
+      assert.equal(
+        readIntakeFrontierOwnedLookupDirtyWrite(f.db, f.captured, token, 'selected', 'other/head'),
+        undefined,
+      );
+    },
+    { actor: 'source-text' },
+  );
+});
+
+for (const preinsert of [false, true])
+  test(`precompiled direct lookup dirty ${preinsert ? 'no-op' : 'insert'} never mints a receipt`, (t) => {
+    let direct: ReturnType<DatabaseSync['prepare']> | undefined;
+    const f = fixture(t, (db) => {
+      db.exec('CREATE TEMP TABLE __intake_lookup_dirty(source_id TEXT PRIMARY KEY)');
+      if (preinsert) db.prepare('INSERT INTO temp.__intake_lookup_dirty VALUES(?)').run('selected');
+      direct = db.prepare('INSERT OR IGNORE INTO temp.__intake_lookup_dirty VALUES(?)');
+    });
+    const statement = direct;
+    assert.ok(statement);
+    transaction(
+      f.db,
+      () => {
+        const token = currentTransactionToken(f.db);
+        assert.ok(token);
+        assert.equal(statement.run('selected').changes, preinsert ? 0 : 1);
+        assert.equal(
+          readIntakeFrontierOwnedLookupDirtyWrite(
+            f.db,
+            f.captured,
+            token,
+            'selected',
+            'selected/head',
+          ),
+          undefined,
+        );
+        assert.equal(intakeFrontierAttemptCounts(f.db)?.revoked, true);
+      },
+      { actor: 'source-text' },
+    );
+  });
 
 test('unrelated TEMP work needs the exact later owner outcome and cannot credit a no-outcome read', (t) => {
   const f = fixture(t, (db) => db.exec('CREATE TEMP TABLE unrelated_work(value TEXT)'));

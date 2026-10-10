@@ -2,7 +2,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { createHmac } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { resolve, relative, dirname } from 'node:path';
-import { opendirSync } from 'node:fs';
+import { opendirSync, fstatSync, lstatSync, realpathSync } from 'node:fs';
 import { openVault } from './vault-store.ts';
 import { openDatabase } from './database.ts';
 import { attachRecordDurability } from './record-versions.ts';
@@ -18,6 +18,7 @@ import {
   unlockPhysicalIdentity,
 } from './encrypted-unlock-physical.ts';
 import type { VaultRecordBackingInput } from './vault-record-backing.ts';
+import type { PackageSourceOriginalPhysical } from './intake-package-source-lease.ts';
 import { VAULT_CERTIFICATE_SCHEMA, vaultRecordCertificates } from './vault-record-certificates.ts';
 import type { IntakeTreeRoot } from './intake-state-tree.ts';
 
@@ -32,8 +33,13 @@ const sign = (path: string, kind: string, identity: string) =>
 let work = 0;
 let certificateRoot: IntakeTreeRoot = null;
 const replayWork = createRecordVersionWorkCounters();
-const checkpoint = () => {
-  if (++work % 64 === 0) parentPort!.postMessage({ checkpoint: true });
+const checkpoint = (phase?: 'leased-source') => {
+  if (++work % 64 === 0 || phase) {
+    const control = new Int32Array(input.checkpointControl);
+    Atomics.store(control, 0, 1);
+    parentPort!.postMessage({ checkpoint: true, mode: input.mode, phase });
+    while (Atomics.load(control, 0)) Atomics.wait(control, 0, 1);
+  }
 };
 function* workspaceEntries() {
   if (!input.workspace) return;
@@ -131,6 +137,46 @@ function verifyPhysical(expected: number): void {
       if (table.prepare('SELECT count(*) AS n FROM workspace').get()!.n !== workspaceCount)
         throw Error('Vault source workspace membership changed');
     }
+    if (input.originalSources !== undefined) {
+      if (!Number.isSafeInteger(input.originalSources) || input.originalSources < 0)
+        throw Error('Vault original source count invalid');
+      let count = 0;
+      const sources = table.prepare(
+        'SELECT sequence,source,signature FROM consumed_sources ORDER BY sequence',
+      );
+      checkpoint('leased-source');
+      for (const row of sources.iterate()) {
+        checkpoint();
+        const serialized = String(row.source);
+        if (
+          row.sequence !== count ||
+          row.signature !== sign('consumed-source:' + count, 'source', serialized)
+        )
+          throw Error('Vault original source proof changed');
+        const source = JSON.parse(serialized) as PackageSourceOriginalPhysical;
+        const fd = fstatSync(source.sourceFd, { bigint: true }),
+          path = lstatSync(source.path, { bigint: true }),
+          parent = lstatSync(dirname(source.path), { bigint: true });
+        const identity = (stat: typeof fd) =>
+          [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+        if (
+          !fd.isFile() ||
+          !path.isFile() ||
+          (source.parentKind === 'directory'
+            ? !parent.isDirectory()
+            : source.parentKind !== 'symlink' || !parent.isSymbolicLink()) ||
+          source.binding.profileId !== input.profileId ||
+          fd.size !== BigInt(source.binding.bytes) ||
+          identity(fd) !== source.statIdentity ||
+          identity(path) !== source.statIdentity ||
+          `${parent.dev}:${parent.ino}:${parent.mode}` !== source.parentIdentity ||
+          realpathSync(dirname(source.path)) !== source.parentRealpath
+        )
+          throw Error('Vault original leased source changed');
+        count++;
+      }
+      if (count !== input.originalSources) throw Error('Vault original source membership changed');
+    }
   } finally {
     table.close();
   }
@@ -141,7 +187,7 @@ async function prepare(): Promise<number> {
   let entries = 0;
   try {
     physical.exec(
-      'CREATE TABLE physical(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE workspace(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE verified_originals(path TEXT NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(path,bytes,sha256)); ' +
+      'CREATE TABLE physical(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE workspace(path TEXT PRIMARY KEY,kind TEXT NOT NULL,identity TEXT NOT NULL,signature TEXT NOT NULL); CREATE TABLE verified_originals(path TEXT NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(path,bytes,sha256)); CREATE TABLE consumed_sources(sequence INTEGER PRIMARY KEY,source TEXT NOT NULL,signature TEXT NOT NULL,UNIQUE(source)); ' +
         VAULT_CERTIFICATE_SCHEMA +
         ' BEGIN',
     );

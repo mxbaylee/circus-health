@@ -34,44 +34,64 @@ import {
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 import { prepareIntakeFilenameFactsSteps } from './intake-filename-facts.ts';
 import { ensureIntakeFrontierObserver } from './intake-lookup-frontier-observer.ts';
+import { assertSourceDetailsSearchFunctionReady } from './source-details-search.ts';
+import {
+  captureIntakeLegacyBridgeReadWitness,
+  assertIntakeLegacyBridgeReadWitness,
+  disposeIntakeLegacyBridgeReadWitness,
+  type IntakeLegacyBridgeReadWitness,
+} from './intake-state-migration.ts';
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 export async function buildIntakeCollectionEnvelope(
-  ...input: Parameters<typeof buildIntakeCollectionEnvelopeOwned>
+  ...input: [
+    db: Database,
+    source: IntakeEnvelopeSource,
+    options?: Parameters<typeof buildIntakeCollectionEnvelopeOwned>[2],
+  ]
 ): Promise<Awaited<ReturnType<typeof buildIntakeCollectionEnvelopeOwned>> | undefined> {
   const [db, source, options = {}] = input;
   return runExclusiveClinicalOperation(
     db,
     async (operation) => {
+      assertSourceDetailsSearchFunctionReady(db);
       ensureIntakeFrontierObserver(db);
-      // A previous queued caller may have completed this exact current source.
-      // The authenticated predicate still validates selected authority and schema.
-      if (hasIntakeCollectionEnvelope(db, source)) {
+      const originalRead = captureIntakeLegacyBridgeReadWitness(db, source.id);
+      try {
+        // A previous queued caller may have completed this exact current source.
+        // The authenticated predicate still validates selected authority and schema.
+        const exists = hasIntakeCollectionEnvelope(db, source);
+        assertIntakeLegacyBridgeReadWitness(db, originalRead);
+        if (exists) {
+          disposeIntakeLegacyBridgeReadWitness(originalRead);
+          const { prepareIntakeFilenameSummary } = await import('./intake-summary-name.ts');
+          await prepareIntakeFilenameSummary(db, source, {
+            assertRunning: options.assertRunning,
+            assertPublicationCurrent: options.assertPublicationCurrent,
+          });
+          return undefined;
+        }
+        const result = await buildIntakeCollectionEnvelopeOwned(
+          db,
+          source,
+          {
+            ...options,
+            assertRunning() {
+              assertClinicalOperation(db, operation);
+              options.assertRunning?.();
+            },
+          },
+          originalRead,
+        );
+        disposeIntakeLegacyBridgeReadWitness(originalRead);
         const { prepareIntakeFilenameSummary } = await import('./intake-summary-name.ts');
         await prepareIntakeFilenameSummary(db, source, {
-          assertRunning() {
-            assertClinicalOperation(db, operation);
-            options.assertRunning?.();
-          },
+          assertRunning: options.assertRunning,
           assertPublicationCurrent: options.assertPublicationCurrent,
         });
-        return undefined;
+        return result;
+      } finally {
+        disposeIntakeLegacyBridgeReadWitness(originalRead);
       }
-      const result = await buildIntakeCollectionEnvelopeOwned(db, source, {
-        ...options,
-        assertRunning() {
-          assertClinicalOperation(db, operation);
-          options.assertRunning?.();
-        },
-      });
-      const { prepareIntakeFilenameSummary } = await import('./intake-summary-name.ts');
-      await prepareIntakeFilenameSummary(db, source, {
-        assertRunning() {
-          assertClinicalOperation(db, operation);
-          options.assertRunning?.();
-        },
-        assertPublicationCurrent: options.assertPublicationCurrent,
-      });
-      return result;
     },
     { operation: currentClinicalOperation(db), assertRunning: options.assertRunning },
   );
@@ -84,9 +104,11 @@ async function buildIntakeCollectionEnvelopeOwned(
     assertPublicationCurrent?: () => void;
     onCheckpoint?: () => void | Promise<void>;
   } = {},
+  originalRead: IntakeLegacyBridgeReadWitness,
 ) {
   const legacy = readIntakeEnvelopeMaterialized(db, source),
     { collections, binding } = selectedEnvelopeStore(db, source);
+  assertIntakeLegacyBridgeReadWitness(db, originalRead);
   const version = (legacy.value.intake as { version: number }).version;
   const sourceTextHash = digest(legacy.text);
   withIntakeWork(db, 'warm', () =>
@@ -94,13 +116,16 @@ async function buildIntakeCollectionEnvelopeOwned(
   );
   if (binding.logicalHead === undefined) {
     const id = randomUUID();
-    collections.commitMaintenance(
-      collections.prepareLegacyBridge({
+    const prepared = collections.prepareLegacyBridge(
+      {
         operationId: id,
         requestDigest: digest(id),
         domainVersion: version,
-      }),
+      },
+      originalRead,
     );
+    assertIntakeLegacyBridgeReadWitness(db, originalRead);
+    collections.commitMaintenance(prepared);
   }
   const resume = prepareEnvelopeBuildResume(
     db,
@@ -226,8 +251,12 @@ export function createEnvelopeBuildWriter(
       changes: batch,
     });
     resume?.assertCurrent();
-    collections.commitMaintenance(prepared, resume ? { assertCurrent: resume.assertWitness } : {});
-    if (progress) resume!.committed(progress);
+    resume?.beginCheckpoint();
+    const result = collections.commitMaintenance(
+      prepared,
+      resume ? { assertCurrent: resume.assertWitness } : {},
+    );
+    if (progress) resume!.committed(progress, result, id);
     await options.onCheckpoint?.();
     await setImmediate();
   };

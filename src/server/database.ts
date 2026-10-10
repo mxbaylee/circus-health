@@ -15,8 +15,26 @@ import {
   expectIntakeFrontierMetaWrite,
   finishIntakeFrontierMetaWrite,
   intakeFrontierTerminalEvent,
+  intakeFrontierTerminalStart,
+  intakeFrontierTerminalOutcome,
 } from './intake-lookup-frontier-observer.ts';
-import { intakeProjectionTerminalEvent } from './intake-lookup-projection-witness.ts';
+import {
+  intakeProjectionTerminalEvent,
+  intakeProjectionTerminalOutcome,
+} from './intake-lookup-projection-witness.ts';
+import { sourceDetailsTerminalOutcome } from './source-details-search.ts';
+import { sourceTextTerminalOutcome } from './source-text-projection.ts';
+import { intakeLookupTerminalOutcome } from './intake-lookup-projection.ts';
+import { intakeDiscoveryTerminalOutcome } from './intake-discovery-admission.ts';
+import { intakeSourceContextTerminalOutcome } from './intake-source-context-classification.ts';
+import { intakeStateTerminalOutcome } from './intake-state-storage.ts';
+import { recordTerminalDurabilityParticipant } from './record-versions.ts';
+import {
+  terminalStatement,
+  terminalExecution,
+  terminalStatementsActive,
+} from './database-terminal-statements.ts';
+import { ensureSourceDetailsSearchFunction } from './source-details-search.ts';
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const LATEST_SCHEMA_VERSION = 7;
 export type Database = DatabaseSync;
@@ -31,12 +49,34 @@ interface ManagedAuthorization {
   readonly policyChanges: Set<() => void>;
   policy: Authorizer | null;
   callbackDepth: number;
+  dispatchDepth: number;
   protectCallbacks: boolean;
 }
 const managedAuthorizers = new WeakMap<DatabaseSync, ManagedAuthorization>();
 const managedMethodEpochs = new WeakMap<DatabaseSync, object>();
 const managedMethodSerials = new WeakMap<DatabaseSync, bigint>();
 const callbackBarriers = new WeakMap<DatabaseSync, number>();
+const nativeOwnDescriptor = Object.getOwnPropertyDescriptor;
+const nativePrototypeOf = Object.getPrototypeOf;
+const databasePrototype = DatabaseSync.prototype;
+const nativeDatabaseMethods = new Map(
+  ['function', 'aggregate', 'setAuthorizer', 'prepare', 'exec', 'applyChangeset'].map((name) => [
+    name,
+    nativeOwnDescriptor(databasePrototype, name)?.value,
+  ]),
+);
+/** Identity only: never evaluate an accessor on the public database surface. */
+export function managedDatabaseDataMethod(
+  db: DatabaseSync,
+  name: 'function' | 'aggregate' | 'setAuthorizer' | 'prepare' | 'exec' | 'applyChangeset',
+): unknown {
+  if (nativePrototypeOf(db) !== databasePrototype) return undefined;
+  const own = nativeOwnDescriptor(db, name);
+  if (own) return 'value' in own ? own.value : undefined;
+  const inherited = nativeOwnDescriptor(databasePrototype, name),
+    original = nativeDatabaseMethods.get(name);
+  return inherited && 'value' in inherited && inherited.value === original ? original : undefined;
+}
 let nativeFunctionSignatures: Set<string> | undefined;
 const functionSignature = (row: SqliteRow) =>
   JSON.stringify([row.name, row.builtin, row.type, row.enc, row.narg, row.flags]);
@@ -196,9 +236,9 @@ export function installManagedDatabaseFunctionRegistration(db: DatabaseSync): vo
 export function managedDatabaseMethodEpoch(db: DatabaseSync): object | undefined {
   if (
     !db.isOpen ||
-    db.function !== managedFunctions.get(db)?.setter ||
-    db.aggregate !== managedFunctions.get(db)?.aggregateSetter ||
-    db.setAuthorizer !== managedAuthorizers.get(db)?.setter
+    managedDatabaseDataMethod(db, 'function') !== managedFunctions.get(db)?.setter ||
+    managedDatabaseDataMethod(db, 'aggregate') !== managedFunctions.get(db)?.aggregateSetter ||
+    managedDatabaseDataMethod(db, 'setAuthorizer') !== managedAuthorizers.get(db)?.setter
   )
     return undefined;
   return managedMethodEpochs.get(db);
@@ -236,6 +276,7 @@ export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
     policyChanges: new Set(),
     policy: null,
     callbackDepth: 0,
+    dispatchDepth: 0,
     protectCallbacks: false,
   };
   const notify = (callback: () => void) => {
@@ -248,6 +289,7 @@ export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
   };
   const setter = function (this: DatabaseSync, policy: Authorizer | null) {
     if (this !== db) return Reflect.apply(nativeSetter, this, [policy]);
+    assertManagedDatabaseCallbackAllowed(db);
     rotateManagedMethodEpoch(db);
     for (const changed of state.policyChanges) notify(changed);
     state.policy = policy;
@@ -256,8 +298,13 @@ export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
   state.setter = setter;
   const dispatch: Authorizer = (...args) => {
     assertManagedDatabaseCallbackAllowed(db);
-    for (const observer of state.observers) notify(() => observer(...args));
-    return state.policy?.(...args) ?? constants.SQLITE_OK;
+    state.dispatchDepth++;
+    try {
+      for (const observer of state.observers) notify(() => observer(...args));
+      return state.policy?.(...args) ?? constants.SQLITE_OK;
+    } finally {
+      state.dispatchDepth--;
+    }
   };
   state.refresh = () =>
     nativeSetter.call(
@@ -272,6 +319,10 @@ export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
 /** Distinguishes observer SQL from the statement whose policy it is observing. */
 export function managedDatabaseAuthorizationCallbackActive(db: DatabaseSync): boolean {
   return (managedAuthorizers.get(db)?.callbackDepth ?? 0) > 0;
+}
+/** Nested SQL dispatched from a policy/observer is never an owner's compile slot. */
+export function managedDatabaseAuthorizationNestedCallbackActive(db: DatabaseSync): boolean {
+  return (managedAuthorizers.get(db)?.dispatchDepth ?? 0) > 1;
 }
 
 export function observeManagedDatabaseAuthorization(
@@ -306,7 +357,7 @@ export function rearmManagedDatabaseAuthorization(db: DatabaseSync): boolean {
 }
 
 export const databaseSchemaVersion = (db: DatabaseSync): number => {
-  const row = db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get();
+  const row = terminalStatement(db, 'SELECT MAX(version) AS version FROM schema_migrations').get();
   return Number(row?.version ?? 0);
 };
 
@@ -397,6 +448,7 @@ export function openDatabase(path?: string | null, profileId?: string): Database
     inTransaction = false;
     installManagedDatabaseAuthorization(db);
     installManagedDatabaseFunctionRegistration(db);
+    ensureSourceDetailsSearchFunction(db);
     return db;
   } catch (error) {
     if (inTransaction) db.exec('ROLLBACK');
@@ -428,11 +480,12 @@ const revisionStatements = new WeakMap<
 >();
 export const revision = (db: DatabaseSync): number => {
   const sql = "SELECT value FROM app_meta WHERE key='revision'";
+  if (terminalStatementsActive(db)) return Number(terminalStatement(db, sql).get()?.value || 0);
   let cached = revisionStatements.get(db);
   // A reentrant SQL function must retain the original fresh-statement behavior.
-  if (cached?.busy) return Number(db.prepare(sql).get()?.value || 0);
+  if (cached?.busy) return Number(terminalStatement(db, sql).get()?.value || 0);
   if (!cached) {
-    const entry = { statement: db.prepare(sql), busy: false };
+    const entry = { statement: terminalStatement(db, sql), busy: false };
     observeDatabaseClose(db, () => {
       if (revisionStatements.get(db) === entry) revisionStatements.delete(db);
     });
@@ -440,7 +493,7 @@ export const revision = (db: DatabaseSync): number => {
   }
   cached.busy = true;
   try {
-    return Number(cached.statement.get()?.value || 0);
+    return Number(terminalStatement(db, sql, cached.statement).get()?.value || 0);
   } finally {
     cached.busy = false;
   }
@@ -484,6 +537,7 @@ export function registerTransactionDurability<Capture, Result>(
 ): void {
   if (hooks) durabilityHooks.set(db, hooks as TransactionDurabilityHooks);
   else durabilityHooks.delete(db);
+  rotateTransactionObserverSerial(db);
 }
 /** Whether a real transaction durability participant is already attached. */
 export function hasTransactionDurability(db: DatabaseSync): boolean {
@@ -574,6 +628,66 @@ export function observeDatabaseClose(db: DatabaseSync, observer: () => void): ()
 }
 const beforePublicationObservers = new WeakMap<DatabaseSync, Set<(token: object) => void>>();
 const startObservers = new WeakMap<DatabaseSync, Set<(token: object) => void>>();
+const transactionObserverSerials = new WeakMap<DatabaseSync, bigint>();
+const rotateTransactionObserverSerial = (db: DatabaseSync) =>
+  transactionObserverSerials.set(db, (transactionObserverSerials.get(db) ?? 0n) + 1n);
+declare const terminalCallbacksBrand: unique symbol;
+export interface TerminalTransactionCallbacks {
+  readonly [terminalCallbacksBrand]: true;
+}
+const terminalCallbacks = new WeakMap<
+  TerminalTransactionCallbacks,
+  { db: DatabaseSync; serial: bigint; hooks: TransactionDurabilityHooks | undefined }
+>();
+/** Only actual lexical issuers qualify; a caller-created issuer is unrelated.
+ * Fixed-SQL frontier notifications still need the terminal statement resolver. */
+export function prepareTerminalTransactionCallbacks(
+  db: DatabaseSync,
+): TerminalTransactionCallbacks {
+  if (
+    db.isTransaction ||
+    !recordTerminalDurabilityParticipant(db, durabilityHooks.get(db)) ||
+    (beforePublicationObservers.get(db)?.size ?? 0) !== 0 ||
+    [...(startObservers.get(db) ?? [])].some(
+      (callback) => !intakeFrontierTerminalStart(db, callback),
+    ) ||
+    [...(outcomeObservers.get(db) ?? [])].some(
+      (callback) =>
+        ![
+          intakeFrontierTerminalOutcome,
+          intakeProjectionTerminalOutcome,
+          sourceDetailsTerminalOutcome,
+          sourceTextTerminalOutcome,
+          intakeLookupTerminalOutcome,
+          intakeDiscoveryTerminalOutcome,
+          intakeSourceContextTerminalOutcome,
+          intakeStateTerminalOutcome,
+        ].some((recognizes) => recognizes(db, callback)),
+    )
+  )
+    throw Error('Compact publication has unsupported transaction callbacks');
+  const capability = Object.freeze({}) as TerminalTransactionCallbacks;
+  terminalCallbacks.set(capability, {
+    db,
+    serial: transactionObserverSerials.get(db) ?? 0n,
+    hooks: durabilityHooks.get(db),
+  });
+  return capability;
+}
+export function terminalTransactionCallbacksCurrent(
+  db: DatabaseSync,
+  capability: TerminalTransactionCallbacks,
+): boolean {
+  const item = terminalCallbacks.get(capability);
+  return (
+    !!item &&
+    item.db === db &&
+    db.isOpen &&
+    (transactionObserverSerials.get(db) ?? 0n) === item.serial &&
+    durabilityHooks.get(db) === item.hooks &&
+    recordTerminalDurabilityParticipant(db, item.hooks)
+  );
+}
 export function observeTransactionStart(
   db: DatabaseSync,
   observer: (token: object) => void,
@@ -581,7 +695,11 @@ export function observeTransactionStart(
   let observers = startObservers.get(db);
   if (!observers) startObservers.set(db, (observers = new Set()));
   observers.add(observer);
-  return () => observers.delete(observer);
+  rotateTransactionObserverSerial(db);
+  return () => {
+    observers.delete(observer);
+    rotateTransactionObserverSerial(db);
+  };
 }
 /** Read-only witnesses inspect the caller write set before durability work.
  * Their exceptions are isolated; an owner may explicitly reject this transaction. */
@@ -592,7 +710,11 @@ export function observeTransactionBeforePublication(
   let observers = beforePublicationObservers.get(db);
   if (!observers) beforePublicationObservers.set(db, (observers = new Set()));
   observers.add(observer);
-  return () => observers.delete(observer);
+  rotateTransactionObserverSerial(db);
+  return () => {
+    observers.delete(observer);
+    rotateTransactionObserverSerial(db);
+  };
 }
 export function currentTransactionToken(db: DatabaseSync): object | undefined {
   return transactionTokens.get(db);
@@ -604,14 +726,18 @@ export function observeTransactionOutcome(
   let observers = outcomeObservers.get(db);
   if (!observers) outcomeObservers.set(db, (observers = new Set()));
   observers.add(observer);
-  return () => observers.delete(observer);
+  rotateTransactionObserverSerial(db);
+  return () => {
+    observers.delete(observer);
+    rotateTransactionObserverSerial(db);
+  };
 }
 export function transaction<T>(
   db: DatabaseSync,
   fn: () => T,
   operation: TransactionOperation = {},
 ): T {
-  db.exec('BEGIN IMMEDIATE');
+  terminalExecution(db, 'BEGIN IMMEDIATE');
   let committed = false;
   let succeeded = false;
   let verifiedIntakeMaintenance = false;
@@ -635,7 +761,7 @@ export function transaction<T>(
     if (retry?.replayed) {
       if (operation.intakeMaintenance)
         throw Error('Intake maintenance replay must be resolved before preparation');
-      db.exec('COMMIT');
+      terminalExecution(db, 'COMMIT');
       committed = true;
       succeeded = true;
       return retry.result as T;
@@ -666,11 +792,10 @@ export function transaction<T>(
     let clinicalInserted = false;
     try {
       clinicalInserted =
-        db
-          .prepare(
-            "INSERT OR IGNORE INTO app_meta(key,value) VALUES('clinical_review_revision',(SELECT value FROM app_meta WHERE key='revision'))",
-          )
-          .run().changes === 1;
+        terminalStatement(
+          db,
+          "INSERT OR IGNORE INTO app_meta(key,value) VALUES('clinical_review_revision',(SELECT value FROM app_meta WHERE key='revision'))",
+        ).run().changes === 1;
     } finally {
       finishIntakeFrontierMetaWrite(db, clinicalInsert, clinicalInserted);
     }
@@ -679,7 +804,8 @@ export function transaction<T>(
         'update',
       ]);
       try {
-        db.exec(
+        terminalExecution(
+          db,
           "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='clinical_review_revision'",
         );
       } finally {
@@ -688,7 +814,10 @@ export function transaction<T>(
     }
     const revisionUpdate = expectIntakeFrontierMetaWrite(db, 'revision', ['update']);
     try {
-      db.exec("UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'");
+      terminalExecution(
+        db,
+        "UPDATE app_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'",
+      );
     } finally {
       finishIntakeFrontierMetaWrite(db, revisionUpdate, true);
     }
@@ -696,7 +825,7 @@ export function transaction<T>(
     // The recoverable intent must reach durable profile storage before an
     // ephemeral SQLite COMMIT can be acknowledged.
     hooks?.prepare(captured, { operation, result });
-    db.exec('COMMIT');
+    terminalExecution(db, 'COMMIT');
     committed = true;
     // Publication may be retried from the durable intent, even after losing
     // this database and its WAL entirely.
@@ -704,12 +833,11 @@ export function transaction<T>(
     succeeded = true;
     return result;
   } catch (error) {
-    if (!committed) db.exec('ROLLBACK');
+    if (!committed) terminalExecution(db, 'ROLLBACK');
     throw error;
   } finally {
     if (operation.intakeMaintenance)
       finishIntakeMaintenancePublication(operation.intakeMaintenance, token);
-    transactionTokens.delete(db);
     transactionFailures.delete(db);
     terminalTransactionGuards.delete(db);
     // Read at completion: observers can register while fn stages its first value.
@@ -719,6 +847,7 @@ export function transaction<T>(
       succeeded = false;
       throw error;
     } finally {
+      transactionTokens.delete(db);
       for (const observer of outcomeObservers.get(db) ?? []) {
         // A disposable-cache observer cannot change a durable acknowledgement
         // or suppress cleanup by another observer.

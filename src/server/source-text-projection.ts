@@ -1,10 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
-import {
-  currentTransactionToken,
-  observeTransactionOutcome,
-  rejectCurrentTransaction,
-} from './database.ts';
+import { currentTransactionToken, rejectCurrentTransaction } from './database.ts';
+import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
   intakeEnvelopeAuthorityBinding,
@@ -30,6 +27,8 @@ import {
 } from './text-piece-reconcile.ts';
 
 const PREFIX = '__record_source_text_';
+const outcomes = createTransactionOutcomeIssuer();
+export const sourceTextTerminalOutcome = outcomes.recognizes;
 const DIRTY = '__source_text_dirty';
 const INVALIDATED = '__source_text_invalidated';
 const OBSOLETE = '__source_text_obsolete';
@@ -90,6 +89,7 @@ interface Connection {
   counters: SourceTextProjectionCounters;
 }
 const connections = new WeakMap<DatabaseSync, Connection>();
+const trackingInstalled = new WeakSet<DatabaseSync>();
 // Preparation owners retain their original raw SQL witness. Search must not
 // repair this shared disposable cache across their asynchronous gaps.
 const readOnlyOwners = new WeakMap<DatabaseSync, Set<() => void>>();
@@ -170,7 +170,7 @@ function connectionFor(db: DatabaseSync): Connection {
       matching: {},
     },
   };
-  connection.dispose = observeTransactionOutcome(db, ({ succeeded }) => {
+  connection.dispose = outcomes.observe(db, ({ succeeded }) => {
     if (!succeeded) {
       connection.schema = -1;
       connection.snapshots.clear();
@@ -231,14 +231,47 @@ function sourceTracking(db: DatabaseSync): void {
     CREATE TEMP TRIGGER IF NOT EXISTS __source_text_insert AFTER INSERT ON main.source_files BEGIN ${mark('NEW.id')} END;
     CREATE TEMP TRIGGER IF NOT EXISTS __source_text_update AFTER UPDATE ON main.source_files BEGIN ${mark('OLD.id')} ${mark('NEW.id')} END;
     CREATE TEMP TRIGGER IF NOT EXISTS __source_text_delete AFTER DELETE ON main.source_files BEGIN ${mark('OLD.id')} END;`);
+  trackingInstalled.add(db);
+}
+
+/** Read only the selected source's indexed disposable invalidation row. */
+export function sourceTextAuthorityDirtyRow(
+  db: DatabaseSync,
+  sourceId: string,
+  authorityKey: string,
+) {
+  if (!trackingInstalled.has(db)) return null;
+  const triggers = db
+    .prepare(
+      "SELECT name,sql FROM sqlite_temp_master WHERE type='trigger' AND name IN ('__source_text_authority_INSERT','__source_text_authority_UPDATE','__source_text_authority_DELETE') ORDER BY name",
+    )
+    .all();
+  if (
+    triggers.length !== 3 ||
+    triggers.some(
+      (row) =>
+        typeof row.name !== 'string' ||
+        row.sql !== `CREATE TRIGGER ${sourceTextAuthorityTrigger(row.name.slice(24))}`,
+    )
+  )
+    throw Error('Source text authority tracking trigger changed');
+  if (
+    db.prepare(`SELECT source_id FROM temp.${AUTHORITIES} WHERE authority_key=?`).get(authorityKey)
+      ?.source_id !== sourceId
+  )
+    return null;
+  return {
+    authority: authorityKey,
+    dirty: !!db.prepare(`SELECT 1 FROM temp.${DIRTY} WHERE source_id=?`).get(sourceId),
+  };
+}
+function sourceTextAuthorityTrigger(op: string): string {
+  const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
+  return `__source_text_authority_${op} AFTER ${op} ON main.app_meta BEGIN ${refs.map((ref) => `INSERT INTO ${DIRTY} SELECT source_id FROM ${AUTHORITIES} a WHERE authority_key=${ref}.key AND NOT EXISTS(SELECT 1 FROM ${DIRTY} d WHERE d.source_id=a.source_id);`).join(' ')} END`;
 }
 function cacheTracking(db: DatabaseSync): void {
-  for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
-    const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
-    db.exec(
-      `CREATE TEMP TRIGGER IF NOT EXISTS __source_text_authority_${op} AFTER ${op} ON main.app_meta BEGIN ${refs.map((ref) => `INSERT INTO ${DIRTY} SELECT source_id FROM ${AUTHORITIES} a WHERE authority_key=${ref}.key AND NOT EXISTS(SELECT 1 FROM ${DIRTY} d WHERE d.source_id=a.source_id);`).join(' ')} END`,
-    );
-  }
+  for (const op of ['INSERT', 'UPDATE', 'DELETE'])
+    db.exec(`CREATE TEMP TRIGGER IF NOT EXISTS ${sourceTextAuthorityTrigger(op)}`);
   for (const name of ['heads', 'occurrences', 'links'] as const)
     for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
       const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];

@@ -37,7 +37,13 @@ import {
   prepareVaultRecordBackingTransport,
   type VaultRecordBackingBinding,
 } from './vault-record-backing.ts';
-import { consumeRecordBackingAdvance, type RecordIndexedPublication } from './record-versions.ts';
+import {
+  consumeRecordBackingAdvance,
+  recordCompactTerminalOwnerCurrent,
+  recordCompactTerminalOriginalSources,
+  type RecordIndexedPublication,
+  type RecordCompactTerminalOwner,
+} from './record-versions.ts';
 
 const mkdirSync: typeof rawMkdirSync = (...args) =>
   withManagedPhysicalMutation(() => rawMkdirSync(...args));
@@ -140,11 +146,13 @@ interface RecordStagingData {
   headPrepared?: boolean;
   preparation?: ClinicalOperation;
   preparationComplete?: boolean;
+  terminalOwner?: RecordCompactTerminalOwner;
   backing?: Awaited<ReturnType<typeof prepareVaultRecordBackingTransport>>;
   workspaceEpoch: object;
 }
 const recordStagingOwners = new WeakMap<object, RecordStagingOwner>();
 const recordStagingWitnesses = new WeakMap<VaultRecordStagingWitness, RecordStagingData>();
+const ownDescriptor = Object.getOwnPropertyDescriptor;
 
 function recordParent(path: string): RecordParent {
   const stat = lstatSync(path, { bigint: true });
@@ -159,11 +167,20 @@ function recordParentsCurrent(parents: RecordParent[]): boolean {
   });
 }
 function recordStagingMethodsCurrent(owner: RecordStagingOwner): boolean {
+  const read = ownDescriptor(owner.storage, 'read'),
+    write = ownDescriptor(owner.storage, 'writeImmutable'),
+    publish = ownDescriptor(owner.storage, 'publishHead');
   return (
     owner.live() &&
-    owner.storage.read === owner.read &&
-    owner.storage.writeImmutable === owner.write &&
-    owner.storage.publishHead === owner.publish
+    !!read &&
+    'value' in read &&
+    read.value === owner.read &&
+    !!write &&
+    'value' in write &&
+    write.value === owner.write &&
+    !!publish &&
+    'value' in publish &&
+    publish.value === owner.publish
   );
 }
 /** Only the actual vault factory has a registered lexical owner. No caller path
@@ -211,6 +228,8 @@ export function vaultRecordStagingCurrent(witness: VaultRecordStagingWitness): b
   return (
     !!data &&
     !data.revoked &&
+    (!data.terminalOwner ||
+      recordCompactTerminalOwnerCurrent(data.terminalOwner, data.db, witness)) &&
     data.db.isOpen &&
     recordStagingMethodsCurrent(data.owner) &&
     data.owner.workspaceEpoch() === data.workspaceEpoch &&
@@ -305,11 +324,27 @@ export async function prepareVaultRecordBackingAdvance(
 }
 export async function finishVaultRecordStagingPreparation(
   witness: VaultRecordStagingWitness,
+  terminal?: RecordCompactTerminalOwner,
 ): Promise<void> {
   const data = recordStagingWitnesses.get(witness);
   if (!data?.backing || data.preparationComplete || !vaultRecordStagingCurrent(witness))
     throw Error('Vault compact backing completion expired');
-  await data.backing.verify();
+  if (terminal) {
+    if (!recordCompactTerminalOwnerCurrent(terminal, data.db, witness))
+      throw Error('Vault terminal owner issuer changed');
+    data.terminalOwner = terminal;
+    const operation = data.preparation;
+    const current = () => {
+      if (!operation) throw Error('Vault terminal preparation owner missing');
+      assertClinicalOperation(data.db, operation);
+      if (!vaultRecordStagingCurrent(witness)) throw Error('Vault terminal backing owner changed');
+    };
+    current();
+    await data.backing.verifyTerminal(
+      current,
+      recordCompactTerminalOriginalSources(terminal, data.db, witness),
+    );
+  } else await data.backing.verify();
   if (!vaultRecordStagingCurrent(witness)) throw Error('Vault compact backing seal changed');
   data.preparationComplete = true;
 }

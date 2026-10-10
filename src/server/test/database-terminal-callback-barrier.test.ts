@@ -7,18 +7,141 @@ import {
   withoutManagedDatabaseCallbacks,
   prepareManagedDatabaseCallbackBarrier,
   managedDatabaseMethodEpoch,
+  transaction,
 } from '../database.ts';
 import {
   ensureIntakeFrontierObserver,
   expectIntakeFrontierMetaWrite,
   finishIntakeFrontierMetaWrite,
   intakeFrontierTerminalEvent,
+  prepareIntakeFrontierCaptureClear,
+  clearIntakeFrontierRecordCapture,
+  type IntakeFrontierCaptureClear,
 } from '../intake-lookup-frontier-observer.ts';
 import {
   intakeProjectionTerminalEvent,
   ensureIntakeProjectionWitness,
   ownedIntakeProjectionWrite,
 } from '../intake-lookup-projection-witness.ts';
+
+test('terminal capture cleanup consumes two exact native slots without authorization replay', () => {
+  const db = new DatabaseSync(':memory:'),
+    foreign = new DatabaseSync(':memory:');
+  try {
+    db.exec(`CREATE TABLE source_files(id TEXT PRIMARY KEY,kind TEXT);
+      CREATE TABLE source_records(id TEXT PRIMARY KEY,source_file_id TEXT);
+      CREATE TABLE app_meta(key TEXT PRIMARY KEY,value TEXT);
+      CREATE TABLE __record_state(singleton INTEGER PRIMARY KEY,head_json TEXT);
+      CREATE TEMP TABLE __record_changed(entity TEXT,record_id TEXT);
+      INSERT INTO app_meta VALUES('revision','0'),('clinical_review_revision','0');
+      INSERT INTO __record_state VALUES(1,'fictional-head');
+      INSERT INTO __record_changed VALUES('source_files','["fictional"]'),('app_meta','["foreign"]')`);
+    installManagedDatabaseFunctionRegistration(db);
+    installManagedDatabaseAuthorization(db);
+    ensureIntakeFrontierObserver(db);
+    prepareManagedDatabaseCallbackBarrier(db);
+    const cleanup = prepareIntakeFrontierCaptureClear(db);
+    assert.throws(() => clearIntakeFrontierRecordCapture(db, cleanup), /expired/);
+    assert.throws(() => clearIntakeFrontierRecordCapture(foreign, cleanup), /Foreign/);
+    transaction(db, () => {
+      assert.throws(
+        () => clearIntakeFrontierRecordCapture(db, Object.freeze({}) as IntakeFrontierCaptureClear),
+        /Foreign/,
+      );
+      assert.equal(
+        withoutManagedDatabaseCallbacks(db, () => clearIntakeFrontierRecordCapture(db, cleanup)),
+        2,
+      );
+      assert.throws(() => clearIntakeFrontierRecordCapture(db), /Ordinary cleanup/);
+      assert.equal(
+        withoutManagedDatabaseCallbacks(db, () => clearIntakeFrontierRecordCapture(db, cleanup)),
+        0,
+      );
+      assert.throws(() => clearIntakeFrontierRecordCapture(db, cleanup), /replayed/);
+    });
+    assert.throws(
+      () => transaction(db, () => clearIntakeFrontierRecordCapture(db, cleanup)),
+      /replayed/,
+    );
+  } finally {
+    db.close();
+    foreign.close();
+  }
+});
+
+test('nested policy capture SQL cannot spend the owner compilation slot', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(`CREATE TABLE source_files(id TEXT PRIMARY KEY,kind TEXT);
+      CREATE TABLE source_records(id TEXT PRIMARY KEY,source_file_id TEXT);
+      CREATE TABLE app_meta(key TEXT PRIMARY KEY,value TEXT);
+      CREATE TABLE __record_state(singleton INTEGER PRIMARY KEY,head_json TEXT);
+      CREATE TEMP TABLE __record_changed(entity TEXT,record_id TEXT);
+      INSERT INTO app_meta VALUES('revision','0'),('clinical_review_revision','0');
+      INSERT INTO __record_state VALUES(1,'fictional-head')`);
+    installManagedDatabaseFunctionRegistration(db);
+    installManagedDatabaseAuthorization(db);
+    ensureIntakeFrontierObserver(db);
+    prepareManagedDatabaseCallbackBarrier(db);
+    let nested = false;
+    db.setAuthorizer((action, name, _detail, database) => {
+      if (
+        action === constants.SQLITE_DELETE &&
+        name === '__record_changed' &&
+        database === 'temp' &&
+        !nested
+      ) {
+        nested = true;
+        db.prepare('DELETE FROM temp.__record_changed').run();
+      }
+      return constants.SQLITE_OK;
+    });
+    // Policy replacement already revokes the old observer. Re-establish only
+    // its ordinary issuer before testing a nested mutation during compilation.
+    ensureIntakeFrontierObserver(db);
+    assert.throws(() => prepareIntakeFrontierCaptureClear(db), /changed its original owner/);
+    assert.equal(nested, true);
+  } finally {
+    db.close();
+  }
+});
+
+test('terminal capture compilation cannot use foreign public prepare statements', () => {
+  const db = new DatabaseSync(':memory:'),
+    foreign = new DatabaseSync(':memory:');
+  try {
+    for (const connection of [db, foreign])
+      connection.exec(`CREATE TABLE source_files(id TEXT PRIMARY KEY,kind TEXT);
+        CREATE TABLE source_records(id TEXT PRIMARY KEY,source_file_id TEXT);
+        CREATE TABLE app_meta(key TEXT PRIMARY KEY,value TEXT);
+        CREATE TABLE __record_state(singleton INTEGER PRIMARY KEY,head_json TEXT);
+        CREATE TEMP TABLE __record_changed(entity TEXT,record_id TEXT);
+        INSERT INTO app_meta VALUES('revision','0'),('clinical_review_revision','0');
+        INSERT INTO __record_state VALUES(1,'fictional-head');
+        INSERT INTO __record_changed VALUES('source_files','["fictional"]')`);
+    installManagedDatabaseFunctionRegistration(db);
+    installManagedDatabaseAuthorization(db);
+    ensureIntakeFrontierObserver(db);
+    prepareManagedDatabaseCallbackBarrier(db);
+    db.setAuthorizer((action, table) =>
+      action === constants.SQLITE_DELETE && table === '__record_changed'
+        ? constants.SQLITE_DENY
+        : constants.SQLITE_OK,
+    );
+    ensureIntakeFrontierObserver(db);
+    let foreignPreparations = 0;
+    db.prepare = (sql) => {
+      foreignPreparations++;
+      return foreign.prepare(sql);
+    };
+    assert.throws(() => prepareIntakeFrontierCaptureClear(db), /authoriz/);
+    assert.equal(foreignPreparations, 0);
+    assert.equal(foreign.prepare('SELECT count(*) AS n FROM __record_changed').get()!.n, 1);
+  } finally {
+    db.close();
+    foreign.close();
+  }
+});
 
 test('projection event exemption belongs to the original private issuer, not its SQLite name', () => {
   const db = new DatabaseSync(':memory:');

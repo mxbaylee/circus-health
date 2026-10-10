@@ -1,15 +1,18 @@
 import { clearNativeIdentityPreviews } from './intake-identity-preview-cache.ts';
+import { terminalStatement } from './database-terminal-statements.ts';
 import { clearPreparedClinicalReviewRead } from './intake-clinical-review-read-cache.ts';
 import { clearCollectionQueueReviews } from './intake-report-group-collection.ts';
 import { clearReviewIssueScratch } from './intake-review-issue-scratch.ts';
 import {
   currentTransactionToken,
-  observeTransactionOutcome,
   rejectCurrentTransaction,
   transaction,
   type Database,
 } from './database.ts';
-import { recordDurabilityStatus } from './record-versions.ts';
+import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
+const outcomes = createTransactionOutcomeIssuer();
+export const intakeStateTerminalOutcome = outcomes.recognizes;
+import { recordDurabilityStatus, recordTerminalSelectionAttempted } from './record-versions.ts';
 import { clearIntakeCollectionCache, createIntakeCollections } from './intake-state-collections.ts';
 import { clearIntakeMaintenancePublications } from './intake-state-maintenance.ts';
 import { clearIntakeLegacyBridgeProofs } from './intake-state-migration.ts';
@@ -94,6 +97,27 @@ interface Cache {
   dispose: () => void;
 }
 const caches = new WeakMap<Database, Cache>();
+const terminalCleanups = new WeakMap<Database, { pending: boolean; selected: boolean }>();
+/** Refusal cleanup can invoke mutable session methods, so it runs only after
+ * the terminal owner has closed its native rollback and callback barrier. */
+export function withIntakeStateTerminalCleanup<T>(db: Database, run: () => T): T {
+  if (terminalCleanups.has(db)) throw Error('Nested terminal intake cleanup');
+  const cleanup = { pending: false, selected: false };
+  terminalCleanups.set(db, cleanup);
+  try {
+    return run();
+  } finally {
+    terminalCleanups.delete(db);
+    if (cleanup.pending && !cleanup.selected) {
+      if (db.isTransaction) throw Error('Terminal intake cleanup requires completed rollback');
+      try {
+        clearIntakeCaches(db, false);
+      } catch {
+        // Disposable outcome cleanup cannot change the original refusal.
+      }
+    }
+  }
+}
 /** Legacy materializations share the connection lifecycle with v4 pages. Large
  * v3 values remain readable, but are not retained as an unbounded warm cache. */
 function remember(cache: Cache, target: Map<string, CachedBasis>, key: string, value: CachedBasis) {
@@ -114,6 +138,21 @@ export function clearIntakeStateCache(db: Database): void {
   clearIntakeCaches(db, true);
 }
 function clearIntakeCaches(db: Database, releaseReviewScratch: boolean): void {
+  const terminal = terminalCleanups.get(db);
+  if (terminal) {
+    terminal.pending = true;
+    const token = currentTransactionToken(db);
+    terminal.selected ||= !!token && recordTerminalSelectionAttempted(token);
+    const cache = caches.get(db);
+    cache?.committed.clear();
+    cache?.candidates.clear();
+    if (cache) {
+      for (const prepared of cache.prepared.keys()) preparations.delete(prepared);
+      cache.prepared.clear();
+      cache.token = undefined;
+    }
+    return;
+  }
   clearNativeIdentityPreviews(db);
   clearPreparedClinicalReviewRead(db);
   clearCollectionQueueReviews(db);
@@ -135,7 +174,31 @@ function cacheFor(db: Database): Cache {
   if (!cache) {
     cache = { committed: new Map(), candidates: new Map(), prepared: new Map(), dispose: () => {} };
     const owned = cache;
-    owned.dispose = observeTransactionOutcome(db, (outcome) => {
+    owned.dispose = outcomes.observe(db, (outcome) => {
+      const terminal = terminalCleanups.get(db);
+      if (terminal) {
+        terminal.selected ||= outcome.committed || recordTerminalSelectionAttempted(outcome.token);
+        if (!outcome.succeeded) {
+          if (!outcome.committed && !recordTerminalSelectionAttempted(outcome.token))
+            terminal.pending = true;
+          // A post-selection failure is not permission to call mutable cleanup
+          // after the original roster. Invalidate only private prepared maps.
+          owned.committed.clear();
+          owned.candidates.clear();
+          for (const prepared of owned.prepared.keys()) preparations.delete(prepared);
+          owned.prepared.clear();
+          owned.token = undefined;
+          return;
+        }
+        if (outcome.token !== owned.token) return;
+        // No mutable session/scope disposal, including a catch path, is allowed
+        // after a successful terminal publication.
+        for (const [key, candidate] of owned.candidates)
+          remember(owned, owned.committed, key, candidate);
+        owned.candidates.clear();
+        owned.token = undefined;
+        return;
+      }
       try {
         if (!outcome.succeeded) {
           // A rollback invalidates cached/prepared state, but does not own
@@ -182,7 +245,10 @@ export function createIntakeStateStorage(
     readSource = db.prepare('SELECT sha256,kind FROM source_files WHERE id=?'),
     insertMeta = db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)');
   const get = (key: string, maxBytes?: number) => {
-    const row = maxBytes === undefined ? readMeta.get(key) : readBoundedMeta.get(maxBytes, key);
+    const row =
+      maxBytes === undefined
+        ? terminalStatement(db, readMeta.sourceSQL, readMeta).get(key)
+        : terminalStatement(db, readBoundedMeta.sourceSQL, readBoundedMeta).get(maxBytes, key);
     count('metadataReads');
     if (maxBytes !== undefined && row && (typeof row.bytes !== 'number' || row.bytes > maxBytes))
       invalid('collection stored row bytes');
@@ -196,7 +262,7 @@ export function createIntakeStateStorage(
       invalid('closed');
     }
     if (get('owner_profile_id') !== identity.profileId) invalid('database owner');
-    const source = readSource.get(identity.intakeId);
+    const source = terminalStatement(db, readSource.sourceSQL, readSource).get(identity.intakeId);
     if (!source || source.sha256 !== identity.sourceHash || source.kind !== 'intake_original')
       invalid('original source');
     const durability = recordDurabilityStatus(db);
@@ -214,7 +280,7 @@ export function createIntakeStateStorage(
       if (old !== serialized) invalid('immutable collision');
       return false;
     }
-    insertMeta.run(key, serialized);
+    terminalStatement(db, insertMeta.sourceSQL, insertMeta).run(key, serialized);
     return true;
   }
   function cachedBasis(basis: Basis, selectedHead: string): CachedBasis {
