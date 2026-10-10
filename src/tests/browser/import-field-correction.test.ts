@@ -8,7 +8,6 @@ import {
   fixtureNativeRecordReady,
   fixtureBrowserResponse,
 } from './native-intake-fixture.ts';
-import type { CollectionImportFeed } from '../../shared/intake-clinical-pages.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { IncomingMessage } from 'node:http';
@@ -254,6 +253,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           row.detail.kind === 'record' ? row.detail.record.id : row.detail.selection.recordId;
         assert.equal(id, selectedRecordId);
         assert.equal(pins.candidateVersionId, selectedPins.candidateVersionId);
+        return feed;
       };
       const updateCorrection = () =>
         awaitFeedRefresh(async () => {
@@ -299,7 +299,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
       if (partial) {
         await inline.getByRole('textbox', { name: 'Test name', exact: true }).fill('Potassium');
         await updateCorrection();
-        await page.reload();
+        await awaitFeedRefresh(() => page.reload());
         await page.getByRole('button', { name: 'Review', exact: true }).waitFor();
         assert(
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
@@ -316,7 +316,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
           .getByRole('textbox', { name: 'Correction reason' })
           .fill('Date verified against the original');
         await updateCorrection();
-        await page.reload();
+        await awaitFeedRefresh(() => page.reload());
         assert(
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
         );
@@ -329,7 +329,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         await inline.screenshot({ path: resolve(screenshots, 'potassium-correction-reason.png') });
       await updateCorrection();
       if (partial) {
-        await page.reload();
+        await awaitFeedRefresh(() => page.reload());
         await page.getByRole('button', { name: 'Review', exact: true }).waitFor();
         assert(
           await page.getByRole('button', { name: 'Confirm & save', exact: true }).isDisabled(),
@@ -343,7 +343,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         await updateCorrection();
       }
       await page.getByText(/^4\.1\s*mmol\/L$/).waitFor();
-      await awaitFeedRefresh(() => page.reload());
+      const reloadedFeed = await awaitFeedRefresh(() => page.reload());
       await page.getByText(/^4\.1\s*mmol\/L$/).waitFor();
       await fixtureAssertNoAccepted(request, prefix, intake.id);
       await page.waitForFunction(() =>
@@ -352,7 +352,7 @@ for (const scenario of ['value', 'partial', 'date-and-value', 'document', 'uncla
         ),
       );
       if (!partial) {
-        const feed = (await request(prefix + '/intakes/import-feed')) as CollectionImportFeed;
+        const feed = reloadedFeed;
         assert.equal(feed.format, 'health-intake-import-feed-v2');
         const selected = feed.records.find((row) => row.intakeId === intake.id);
         assert.ok(selected);

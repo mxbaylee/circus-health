@@ -11,7 +11,7 @@ import {
 } from 'node:fs';
 import { dirname } from 'node:path';
 import { parentPort } from 'node:worker_threads';
-import { intakeFileIdentity } from './intake-files.ts';
+import { regularFileIdentity } from './regular-file-identity.ts';
 import type { ClinicalPhysicalItem } from './clinical-review-physical-worker.ts';
 
 function absent(path: string): boolean {
@@ -63,7 +63,7 @@ function directory(item: Extract<ClinicalPhysicalItem, { kind: 'directory' }>): 
 }
 
 function verify(item: ClinicalPhysicalItem): boolean {
-  if (item.kind === 'identity') return intakeFileIdentity(item.path) === item.expectedIdentity;
+  if (item.kind === 'identity') return regularFileIdentity(item.path) === item.expectedIdentity;
   if (item.kind === 'marker') return marker(item);
   return directory(item);
 }

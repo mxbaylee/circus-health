@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } 
 import { tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
 import test from 'node:test';
+import { Worker } from 'node:worker_threads';
 import {
   beginManagedPhysicalMutation,
   captureManagedPhysicalEpoch,
@@ -19,6 +20,52 @@ import {
   type ClinicalPhysicalItem,
 } from '../clinical-review-physical-worker.ts';
 import { intakeFileIdentity } from '../intake-files.ts';
+import { regularFileIdentity } from '../regular-file-identity.ts';
+
+test('physical file identity leaf preserves exact host identity and non-file refusal', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-physical-identity-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = join(root, 'original');
+  writeFileSync(path, 'fictional original');
+  const stat = statSync(path, { bigint: true }),
+    expected = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+  assert.equal(regularFileIdentity(path), expected);
+  assert.equal(intakeFileIdentity(path), expected);
+  assert.equal(regularFileIdentity(root), undefined);
+  assert.throws(intakeFileIdentity.bind(null, root), {
+    status: 409,
+    code: 'SOURCE_CHANGED',
+    message: 'Retained original is not a regular file',
+  });
+  assert.throws(() => regularFileIdentity(join(root, 'missing')), { code: 'ENOENT' });
+});
+
+test('physical proof worker loads only its filesystem identity leaf', async (t) => {
+  const entry = new URL('../clinical-review-physical-worker-thread.ts', import.meta.url),
+    leaf = new URL('../regular-file-identity.ts', import.meta.url),
+    worker = new Worker(
+      `const { registerHooks } = require('node:module');
+       const { parentPort, workerData } = require('node:worker_threads');
+       const imports = [];
+       registerHooks({ load(url, context, nextLoad) {
+         if (url.startsWith('file:')) imports.push(url);
+         return nextLoad(url, context);
+       } });
+       import(workerData).then(() => parentPort.postMessage({ imports }));`,
+      { eval: true, workerData: entry.href },
+    );
+  t.after(() => worker.terminate());
+  const exit = new Promise<number>((resolve) => worker.once('exit', resolve));
+  const imports = await new Promise<string[]>((resolve, reject) => {
+    worker.on('error', reject);
+    worker.on('message', (message) => {
+      if (Array.isArray(message.imports)) resolve(message.imports);
+    });
+  });
+  assert.deepEqual(imports.sort(), [entry.href, leaf.href].sort());
+  worker.postMessage({ type: 'close', id: 1 });
+  assert.equal(await exit, 0);
+});
 
 test('physical transport splits escaped fields without losing or rebinding items', () => {
   const items: ClinicalPhysicalItem[] = Array.from({ length: 64 }, (_, index) => ({

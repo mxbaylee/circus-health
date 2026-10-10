@@ -1,6 +1,7 @@
 import { finishClinicalReviewWork } from './clinical-review-work.ts';
 import { createHash } from 'node:crypto';
-import { openSync, readSync, closeSync, fstatSync, statSync } from 'node:fs';
+import { openSync, readSync, closeSync, fstatSync } from 'node:fs';
+import { regularFileIdentity } from './regular-file-identity.ts';
 import { HttpError } from './database.ts';
 import type { IntakeImageEncoding } from './intake-image.ts';
 import { recordIntakeFileWork } from './intake-file-work.ts';
@@ -145,10 +146,10 @@ export function* inspectIntakeFileWork(
 const verified = new Map<string, string>();
 const VERIFIED_LIMIT = 256;
 export function intakeFileIdentity(path: string): string {
-  const stat = statSync(path, { bigint: true });
-  if (!stat.isFile())
+  const identity = regularFileIdentity(path);
+  if (identity === undefined)
     throw new HttpError(409, 'SOURCE_CHANGED', 'Retained original is not a regular file');
-  return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+  return identity;
 }
 export function verifyIntakeFileHash(path: string, expected: { bytes: number; sha256: string }) {
   finishClinicalReviewWork(verifyIntakeFileHashWork(path, expected));

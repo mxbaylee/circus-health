@@ -740,6 +740,10 @@ snapshot against unrelated host processes: an unmanaged rewrite after its page
 was checked can be observed by the next proof rather than the current response.
 This temporal limit does not authorize refreshing the captured identities or
 ignoring managed writes between pages and handoff.
+Physical-proof workers load only their verification entry point and a filesystem
+identity helper, not the database or application module graph. This removes
+repeated module initialization without pooling workers, caching proof results,
+or changing the original identity, marker, directory or cancellation checks.
 The first cold request still constructs the complete selected review.
 Referenced question and report-link sections use session-owned dense ordinal
 indexes for later pages and fragments; they do not replay preceding entries.
