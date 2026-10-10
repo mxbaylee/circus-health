@@ -49,6 +49,16 @@ storage adapter or record replay modules. Both complete signed physical passes,
 membership checks and owner checkpoints remain unchanged; this reduces worker
 initialization work, not the number of originals verified.
 
+Cold backing workers construct derivative certificate trees in batches of at most
+64 certificates. Each certificate retains its exact entity/key, version, tombstone,
+preimage and field digests; only final reachable shared tree paths are inserted for
+each batch. Earlier roots remain immutable. The temporary tree shape may differ
+from per-key construction, but membership, absence and certificate contents do not.
+Vault quoted-string and contributor raw-document predecessor digests remain distinct.
+This reduces private page writes without widening compact certificate scope,
+skipping accepted-history replay or removing complete physical verification. It
+does not bound the native SQLite column values read before digest construction.
+
 Preparatory recipes record both literal SQL and genuine native changeset effects,
 including their exact write counts. Before final physical verification, every
 retained literal replay statement is compiled again under the installed policy.

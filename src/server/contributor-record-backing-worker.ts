@@ -18,6 +18,7 @@ import {
 } from './record-version-work.ts';
 import type { ContributorRecordBackingInput } from './contributor-record-staging.ts';
 import type { IntakeTreeRoot } from './intake-state-tree.ts';
+import type { VaultRecordCertificate } from './vault-record-certificates.ts';
 
 const input = workerData as ContributorRecordBackingInput;
 const sign = (path: string, kind: string, identity: string) =>
@@ -283,6 +284,12 @@ async function prepare() {
       ),
     );
     const certificates = vaultRecordCertificates(scratch, input.profileId, input.nonce, checkpoint);
+    const certificateBatch: VaultRecordCertificate[] = [];
+    const flushCertificates = () => {
+      if (!certificateBatch.length) return;
+      certificateRoot = certificates.putMany(certificateRoot, certificateBatch).root;
+      certificateBatch.length = 0;
+    };
     for (const row of db
       .prepare(
         'SELECT c.entity,c.record_id,c.version_id,v.contents_json,v.deleted FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id',
@@ -306,15 +313,17 @@ async function prepare() {
           fields.push({ name, ...digest });
         }
       }
-      certificateRoot = certificates.put(certificateRoot, {
+      certificateBatch.push({
         entity: String(row.entity),
         recordId: String(row.record_id),
         versionId: String(row.version_id),
         deleted: Number(row.deleted),
         preimage: await rawDigest(String(row.contents_json)),
         fields,
-      }).root;
+      });
+      if (certificateBatch.length === 64) flushCertificates();
     }
+    flushCertificates();
     if (storage.read('head')?.toString('utf8') !== input.selectedHead)
       throw Error('Contributor accepted HEAD changed during backing replay');
     scratch.exec('COMMIT');

@@ -16,6 +16,7 @@ import {
 import type { VaultRecordBackingInput } from './vault-record-backing.ts';
 import type { PackageSourceOriginalPhysical } from './intake-package-source-lease.ts';
 import type { IntakeTreeRoot } from './intake-state-tree.ts';
+import type { VaultRecordCertificate } from './vault-record-certificates.ts';
 import { regularFileIdentity } from './regular-file-identity.ts';
 
 const input = workerData as VaultRecordBackingInput;
@@ -355,6 +356,12 @@ async function prepare(): Promise<number> {
       checkpoint,
     );
     const readSource = db.prepare('SELECT * FROM source_files WHERE id=?');
+    const certificateBatch: VaultRecordCertificate[] = [];
+    const flushCertificates = () => {
+      if (!certificateBatch.length) return;
+      certificateRoot = certificates.putMany(certificateRoot, certificateBatch).root;
+      certificateBatch.length = 0;
+    };
     for (const row of db
       .prepare(
         'SELECT c.entity,c.record_id,c.version_id,v.contents_json,v.deleted FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id' +
@@ -383,15 +390,17 @@ async function prepare(): Promise<number> {
             : recordFieldDigest(JSON.stringify(value));
         fields.push({ name, ...digest });
       }
-      certificateRoot = certificates.put(certificateRoot, {
+      certificateBatch.push({
         entity,
         recordId,
         versionId: String(row.version_id),
         deleted,
         preimage,
         fields,
-      }).root;
+      });
+      if (certificateBatch.length === 64) flushCertificates();
     }
+    flushCertificates();
     if (storage.read('head')?.toString('utf8') !== input.selectedHead)
       throw Error('Vault accepted HEAD changed during backing verification');
     originals.exec('COMMIT');

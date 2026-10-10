@@ -79,6 +79,43 @@ export function vaultRecordCertificates(
       check();
       return { root: next, writes };
     },
+    /** Cold replay already proved every member. Share bounded tree paths without
+     * retaining obsolete intermediate roots or buffering the full keyspace. */
+    putMany(
+      root: IntakeTreeRoot,
+      values: readonly VaultRecordCertificate[],
+    ): { root: IntakeTreeRoot; writes: number } {
+      check();
+      if (values.length > 64) throw Error('Vault accepted certificate batch exceeds bound');
+      const entries = values.map((value) => {
+        check();
+        const raw = JSON.stringify(value);
+        if (Buffer.byteLength(raw) > 32768) throw Error('Vault accepted certificate exceeds page');
+        return { key: key(value.entity, value.recordId), raw, digest: hash(raw) };
+      });
+      let writes = 0;
+      for (const entry of entries) {
+        check();
+        const count = Number(retain.run(entry.digest, entry.raw).changes);
+        writes += count;
+        ownWrites(count);
+        check();
+      }
+      const codec = tree(),
+        next = codec.putMany(
+          root,
+          entries.map((entry) => ({ key: entry.key, value: entry.digest })),
+        ).root;
+      for (const page of codec.writes([next])) {
+        check();
+        const count = Number(insert.run(page.hash, page.raw).changes);
+        writes += count;
+        ownWrites(count);
+        check();
+      }
+      check();
+      return { root: next, writes };
+    },
   };
 }
 

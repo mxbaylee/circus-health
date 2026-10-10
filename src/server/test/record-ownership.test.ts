@@ -2,6 +2,11 @@ import { fixtureTransaction } from './helpers/accepted-record-fixture.ts';
 import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
 import { readIntakeEnvelopeText } from '../intake-authority.ts';
 import { attachPersonalDurability } from '../portable.ts';
+import {
+  contributorAuthorityPath,
+  contributorOriginalVerifier,
+  openContributorRecordStorage,
+} from '../contributor-record-storage.ts';
 import { recordOwner } from '../record-owner.ts';
 import { ownershipCorrections } from '../ownership-history.ts';
 import { evidenceFor } from '../queries.ts';
@@ -12,7 +17,7 @@ import { getIntakeRelatedRecords } from '../related-records.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, transaction } from '../database.ts';
@@ -2083,8 +2088,7 @@ test('native selected record pages all attached originals, refuses an off-page s
     await import('../ownership-outcome-page.ts');
   const { rebuildRecordDatabase, attachRecordDurability } = await import('../record-versions.ts');
   const { ownershipIdentityIssueIncluded } = await import('../ownership-identity-snapshots.ts');
-  const journal = memoryJournal(),
-    f = fixture(t, 'observation', journal),
+  const f = fixture(t, 'observation'),
     b = attachedReport(f),
     c = attachedReport(f, 'c');
   for (const original of [f.original, b.original, c.original])
@@ -2113,21 +2117,40 @@ test('native selected record pages all attached originals, refuses an off-page s
   const oldHash = String(
     f.db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(c.original.id)!.sha256,
   );
-  fixtureTransaction(f.db, () =>
-    f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('f'.repeat(64), c.original.id),
-  );
+  const headPath = join(contributorAuthorityPath(f.root, f.profileId), 'head'),
+    acceptedHead = readFileSync(headPath),
+    refusedOperationId = randomUUID();
+  assert.deepEqual(f.db.prepare('SELECT * FROM temp.__record_changed').all(), []);
+  // Corrupt only disposable SQL; genuine storage must never accept a forged original hash.
+  f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('f'.repeat(64), c.original.id);
   await assert.rejects(
     commitNativeRecordOwnership(f.db, f.root, f.profileId, {
-      operationId: randomUUID(),
+      operationId: refusedOperationId,
       request: preview.request,
       version: preview.version,
       scopeToken: preview.scopeToken,
     }),
   );
   assert.equal(f.row().person_id, 'patient');
-  fixtureTransaction(f.db, () =>
-    f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run(oldHash, c.original.id),
+  assert.equal(ownershipReceiptReference(f.db, f.profileId, refusedOperationId), undefined);
+  assert.deepEqual(readFileSync(headPath), acceptedHead);
+  f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run(oldHash, c.original.id);
+  assert.deepEqual(
+    f.db
+      .prepare('SELECT * FROM temp.__record_changed')
+      .all()
+      .map((row) => ({ ...row })),
+    [{ entity: 'source_files', record_id: JSON.stringify([c.original.id]) }],
   );
+  f.db
+    .prepare('DELETE FROM temp.__record_changed WHERE entity=? AND record_id=?')
+    .run('source_files', JSON.stringify([c.original.id]));
+  assert.equal(
+    f.db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(c.original.id)!.sha256,
+    oldHash,
+  );
+  assert.deepEqual(f.db.prepare('SELECT * FROM temp.__record_changed').all(), []);
+  assert.deepEqual(readFileSync(headPath), acceptedHead);
   const fresh = await previewNativeRecordOwnership(f.db, f.root, f.profileId, f.request),
     operationId = randomUUID(),
     command = {
@@ -2147,14 +2170,20 @@ test('native selected record pages all attached originals, refuses an off-page s
   assert.deepEqual(sourceAuthorities.map((row) => row.sourceRecordId).sort(), ids.sort());
   assert.equal(replayOwnershipReceiptReference(f.db, f.profileId, command)?.replayed, true);
   const restoredPath = join(f.root, 'ownership-restored.sqlite');
-  rebuildRecordDatabase(restoredPath, { profileId: f.profileId, storage: journal.storage });
+  const storage = openContributorRecordStorage(f.root, f.profileId, { readOnly: true });
+  t.after(() => storage.close());
+  rebuildRecordDatabase(restoredPath, {
+    profileId: f.profileId,
+    storage,
+    verifyReferences: contributorOriginalVerifier(f.root, f.profileId),
+  });
   const restored = openDatabase(restoredPath, f.profileId);
   try {
-    attachRecordDurability(restored, { profileId: f.profileId, storage: journal.storage });
+    attachRecordDurability(restored, { profileId: f.profileId, storage });
     attachPersonalDurability(restored, {
       root: f.root,
       profileId: f.profileId,
-      recordStorage: journal.storage,
+      recordStorage: storage,
     });
     assert.equal(
       restored.prepare('SELECT person_id FROM observations WHERE id=?').get(f.recordId)!.person_id,
