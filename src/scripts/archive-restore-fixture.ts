@@ -1,7 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { Asset, Note, NoteHistory, Observation } from '../shared/api.ts';
-import type { HealthRecordEnvelope, Intake, IntakeReview } from '../shared/intake.ts';
+import type {
+  HealthRecordEnvelope,
+  IntakeReview,
+  IntakeReportAcceptanceResult,
+} from '../shared/intake.ts';
+import type { IntakeRead } from '../shared/intake-summary.ts';
+import { isIntakeSummary } from '../shared/intake-summary.ts';
+import { readQualificationReview } from './qualification-intake-read.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
 import type { OwnershipPreview, OwnershipReceipt } from '../shared/record-ownership.ts';
 import type {
@@ -9,6 +16,7 @@ import type {
   RecordCorrectionPreview,
 } from '../shared/record-correction.ts';
 import type { RecoveryKit } from '../server/vault-crypto.ts';
+import type { PersonalDurabilityStatus } from '../server/portable.ts';
 import type { clinicalRecordHistory } from '../server/clinical-history.ts';
 
 /** The adapter unwraps API data and maintains only its installation's HTTP session. */
@@ -25,6 +33,7 @@ export interface ArchiveRestoreRequest {
   ): Promise<T>;
 }
 
+type PublishedNoteHistory = NoteHistory & { durability: PersonalDurabilityStatus };
 type ClinicalHistory = ReturnType<typeof clinicalRecordHistory>;
 interface OriginalExpectation {
   contentUrl: string;
@@ -35,20 +44,21 @@ interface OriginalExpectation {
 
 /** Independently fictional, bounded evidence. Keep this and the kit outside Git/logs. */
 export interface ArchiveRestoreOracle {
-  format: 'circus-fictional-archive-restore-v1';
+  format: 'circus-fictional-archive-restore-v2';
   profileId: string;
   self: Note;
   person: Note;
   note: Note;
-  noteHistory: NoteHistory;
+  noteHistory: PublishedNoteHistory;
   observations: Observation[];
   histories: ClinicalHistory[];
   originals: OriginalExpectation[];
-  acceptedIntakes: Intake[];
+  acceptedIntakes: IntakeRead[];
   ownershipReceipt: OwnershipReceipt;
   fieldCorrection: RecordCorrectionApplyResult;
-  pending: { intake: Intake; review: IntakeReview };
-  stopped: { intake: Intake; batch: IntakeBatch };
+  acceptanceReceipts: IntakeReportAcceptanceResult['receipt'][];
+  pending: { intake: IntakeRead; review: IntakeReview };
+  stopped: { intake: IntakeRead; batch: IntakeBatch };
 }
 
 function check(condition: unknown, message: string): asserts condition {
@@ -97,6 +107,58 @@ function originalExpectation(contentUrl: string, bytes: Buffer): OriginalExpecta
   };
 }
 
+function noteHistoryAuthority(history: PublishedNoteHistory) {
+  const { currentRevision: _currentRevision, durability, ...authority } = history;
+  check(
+    durability.configured &&
+      !durability.dirty &&
+      !durability.conflicted &&
+      durability.lastError === null,
+    'note history has been durably published',
+  );
+  // The installation revision and publication status are live diagnostics.
+  // Entry revisions, generation IDs, actors, values and lineage remain exact.
+  return authority;
+}
+
+function reviewAuthority(review: IntakeReview) {
+  const { reviewToken: _reviewToken, records, ...authority } = review;
+  // Request tokens certify a live command against the installation revision.
+  // Compare every retained candidate, draft and pair-context field separately.
+  return {
+    ...authority,
+    records: records.map((record) => ({
+      ...record,
+      ...(record.comparisons
+        ? {
+            comparisons: record.comparisons.map((comparison) => {
+              if (comparison.scope?.format !== 'intake-pair-scope-v2') return comparison;
+              const {
+                requestRevision: _requestRevision,
+                token: _token,
+                ...scope
+              } = comparison.scope;
+              return { ...comparison, scope };
+            }),
+          }
+        : {}),
+    })),
+  };
+}
+
+function intakeAuthority(intake: IntakeRead) {
+  const { durability, ...authority } = intake;
+  // These are installation-wide publication counters, not source history. A
+  // later read can publish another prepared index without changing this intake.
+  check(
+    !durability.pending &&
+      durability.error === null &&
+      durability.persistedRevision >= durability.mutationRevision,
+    'intake authority has been durably published',
+  );
+  return authority;
+}
+
 function batchAuthority(batch: IntakeBatch): IntakeBatch {
   return {
     ...batch,
@@ -128,7 +190,7 @@ export async function seedArchiveRestoreFixture(request: ArchiveRestoreRequest) 
   const path = pathFor(profile.id);
   const originals: OriginalExpectation[] = [];
   const upload = async (filename: string, bytes: Buffer, mimeType = 'application/x-ndjson') => {
-    const intake = await request<Intake>(path + '/intakes', {
+    const intake = await request<IntakeRead>(path + '/intakes', {
       method: 'POST',
       bytes,
       headers: {
@@ -161,8 +223,9 @@ export async function seedArchiveRestoreFixture(request: ArchiveRestoreRequest) 
     person.personId && person.personId !== 'patient',
     'managed person has independent identity',
   );
-  const accepted = [] as Intake[];
+  const accepted = [] as IntakeRead[];
   const observations = [] as Observation[];
+  const acceptanceReceipts: IntakeReportAcceptanceResult['receipt'][] = [];
   for (const [id, label, value] of [
     ['self', 'Fictional Self reach', '12.00'],
     ['managed', 'Fictional Managed reach', '18.00'],
@@ -171,19 +234,48 @@ export async function seedArchiveRestoreFixture(request: ArchiveRestoreRequest) 
       'fictional-' + id + '.jsonl',
       Buffer.from(JSON.stringify(envelope(id!, label!, value!)) + '\n'),
     );
-    const review = await request<IntakeReview>(path + '/intakes/' + encoded(intake.id) + '/review');
+    const review = await readQualificationReview(
+      request,
+      path + '/intakes/' + encoded(intake.id) + '/review',
+    );
     equal(review.records.length, 1, 'exact authored candidate count');
     equal(review.records[0]!.mapping.valueText, value, 'candidate original literal');
-    const imported = await request<Intake>(path + '/intakes/' + encoded(intake.id) + '/import', {
-      method: 'POST',
-      json: {
-        version: review.version,
-        reviewToken: review.reviewToken,
-        decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+    const selected = review.records[0]!;
+    check(selected.candidateId && selected.candidateVersionId, 'candidate version is explicit');
+    const imported = await request<IntakeReportAcceptanceResult>(
+      path + '/intakes/report-acceptance',
+      {
+        method: 'POST',
+        json: {
+          operationId: randomUUID(),
+          blocks: [
+            {
+              intakeId: intake.id,
+              proposalId: review.proposalId,
+              intakeVersion: review.version,
+              reviewToken: review.reviewToken,
+              selections: [
+                {
+                  recordId: selected.id,
+                  candidateId: selected.candidateId,
+                  candidateVersionId: selected.candidateVersionId,
+                  mapping: {},
+                },
+              ],
+            },
+          ],
+        },
       },
-    });
-    equal(imported.imported?.clinical?.added, 1, 'explicit acceptance adds one observation');
-    const entityId = imported.imported?.clinical?.records?.[0]?.entityId;
+    );
+    equal(imported.receipt.acceptedCount, 1, 'explicit acceptance adds one observation');
+    equal(imported.receipt.receipts.length, 1, 'one source acceptance receipt');
+    const acceptedRecord = imported.receipt.receipts[0]!.records[0];
+    check(
+      acceptedRecord?.kind === 'observation' && acceptedRecord.outcome === 'added',
+      'new accepted observation receipt',
+    );
+    const entityId = acceptedRecord.entityId;
+    acceptanceReceipts.push(imported.receipt);
     check(entityId, 'accepted record identity returned');
     const observation = await request<Observation>(path + '/tests/' + encoded(entityId));
     equal(observation.personId, 'patient', 'initial acceptance belongs to Self');
@@ -191,7 +283,7 @@ export async function seedArchiveRestoreFixture(request: ArchiveRestoreRequest) 
     equal(observation.valueText, value, 'accepted original literal');
     equal(observation.unit, 'cm', 'accepted original unit');
     equal(observation.date, '2026-01-12', 'accepted original date');
-    accepted.push(imported);
+    accepted.push(await request<IntakeRead>(path + '/intakes/' + encoded(intake.id)));
     observations.push(observation);
   }
   const managed = observations[1]!;
@@ -306,7 +398,8 @@ export async function seedArchiveRestoreFixture(request: ArchiveRestoreRequest) 
     'fictional-review-later.jsonl',
     Buffer.from(JSON.stringify(envelope('pending', 'Fictional Pending reach', '23.00')) + '\n'),
   );
-  const pendingReview = await request<IntakeReview>(
+  const pendingReview = await readQualificationReview(
+    request,
     path + '/intakes/' + encoded(pending.id) + '/review',
   );
   equal(pendingReview.records.length, 1, 'one pending candidate');
@@ -338,12 +431,14 @@ export async function seedArchiveRestoreFixture(request: ArchiveRestoreRequest) 
     json: {},
   });
   const oracle: ArchiveRestoreOracle = {
-    format: 'circus-fictional-archive-restore-v1',
+    format: 'circus-fictional-archive-restore-v2',
     profileId: profile.id,
     self: await request<Note>(path + '/notes/patient'),
     person: await request<Note>(path + '/notes/' + encoded(person.id)),
     note: await request<Note>(path + '/notes/' + encoded(note.id)),
-    noteHistory: await request<NoteHistory>(path + '/notes/' + encoded(note.id) + '/history'),
+    noteHistory: await request<PublishedNoteHistory>(
+      path + '/notes/' + encoded(note.id) + '/history',
+    ),
     observations: await Promise.all(
       observations.map((row) => request<Observation>(path + '/tests/' + encoded(row.id))),
     ),
@@ -359,15 +454,19 @@ export async function seedArchiveRestoreFixture(request: ArchiveRestoreRequest) 
     originals,
     ownershipReceipt,
     fieldCorrection,
+    acceptanceReceipts,
     acceptedIntakes: await Promise.all(
-      accepted.map((item) => request<Intake>(path + '/intakes/' + encoded(item.id))),
+      accepted.map((item) => request<IntakeRead>(path + '/intakes/' + encoded(item.id))),
     ),
     pending: {
-      intake: await request<Intake>(path + '/intakes/' + encoded(pending.id)),
-      review: await request<IntakeReview>(path + '/intakes/' + encoded(pending.id) + '/review'),
+      intake: await request<IntakeRead>(path + '/intakes/' + encoded(pending.id)),
+      review: await readQualificationReview(
+        request,
+        path + '/intakes/' + encoded(pending.id) + '/review',
+      ),
     },
     stopped: {
-      intake: await request<Intake>(path + '/intakes/' + encoded(stopped.id)),
+      intake: await request<IntakeRead>(path + '/intakes/' + encoded(stopped.id)),
       batch: batchAuthority(
         await request<IntakeBatch>(path + '/intake-batches/' + encoded(batch.id)),
       ),
@@ -461,13 +560,25 @@ function checkSeededOracle(oracle: ArchiveRestoreOracle, ownershipReason: string
     ),
     'prior versions retain source attribution',
   );
-  equal(oracle.pending.intake.imported, null, 'pending review never accepted');
+  equal(
+    isIntakeSummary(oracle.pending.intake)
+      ? oracle.pending.intake.collections.importHistory.total
+      : oracle.pending.intake.imported,
+    isIntakeSummary(oracle.pending.intake) ? 0 : null,
+    'pending review never accepted',
+  );
   equal(
     oracle.pending.review.records[0]!.draft?.disposition,
     'review_later',
     'pending review disposition',
   );
-  equal(oracle.stopped.intake.imported, null, 'stopped original never accepted');
+  equal(
+    isIntakeSummary(oracle.stopped.intake)
+      ? oracle.stopped.intake.collections.importHistory.total
+      : oracle.stopped.intake.imported,
+    isIntakeSummary(oracle.stopped.intake) ? 0 : null,
+    'stopped original never accepted',
+  );
   equal(oracle.stopped.batch.status, 'stopped', 'explicit Stop retained');
   equal(oracle.stopped.batch.reason, 'stopped', 'explicit Stop reason');
   const stopped = oracle.stopped.batch.items.find(
@@ -485,7 +596,7 @@ export async function verifyArchiveRestoreFixture(
   oracle: ArchiveRestoreOracle,
 ) {
   const path = pathFor(oracle.profileId);
-  equal(oracle.format, 'circus-fictional-archive-restore-v1', 'oracle format');
+  equal(oracle.format, 'circus-fictional-archive-restore-v2', 'oracle format');
   for (const original of oracle.originals) {
     const bytes = await request<Buffer>(original.contentUrl, { binary: true });
     equal(bytes.length, original.bytes, 'exact original length after restore');
@@ -499,8 +610,10 @@ export async function verifyArchiveRestoreFixture(
       'exact person/note/attachment after restore',
     );
   equal(
-    await request(path + '/notes/' + encoded(oracle.note.id) + '/history'),
-    oracle.noteHistory,
+    noteHistoryAuthority(
+      await request<PublishedNoteHistory>(path + '/notes/' + encoded(oracle.note.id) + '/history'),
+    ),
+    noteHistoryAuthority(oracle.noteHistory),
     'exact prior note versions after restore',
   );
   for (const expected of oracle.observations)
@@ -534,25 +647,40 @@ export async function verifyArchiveRestoreFixture(
       expected,
       'exact correction actor/time/source and prior versions after restore',
     );
+  for (const receipt of oracle.acceptanceReceipts) {
+    const retained = await request<IntakeReportAcceptanceResult>(
+      path + '/intakes/report-acceptance/' + encoded(receipt.operationId),
+    );
+    equal(retained.receipt, receipt, 'exact explicit acceptance receipt after restore');
+  }
   for (const expected of oracle.acceptedIntakes)
     equal(
-      await request(path + '/intakes/' + encoded(expected.id)),
-      expected,
+      intakeAuthority(await request<IntakeRead>(path + '/intakes/' + encoded(expected.id))),
+      intakeAuthority(expected),
       'explicit acceptance history after restore',
     );
   equal(
-    await request(path + '/intakes/' + encoded(oracle.pending.intake.id)),
-    oracle.pending.intake,
+    intakeAuthority(
+      await request<IntakeRead>(path + '/intakes/' + encoded(oracle.pending.intake.id)),
+    ),
+    intakeAuthority(oracle.pending.intake),
     'pending intake after restore',
   );
   equal(
-    await request(path + '/intakes/' + encoded(oracle.pending.intake.id) + '/review'),
-    oracle.pending.review,
+    reviewAuthority(
+      await readQualificationReview(
+        request,
+        path + '/intakes/' + encoded(oracle.pending.intake.id) + '/review',
+      ),
+    ),
+    reviewAuthority(oracle.pending.review),
     'exact pending candidate and review-later draft after restore',
   );
   equal(
-    await request(path + '/intakes/' + encoded(oracle.stopped.intake.id)),
-    oracle.stopped.intake,
+    intakeAuthority(
+      await request<IntakeRead>(path + '/intakes/' + encoded(oracle.stopped.intake.id)),
+    ),
+    intakeAuthority(oracle.stopped.intake),
     'stopped retained original after restore',
   );
   equal(

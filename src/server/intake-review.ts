@@ -1,4 +1,7 @@
+import { finishClinicalReviewWork, someClinicalReviewWork } from './clinical-review-work.ts';
+import { latestSelfReviewDraftResolution } from './intake-review-draft-selection.ts';
 import { labelledBirthDates, supportedDateValues } from './intake-evidence-dates.ts';
+import type { ReviewIssueCollection } from './intake-review-issue-state.ts';
 import { createHash } from 'node:crypto';
 import { HttpError } from './database.ts';
 import { clinicalFields, clinicalMappingEnvelope, datePrecision } from './clinical-import.ts';
@@ -315,17 +318,23 @@ export function resolutionFields(
     ? [issue.field as keyof IntakeClinicalMapping]
     : [];
 }
-export function reviewIssues(
+export function reviewIssues(...input: Parameters<typeof reviewIssuesWork>): ReviewIssueCollection {
+  return finishClinicalReviewWork(reviewIssuesWork(...input));
+}
+export function* reviewIssuesWork(
   record: ReviewRecordInput,
   entry: IntakeEntry,
-  questions: IntakeQuestion[] = [],
+  questions: Iterable<IntakeQuestion> & {
+    some(predicate: (question: IntakeQuestion) => boolean): boolean;
+  } = [],
   metadataScope: SuggestionEvidenceScope = {
     packageEvidence: false,
     reportScoped: false,
     memberId: null,
   },
-): IntakeReviewIssue[] {
-  const issues: IntakeReviewIssue[] = [];
+  sink?: ReviewIssueCollection,
+): Generator<void, ReviewIssueCollection, void> {
+  const issues: ReviewIssueCollection = sink || [];
   const add = (
     prompt: unknown,
     kind: IssueKind,
@@ -338,7 +347,8 @@ export function reviewIssues(
       kind === 'date' && !dateFields.includes(field || '') ? 'information' : kind;
     const writableField = writableKind === 'information' && kind === 'date' ? null : field;
     const id = question?.id || 'issue:' + hash([record.candidateVersionId, writableKind, key]);
-    if (issues.some((i) => i.id === id)) return issues.find((i) => i.id === id) || null;
+    const retained = issues.findId ? issues.findId(id) : issues.find((issue) => issue.id === id);
+    if (retained) return retained;
     issues.push({
       id,
       kind: writableKind,
@@ -358,9 +368,7 @@ export function reviewIssues(
     ...(Array.isArray(value.reviewIssues) ? value.reviewIssues : []),
     ...(Array.isArray(clinical.reviewIssues) ? clinical.reviewIssues : []),
   ] as ReviewIssueSource[];
-  const retainedSelfConfirmation = record.draft?.resolutions?.findLast(
-    (resolution) => resolution.outcome === 'this_is_me',
-  );
+  const retainedSelfConfirmation = latestSelfReviewDraftResolution(record.draft);
   if (
     original.subject !== 'self' ||
     (record.identityConfirmationRequired &&
@@ -374,11 +382,12 @@ export function reviewIssues(
     }
   }
   const scopedDocumentDateReview =
-    questions.some(
-      (question) =>
+    (yield* someClinicalReviewWork(questions, function* (question) {
+      return (
         documentDateFields.includes(question.field || '') &&
-        actionableIssueKind(question.prompt, question.field) === 'date',
-    ) ||
+        actionableIssueKind(question.prompt, question.field) === 'date'
+      );
+    })) ||
     explicit.some(
       (item) =>
         item?.kind === 'date' &&
@@ -394,9 +403,12 @@ export function reviewIssues(
       null,
       'date',
     );
-  for (const question of questions)
+  for (const question of questions) {
+    yield;
     add(question.prompt, issueKind(question.prompt, question.field), question.field, question);
-  for (const item of explicit)
+  }
+  for (const item of explicit) {
+    yield;
     if (item && kinds.includes(item.kind as IssueKind)) {
       const issue = add(
         item.prompt,
@@ -420,12 +432,18 @@ export function reviewIssues(
       const choices = scopedDateChoices(item, value, metadataScope);
       if (choices) issue.choices = choices;
     }
+  }
   const sourceUncertainties = [
     ...(Array.isArray(value.uncertainties) ? value.uncertainties : []),
     ...(Array.isArray(clinical.uncertainties) ? clinical.uncertainties : []),
   ];
   for (const prompt of sourceUncertainties) {
-    if (!questions.some((q) => q.prompt === prompt)) add(prompt, issueKind(prompt));
+    if (
+      !(yield* someClinicalReviewWork(questions, function* (q) {
+        return q.prompt === prompt;
+      }))
+    )
+      add(prompt, issueKind(prompt));
   }
   for (const prompt of record.uncertainties)
     if (!sourceUncertainties.includes(prompt)) add(prompt, 'information');
@@ -455,7 +473,7 @@ export function validateDraftMapping(
             key as keyof IntakeClinicalMapping,
             value,
           )
-        : JSON.stringify(value) !== JSON.stringify((baseline as UnknownRecord)[key]),
+        : canonicalLiteral(value) !== canonicalLiteral((baseline as UnknownRecord)[key]),
     )
   )
     throw new HttpError(

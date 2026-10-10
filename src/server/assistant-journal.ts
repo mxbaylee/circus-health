@@ -1,24 +1,33 @@
 import {
-  mkdirSync,
   readdirSync,
   realpathSync,
   existsSync,
-  openSync,
   fsyncSync,
   closeSync,
   fstatSync,
   readSync,
-  writeFileSync,
   constants,
   opendirSync,
-  linkSync,
+} from 'node:fs';
+import {
+  mkdirSync,
+  openSync,
+  writeFileSync,
   unlinkSync,
   renameSync,
-} from 'node:fs';
+  writeExclusiveJournalFileSync,
+  linkExclusiveJournalFileSync,
+} from './journal-physical-write.ts';
 import { join, resolve, dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { profilePaths } from './profile-storage.ts';
+import { portableWork } from './portable-work.ts';
 import { HttpError } from './database.ts';
+import {
+  clearJournalActivityIndex,
+  forgetJournalActivityScope,
+  publishedJournalActivity,
+} from './journal-activity-index.ts';
 import {
   applyChatChanges,
   chatChanges,
@@ -70,9 +79,12 @@ function remember(chat: object, value: Remembered) {
   scopes.set(value.scope, references);
 }
 export function forgetChatJournal(chat: object): void {
+  const prior = remembered.get(chat);
+  if (prior) forgetJournalActivityScope(prior.scope);
   remembered.delete(chat);
 }
 export function clearChatJournalCache(root: string, profileId?: string): void {
+  clearJournalActivityIndex(root, profileId);
   const prefix = resolve(root) + '/';
   const selected = profileId ? resolve(profilePaths(root, profileId).root) : null;
   for (const [scope, references] of scopes) {
@@ -245,13 +257,10 @@ function publishHead(directory: string, profileId: string, chatId: string, tip: 
   const file = join(directory, 'current');
   const pending = join(pendingDirectory(directory), 'current.' + randomUUID() + '.pending');
   try {
-    const fd = openSync(pending, 'wx', 0o600);
-    try {
-      writeFileSync(fd, JSON.stringify({ format: HEAD, profileId, chatId, ...tip }));
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
+    writeExclusiveJournalFileSync(
+      pending,
+      JSON.stringify({ format: HEAD, profileId, chatId, ...tip }),
+    );
     renameSync(pending, file);
     const dir = openSync(directory, 'r');
     try {
@@ -352,6 +361,39 @@ export function readChat(
     });
   return decoded.state;
 }
+function* chatIds(root: string, profileId: string): Generator<string> {
+  const path = join(realpathSync(profilePaths(root, profileId).root), 'chats');
+  if (!existsSync(path)) return;
+  if (realpathSync(path) !== path) invalid();
+  const directory = opendirSync(path);
+  try {
+    for (let entry = directory.readSync(); entry; entry = directory.readSync())
+      if (UUID.test(entry.name)) yield entry.name;
+  } finally {
+    directory.closeSync();
+  }
+}
+/** Startup validates every journal but retains only one decoded conversation. */
+export function countChats(root: string, profileId: string): number {
+  let total = 0;
+  for (const id of chatIds(root, profileId)) {
+    try {
+      if (
+        object(
+          readChat(root, profileId, id, {
+            maxBytes: DEFAULT_BYTES,
+            maxEntries: DEFAULT_ENTRIES,
+            onReadBytes: (bytes) => portableWork('journalReadBytes', bytes),
+          }),
+        )
+      )
+        total++;
+    } catch (error) {
+      if (!(error instanceof HttpError && error.code === 'CHAT_NOT_FOUND')) throw error;
+    }
+  }
+  return total;
+}
 export function listChats(root: string, profileId: string): unknown[] {
   const directory = join(realpathSync(profilePaths(root, profileId).root), 'chats');
   if (!existsSync(directory)) return [];
@@ -448,15 +490,8 @@ export function writeChat(root: string, profileId: string, chat: unknown, reason
     file = join(directory, nextTail);
     const temporary = join(pendingDirectory(directory), nextTail + '.' + randomUUID() + '.pending');
     try {
-      const fd = openSync(temporary, 'wx', 0o600);
-      try {
-        writeFileSync(fd, bytes);
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      linkSync(temporary, file);
-      unlinkSync(temporary);
+      const staged = writeExclusiveJournalFileSync(temporary, bytes);
+      linkExclusiveJournalFileSync(staged, file);
       const dir = openSync(directory, 'r');
       try {
         fsyncSync(dir);
@@ -474,7 +509,9 @@ export function writeChat(root: string, profileId: string, chat: unknown, reason
       usage,
       scope: resolve(profilePaths(root, profileId).root),
     });
+    publishedJournalActivity(root, profileId, 'chat', chat.id);
   } catch (error) {
+    clearJournalActivityIndex(root, profileId);
     forgetChatJournal(chat);
     // Keep an ambiguously committed generation if the current pointer names it.
     // Never delete prior history or rely on a failed append's cached basis.
@@ -491,6 +528,7 @@ export function copyAssistantJournals(
   root: string,
   profileId: string,
   targetRoot: string,
+  { onFile }: { onFile?: (path: string) => void } = {},
 ): string[] {
   const copied: string[] = [];
   const chats = join(realpathSync(profilePaths(root, profileId).root), 'chats');
@@ -498,9 +536,13 @@ export function copyAssistantJournals(
   if (realpathSync(chats) !== chats) invalid();
   mkdirSync(targetRoot, { recursive: true, mode: 0o700 });
   const targetBase = realpathSync(targetRoot);
-  for (const id of readdirSync(chats).filter((id) => UUID.test(id))) {
+  for (const id of chatIds(root, profileId)) {
     const directory = directories(root, profileId, id),
-      limits = budget();
+      limits = budget({
+        maxBytes: DEFAULT_BYTES,
+        maxEntries: DEFAULT_ENTRIES,
+        onReadBytes: (bytes) => portableWork('journalReadBytes', bytes),
+      });
     const tip = readHead(directory, limits, profileId, id);
     const names = inventory(directory, limits, tip?.tail ?? null);
     if (!names.length) continue;
@@ -509,8 +551,11 @@ export function copyAssistantJournals(
       const target = resolve(targetBase, path);
       mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
       if (realpathSync(dirname(target)) !== dirname(target)) invalid();
+      portableWork('outputBytes', bytes.length);
+      portableWork('maxOutputChunkBytes', bytes.length, true);
       writeFileSync(target, bytes, { flag: 'wx', mode: 0o600 });
-      copied.push(path);
+      if (onFile) onFile(path);
+      else copied.push(path);
     };
     reconstruct(directory, names, limits, profileId, id, tip, save);
     save('current', Buffer.from(JSON.stringify({ format: HEAD, profileId, chatId: id, ...tip! })));

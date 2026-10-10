@@ -1,13 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAssistant } from '../assistant.ts';
 import { readChat } from '../assistant-journal.ts';
-import { assertConversionCoverage } from '../intake-continuation.ts';
+import {
+  assertNativeAssistantCoverage,
+  isNativeAssistantCheckpoint,
+  nativeAssistantConversion,
+  nativeAssistantResume,
+} from '../assistant-intake-native.ts';
+import { readNativeAttributionMetadata } from '../assistant-intake-attribution.ts';
+import { activeMappingRules } from '../clinical-import.ts';
 import { openDatabase } from '../database.ts';
-import { createIntakePlan, getIntake, linkIntakeConversion, uploadIntake } from '../intake.ts';
+import {
+  createIntakePlan,
+  getIntakeRead,
+  intakeConversionChatId,
+  linkIntakeConversion,
+  uploadIntake,
+} from '../intake.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { profilePaths } from '../profile-storage.ts';
 import { ProxyModelBridge } from '../proxy-model-bridge.ts';
@@ -143,7 +158,7 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
             if (round === 3)
               return response('health_intake_batch', {
                 id: source.id,
-                version: getIntake(db, root, profileId, source.id).version,
+                version: getIntakeRead(db, root, profileId, source.id).version,
                 planId: plan.id,
                 operationId: 'fictional-recovered-batch',
                 sourceTextRevisionId,
@@ -184,33 +199,59 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
         context: { intakeId: source.id },
       });
     const settled = async () => {
-      const deadline = Date.now() + 5000;
-      while (chat.status === 'running' && Date.now() < deadline)
+      // Native startup and publication do real host work. The whole-case guard
+      // bounds a hang; five seconds is not an admission or consumption contract.
+      while (chat.status === 'running') {
+        t.signal.throwIfAborted();
         await new Promise((resolve) => setTimeout(resolve, 5));
+      }
       assert.notEqual(chat.status, 'running');
     };
+    const checkpoint = () => {
+      assert.ok(isNativeAssistantCheckpoint(chat.conversionCheckpoint));
+      return chat.conversionCheckpoint;
+    };
+    const header = () => {
+      const value = getIntakeRead(db, root, profileId, source.id);
+      assert.ok(isIntakeSummary(value));
+      return value;
+    };
+    const host = () => nativeAssistantConversion(db, root, profileId, chat.id, header());
+    const resume = () =>
+      nativeAssistantResume(
+        host(),
+        checkpoint(),
+        createHash('sha256')
+          .update(JSON.stringify(activeMappingRules(db, header().providerId)))
+          .digest('hex'),
+      );
     send();
     await settled();
     assert.equal(hostReads, 1);
     assert.equal(requests, ['time', 'transcript'].includes(boundary) ? 1 : 2);
     assert.equal(chat.reading?.readWindows, 0, 'host completion is not provider consumption');
-    assert.equal(chat.conversionCheckpoint!.pending.length, 1);
-    assert.equal(chat.conversionCheckpoint!.pending[0]!.args.id, source.id);
-    const current = getIntake(db, root, profileId, source.id);
+    const pending = resume().pendingWindows;
+    assert.equal(pending.total, 1);
+    assert.equal(pending.complete, true);
+    assert.equal(pending.items.length, 1);
+    const window = pending.items[0]!;
+    assert.ok('args' in window, 'the exact fictional pending window fits inline');
+    assert.equal(window.args.id, source.id);
     assert.throws(
       () =>
-        assertConversionCoverage(
-          chat.conversionCheckpoint!,
-          { ...current, workflow: current.workflow! },
-          { planId: plan.id, coverage },
-        ),
+        assertNativeAssistantCoverage(host(), checkpoint(), { planId: plan.id, coverage }, false),
       { code: 'CONVERSION_COVERAGE_PENDING' },
     );
     const retained = readChat(root, profileId, chat.id) as typeof chat;
-    assert.deepEqual(retained.conversionCheckpoint, chat.conversionCheckpoint);
+    assert.deepEqual(
+      retained.conversionCheckpoint,
+      JSON.parse(JSON.stringify(chat.conversionCheckpoint)),
+      'every serialized native checkpoint field survives its durable journal',
+    );
     assert.ok(!JSON.stringify(retained.conversionCheckpoint).includes('FICTIONAL SOURCE SENTINEL'));
-    assert.equal(current.proposals.length, 0);
-    const beforeAttribution = chat.conversionCheckpoint!.attribution!;
+    assert.equal(header().collections.proposals.total, 0);
+    const beforeAttribution = readNativeAttributionMetadata(host(), checkpoint());
+    assert.equal(beforeAttribution.truncated, false);
     const beforeScope = Object.values(beforeAttribution.scopes)[0]!;
     assert.equal(beforeScope.hostReads, 1);
     assert.equal(beforeScope.acknowledgedReads, 0);
@@ -220,14 +261,15 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
     recovery = true;
     send();
     await settled();
-    assert.match(resumedPrompt, /nextReadWindows/);
+    assert.match(resumedPrompt, /pendingWindows/);
     assert.equal(hostReads, 2, 'the pending scope is re-read in the fresh context');
     assert.equal(chat.reading?.readWindows, 1);
     assert.equal(chat.reading?.pendingReadWindows, 0);
     assert.equal(chat.reading?.reason, 'reading_exhausted');
-    assert.equal(getIntake(db, root, profileId, source.id).proposals.length, 1);
+    assert.equal(header().collections.proposals.total, 1);
     assert.equal(db.prepare('SELECT count(*) AS n FROM documents').get()?.n, 0);
-    const attribution = chat.conversionCheckpoint!.attribution!;
+    const attribution = readNativeAttributionMetadata(host(), checkpoint());
+    assert.equal(attribution.truncated, false);
     const scope = Object.values(attribution.scopes)[0]!;
     assert.equal(scope.hostReads, 2, 'host read tally does not reset across explicit continues');
     assert.equal(scope.acknowledgedReads, 1);
@@ -242,9 +284,9 @@ for (const boundary of ['time', 'transcript', 'provider-context', 'invalid-respo
       attribution.totals.unknownUsageAttempts,
       ['time', 'transcript'].includes(boundary) ? 0 : 1,
     );
-    const metadata = assistant.attributionMetadata(profileId, [
-      getIntake(db, root, profileId, source.id),
-    ]);
+    const conversionChatId = intakeConversionChatId(db, profileId, source.id);
+    assert.equal(conversionChatId, chat.id);
+    const metadata = assistant.attributionMetadata(profileId, [{ conversionChatId }]);
     assert.equal(metadata.chats.length, 1);
     assert.equal(metadata.unavailableChats, 0);
     assert.ok(!JSON.stringify(metadata).includes('FICTIONAL SOURCE SENTINEL'));

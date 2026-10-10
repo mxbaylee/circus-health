@@ -12,6 +12,19 @@ export function useReviewApprovalSelection() {
     setNeedsApproval(new Set());
   };
   const clearSelected = () => setSelected(new Set());
+  const retainShown = (shown: Set<string>) => {
+    for (const id of snapshots.current.keys()) if (!shown.has(id)) snapshots.current.delete(id);
+    setSelected((current) =>
+      [...current].every((id) => shown.has(id))
+        ? current
+        : new Set([...current].filter((id) => shown.has(id))),
+    );
+    setNeedsApproval((current) =>
+      [...current].every((id) => shown.has(id))
+        ? current
+        : new Set([...current].filter((id) => shown.has(id))),
+    );
+  };
   const removeSaved = (ids: string[]) => {
     for (const id of ids) snapshots.current.delete(id);
     setSelected((current) => new Set([...current].filter((id) => !ids.includes(id))));
@@ -76,6 +89,7 @@ export function useReviewApprovalSelection() {
     selected,
     needsApproval,
     clearContext,
+    retainShown,
     clearSelected,
     removeSaved,
     reject,

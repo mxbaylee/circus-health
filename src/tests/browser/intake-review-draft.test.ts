@@ -1,8 +1,18 @@
-import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import type { IntakeClinicalMapping } from '../../shared/intake.ts';
+import {
+  fixtureReview,
+  fixtureProposalId,
+  fixtureReportUrl,
+  fixtureSourcePath,
+  fixtureBrowserResponse,
+  fixtureNativeReportReady,
+  fixtureNativeRecordReady,
+} from './native-intake-fixture.ts';
+import { launchBrowser, newTestPage } from './harness.ts';
+import { startProcessRuntime } from './process-runtime.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Browser } from 'playwright';
-import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
@@ -75,17 +85,18 @@ const envelope = (clinical: boolean) => ({
 
 test(
   'encrypted browser autosaves consecutive review choices with entire server mapping and restores drafts after cache loss',
-  { timeout: 60000 },
+  // Two complete autosave, encrypted cache-loss recovery and acceptance journeys.
+  // Host hang guard only; individual UI assertions keep their normal deadline.
+  { timeout: 180000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-review-draft-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startBrowserRuntime(t, {
+    const runtime = await startProcessRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
       host: '127.0.0.1',
-      assistantOptions: { availability: () => ({ available: false }) },
     });
     let browser: Browser | undefined;
     t.after(async () => {
@@ -96,7 +107,7 @@ test(
     });
     browser = await launchBrowser(t);
     const page = await newTestPage(browser);
-    const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
+    const url = `http://127.0.0.1:${runtime.port}`;
     await page.goto(url);
     const setup = await page.evaluate(async () => {
       const api = async (path: string, body?: unknown) => {
@@ -143,6 +154,7 @@ test(
     });
     for (const clinical of [false, true]) {
       const value = envelope(clinical);
+      const uploadDiagnostics = runtime.captureDiagnostics();
       const uploaded = await page.request.post(url + prefix + '/intakes', {
         headers: {
           Origin: url,
@@ -151,7 +163,18 @@ test(
         },
         data: Buffer.from('Fictional retained original ' + clinical),
       });
-      assert.equal(uploaded.status(), 201);
+      assert.equal(
+        uploaded.status(),
+        201,
+        uploaded.status() === 201
+          ? undefined
+          : JSON.stringify({
+              serverDiagnostics: await uploadDiagnostics(),
+              fixture: 'fictional review draft upload',
+              clinical,
+              error: (await uploaded.json()).error ?? null,
+            }),
+      );
       let item = await stopFixtureImport(page, url, prefix, (await uploaded.json()).data.id);
       item = await api(`${prefix}/intakes/${encodeURIComponent(item.id)}/proposals`, {
         version: item.version,
@@ -159,54 +182,72 @@ test(
         jsonlText: JSON.stringify(value),
       });
       const path = `${prefix}/intakes/${encodeURIComponent(item.id)}`;
-      const reviewPath = path + '/review?proposalId=' + encodeURIComponent(item.proposals[0].id);
-      const originalReview = await api(reviewPath);
-      await page.goto(url + '/#/import?intake=' + encodeURIComponent(item.id));
-      await page.reload();
-      await page.locator('.import-detail-record-link').first().click();
-      // No shared printed subject exists in this fixture. Its header review is
-      // informational; the explicit record-level identity answer stays separate.
+      const proposalId = await fixtureProposalId(api, prefix, item.id);
+      const reviewPath = path + '/review?proposalId=' + encodeURIComponent(proposalId);
+      const originalReview = await fixtureReview(api, reviewPath);
+      const reportUrl = await fixtureReportUrl(api, prefix, item.id);
+      const groupId = new URLSearchParams(reportUrl.split('?')[1]).get('group')!;
+      const recordScope = {
+        intakeId: item.id,
+        proposalId,
+        recordId: originalReview.records[0].id,
+        candidateVersionId: originalReview.records[0].candidateVersionId,
+      };
+      await page.goto('about:blank');
+      await fixtureNativeReportReady(page, prefix, { intakeId: item.id, groupId }, () =>
+        page.goto(url + reportUrl),
+      );
+      await fixtureNativeRecordReady(page, prefix, recordScope, () =>
+        page.locator('.import-detail-record-link:not([data-saved-record-id])').first().click(),
+      );
+      // The native report identity remains informational when no printed subject exists.
       await page
-        .getByRole('button', { name: 'Review person for this report', exact: true })
-        .click();
-      const personSidebar = page.getByRole('dialog', { name: 'Who is this report for?' });
-      await personSidebar
         .getByText('Identity is not printed clearly in this report.', { exact: true })
         .waitFor();
       assert.equal(
-        await personSidebar.getByRole('button', { name: 'This is me', exact: true }).count(),
+        await page.getByRole('region', { name: 'Report identity', exact: true }).count(),
         0,
+        'missing report identity does not invent a report-level confirmation; the record-level answer remains separate',
       );
-      await personSidebar.getByRole('button', { name: 'Close', exact: true }).click();
       await page.getByRole('button', { name: 'This is me', exact: true }).click();
       await page.getByRole('button', { name: 'Keep unconfirmed', exact: true }).click();
-      await page.getByRole('button', { name: 'Leave uncertain', exact: true }).click();
-      await page.waitForResponse(async (response) => {
-        if (!response.url().endsWith('/review-draft')) return false;
-        const body = await response.json();
-        assert(response.ok(), JSON.stringify(body));
-        return body.data.workflow.reviewDrafts.at(-1).resolutions.length === 4;
-      });
-      const deferred = page.waitForResponse(
-        async (response) =>
+      const choicesSaved = fixtureBrowserResponse(
+        page,
+        (response) =>
           response.url().endsWith('/review-draft') &&
-          (await response.json()).data?.workflow.reviewDrafts.at(-1).disposition === 'review_later',
+          response.ok() &&
+          response.request().postDataJSON().resolutions?.length === 4,
+      );
+      await page.getByRole('button', { name: 'Leave uncertain', exact: true }).click();
+      await choicesSaved;
+      const deferred = fixtureBrowserResponse(
+        page,
+        (response) =>
+          response.url().endsWith('/review-draft') &&
+          response.ok() &&
+          response.request().postDataJSON().disposition === 'review_later',
       );
       await page
         .locator('.intake-guided-actions')
         .getByRole('button', { name: 'Review later', exact: true })
         .click();
       await deferred;
-      const stored = await api(reviewPath);
-      assert.equal((await api(path)).imported, null, 'Autosave does not accept the record');
+      const stored = await fixtureReview(api, reviewPath);
+      assert.equal(
+        (await api(path)).collections.importHistory.total,
+        0,
+        'Autosave does not accept the record',
+      );
       assert.equal((await api(prefix + '/vision-prescriptions')).length, 0);
-      assert.equal(stored.records[0].draft.disposition, 'review_later');
+      assert.equal(stored.records[0].draft!.disposition, 'review_later');
       assert.equal(stored.records[0].mapping.subject, 'self');
       assert.equal(stored.records[0].mapping.date, '');
       assert.equal(stored.records[0].mapping.documentDate, '');
       assert.deepEqual(
-        stored.records[0].mapping.mappingOrigins,
-        originalReview.records[0].mapping.mappingOrigins,
+        (stored.records[0].mapping as IntakeClinicalMapping & { mappingOrigins?: unknown })
+          .mappingOrigins,
+        (originalReview.records[0].mapping as IntakeClinicalMapping & { mappingOrigins?: unknown })
+          .mappingOrigins,
       );
       assert.deepEqual(stored.records[0].mapping.assets, originalReview.records[0].mapping.assets);
       assert.deepEqual(
@@ -218,11 +259,12 @@ test(
       const sent = draftBodies.at(-1)!;
       assert.deepEqual(
         sent.mapping.mappingOrigins,
-        originalReview.records[0].mapping.mappingOrigins,
+        (originalReview.records[0].mapping as IntakeClinicalMapping & { mappingOrigins?: unknown })
+          .mappingOrigins,
       );
       assert.deepEqual(sent.mapping, sent.decision.mapping);
       assert.equal(sent.answers && typeof sent.answers, 'object');
-      await page.reload();
+      await fixtureNativeRecordReady(page, prefix, recordScope, () => page.reload());
       const reviewActions = page.getByRole('region', { name: 'Review actions' });
       await reviewActions.getByRole('button', { name: 'Return to review', exact: true }).waitFor();
       assert.equal(
@@ -242,14 +284,36 @@ test(
         recursive: true,
         force: true,
       });
-      await api(prefix + '/unlock', { recovery: setup.recovery });
-      const rebuilt = await api(reviewPath);
+      // Deleting the cache forces actual encrypted reconstruction on unlock.
+      // This host operation uses the enclosing journey's hang guard.
+      const unlocked = await page.request.post(url + prefix + '/unlock', {
+        headers: { Origin: url },
+        data: { recovery: setup.recovery },
+        timeout: 0,
+      });
+      assert.equal(unlocked.status(), 200, await unlocked.text());
+      assert.equal((await unlocked.json()).data.id, setup.profileId);
+      const rebuilt = await fixtureReview(api, reviewPath);
       assert.deepEqual(rebuilt.records[0].draft, stored.records[0].draft);
       assert.deepEqual(rebuilt.records[0].mapping, stored.records[0].mapping);
-      await page.reload();
+      await fixtureNativeRecordReady(page, prefix, recordScope, () => page.reload());
       await reviewActions.getByRole('button', { name: 'Return to review', exact: true }).waitFor();
+      const returningSince = Date.now();
+      const returned = fixtureBrowserResponse(
+        page,
+        (response) =>
+          new URL(response.url()).pathname === path + '/review-draft' &&
+          response.request().method() === 'POST' &&
+          response.request().timing().startTime >= returningSince &&
+          response.request().postDataJSON().recordId === recordScope.recordId &&
+          response.request().postDataJSON().candidateVersionId === recordScope.candidateVersionId &&
+          response.request().postDataJSON().disposition === 'pending',
+      );
       await reviewActions.getByRole('button', { name: 'Return to review', exact: true }).click();
-      const accepted = page.waitForResponse((response) =>
+      const returnedResponse = await returned;
+      assert.equal(returnedResponse.status(), 200, await returnedResponse.text());
+      assert.equal(await returnedResponse.finished(), null);
+      const accepted = fixtureBrowserResponse(page, (response) =>
         response.url().endsWith('/intakes/report-acceptance'),
       );
       await reviewActions
@@ -263,9 +327,11 @@ test(
         assert.equal(prescriptions.length, 1);
         assert.deepEqual(prescriptions[0].opticalPrescription, optical);
       }
-      const original = await page.request.get(url + item.contentUrl);
+      const original = await page.request.get(url + fixtureSourcePath(prefix, item.contentUrl));
       assert.equal(await original.text(), 'Fictional retained original ' + clinical);
-      const proposal = await page.request.get(url + item.proposals[0].contentUrl);
+      const proposal = await page.request.get(
+        url + prefix + '/sources/' + encodeURIComponent(proposalId) + '/content',
+      );
       assert.deepEqual(JSON.parse(await proposal.text()), value);
     }
     assert.deepEqual(errors, []);

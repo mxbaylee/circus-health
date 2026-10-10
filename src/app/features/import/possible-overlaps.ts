@@ -31,7 +31,9 @@ export function possibleSavedOverlapCount(
       candidate.mapping.date === mapping.date &&
       candidate.mapping.valueText === mapping.valueText &&
       candidate.mapping.unit === mapping.unit &&
-      candidate.evidence.some((item) => !!item.contentUrl && originals.has(item.contentUrl))
+      (Array.isArray(candidate.evidence)
+        ? candidate.evidence.some((item) => !!item.contentUrl && originals.has(item.contentUrl))
+        : candidate.originalOverlap === true)
     );
   }).length;
 }

@@ -472,6 +472,7 @@ test('intake paired evidence remains unresolved on its delivery, survives rebuil
     record = review.records[0],
     other = record.comparisons[0];
   assert.equal(record.classification, 'addition', 'same date and label do not merge events');
+  assert.ok(Array.isArray(other.evidence));
   assert.equal(other.evidence[0].label, 'Acquiring clinic');
   const request: Parameters<typeof importIntake>[4] = {
     version: review.version,

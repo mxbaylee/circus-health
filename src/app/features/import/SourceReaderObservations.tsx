@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import type { Intake } from '../../../shared/intake';
+import {
+  isIntakeSummary,
+  type IntakeRead,
+  type IntakeUnitDetail,
+} from '../../../shared/intake-summary';
 import type { SourceReaderCoverage, SourceTextIssueList } from '../../../shared/intake-source-text';
 import { useResource } from '../../data/api';
 export type ReaderObservation = SourceReaderCoverage['entries'][number];
@@ -179,12 +183,25 @@ function FullReaderNote({
   entry: ReaderObservation;
 }) {
   const [open, setOpen] = useState(false);
-  const resource = useResource<Intake>(open ? `/intakes/${encodeURIComponent(intakeId)}` : null);
+  const resource = useResource<IntakeRead>(
+    open ? `/intakes/${encodeURIComponent(intakeId)}` : null,
+  );
+  const selectedUnit = useResource<IntakeUnitDetail>(
+    open && resource.data && isIntakeSummary(resource.data)
+      ? `/intakes/${encodeURIComponent(intakeId)}/plan-unit?planId=${encodeURIComponent(entry.planId)}&unitId=${encodeURIComponent(entry.unitId)}&version=${version}`
+      : null,
+  );
   const unit =
     resource.data?.version === version
-      ? resource.data.workflow?.plans
-          .find((plan) => plan.id === entry.planId)
-          ?.units.find((unit) => unit.id === entry.unitId)
+      ? isIntakeSummary(resource.data)
+        ? selectedUnit.data?.version === version &&
+          selectedUnit.data.planId === entry.planId &&
+          selectedUnit.data.unit.id === entry.unitId
+          ? selectedUnit.data.unit
+          : undefined
+        : resource.data.workflow?.plans
+            .find((plan) => plan.id === entry.planId)
+            ?.units.find((unit) => unit.id === entry.unitId)
       : undefined;
   return (
     <details
@@ -194,9 +211,17 @@ function FullReaderNote({
       }}
     >
       <summary>Full retained reader note</summary>
-      {resource.loading && <p role="status">Loading retained note…</p>}
+      {(resource.loading || selectedUnit.loading) && <p role="status">Loading retained note…</p>}
       {resource.error && <p role="alert">{resource.error.message}</p>}
-      {resource.data && !unit && (
+      {selectedUnit.error && (
+        <p role="alert">
+          {selectedUnit.error.message}{' '}
+          <button className="text-link" type="button" onClick={selectedUnit.reload}>
+            Retry full reader note
+          </button>
+        </p>
+      )}
+      {resource.data && !selectedUnit.loading && !selectedUnit.error && !unit && (
         <p role="alert">
           The processing record changed. Refresh reader observations before opening its current
           note.

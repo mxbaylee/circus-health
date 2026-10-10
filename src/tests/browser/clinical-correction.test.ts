@@ -7,6 +7,15 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { fictionalModel } from '../../server/test/fictional-model.ts';
+import type { IntakeReviewRecord, IntakeEvidenceComparison } from '../../shared/intake.ts';
+import type { ClinicalRecordSectionPage } from '../../shared/intake-clinical-record-sections.ts';
+import {
+  fixtureApi,
+  fixtureReview,
+  fixtureReportUrl,
+  fixtureSourcePath,
+  fixtureAssertNoAccepted,
+} from './native-intake-fixture.ts';
 
 test(
   'encrypted browser corrects a saved result from comparison and returns to the unchanged incoming review',
@@ -91,27 +100,76 @@ test(
       const savedOriginal = original('fictional-saved');
       const first = await request(prefix + '/intakes', undefined, savedOriginal);
       const firstPath = prefix + '/intakes/' + encodeURIComponent(first.id);
-      const review = await request(firstPath + '/review');
-      await request(firstPath + '/import', {
-        version: review.version,
-        reviewToken: review.reviewToken,
-        decisions: [{ recordId: review.records[0].id, action: 'accept', mapping: {} }],
-      });
-      const second = await request(prefix + '/intakes', undefined, original('fictional-incoming'));
-      const incomingPath = prefix + '/intakes/' + encodeURIComponent(second.id);
-      const pending = await request(incomingPath + '/review');
       return {
         prefix,
-        incomingPath,
-        incomingId: second.id,
-        savedId: pending.records[0].comparisons[0].id,
-        draft: pending.records[0].draft,
-        candidateVersionId: pending.records[0].candidateVersionId,
+        firstPath,
+        incomingOriginal: original('fictional-incoming'),
         originalUrl: first.contentUrl,
         savedOriginal,
       };
     });
-    await page.goto(url + '/#/import?intake=' + encodeURIComponent(seed.incomingId));
+    const api = fixtureApi(page, url);
+    const savedReview = await fixtureReview(api, seed.firstPath + '/review');
+    assert.equal(savedReview.records.length, 1);
+    await api(seed.firstPath + '/import', {
+      version: savedReview.version,
+      reviewToken: savedReview.reviewToken,
+      decisions: [{ recordId: savedReview.records[0]!.id, action: 'accept', mapping: {} }],
+    });
+    const incomingUpload = await page.request.post(url + seed.prefix + '/intakes', {
+      headers: {
+        Origin: url,
+        'Content-Type': 'application/x-ndjson',
+        'X-Filename': 'fictional-mass-report.jsonl',
+      },
+      data: seed.incomingOriginal,
+    });
+    assert.equal(incomingUpload.status(), 201, await incomingUpload.text());
+    const incomingId = (await incomingUpload.json()).data.id as string;
+    const incomingPath = seed.prefix + '/intakes/' + encodeURIComponent(incomingId);
+    const incomingReview = await fixtureReview(api, incomingPath + '/review');
+    assert.equal(incomingReview.records.length, 1);
+    const incomingRecord = incomingReview.records[0]!;
+    const readComparison = async (record: IntakeReviewRecord) => {
+      const page = (await api(incomingPath + '/related-records', {
+        proposalId: incomingReview.proposalId,
+        recordId: record.id,
+        candidateVersionId: record.candidateVersionId,
+      })) as ClinicalRecordSectionPage;
+      assert.equal(page.format, 'health-clinical-record-section-page-v1');
+      assert.equal(page.section, 'comparisons');
+      assert.equal(page.total, 1);
+      assert.equal(page.items.length, 1);
+      assert.equal(page.nextCursor, null);
+      const item = page.items[0]!;
+      assert.ok(item.control.kind === 'pair');
+      assert.equal(item.control.targetAvailable, true);
+      let value: unknown;
+      if (item.detail.kind === 'value') value = item.detail.value;
+      else {
+        const chunks: Buffer[] = [];
+        let offset: number | null = 0;
+        do {
+          const fragment = (await api(incomingPath + '/review-record-section-fragment', {
+            reference: item.detail.reference,
+            offset,
+            bytes: 32768,
+          })) as { data: string; totalBytes: number; complete: boolean; nextOffset: number | null };
+          chunks.push(Buffer.from(fragment.data, 'base64'));
+          offset = fragment.nextOffset;
+          assert.equal(fragment.complete, offset === null);
+        } while (offset !== null);
+        const bytes = Buffer.concat(chunks);
+        assert.equal(bytes.length, item.detail.reference.bytes);
+        value = JSON.parse(bytes.toString('utf8'));
+      }
+      const pair = value as { comparison: IntakeEvidenceComparison | null };
+      assert.ok(pair.comparison);
+      assert.equal(pair.comparison.id, item.control.otherRecordId);
+      return pair.comparison;
+    };
+    const savedId = (await readComparison(incomingRecord)).id;
+    await page.goto(url + (await fixtureReportUrl(api, seed.prefix, incomingId)));
     await page.reload();
     await page.locator('.import-detail-record-link').first().click();
     const related = page.locator('.intake-related-disclosure');
@@ -150,23 +208,24 @@ test(
     await page.getByRole('button', { name: 'Apply reviewed correction' }).click();
     await page.getByRole('dialog', { name: 'Correction saved' }).waitFor();
     await page.getByRole('button', { name: 'Return to import review' }).click();
-    assert.equal(new URL(page.url()).hash.includes(encodeURIComponent(seed.incomingId)), true);
+    assert.equal(new URL(page.url()).hash.includes(encodeURIComponent(incomingId)), true);
     const get = async (path: string) => {
       const response = await page.request.get(url + path);
       assert.equal(response.status(), 200);
       return (await response.json()).data;
     };
-    const result = await get(seed.prefix + '/tests/' + encodeURIComponent(seed.savedId));
+    const result = await get(seed.prefix + '/tests/' + encodeURIComponent(savedId));
     assert.equal(result.valueText, '14.00');
     assert.equal(result.unit, 'mg');
-    assert.equal((await page.request.get(url + seed.originalUrl)).status(), 200);
-    assert.equal(await (await page.request.get(url + seed.originalUrl)).text(), seed.savedOriginal);
-    assert.equal((await get(seed.incomingPath)).imported, null);
-    const pending = await get(seed.incomingPath + '/review');
-    assert.equal(pending.records[0].candidateVersionId, seed.candidateVersionId);
-    assert.deepEqual(pending.records[0].draft, seed.draft);
-    assert.equal(pending.records[0].comparisons[0].mapping.valueText, '14.00');
-    await page.goto(url + '/#/tests?result=' + encodeURIComponent(seed.savedId) + '&detail=1');
+    const retained = await page.request.get(url + fixtureSourcePath(seed.prefix, seed.originalUrl));
+    assert.equal(retained.status(), 200);
+    assert.equal(await retained.text(), seed.savedOriginal);
+    await fixtureAssertNoAccepted(api, seed.prefix, incomingId);
+    const pending = await fixtureReview(api, incomingPath + '/review');
+    assert.equal(pending.records[0].candidateVersionId, incomingRecord.candidateVersionId);
+    assert.deepEqual(pending.records[0].draft, incomingRecord.draft);
+    assert.equal((await readComparison(pending.records[0]!)).mapping.valueText, '14.00');
+    await page.goto(url + '/#/tests?result=' + encodeURIComponent(savedId) + '&detail=1');
     await page.getByRole('button', { name: 'More entry actions' }).click();
     await page.getByRole('button', { name: 'Correct saved record', exact: true }).click();
     const savedDialog = page.getByRole('dialog', { name: 'Correct saved record' });
@@ -211,19 +270,12 @@ test(
       'g',
     );
     // Arrange the second accepted assertion only after proving correction did not accept it.
-    await page.evaluate(async (path) => {
-      const review = (await (await fetch(path + '/review')).json()).data;
-      const response = await fetch(path + '/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          version: review.version,
-          reviewToken: review.reviewToken,
-          decisions: [{ recordId: review.records[0].id, action: 'accept', mapping: {} }],
-        }),
-      });
-      if (!response.ok) throw new Error(await response.text());
-    }, seed.incomingPath);
+    const review = await fixtureReview(api, incomingPath + '/review');
+    await api(incomingPath + '/import', {
+      version: review.version,
+      reviewToken: review.reviewToken,
+      decisions: [{ recordId: review.records[0].id, action: 'accept', mapping: {} }],
+    });
     await page.reload();
     await page.getByRole('button', { name: 'Review another accepted record' }).click();
     const picker = page.getByRole('dialog', { name: 'Choose another measurement' });

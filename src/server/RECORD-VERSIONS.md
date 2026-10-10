@@ -73,6 +73,15 @@ single primary key or an array of composite keys. Querying uses SQLite indexes
 and never reads the vault. The supplied database must be attached to its unlocked
 owning profile. Close it when locking; no history API exists for locked profiles.
 
+SQLite projection 3 derives the two creation changes for an initial, nondeleted
+`app_meta` version with exactly string `key` and `value` contents from its complete
+validated version. It stores no field-reference rows for that case and refuses
+unexpected references. Other versions retain exact stored field references.
+Older projections require fresh reconstruction, not in-place relabeling. The
+encrypted unlock owner rebuilds an incompatible cache from authenticated history;
+direct contributor attachment refuses it and explicit staged recovery creates a
+new target. This changes no accepted journal or original format.
+
 The format pins the current application schema and projection version. Unsupported
 schemas, revision/sequence gaps, broken ancestry, corrupt/missing committed bytes,
 invalid previous versions, partial transactions and wrong owners fail explicitly.

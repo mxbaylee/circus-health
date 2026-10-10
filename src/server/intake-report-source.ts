@@ -1,3 +1,4 @@
+import { selectedReportGroups } from './intake-selected-report-groups.ts';
 import { createHash } from 'node:crypto';
 import { canonicalLiteral } from './intake-format.ts';
 import type {
@@ -9,7 +10,6 @@ import type {
   IntakeReportSourceScope,
   IntakeReportQueueView,
   IntakeReportSourceCoverageCounts,
-  IntakeReviewGroupReference,
   IntakeWorkflow,
 } from '../shared/intake.ts';
 
@@ -25,7 +25,10 @@ const occurrenceKey = (occurrence: IntakeReportSourceCoverageEntry['occurrence']
     occurrence.locator,
   ]);
 
-function reportFingerprint(group: IntakeReportGroup): string {
+export type IntakeReportSourceGroupHeader = Omit<IntakeReportGroup, 'versions'>;
+export type IntakeReportSourceVersionHeader = Omit<IntakeReportGroupVersion, 'members'>;
+
+function reportFingerprint(group: IntakeReportSourceGroupHeader): string {
   return hash([
     group.id,
     group.sourceFileId,
@@ -37,9 +40,9 @@ function reportFingerprint(group: IntakeReportGroup): string {
   ]);
 }
 
-function sourceReference(
-  group: IntakeReportGroup,
-  version: IntakeReportGroupVersion,
+export function intakeReportSourceReference(
+  group: IntakeReportSourceGroupHeader,
+  version: IntakeReportSourceVersionHeader,
 ): IntakeReportSourceCoverageEntry['sourceRef'] {
   const contextId = version.context?.contextId || version.id;
   const extensionScope = intakeReportSourceScope(group, version, 'manual_report_label');
@@ -180,7 +183,7 @@ export function intakeReportSourceReviewScope(
         ),
       );
       if (!introduced) continue;
-      const sourceRef = sourceReference(group, introduced);
+      const sourceRef = intakeReportSourceReference(group, introduced);
       const identity = [candidate.id, version.id, occurrence, sourceRef];
       entries.push({
         id: 'report-source-coverage:' + hash(identity),
@@ -226,8 +229,8 @@ export function intakeReportSourceReviewScope(
 
 /** A durable boundary for later members; presentation labels and sections are excluded. */
 export function intakeReportSourceScope(
-  group: IntakeReportGroup,
-  version: IntakeReportGroupVersion,
+  group: IntakeReportSourceGroupHeader,
+  version: IntakeReportSourceVersionHeader,
   basis: IntakeReportSourceConfirmation['basis'],
 ): IntakeReportSourceScope | null {
   if (
@@ -348,7 +351,7 @@ export function extendIntakeReportSourceConfirmations(
                 // A compatible contribution may inherit only occurrences it actually introduced.
                 // Older active/deferred occurrences excluded from the explicit click stay uncovered.
                 if (coveredOccurrences.has(identity) || priorOccurrences.has(identity)) return [];
-                const sourceRef = sourceReference(group, version);
+                const sourceRef = intakeReportSourceReference(group, version);
                 return [
                   {
                     id:
@@ -461,16 +464,18 @@ export function intakeReportSourceForVersion(
 /** Resolve an exact member and the immutable group version that introduced this occurrence. */
 export function intakeReportSourceForMember(
   confirmations: IntakeReportSourceConfirmation[] | undefined,
-  references: IntakeReviewGroupReference[] | undefined,
+  references: import('../shared/intake-report-group-links.ts').IntakeReviewGroupLinks | undefined,
   member: { candidateId?: string; candidateVersionId?: string },
   occurrence?: OccurrenceLookup,
 ): ResolvedIntakeReportSource | null {
   if (!member.candidateId || !member.candidateVersionId) return null;
-  const scopes = new Set(
-    (references || []).map((reference) =>
-      canonicalLiteral([reference.groupId, reference.groupVersionId]),
-    ),
-  );
+  const scopes = {
+    has(key: string) {
+      return selectedReportGroups(references).some(
+        (reference) => canonicalLiteral([reference.groupId, reference.groupVersionId]) === key,
+      );
+    },
+  };
   const key = memberKey({
     candidateId: member.candidateId,
     candidateVersionId: member.candidateVersionId,

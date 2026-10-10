@@ -286,6 +286,21 @@ test('section search and reference following remain scoped, literal, bounded and
   assert.equal(followed.followed, true);
   assert.match(followed.text, /Method literal/);
   assert.equal(followed.start, 0);
+  // A retained legacy source may point to a sibling that has since entered the
+  // native path. Following the link needs its header, never a whole DTO.
+  const targetReference = references.find(
+    (reference) => reference.source === 'detail.html#method',
+  )!;
+  assert.ok(targetReference.sourceFileId);
+  await intake.ensureNativeIntakeSchema(f.db, f.profileId, targetReference.sourceFileId);
+  const mixed = await navigateIntakeEvidence({
+    ...context,
+    action: 'follow',
+    referenceId: targetReference.id,
+  });
+  assert.equal(mixed.followed, true);
+  assert.equal(mixed.text, followed.text);
+  assert.equal(mixed.start, followed.start);
   const remote = await navigateIntakeEvidence({
     ...context,
     action: 'follow',
@@ -318,6 +333,25 @@ test('section search and reference following remain scoped, literal, bounded and
     before,
     'reads never mark extraction complete or change reviewed decisions',
   );
+  // Selecting the parent does not require old extracted children to migrate.
+  // Their reference resolver must use the parent's complete paged inventory.
+  await intake.createIntakePlanRead(f.db, f.root, f.profileId, item.id, {
+    version: intake.getIntakeRead(f.db, f.root, f.profileId, item.id).version,
+    operationId: 'fictional-parent-native-plan',
+  });
+  assert.ok(!('format' in intake.getIntakeRead(f.db, f.root, f.profileId, sourceId)));
+  const mixedParentIndex = await indexIntakeEvidence(context);
+  assert.equal(
+    mixedParentIndex.references?.find((r) => r.source === 'detail.html#method')?.sourceFileId,
+    targetReference.sourceFileId,
+  );
+  const mixedParentFollow = await navigateIntakeEvidence({
+    ...context,
+    action: 'follow',
+    referenceId: targetReference.id,
+  });
+  assert.equal(mixedParentFollow.text, followed.text);
+  assert.equal(mixedParentFollow.start, followed.start);
 });
 
 test('interrupted ZIP indexing retries retained children without duplicate originals or recursive expansion', async (t) => {

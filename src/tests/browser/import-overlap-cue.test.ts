@@ -1,3 +1,4 @@
+import { fixtureApi, fixtureReview } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
@@ -91,17 +92,44 @@ test(
         .join('\n');
       const uploaded = await request(prefix + '/intakes', undefined, source);
       const path = prefix + '/intakes/' + encodeURIComponent(uploaded.id);
-      const review = await request(path + '/review');
-      await request(path + '/import', {
-        version: review.version,
-        reviewToken: review.reviewToken,
-        decisions: [{ recordId: review.records[0].id, action: 'accept', mapping: {} }],
-      });
       return { prefix, path };
     });
+    const api = fixtureApi(page, origin);
+    const reviewPath = seed.path;
+    const review = await fixtureReview(api, reviewPath + '/review');
+    await api(reviewPath + '/import', {
+      version: review.version,
+      reviewToken: review.reviewToken,
+      decisions: [{ recordId: review.records[0].id, action: 'accept', mapping: {} }],
+    });
     await page.goto(origin + '/#/import');
+    // Await the current browser's bounded metadata/identity preparation, then
+    // keep the normal fast assertion for the exact overlap link.
+    const readingSince = Date.now();
+    const reportReady = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'GET' &&
+        response.request().timing().startTime >= readingSince &&
+        new URL(response.url()).pathname.startsWith(seed.prefix + '/intakes/report-queue/'),
+      { timeout: 0 },
+    );
+    const identityReady = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'GET' &&
+        response.request().timing().startTime >= readingSince &&
+        new URL(response.url()).pathname === seed.path + '/identity-review',
+      { timeout: 0 },
+    );
     await page.reload();
-    const link = page.getByRole('link', { name: 'Check possible overlap' });
+    for (const response of await Promise.all([reportReady, identityReady])) {
+      assert.equal(response.status(), 200);
+      assert.equal(await response.finished(), null);
+    }
+    await page
+      .getByRole('status')
+      .filter({ hasText: 'Checking retained identity evidence…' })
+      .waitFor({ state: 'hidden', timeout: 0 });
+    const link = page.getByRole('link', { name: 'Check possible overlap', exact: true });
     await link.waitFor();
     assert.equal(await link.count(), 1);
     assert.match(
@@ -131,7 +159,7 @@ test(
     await page.getByRole('region', { name: 'Paired evidence review' }).waitFor();
     const pending = await page.request.get(origin + seed.path + '/review');
     assert(pending.ok());
-    const rows = (await pending.json()).data.records;
+    const rows = (await fixtureReview(api, seed.path + '/review')).records;
     assert.equal(
       rows.filter((row: { reviewState?: string }) => row.reviewState === 'accepted').length,
       1,

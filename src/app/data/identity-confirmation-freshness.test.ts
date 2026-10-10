@@ -317,3 +317,238 @@ test('non-version failures preserve existing exact recovery behavior', async (t)
       assert.deepEqual(retained, expectedRetained);
     });
 });
+
+const nativeReview = (version = 4): IntakeIdentityReview => {
+  const { membership: _membership, targets: _targets, questions: _questions, ...header } = scope();
+  const token = String(version).repeat(64);
+  return review({
+    scope: null,
+    evidenceCommitment: { format: 'health-intake-identity-evidence-v1', sha256: 'a'.repeat(64) },
+    scopeReference: {
+      ...header,
+      intakeVersion: version,
+      scopeToken: token,
+      format: 'health-intake-identity-scope-v2',
+      collection: {
+        snapshotId: 'identity:' + token,
+        membership: 1000,
+        targets: 500,
+        assignmentTargets: 500,
+        questions: 40,
+        competingSubjects: 2,
+      },
+    },
+  });
+};
+
+test('native version-specific references retry exactly once after equal complete evidence proof', async () => {
+  const displayed = nativeReview(),
+    fresh = nativeReview(5),
+    sent: IntakeIdentityConfirmation[] = [];
+  assert.notEqual(
+    displayed.scopeReference!.collection.snapshotId,
+    fresh.scopeReference!.collection.snapshotId,
+  );
+  assert.equal(sameDisplayedIdentityReview(displayed, fresh), true);
+  const input = { ...request(), scope: displayed.scopeReference! };
+  const outcome = await confirmIdentityWithFreshness({
+    displayed,
+    request: input,
+    send: async (value) => {
+      sent.push(structuredClone(value));
+      if (sent.length === 1) throw conflict();
+      return result;
+    },
+    loadFresh: async () => fresh,
+    isContextCurrent: () => true,
+    retainRequest: () => {},
+  });
+  assert.equal(outcome.status, 'confirmed');
+  assert.deepEqual(sent, [input, { ...input, version: 5, scope: fresh.scopeReference! }]);
+});
+
+test('native proof and reference validation refuse missing/malformed/changed hidden evidence', async (t) => {
+  const shown = nativeReview(),
+    fresh = nativeReview(5);
+  const cases: [string, IntakeIdentityReview][] = [
+    [
+      'missing collection',
+      {
+        ...fresh,
+        scopeReference: { ...fresh.scopeReference!, collection: undefined },
+      } as unknown as IntakeIdentityReview,
+    ],
+    [
+      'null collection',
+      {
+        ...fresh,
+        scopeReference: { ...fresh.scopeReference!, collection: null },
+      } as unknown as IntakeIdentityReview,
+    ],
+    ['missing proof', { ...fresh, evidenceCommitment: undefined }],
+    [
+      'malformed hash',
+      { ...fresh, evidenceCommitment: { ...fresh.evidenceCommitment!, sha256: 'not-a-digest' } },
+    ],
+    [
+      'unsupported proof',
+      {
+        ...fresh,
+        evidenceCommitment: { ...fresh.evidenceCommitment!, format: 'future' },
+      } as unknown as IntakeIdentityReview,
+    ],
+    [
+      'new proof field',
+      {
+        ...fresh,
+        evidenceCommitment: { ...fresh.evidenceCommitment!, future: true },
+      } as IntakeIdentityReview,
+    ],
+    [
+      'changed same-count evidence',
+      { ...fresh, evidenceCommitment: { ...fresh.evidenceCommitment!, sha256: 'b'.repeat(64) } },
+    ],
+    [
+      'unbound snapshot',
+      {
+        ...fresh,
+        scopeReference: {
+          ...fresh.scopeReference!,
+          collection: {
+            ...fresh.scopeReference!.collection,
+            snapshotId: shown.scopeReference!.collection.snapshotId,
+          },
+        },
+      },
+    ],
+    [
+      'malformed token',
+      { ...fresh, scopeReference: { ...fresh.scopeReference!, scopeToken: 'invalid' } },
+    ],
+    [
+      'changed collection count',
+      {
+        ...fresh,
+        scopeReference: {
+          ...fresh.scopeReference!,
+          collection: { ...fresh.scopeReference!.collection, membership: 999 },
+        },
+      },
+    ],
+    [
+      'changed header',
+      {
+        ...fresh,
+        scopeReference: {
+          ...fresh.scopeReference!,
+          subject: { ...fresh.scopeReference!.subject, text: 'A changed subject' },
+        },
+      },
+    ],
+    ['changed Self', { ...fresh, self: { ...fresh.self, version: fresh.self.version + 1 } }],
+    ['changed view', { ...fresh, message: 'A changed decision' }],
+    ['future view field', { ...fresh, future: 'new' } as IntakeIdentityReview],
+  ];
+  for (const [name, value] of cases)
+    await t.test(name, async () => {
+      let sends = 0;
+      const outcome = await confirmIdentityWithFreshness({
+        displayed: shown,
+        request: { ...request(), scope: shown.scopeReference! },
+        send: async () => {
+          sends++;
+          throw conflict();
+        },
+        loadFresh: async () => value,
+        isContextCurrent: () => true,
+        retainRequest: () => {},
+      });
+      assert.equal(outcome.status, 'scope_changed');
+      assert.equal(sends, 1);
+    });
+  assert.equal(
+    sameDisplayedIdentityReview({ ...shown, evidenceCommitment: undefined }, fresh),
+    false,
+  );
+  assert.equal(sameDisplayedIdentityReview(shown, review()), false);
+});
+
+test('paged warnings retain exact snapshot binding and complete warning commitment', () => {
+  const warningReview = (version: number) => {
+    const value = nativeReview(version);
+    return {
+      ...value,
+      warningsReference: {
+        format: 'health-intake-identity-warnings-v2' as const,
+        scopeToken: value.scopeReference!.scopeToken,
+        snapshotId: 'identity-warnings:' + value.scopeReference!.scopeToken + ':' + 'd'.repeat(64),
+        sha256: 'd'.repeat(64),
+        count: 101,
+      },
+    };
+  };
+  const shown = warningReview(4),
+    fresh = warningReview(5);
+  assert.equal(
+    sameDisplayedIdentityReview(shown, {
+      ...fresh,
+      warningsReference: {
+        format: 'health-intake-identity-warnings-v1',
+        scopeToken: fresh.scopeReference!.scopeToken,
+        snapshotId: fresh.scopeReference!.collection.snapshotId,
+        count: 101,
+      },
+    }),
+    false,
+  );
+  assert.equal(sameDisplayedIdentityReview(shown, fresh), true);
+  assert.equal(
+    sameDisplayedIdentityReview(shown, {
+      ...fresh,
+      warningsReference: {
+        ...fresh.warningsReference,
+        snapshotId: shown.warningsReference.snapshotId,
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    sameDisplayedIdentityReview(shown, {
+      ...fresh,
+      evidenceCommitment: { ...fresh.evidenceCommitment!, sha256: 'c'.repeat(64) },
+    }),
+    false,
+  );
+  assert.equal(
+    sameDisplayedIdentityReview(shown, {
+      ...fresh,
+      warningsReference: { ...fresh.warningsReference, count: 102 },
+    }),
+    false,
+  );
+});
+
+test('a second native VERSION_CONFLICT cannot initiate another read or retry', async () => {
+  let sends = 0,
+    reads = 0;
+  await assert.rejects(
+    () =>
+      confirmIdentityWithFreshness({
+        displayed: nativeReview(),
+        request: { ...request(), scope: nativeReview().scopeReference! },
+        send: async () => {
+          sends++;
+          throw conflict();
+        },
+        loadFresh: async () => {
+          reads++;
+          return nativeReview(5);
+        },
+        isContextCurrent: () => true,
+        retainRequest: () => {},
+      }),
+    conflict(),
+  );
+  assert.equal(sends, 2);
+  assert.equal(reads, 1);
+});

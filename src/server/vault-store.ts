@@ -1,21 +1,93 @@
 import { randomUUID, createHash } from 'node:crypto';
 import {
   existsSync,
-  mkdirSync,
+  mkdirSync as rawMkdirSync,
   readdirSync,
   lstatSync,
   statSync,
-  rmSync,
+  rmSync as rawRmSync,
   openSync,
   closeSync,
   readSync,
+  opendirSync,
+  realpathSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  unlinkSync,
+  constants as fsConstants,
+  renameSync,
+  type Dir,
 } from 'node:fs';
-import { resolve, relative } from 'node:path';
+import {
+  withManagedPhysicalMutation,
+  beginManagedPhysicalMutation,
+  captureManagedPhysicalEpoch,
+  managedPhysicalEpochCurrent,
+  managedPhysicalMutationSequence,
+} from './clinical-review-physical-epoch.ts';
+import type { DatabaseSync } from 'node:sqlite';
+import { currentTransactionToken, managedDatabaseMethodEpoch } from './database.ts';
+import {
+  currentClinicalOperation,
+  assertClinicalOperation,
+  type ClinicalOperation,
+} from './clinical-operation.ts';
+import {
+  prepareVaultRecordBackingTransport,
+  type VaultRecordBackingBinding,
+} from './vault-record-backing.ts';
+import {
+  consumeRecordBackingAdvance,
+  recordCompactTerminalOwnerCurrent,
+  recordCompactTerminalOriginalSources,
+  type RecordIndexedPublication,
+  type RecordCompactTerminalOwner,
+  recordTransactionTerminalExecutionCurrent,
+  runRecordTransactionTerminalExecution,
+  verifiedRecordTransactionOriginalArtifacts,
+  verifiedRecordTransactionOriginalSources,
+  verifiedRecordTransactionBackingVersions,
+  consumeRecordTransactionBackingAdvance,
+  consumeRecordTransactionBackingPublication,
+  type RecordTransactionIndexedPublication,
+  type RecordTransactionBackingPlan,
+  type RecordTransactionTerminalExecution,
+} from './record-versions.ts';
+
+const mkdirSync: typeof rawMkdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawMkdirSync(...args));
+const rmSync: typeof rawRmSync = (...args) => withManagedPhysicalMutation(() => rawRmSync(...args));
+import { resolve, relative, dirname } from 'node:path';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { recentPerformanceLimits } from './import-performance.ts';
-import { encryptObject, decryptObject, type VaultKey } from './vault-crypto.ts';
-import { openVaultIndex, safeVaultName, type VaultIndexLimits } from './vault-index.ts';
+import {
+  encryptObject,
+  encryptObjectToFileDescriptor,
+  decryptObject,
+  type VaultKey,
+} from './vault-crypto.ts';
+import { openVaultIndexSteps, safeVaultName, type VaultIndexLimits } from './vault-index.ts';
+import { setImmediate as yieldHost } from 'node:timers/promises';
 import { openDiagnosticChunkStore, type DiagnosticChunkStore } from './diagnostic-chunk-store.ts';
+import { captureRecordHeadPhysical } from './record-head-physical.ts';
+import { recordVersionWork } from './record-version-work.ts';
+
+export type VaultDiagnosticWriter = (sequence: number, bytes: Uint8Array) => void;
+const diagnosticWriters = new WeakMap<
+  VaultDiagnosticWriter,
+  { directory: string; profileId: string }
+>();
+
+/** Only openVault can mint a writer, and its destination is fixed in its closure. */
+export function isVaultDiagnosticWriter(
+  writer: VaultDiagnosticWriter,
+  directory: string,
+  profileId: string,
+): boolean {
+  const bound = diagnosticWriters.get(writer);
+  return bound?.directory === resolve(directory) && bound.profileId === profileId;
+}
 
 interface VaultObjectMetadata {
   bytes: number;
@@ -35,6 +107,849 @@ export interface VaultRecordStorage {
   read(name: string): Buffer | null;
   writeImmutable(name: string, bytes: Uint8Array): void;
   publishHead(bytes: Uint8Array): void;
+}
+
+declare const stagingWitnessBrand: unique symbol;
+export interface VaultRecordStagingWitness {
+  readonly [stagingWitnessBrand]: true;
+}
+interface RecordParent {
+  path: string;
+  dev: bigint;
+  ino: bigint;
+  mode: bigint;
+}
+interface RecordStagingOwner {
+  storage: VaultRecordStorage;
+  read: VaultRecordStorage['read'];
+  write: VaultRecordStorage['writeImmutable'];
+  publish: VaultRecordStorage['publishHead'];
+  directory: string;
+  profileId: string;
+  key: VaultKey;
+  guard(): void;
+  live(): boolean;
+  head(): string | null;
+  prepareHead(): void;
+  installHead(bytes: Uint8Array): void;
+  workspace?: string;
+  workspaceEpoch(): object;
+  workspaceNames(): readonly string[];
+  compactReady(): boolean;
+  stagingWitnesses: Set<VaultRecordStagingWitness>;
+  transactionBackingPoisoned?: boolean;
+  backingFrontier?: {
+    backing: Awaited<ReturnType<typeof prepareVaultRecordBackingTransport>>;
+    db: DatabaseSync;
+    head: string;
+    epoch: object;
+    sequence: bigint;
+    workspaceEpoch: object;
+    parents: RecordParent[];
+    methods: object;
+  };
+}
+interface RecordStagingData {
+  owner: RecordStagingOwner;
+  db: DatabaseSync;
+  originalEpoch: object;
+  originalSequence: bigint;
+  approvedEpoch: object;
+  sequence: bigint;
+  parents: RecordParent[];
+  transaction?: object;
+  revoked: boolean;
+  headPrepared?: boolean;
+  preparation?: ClinicalOperation;
+  preparationComplete?: boolean;
+  terminalOwner?: RecordCompactTerminalOwner;
+  backing?: Awaited<ReturnType<typeof prepareVaultRecordBackingTransport>>;
+  workspaceEpoch: object;
+  fullPrepared?: boolean;
+  stagedAttempt?: boolean;
+  pendingPlan?: RecordTransactionBackingPlan;
+  pendingHead?: string;
+  installed?: {
+    epoch: object;
+    sequence: bigint;
+    methods: object;
+  };
+}
+const recordStagingOwners = new WeakMap<object, RecordStagingOwner>();
+const recordStagingWitnesses = new WeakMap<VaultRecordStagingWitness, RecordStagingData>();
+const ownDescriptor = Object.getOwnPropertyDescriptor;
+declare const recordReadOwnerBrand: unique symbol;
+export interface VaultRecordReadOwner {
+  readonly [recordReadOwnerBrand]: true;
+}
+const recordReadOwners = new WeakMap<
+  VaultRecordReadOwner,
+  {
+    owner: RecordStagingOwner;
+    physical: ReturnType<typeof captureRecordHeadPhysical>;
+    head: string | null;
+    epoch: object;
+    sequence: bigint;
+    workspaceEpoch: object;
+  }
+>();
+/** Only the actual vault storage factory supplies these fixed original paths. */
+export function vaultRecordReadOwnerSupported(storage: object): boolean {
+  return recordStagingOwners.has(storage);
+}
+export function captureVaultRecordReadOwner(storage: object): VaultRecordReadOwner | undefined {
+  const owner = recordStagingOwners.get(storage),
+    epoch = captureManagedPhysicalEpoch();
+  if (!owner) return undefined;
+  if (!epoch || !recordStagingMethodsCurrent(owner))
+    throw Error('Vault record read owner unavailable');
+  owner.guard();
+  const physical = captureRecordHeadPhysical(
+    [resolve(owner.directory, 'vault/manifest.enc')],
+    [owner.directory, resolve(owner.directory, 'vault')],
+  );
+  const cap = Object.freeze({}) as VaultRecordReadOwner;
+  recordReadOwners.set(cap, {
+    owner,
+    physical,
+    head: owner.head(),
+    epoch,
+    sequence: managedPhysicalMutationSequence(),
+    workspaceEpoch: owner.workspaceEpoch(),
+  });
+  if (!vaultRecordReadOwnerCurrent(storage, cap)) {
+    closeVaultRecordReadOwner(cap);
+    throw Error('Vault record read owner changed during capture');
+  }
+  return cap;
+}
+/** Fixed native physical checks and factory-owned memory only. */
+export function vaultRecordReadOwnerCurrent(storage: object, cap: VaultRecordReadOwner): boolean {
+  const data = recordReadOwners.get(cap);
+  return (
+    !!data &&
+    data.owner.storage === storage &&
+    recordStagingMethodsCurrent(data.owner) &&
+    data.owner.head() === data.head &&
+    data.owner.workspaceEpoch() === data.workspaceEpoch &&
+    managedPhysicalEpochCurrent(data.epoch) &&
+    managedPhysicalMutationSequence() === data.sequence &&
+    data.physical.current()
+  );
+}
+/** The private publication owner must keep its original leaf witness. A fresh
+ * witness after writes cannot advance an earlier original HEAD capability. */
+export function vaultRecordReadOwnerStagingCurrent(
+  storage: object,
+  cap: VaultRecordReadOwner,
+  witness: VaultRecordStagingWitness,
+): boolean {
+  const original = recordReadOwners.get(cap),
+    staging = recordStagingWitnesses.get(witness);
+  return (
+    !!original &&
+    !!staging &&
+    original.owner === staging.owner &&
+    original.owner.storage === storage &&
+    original.epoch === staging.originalEpoch &&
+    original.sequence === staging.originalSequence &&
+    original.workspaceEpoch === staging.workspaceEpoch &&
+    original.owner.head() === original.head &&
+    vaultRecordStagingCurrent(witness) &&
+    original.physical.current()
+  );
+}
+export function closeVaultRecordReadOwner(cap: VaultRecordReadOwner): void {
+  const data = recordReadOwners.get(cap);
+  recordReadOwners.delete(cap);
+  data?.physical.close();
+}
+
+function recordParent(path: string): RecordParent {
+  const stat = lstatSync(path, { bigint: true });
+  if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(path) !== path)
+    throw Error('Immutable record parent changed');
+  return { path, dev: stat.dev, ino: stat.ino, mode: stat.mode };
+}
+function recordParentsCurrent(parents: RecordParent[]): boolean {
+  return parents.every((parent) => {
+    const current = recordParent(parent.path);
+    return current.dev === parent.dev && current.ino === parent.ino && current.mode === parent.mode;
+  });
+}
+function recordStagingMethodsCurrent(owner: RecordStagingOwner): boolean {
+  const read = ownDescriptor(owner.storage, 'read'),
+    write = ownDescriptor(owner.storage, 'writeImmutable'),
+    publish = ownDescriptor(owner.storage, 'publishHead');
+  return (
+    owner.live() &&
+    !!read &&
+    'value' in read &&
+    read.value === owner.read &&
+    !!write &&
+    'value' in write &&
+    write.value === owner.write &&
+    !!publish &&
+    'value' in publish &&
+    publish.value === owner.publish
+  );
+}
+/** Only the actual vault factory has a registered lexical owner. No caller path
+ * or post-write physical baseline can produce this continuation. */
+export function captureVaultRecordStaging(
+  db: DatabaseSync,
+  storage: object,
+  originalEpoch: object,
+): VaultRecordStagingWitness | undefined {
+  const owner = recordStagingOwners.get(storage);
+  if (!owner) return undefined;
+  if (!recordStagingMethodsCurrent(owner) || !managedPhysicalEpochCurrent(originalEpoch))
+    throw Error('Immutable record staging owner changed');
+  owner.guard();
+  const parents = [
+    owner.directory,
+    resolve(owner.directory, 'vault'),
+    resolve(owner.directory, 'vault/versions'),
+  ].map(recordParent);
+  if (!recordStagingMethodsCurrent(owner) || !managedPhysicalEpochCurrent(originalEpoch))
+    throw Error('Immutable record staging interval changed');
+  const witness = Object.freeze({}) as VaultRecordStagingWitness;
+  recordStagingWitnesses.set(witness, {
+    owner,
+    db,
+    originalEpoch,
+    originalSequence: managedPhysicalMutationSequence(),
+    approvedEpoch: originalEpoch,
+    sequence: managedPhysicalMutationSequence(),
+    parents,
+    revoked: false,
+    workspaceEpoch: owner.workspaceEpoch(),
+  });
+  owner.stagingWitnesses.add(witness);
+  return witness;
+}
+/** Closing check only; no filesystem, SQL, storage or authorization callback. */
+export function vaultRecordStagingCurrent(witness: VaultRecordStagingWitness): boolean {
+  const data = recordStagingWitnesses.get(witness);
+  if (data?.preparation) {
+    try {
+      assertClinicalOperation(data.db, data.preparation);
+    } catch {
+      return false;
+    }
+  }
+  return (
+    !!data &&
+    !data.revoked &&
+    (!data.terminalOwner ||
+      recordCompactTerminalOwnerCurrent(data.terminalOwner, data.db, witness)) &&
+    data.db.isOpen &&
+    recordStagingMethodsCurrent(data.owner) &&
+    data.owner.workspaceEpoch() === data.workspaceEpoch &&
+    managedPhysicalEpochCurrent(data.approvedEpoch) &&
+    managedPhysicalMutationSequence() === data.sequence &&
+    (!data.transaction ||
+      (data.db.isTransaction && currentTransactionToken(data.db) === data.transaction))
+  );
+}
+export function discardVaultRecordStaging(witness: VaultRecordStagingWitness): void {
+  const data = recordStagingWitnesses.get(witness);
+  recordStagingWitnesses.delete(witness);
+  if (!data) return;
+  data.owner.stagingWitnesses.delete(witness);
+  const poison =
+    data.fullPrepared && (data.revoked || data.stagedAttempt || data.pendingPlan || data.installed);
+  data.revoked = true;
+  if (poison) data.owner.transactionBackingPoisoned = true;
+  data.backing?.close();
+}
+/** Adapter-owned accepted evidence preparation, never a caller path/epoch proof. */
+export async function prepareVaultRecordStagingBacking(
+  witness: VaultRecordStagingWitness,
+  selectedHead: string,
+  binding: VaultRecordBackingBinding,
+  assertCurrent: () => void,
+): Promise<void> {
+  const data = recordStagingWitnesses.get(witness),
+    operation = data && currentClinicalOperation(data.db);
+  if (
+    !data ||
+    !operation ||
+    data.db.isTransaction ||
+    data.backing ||
+    data.preparation ||
+    !vaultRecordStagingCurrent(witness)
+  )
+    throw Error('Vault compact backing preparation unavailable');
+  data.preparation = operation;
+  const check = () => {
+    assertCurrent();
+    if (!vaultRecordStagingCurrent(witness)) throw Error('Vault compact backing owner changed');
+  };
+  try {
+    check();
+    // Configured profile workspaces have their accepted manifest/physical
+    // comparison in the worker. Other actual adapters retain their callback.
+    if (!data.owner.compactReady())
+      throw Error('Vault compact preparation has unpublished changes');
+    if (!data.owner.workspace) data.owner.prepareHead();
+    check();
+    const retained = data.owner.backingFrontier;
+    if (retained) {
+      data.owner.backingFrontier = undefined;
+      const scopeRejected =
+        (binding.kind === 'records' && !retained.backing.supportsRecordPriors) ||
+        (binding.kind !== 'records' && !retained.backing.supportsCompactBindings);
+      const rejection =
+        retained.db !== data.db
+          ? 'vaultBackingRejectedOwner'
+          : retained.methods !== managedDatabaseMethodEpoch(data.db)
+            ? 'vaultBackingRejectedMethods'
+            : retained.head !== selectedHead
+              ? 'vaultBackingRejectedHead'
+              : !managedPhysicalEpochCurrent(retained.epoch)
+                ? 'vaultBackingRejectedPhysical'
+                : retained.sequence !== data.sequence
+                  ? 'vaultBackingRejectedSequence'
+                  : retained.workspaceEpoch !== data.workspaceEpoch
+                    ? 'vaultBackingRejectedWorkspace'
+                    : !recordParentsCurrent(retained.parents)
+                      ? 'vaultBackingRejectedParents'
+                      : undefined;
+      if (!rejection && !scopeRejected) {
+        data.backing = retained.backing;
+        data.backing.acquire(selectedHead, binding, check);
+      } else {
+        recordVersionWork(rejection ?? 'vaultBackingRejectedScope');
+        retained.backing.close();
+        if (rejection && data.fullPrepared)
+          throw Error('Vault prepared backing original frontier changed');
+      }
+    }
+    data.backing ??= await prepareVaultRecordBackingTransport(
+      data.owner.directory,
+      data.owner.profileId,
+      data.owner.key,
+      selectedHead,
+      binding,
+      check,
+      data.owner.workspace,
+      data.owner.workspaceNames(),
+    );
+    check();
+  } catch (error) {
+    data.revoked = true;
+    if (data.fullPrepared) data.owner.transactionBackingPoisoned = true;
+    data.backing?.close();
+    throw error;
+  }
+}
+/** Namespace-only transport for the private ordinary record consumer. It does
+ * not certify arbitrary SQLite priors; every changed key must match below. */
+export async function prepareVaultRecordTransactionBacking(
+  witness: VaultRecordStagingWitness,
+  selectedHead: string,
+  assertCurrent: () => void,
+): Promise<void> {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data || data.fullPrepared || data.owner.transactionBackingPoisoned)
+    throw Error('Vault prepared backing recovery required');
+  data.fullPrepared = true;
+  try {
+    await prepareVaultRecordStagingBacking(
+      witness,
+      selectedHead,
+      { kind: 'records', fields: [], metadata: [] },
+      assertCurrent,
+    );
+  } catch (error) {
+    discardVaultRecordStaging(witness);
+    throw error;
+  }
+}
+/** Full ordinary advance is issued only by the exact core backing plan. It
+ * does not widen compact selected-source certificate eligibility. */
+export async function prepareVaultRecordTransactionBackingAdvance(
+  witness: VaultRecordStagingWitness,
+  head: string,
+  plan: RecordTransactionBackingPlan,
+): Promise<void> {
+  const data = recordStagingWitnesses.get(witness);
+  if (
+    !data?.fullPrepared ||
+    !data.backing ||
+    data.pendingPlan ||
+    !vaultRecordStagingCurrent(witness)
+  )
+    throw Error('Vault prepared backing advance owner expired');
+  try {
+    await data.backing.prepareTransactionAdvance(
+      head,
+      verifiedRecordTransactionBackingVersions(plan, data.db, witness, head),
+    );
+    if (!vaultRecordStagingCurrent(witness))
+      throw Error('Vault prepared backing advance seal changed');
+    data.pendingPlan = plan;
+    data.pendingHead = head;
+  } catch (error) {
+    discardVaultRecordStaging(witness);
+    throw error;
+  }
+}
+export function assertVaultRecordTransactionPrior(
+  witness: VaultRecordStagingWitness,
+  entity: string,
+  recordId: string,
+  previousVersion: string | null,
+  prior: { deleted: boolean; preimage: { hash: string; bytes: number } } | null,
+): void {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data?.backing || !vaultRecordStagingCurrent(witness))
+    throw Error('Vault record predecessor proof unavailable');
+  try {
+    data.backing.assertRecordPrior(entity, recordId, previousVersion, prior);
+    if (!vaultRecordStagingCurrent(witness)) throw Error('Vault record predecessor seal changed');
+  } catch (error) {
+    data.revoked = true;
+    throw error;
+  }
+}
+export async function prepareVaultRecordBackingAdvance(
+  witness: VaultRecordStagingWitness,
+  head: string,
+  versions: Parameters<
+    Awaited<ReturnType<typeof prepareVaultRecordBackingTransport>>['prepareAdvance']
+  >[1],
+): Promise<void> {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data?.backing || !vaultRecordStagingCurrent(witness))
+    throw Error('Vault backing advance owner expired');
+  await data.backing.prepareAdvance(head, versions);
+  if (!vaultRecordStagingCurrent(witness)) throw Error('Vault backing advance seal changed');
+}
+export async function finishVaultRecordStagingPreparation(
+  witness: VaultRecordStagingWitness,
+  terminal?: RecordCompactTerminalOwner,
+): Promise<void> {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data?.backing || data.preparationComplete || !vaultRecordStagingCurrent(witness))
+    throw Error('Vault compact backing completion expired');
+  if (terminal) {
+    if (!recordCompactTerminalOwnerCurrent(terminal, data.db, witness))
+      throw Error('Vault terminal owner issuer changed');
+    data.terminalOwner = terminal;
+    const operation = data.preparation;
+    const current = () => {
+      if (!operation) throw Error('Vault terminal preparation owner missing');
+      assertClinicalOperation(data.db, operation);
+      if (!vaultRecordStagingCurrent(witness)) throw Error('Vault terminal backing owner changed');
+    };
+    current();
+    await data.backing.verifyTerminal(
+      current,
+      recordCompactTerminalOriginalSources(terminal, data.db, witness),
+    );
+  } else await data.backing.verify();
+  if (!vaultRecordStagingCurrent(witness)) throw Error('Vault compact backing seal changed');
+  data.preparationComplete = true;
+}
+/** Only a genuine record preparation can select HEAD from the final combined
+ * worker reply. No caller-selected completion callback is accepted here. */
+export async function finishVaultRecordTransactionPreparation(
+  witness: VaultRecordStagingWitness,
+  plan: RecordTransactionBackingPlan,
+  execution: RecordTransactionTerminalExecution,
+): Promise<unknown> {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data?.backing || data.preparationComplete)
+    throw Error('Vault record transaction completion expired');
+  const current = () => {
+    if (
+      !vaultRecordStagingCurrent(witness) ||
+      !recordTransactionTerminalExecutionCurrent(execution, data.db, witness, plan)
+    )
+      throw Error('Vault record transaction terminal issuer changed');
+  };
+  current();
+  return data.backing.verifyTransaction(
+    current,
+    verifiedRecordTransactionOriginalArtifacts(plan, data.db, witness),
+    verifiedRecordTransactionOriginalSources(plan, data.db, witness),
+    () => {
+      current();
+      data.preparationComplete = true;
+      return runRecordTransactionTerminalExecution(execution, data.db, witness, plan);
+    },
+  );
+}
+export async function assertVaultRecordMetadataPrior(
+  witness: VaultRecordStagingWitness,
+  key: string,
+  value: string | undefined,
+  previous: { versionId: string; contents: string; deleted: number } | undefined,
+): Promise<void> {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data?.backing || !vaultRecordStagingCurrent(witness))
+    throw Error('Vault accepted metadata proof unavailable');
+  await data.backing.assertMetadataPrior(key, value, previous);
+  if (!vaultRecordStagingCurrent(witness)) throw Error('Vault accepted metadata seal changed');
+}
+export function bindVaultRecordStagingTransaction(witness: VaultRecordStagingWitness): void {
+  const data = recordStagingWitnesses.get(witness),
+    token = data && currentTransactionToken(data.db);
+  if (
+    !data?.preparationComplete ||
+    !token ||
+    !data.db.isTransaction ||
+    data.transaction ||
+    !vaultRecordStagingCurrent(witness)
+  )
+    throw Error('Vault compact staging transaction expired');
+  data.transaction = token;
+}
+/** The callback completes before the private compact consumer's last seal. */
+export function prepareVaultRecordHead(witness: VaultRecordStagingWitness): void {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data || data.headPrepared || !data.transaction || !vaultRecordStagingCurrent(witness))
+    throw Error('Immutable record head preparation expired');
+  try {
+    if (!data.preparationComplete) data.owner.prepareHead();
+    if (!vaultRecordStagingCurrent(witness) || !recordParentsCurrent(data.parents))
+      throw Error('Immutable record head preparation changed authority');
+    data.headPrepared = true;
+  } catch (error) {
+    data.revoked = true;
+    throw error;
+  }
+}
+/** Only the lexical factory installs HEAD; no storage/user callback follows
+ * the caller's final SQL/physical seal. New-object receipts never admit HEAD. */
+export function installVaultRecordHead(
+  witness: VaultRecordStagingWitness,
+  bytes: Uint8Array,
+  indexed?: RecordIndexedPublication,
+): void {
+  const data = recordStagingWitnesses.get(witness);
+  if (!data || !data.headPrepared || !vaultRecordStagingCurrent(witness))
+    throw Error('Immutable record head publication expired');
+  const head = Buffer.from(bytes).toString('utf8'),
+    sequence = data.sequence;
+  // Only the private indexed compact plan can promote reusable certificates.
+  // Ordinary writes retain their existing publication contract and revoke them.
+  const versions = indexed && consumeRecordBackingAdvance(data.db, indexed, witness, head);
+  if (!vaultRecordStagingCurrent(witness)) throw Error('Vault backing install seal expired');
+  if (versions) data.backing!.beforeHead();
+  data.revoked = true;
+  installVaultRecordHeadBytes(data, bytes);
+  if (versions) {
+    const epoch = captureManagedPhysicalEpoch();
+    const methods = managedDatabaseMethodEpoch(data.db);
+    if (
+      epoch &&
+      methods &&
+      managedPhysicalEpochCurrent(epoch) &&
+      managedPhysicalMutationSequence() === sequence + 2n &&
+      recordStagingMethodsCurrent(data.owner) &&
+      data.owner.compactReady() &&
+      data.owner.workspaceEpoch() === data.workspaceEpoch &&
+      recordParentsCurrent(data.parents)
+    ) {
+      data.backing!.afterHead();
+      data.backing!.promote(head, versions);
+      data.backing!.release();
+      data.owner.backingFrontier = {
+        backing: data.backing!,
+        db: data.db,
+        head,
+        epoch,
+        sequence: sequence + 2n,
+        workspaceEpoch: data.workspaceEpoch,
+        parents: data.parents,
+        methods,
+      };
+      data.backing = undefined;
+    }
+  }
+}
+function installVaultRecordHeadBytes(data: RecordStagingData, bytes: Uint8Array): void {
+  data.owner.installHead(Buffer.from(bytes));
+  const manifest = JSON.parse(
+    decryptObject(
+      resolve(data.owner.directory, 'vault/manifest.enc'),
+      data.owner.key,
+      data.owner.profileId,
+      'manifest',
+    ).toString('utf8'),
+  );
+  if (
+    manifest.format !== 'circus-health-vault-head-v2' ||
+    manifest.profileId !== data.owner.profileId ||
+    manifest.recordsHead !== Buffer.from(bytes).toString('base64')
+  )
+    throw Error('Immutable record HEAD readback differs');
+}
+/** The ordinary core's exact indexed receipt selects HEAD. Certificate reuse
+ * remains pending until the distinct committed+succeeded grant is consumed. */
+export function installVaultRecordTransactionHead(
+  witness: VaultRecordStagingWitness,
+  bytes: Uint8Array,
+  indexed: RecordTransactionIndexedPublication,
+  plan: RecordTransactionBackingPlan,
+): void {
+  const data = recordStagingWitnesses.get(witness),
+    head = Buffer.from(bytes).toString('utf8');
+  if (
+    !data?.fullPrepared ||
+    !data.backing ||
+    !data.headPrepared ||
+    !data.preparationComplete ||
+    data.installed ||
+    data.pendingPlan !== plan ||
+    data.pendingHead !== head ||
+    !vaultRecordStagingCurrent(witness)
+  )
+    throw Error('Vault prepared HEAD installation not sealed');
+  consumeRecordTransactionBackingAdvance(data.db, indexed, witness, head, plan);
+  if (!vaultRecordStagingCurrent(witness))
+    throw Error('Vault prepared HEAD installation issuer changed');
+  data.backing.beforeHead();
+  data.revoked = true;
+  data.owner.transactionBackingPoisoned = true;
+  installVaultRecordHeadBytes(data, bytes);
+  const epoch = captureManagedPhysicalEpoch(),
+    methods = managedDatabaseMethodEpoch(data.db);
+  if (
+    !epoch ||
+    !methods ||
+    !managedPhysicalEpochCurrent(epoch) ||
+    managedPhysicalMutationSequence() !== data.sequence + 2n ||
+    !recordStagingMethodsCurrent(data.owner) ||
+    !data.owner.compactReady() ||
+    data.owner.workspaceEpoch() !== data.workspaceEpoch ||
+    !recordParentsCurrent(data.parents)
+  )
+    throw Error('Vault prepared HEAD installed interval changed');
+  data.backing.afterHead();
+  data.backing.retainTransactionSuccessor(head);
+  data.installed = { epoch, sequence: data.sequence + 2n, methods };
+}
+/** This derivative completion cannot authorize publication or turn an accepted
+ * acknowledgement into failure. An invalid/reused grant still refuses. */
+export function completeVaultRecordTransactionPublication(
+  db: DatabaseSync,
+  witness: VaultRecordStagingWitness,
+  plan: RecordTransactionBackingPlan,
+): void {
+  consumeRecordTransactionBackingPublication(plan, db, witness);
+  const data = recordStagingWitnesses.get(witness);
+  if (!data) return;
+  try {
+    if (
+      data.db !== db ||
+      !db.isOpen ||
+      !data.fullPrepared ||
+      !data.backing ||
+      data.pendingPlan !== plan ||
+      !data.pendingHead ||
+      !data.installed ||
+      !recordStagingMethodsCurrent(data.owner) ||
+      !data.owner.compactReady() ||
+      data.owner.head() !== Buffer.from(data.pendingHead).toString('base64') ||
+      data.owner.workspaceEpoch() !== data.workspaceEpoch ||
+      !managedPhysicalEpochCurrent(data.installed.epoch) ||
+      managedPhysicalMutationSequence() !== data.installed.sequence ||
+      managedDatabaseMethodEpoch(db) !== data.installed.methods ||
+      !recordParentsCurrent(data.parents)
+    )
+      throw Error('Vault accepted prepared successor changed');
+    data.backing.promoteTransaction(data.pendingHead);
+    data.backing.release();
+    const previous = data.owner.backingFrontier;
+    data.owner.backingFrontier = {
+      backing: data.backing,
+      db,
+      head: data.pendingHead,
+      epoch: data.installed.epoch,
+      sequence: data.installed.sequence,
+      workspaceEpoch: data.workspaceEpoch,
+      parents: data.parents,
+      methods: data.installed.methods,
+    };
+    data.backing = undefined;
+    data.owner.transactionBackingPoisoned = false;
+    recordStagingWitnesses.delete(witness);
+    data.owner.stagingWitnesses.delete(witness);
+    previous?.backing.close();
+  } catch {
+    try {
+      discardVaultRecordStaging(witness);
+    } catch {
+      /* The actual committed acknowledgement survives derivative disposal. */
+    }
+  }
+}
+function hashRecordCiphertext(fd: number): string {
+  const hash = createHash('sha256');
+  const buffer = Buffer.alloc(65536);
+  for (let offset = 0; ;) {
+    const count = readSync(fd, buffer, 0, buffer.length, offset);
+    if (!count) return hash.digest('hex');
+    hash.update(buffer.subarray(0, count));
+    offset += count;
+  }
+}
+/** Create-only changed-object staging. Its private continuation remains rooted
+ * in the original authority interval; HEAD and existing objects are excluded. */
+export function stageVaultRecordObject(
+  witness: VaultRecordStagingWitness,
+  ref: { name: string; sha256: string; bytes: number },
+  input: Uint8Array,
+): void {
+  const data = recordStagingWitnesses.get(witness);
+  if (
+    !data ||
+    !vaultRecordStagingCurrent(witness) ||
+    data.preparationComplete ||
+    (!data.db.isTransaction && !data.preparation)
+  )
+    throw Error('Immutable record staging continuation expired');
+  const token = currentTransactionToken(data.db);
+  if (
+    (data.db.isTransaction && !token) ||
+    (data.transaction && data.transaction !== token) ||
+    (data.preparation && data.db.isTransaction)
+  )
+    throw Error('Immutable record staging transaction changed');
+  if (token) data.transaction = token;
+  // Copy before any authorization/readback callback can mutate caller bytes.
+  const bytes = Buffer.from(input),
+    reference = { ...ref };
+  if (
+    !/^objects\/[0-9a-f-]{36}$/.test(reference.name) ||
+    bytes.length !== reference.bytes ||
+    digest(bytes) !== reference.sha256
+  ) {
+    data.revoked = true;
+    throw Error('Immutable record staging reference changed');
+  }
+  const owner = data.owner;
+  try {
+    owner.guard();
+    if (!recordParentsCurrent(data.parents) || !vaultRecordStagingCurrent(witness))
+      throw Error('Immutable record staging parent or interval changed');
+  } catch (error) {
+    data.revoked = true;
+    throw error;
+  }
+  const path = resolve(owner.directory, 'vault/versions', reference.name.slice(8) + '.enc');
+  try {
+    data.backing?.beforeNewRecord(path);
+  } catch (error) {
+    data.revoked = true;
+    throw error;
+  }
+  const pending = path + '.pending-' + randomUUID();
+  const predecessor = data.approvedEpoch,
+    sequence = data.sequence;
+  if (data.fullPrepared) data.stagedAttempt = true;
+  let fd: number | undefined,
+    installed = false,
+    created: { dev: bigint; ino: bigint } | undefined,
+    verified: { mtime: bigint; ctime: bigint } | undefined;
+  const finish = beginManagedPhysicalMutation();
+  try {
+    fd = openSync(pending, 'wx+', 0o600);
+    const initial = fstatSync(fd, { bigint: true });
+    created = { dev: initial.dev, ino: initial.ino };
+    encryptObjectToFileDescriptor(
+      fd,
+      bytes,
+      owner.key,
+      owner.profileId,
+      `record:${reference.name}`,
+    );
+    fsyncSync(fd);
+    const staged = fstatSync(fd, { bigint: true }),
+      cipherHash = hashRecordCiphertext(fd);
+    closeSync(fd);
+    fd = undefined;
+    // link refuses an already present target, unlike overwrite rename.
+    linkSync(pending, path);
+    installed = true;
+    unlinkSync(pending);
+    const directory = openSync(
+      data.parents[2]!.path,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    );
+    try {
+      const parent = fstatSync(directory, { bigint: true });
+      if (parent.dev !== data.parents[2]!.dev || parent.ino !== data.parents[2]!.ino)
+        throw Error('Immutable record staging parent replaced');
+      fsyncSync(directory);
+    } finally {
+      closeSync(directory);
+    }
+    const readback = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      const actual = fstatSync(readback, { bigint: true });
+      if (
+        actual.dev !== staged.dev ||
+        actual.ino !== staged.ino ||
+        actual.size !== staged.size ||
+        actual.nlink !== 1n ||
+        hashRecordCiphertext(readback) !== cipherHash
+      )
+        throw Error('Immutable record staging ciphertext changed');
+      verified = { mtime: actual.mtimeNs, ctime: actual.ctimeNs };
+    } finally {
+      closeSync(readback);
+    }
+    if (
+      !decryptObject(path, owner.key, owner.profileId, `record:${reference.name}`).equals(bytes) ||
+      !recordParentsCurrent(data.parents) ||
+      !recordStagingMethodsCurrent(owner)
+    )
+      throw Error('Immutable record staging readback or owner changed');
+    const final = lstatSync(path, { bigint: true });
+    if (
+      final.dev !== staged.dev ||
+      final.ino !== staged.ino ||
+      final.size !== staged.size ||
+      final.nlink !== 1n ||
+      final.mtimeNs !== verified!.mtime ||
+      final.ctimeNs !== verified!.ctime
+    )
+      throw Error('Immutable record staging target replaced');
+  } catch (error) {
+    data.revoked = true;
+    if (fd !== undefined) closeSync(fd);
+    // Installed objects stay unselected. Never delete a competing target.
+    if (!installed && created && recordParentsCurrent(data.parents) && existsSync(pending)) {
+      const leftover = lstatSync(pending, { bigint: true });
+      if (leftover.dev === created.dev && leftover.ino === created.ino) unlinkSync(pending);
+    }
+    throw error;
+  } finally {
+    finish();
+  }
+  const successor = captureManagedPhysicalEpoch();
+  if (
+    !successor ||
+    data.approvedEpoch !== predecessor ||
+    managedPhysicalMutationSequence() !== sequence + 2n
+  ) {
+    data.revoked = true;
+    throw Error('Immutable record staging has an unknown mutation');
+  }
+  // Only this successful lexical leaf may advance its private continuation.
+  data.approvedEpoch = successor;
+  data.sequence = sequence + 2n;
+  try {
+    data.backing?.afterNewRecord(path);
+  } catch (error) {
+    data.revoked = true;
+    throw error;
+  }
 }
 
 export interface Vault {
@@ -59,7 +974,7 @@ export interface Vault {
     deferredBytes: number;
     databasePlanningBytes: number;
   };
-  recordStorage(beforeHead?: () => void): VaultRecordStorage;
+  recordStorage(beforeHead?: () => void, compactWorkspace?: string): VaultRecordStorage;
   readFile(name: string): Buffer | null;
   fileMetadata(name: string): VaultObjectMetadata | null;
   writeCache(path: string, metadata: unknown): void;
@@ -124,19 +1039,49 @@ function checkPlainTree(root: string, excludeDirectory = (_name: string) => fals
   return result;
 }
 /** One instance belongs to one unlocked profile. Metadata/digest indexes are encrypted. */
-export function openVault({
+function* verifyTreeSteps(root: string): Generator<void, void, void> {
+  const stack: { directory: Dir; path: string }[] = [];
+  if (!existsSync(root)) return;
+  stack.push({ directory: opendirSync(root), path: root });
+  try {
+    while (stack.length) {
+      const current = stack[stack.length - 1]!;
+      const entry = current.directory.readSync();
+      if (!entry) {
+        current.directory.closeSync();
+        stack.pop();
+      } else {
+        const path = resolve(current.path, entry.name);
+        const stat = lstatSync(path);
+        if (stat.isSymbolicLink()) throw Error('Vault workspace cannot contain symbolic links');
+        if (stat.isDirectory()) stack.push({ directory: opendirSync(path), path });
+        else if (!stat.isFile()) throw Error('Unsupported workspace object');
+      }
+      yield;
+    }
+  } finally {
+    for (const current of stack) current.directory.closeSync();
+  }
+}
+function* openVaultSteps({
   directory,
   profileId,
   key,
   initialize = false,
   indexLimits,
-}: OpenVaultOptions): Vault {
-  checkPlainTree(directory);
+}: OpenVaultOptions): Generator<void, Vault, void> {
+  yield* verifyTreeSteps(directory);
+  if (initialize && !existsSync(directory))
+    withManagedPhysicalMutation(() => mkdirSync(directory, { recursive: true, mode: 0o700 }));
+  // Resolve a configured path alias once, before the lexical storage owner and
+  // index retain their paths. Publication never adopts a later alias target.
+  directory = realpathSync(directory);
   const manifestPath = resolve(directory, 'vault', 'manifest.enc');
   let closed = false;
   const pendingFiles = new Map<string, string>();
   const pendingObjects = new Map<string, VaultObjectMetadata>();
   const selectedWorkspaceFiles = new Map<string, Set<string>>();
+  let workspaceEpoch: object = Object.freeze({});
   const stagedWorkspaceFiles = new Map<string, Set<string>>();
   const digests = new Map<string, string[]>();
   let diagnosticChunks: DiagnosticChunkStore | undefined;
@@ -148,7 +1093,99 @@ export function openVault({
   const guard = (): void => {
     if (closed) throw Error('Profile is locked');
   };
-  const index = openVaultIndex(directory, profileId, key, initialize, indexLimits);
+  let index = yield* openVaultIndexSteps(directory, profileId, key, initialize, indexLimits);
+  // Establish the non-authoritative namespace before any retained proof can escape.
+  if (!existsSync(directory)) mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const canonicalRoot = realpathSync(directory);
+  const diagnosticDirectory = resolve(canonicalRoot, 'diagnostics');
+  const eventDirectory = resolve(diagnosticDirectory, 'events');
+  const containers: { path: string; identity: string }[] = [];
+  const directoryIdentity = (path: string): string => {
+    const stat = lstatSync(path, { bigint: true });
+    if (!stat.isDirectory() || realpathSync(path) !== path)
+      throw Error('Diagnostic namespace changed');
+    return `${stat.dev}:${stat.ino}`;
+  };
+  try {
+    for (let path = canonicalRoot; ; path = dirname(path)) {
+      containers.push({ path, identity: directoryIdentity(path) });
+      if (dirname(path) === path) break;
+    }
+    for (const path of [diagnosticDirectory, eventDirectory]) {
+      if (!existsSync(path)) mkdirSync(path, { mode: 0o700 });
+      containers.push({ path, identity: directoryIdentity(path) });
+    }
+  } catch (error) {
+    index.close();
+    throw error;
+  }
+  const guardDiagnostics = () => {
+    guard();
+    if (realpathSync(directory) !== canonicalRoot) throw Error('Diagnostic namespace changed');
+    for (const container of containers)
+      if (directoryIdentity(container.path) !== container.identity)
+        throw Error('Diagnostic namespace changed');
+  };
+  const writeDiagnostic = (path: string, bytes: Uint8Array, purpose: string) => {
+    const input = Buffer.from(bytes);
+    guardDiagnostics();
+    if (existsSync(path)) {
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.nlink !== 1) throw Error('Invalid diagnostic ciphertext');
+    }
+    const pending = `${path}.pending-${randomUUID().replaceAll('-', '').slice(0, 24)}`;
+    let fd: number | undefined;
+    try {
+      fd = openSync(pending, 'wx', 0o600);
+      const opened = fstatSync(fd);
+      guardDiagnostics();
+      if (!opened.isFile() || opened.nlink !== 1) throw Error('Invalid diagnostic ciphertext');
+      encryptObjectToFileDescriptor(fd, input, key, profileId, purpose);
+      fsyncSync(fd);
+      const sealed = fstatSync(fd, { bigint: true });
+      closeSync(fd);
+      fd = undefined;
+      guardDiagnostics();
+      const staged = lstatSync(pending, { bigint: true });
+      if (
+        !staged.isFile() ||
+        staged.nlink !== 1n ||
+        staged.dev !== sealed.dev ||
+        staged.ino !== sealed.ino ||
+        staged.size !== sealed.size ||
+        staged.mtimeNs !== sealed.mtimeNs ||
+        staged.ctimeNs !== sealed.ctimeNs
+      )
+        throw Error('Diagnostic ciphertext changed');
+      renameSync(pending, path);
+      const parent = openSync(dirname(path), 'r');
+      try {
+        fsyncSync(parent);
+      } finally {
+        closeSync(parent);
+      }
+      guardDiagnostics();
+    } catch (error) {
+      if (fd !== undefined) closeSync(fd);
+      // Do not follow a replaced namespace even for temporary-file cleanup.
+      guardDiagnostics();
+      rawRmSync(pending, { force: true });
+      throw error;
+    }
+  };
+  const writeDiagnosticChunk: VaultDiagnosticWriter = (sequence, bytes) => {
+    if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence >= Number.MAX_SAFE_INTEGER)
+      throw Error('Invalid diagnostic chunk sequence');
+    writeDiagnostic(
+      resolve(eventDirectory, String(sequence).padStart(16, '0') + '.enc'),
+      bytes,
+      `diagnostic-events-v1:${sequence}`,
+    );
+  };
+  diagnosticWriters.set(writeDiagnosticChunk, {
+    directory: resolve(directory, 'diagnostics/events'),
+    profileId,
+  });
   let manifest: VaultMetadata = {
     format: 'circus-health-vault-index-v1',
     profileId,
@@ -163,10 +1200,38 @@ export function openVault({
     ids.push(id);
     digests.set(hash, ids);
   };
-  for (const [id, meta] of Object.entries(manifest.objects)) rememberDigest(id, meta);
+  let indexed = false;
+  try {
+    for (const id in manifest.objects) {
+      rememberDigest(id, manifest.objects[id]!);
+      yield;
+    }
+    indexed = true;
+  } finally {
+    if (!indexed) index.close();
+  }
+  const backingOwners = new Set<RecordStagingOwner>();
   function discard(): void {
     if (closed) return;
     closed = true;
+    const failures: unknown[] = [];
+    for (const owner of backingOwners) {
+      const frontier = owner.backingFrontier;
+      owner.backingFrontier = undefined;
+      try {
+        frontier?.backing.close();
+      } catch (error) {
+        failures.push(error);
+      }
+      for (const witness of owner.stagingWitnesses) {
+        try {
+          discardVaultRecordStaging(witness);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+    }
+    backingOwners.clear();
     diagnosticChunks?.close();
     diagnosticChunks = undefined;
     fingerprints.clear();
@@ -176,9 +1241,9 @@ export function openVault({
     stagedWorkspaceFiles.clear();
     digests.clear();
     index.close();
-    for (const name of Object.keys(manifest.files)) delete manifest.files[name];
-    for (const id of Object.keys(manifest.objects)) delete manifest.objects[id];
+    index = null!;
     manifest = null!;
+    if (failures.length) throw new AggregateError(failures, 'Vault backing disposal failed');
   }
   const objectPath = (id: string): string => {
     if (!/^[0-9a-f-]{36}$/.test(id)) throw Error('Invalid vault object ID');
@@ -394,12 +1459,12 @@ export function openVault({
     for (const name of Object.keys(manifest.files))
       if (!exclude(name)) materializeFile(name, workspace);
   }
-  function recordStorage(beforeHead?: () => void): VaultRecordStorage {
+  function recordStorage(beforeHead?: () => void, compactWorkspace?: string): VaultRecordStorage {
     const recordPath = (name: string): string => {
       if (!/^objects\/[0-9a-f-]{36}$/.test(name)) throw Error('Invalid record storage name');
       return resolve(directory, 'vault/versions', name.slice(8) + '.enc');
     };
-    return {
+    const storage: VaultRecordStorage = {
       read(name: string): Buffer | null {
         guard();
         if (name === 'head')
@@ -429,6 +1494,43 @@ export function openVault({
         }
       },
     };
+    const stagingOwner: RecordStagingOwner = {
+      storage,
+      read: storage.read,
+      write: storage.writeImmutable,
+      publish: storage.publishHead,
+      directory: resolve(directory),
+      profileId,
+      key,
+      workspace: compactWorkspace === undefined ? undefined : resolve(compactWorkspace),
+      workspaceEpoch: () => workspaceEpoch,
+      workspaceNames: () =>
+        compactWorkspace === undefined
+          ? []
+          : [...(selectedWorkspaceFiles.get(resolve(compactWorkspace)) ?? [])],
+      compactReady: () => pendingFiles.size === 0 && pendingObjects.size === 0,
+      stagingWitnesses: new Set(),
+      guard,
+      live: () => !closed,
+      head: () => manifest.recordsHead,
+      prepareHead() {
+        guard();
+        beforeHead?.();
+      },
+      installHead(bytes) {
+        guard();
+        try {
+          manifest.recordsHead = Buffer.from(bytes).toString('base64');
+          publishInternal();
+        } catch (error) {
+          discard();
+          throw error;
+        }
+      },
+    };
+    backingOwners.add(stagingOwner);
+    recordStagingOwners.set(storage, stagingOwner);
+    return storage;
   }
   if (initialize && !existsSync(manifestPath)) publish();
   return {
@@ -437,6 +1539,7 @@ export function openVault({
     publish,
     trackWorkspaceFiles(workspace, names) {
       guard();
+      workspaceEpoch = Object.freeze({});
       workspace = resolve(workspace);
       const selected = selectedWorkspaceFiles.get(workspace) ?? new Set<string>();
       for (const name of names) {
@@ -525,7 +1628,7 @@ export function openVault({
       }
     },
     readPerformanceSummary() {
-      guard();
+      guardDiagnostics();
       const path = resolve(directory, 'diagnostics/recent-performance.enc');
       if (!existsSync(path)) return null;
       const stat = lstatSync(path);
@@ -534,23 +1637,22 @@ export function openVault({
       return decryptObject(path, key, profileId, 'recent-performance-v1');
     },
     diagnosticChunks() {
-      guard();
+      guardDiagnostics();
       return (diagnosticChunks ??= openDiagnosticChunkStore({
         directory: resolve(directory, 'diagnostics/events'),
         profileId,
         key,
-        guard,
+        guard: guardDiagnostics,
+        writer: writeDiagnosticChunk,
       }));
     },
     writePerformanceSummary(bytes) {
       guard();
       if (bytes.byteLength > recentPerformanceLimits.maxBytes)
         throw Error('Diagnostic summary limit');
-      encryptObject(
-        resolve(directory, 'diagnostics/recent-performance.enc'),
+      writeDiagnostic(
+        resolve(diagnosticDirectory, 'recent-performance.enc'),
         bytes,
-        key,
-        profileId,
         'recent-performance-v1',
       );
     },
@@ -562,4 +1664,41 @@ export function openVault({
       if (!closed) discard();
     },
   };
+}
+
+export function openVault(options: OpenVaultOptions): Vault {
+  const steps = openVaultSteps(options);
+  for (;;) {
+    const next = steps.next();
+    if (next.done) return next.value;
+  }
+}
+
+/** Cooperate while opening; the caller retains its original authority witness. */
+export async function openVaultAsync(
+  options: OpenVaultOptions,
+  checkpoint: () => void,
+): Promise<Vault> {
+  const steps = openVaultSteps(options);
+  try {
+    for (;;) {
+      checkpoint();
+      for (let work = 0; work < 64; work++) {
+        const next = steps.next();
+        if (next.done) {
+          try {
+            checkpoint();
+          } catch (error) {
+            next.value.close();
+            throw error;
+          }
+          return next.value;
+        }
+      }
+      await yieldHost();
+    }
+  } catch (error) {
+    steps.return(undefined as never);
+    throw error;
+  }
 }

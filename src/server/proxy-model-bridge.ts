@@ -105,7 +105,9 @@ type ResolveHost = (
   options: { all: true },
 ) => Promise<readonly Pick<LookupAddress, 'address'>[]>;
 type DiagnosticHandler = (diagnostic: string) => void;
-type BridgeEventHandler = (method: string, params: UnknownRecord) => void;
+/** Promise results are admission/acknowledgment barriers. Other return values
+ * remain ignored, preserving existing synchronous side-effect callbacks. */
+type BridgeEventHandler = (method: string, params: UnknownRecord) => unknown;
 type RetryDelay = (milliseconds: number, signal: AbortSignal) => Promise<void>;
 type BridgeToolHandler = (request: {
   tool: string;
@@ -122,7 +124,7 @@ type BridgeToolHandler = (request: {
 export interface ProxyModelBridgeOptions {
   config: ProxyConfig;
   /** Host-only budget gate evaluated immediately before each provider request. */
-  beforeRequest?: () => void;
+  beforeRequest?: () => void | Promise<void>;
   durableRetries?: boolean;
   onEvent?: BridgeEventHandler;
   onTool?: BridgeToolHandler;
@@ -1109,7 +1111,7 @@ export class ProxyModelBridge {
   readonly onTool: BridgeToolHandler;
   readonly onExit: (error: ModelError) => void;
   readonly durableRetries: boolean;
-  readonly beforeRequest: (() => void) | undefined;
+  readonly beforeRequest: (() => void | Promise<void>) | undefined;
   readonly fetchImpl: typeof fetch | undefined;
   readonly resolveHost: ResolveHost | undefined;
   readonly onDiagnostic: DiagnosticHandler | undefined;
@@ -1179,7 +1181,7 @@ export class ProxyModelBridge {
     this.running = true;
     this.turnId = randomUUID();
     const turnContext = { ...this.diagnosticContext, turnId: this.turnId };
-    this.onEvent('turn/started', { turn: { id: this.turnId } });
+    await this.onEvent('turn/started', { turn: { id: this.turnId } });
     this.completion = this.diagnostics
       .run(turnContext, () => this.loop(text))
       .catch((error) => {
@@ -1197,11 +1199,12 @@ export class ProxyModelBridge {
   }
   private async request(body: unknown, exposedCallIds: string[] = []): Promise<unknown> {
     for (let attempt = 0; ; attempt++) {
-      this.beforeRequest?.();
+      await this.beforeRequest?.();
+      if (this.closed) return undefined;
       const requestId = randomUUID();
       const serialized = JSON.stringify(body);
       const measuredEnvelope = proxyTranscriptSize(object(body) ? body : {});
-      this.onEvent('model/requestStarted', {
+      await this.onEvent('model/requestStarted', {
         turnId: this.turnId,
         requestId,
         attempt: attempt + 1,
@@ -1239,7 +1242,7 @@ export class ProxyModelBridge {
           this.diagnosticContext,
           this.diagnostics,
         );
-        this.onEvent('model/requestFinished', {
+        await this.onEvent('model/requestFinished', {
           requestId,
           failed: false,
           outcome: 'response',
@@ -1281,7 +1284,7 @@ export class ProxyModelBridge {
                   ),
               ).toISOString()
             : null;
-        this.onEvent('model/requestFinished', {
+        await this.onEvent('model/requestFinished', {
           requestId,
           failed: true,
           usage: null,
@@ -1347,13 +1350,13 @@ export class ProxyModelBridge {
           .map((result) => result.attributionCallId)
           .filter((id): id is string => typeof id === 'string'),
       );
-    const consumeHistory = () => {
+    const consumeHistory = async () => {
       const callIds = history
         .filter((group) => !group.consumed)
         .flatMap((group) =>
           group.calls.filter((call) => call.successful).map((call) => call.wire.id),
         );
-      if (callIds.length) this.onEvent('model/toolResultsConsumed', { callIds });
+      if (callIds.length) await this.onEvent('model/toolResultsConsumed', { callIds });
       const attributionCallIds = history
         .filter((group) => !group.consumed)
         .flatMap((group) =>
@@ -1363,7 +1366,7 @@ export class ProxyModelBridge {
             .filter((id): id is string => typeof id === 'string'),
         );
       if (attributionCallIds.length)
-        this.onEvent('model/evidenceAcknowledged', { attributionCallIds });
+        await this.onEvent('model/evidenceAcknowledged', { attributionCallIds });
       for (const group of history) group.consumed = true;
     };
     let pdfEnabled = this.capabilities?.pdf === true;
@@ -1446,7 +1449,7 @@ export class ProxyModelBridge {
             JSON.stringify(replacement.metadata);
         }
         for (const group of history) group.pdfFallbacks = [];
-        this.onEvent('model/evidenceFallback', {
+        await this.onEvent('model/evidenceFallback', {
           format: 'png',
           reason: 'pdf_unsupported',
           pageCount: fallbacks.length,
@@ -1493,7 +1496,7 @@ export class ProxyModelBridge {
         ? choice.message
         : fail('LiteLLM Proxy returned an unsupported message.');
       const counts = usage(result);
-      this.onEvent('model/requestUsage', { turnId: this.turnId, measured: !!counts });
+      await this.onEvent('model/requestUsage', { turnId: this.turnId, measured: !!counts });
       // Optional cache usage is a whole-turn total only when every request reports it.
       // A later known count must not turn an earlier unknown request into an apparent zero.
       cachedInputTokens =
@@ -1503,7 +1506,7 @@ export class ProxyModelBridge {
       if (counts) {
         inputTokens += counts.total.inputTokens;
         outputTokens += counts.total.outputTokens;
-        this.onEvent('thread/tokenUsage/updated', {
+        await this.onEvent('thread/tokenUsage/updated', {
           turnId: this.turnId,
           tokenUsage: {
             total: {
@@ -1523,16 +1526,16 @@ export class ProxyModelBridge {
       )
         fail('AI returned invalid response text.');
       if (message.content)
-        this.onEvent('item/completed', {
+        await this.onEvent('item/completed', {
           item: { id: randomUUID(), type: 'agentMessage', text: message.content },
         });
       const calls = parseCalls(message);
       if (!calls.length) {
         if (choice.finish_reason !== 'stop')
           fail('AI response ended before completion. Partial work is retained.');
-        consumeHistory();
+        await consumeHistory();
         if (this.closed) return;
-        this.onEvent('turn/completed', { turn: { id: this.turnId, status: 'completed' } });
+        await this.onEvent('turn/completed', { turn: { id: this.turnId, status: 'completed' } });
         return;
       }
       if (choice.finish_reason !== 'tool_calls') fail('AI returned an incomplete tool request.');
@@ -1601,7 +1604,7 @@ export class ProxyModelBridge {
         continue;
       }
       consecutiveToolArgumentErrors = 0;
-      consumeHistory();
+      await consumeHistory();
       if (this.closed) return;
       compactConsumedProxyHistory(history);
       for (const previous of history) if (previous.imageCompacted) previous.pdfFallbacks = [];

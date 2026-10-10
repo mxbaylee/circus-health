@@ -78,6 +78,114 @@ function apply(f: Fixture, id: string, input: RestoreSelection): NoteRestoreResu
   }) as unknown as NoteRestoreResult;
 }
 
+test('association history indexes exclude unrelated versions and upgrade old caches without publication', (t) => {
+  const f = fixture(t),
+    person = createNote(f.db, { kind: 'person', title: 'Fictional index owner' });
+  let note = createNote(f.db, {
+    title: 'Fictional linked note',
+    links: [{ targetType: 'person', targetId: person.personId }],
+  });
+  const asset = uploadAsset(
+      f.db,
+      f.root,
+      f.profileId,
+      Buffer.from('%PDF-1.4\nFictional attachment bytes\n'),
+      'fictional.pdf',
+      'application/pdf',
+    ),
+    attachment = createAttachment(f.db, f.root, f.profileId, {
+      assetId: asset.id,
+      ownerType: 'person',
+      ownerId: person.personId!,
+      version: person.version,
+      caption: 'Fictional original person attachment',
+    });
+  const old = history(f, person.id).entries[0]!.generationId;
+  editAttachment(f.db, attachment.id, { version: getNote(f.db, person.id).version }, true);
+  note = saveNote(f.db, note.id, { ...note, links: [] });
+  const indexes = [
+    ['__record_link_owner', 'note_links'],
+    ['__record_attachment_owner', 'attachments'],
+  ] as const;
+  const members = () =>
+    indexes.map(([name]) =>
+      Number(f.db.prepare('SELECT coalesce(sum(ncell),0) n FROM dbstat WHERE name=?').get(name)!.n),
+    );
+  const before = members();
+  for (const [index, [name, entity]] of indexes.entries()) {
+    const rows = f.db
+      .prepare(
+        `SELECT version_id,deleted FROM __record_versions INDEXED BY ${name} WHERE entity='${entity}'`,
+      )
+      .all();
+    assert.equal(rows.length, before[index]);
+    assert.ok(
+      rows.some((row) => row.deleted === 1),
+      'deleted association versions stay indexed',
+    );
+  }
+  for (const count of [16, 128]) {
+    transaction(f.db, () => {
+      const put = f.db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)');
+      for (let index = 0; index < count; index++)
+        put.run(
+          `fictional-index-${count}-${index}`,
+          JSON.stringify({ literal: 'Unrelated metadata' }),
+        );
+    });
+    assert.deepEqual(
+      members(),
+      before,
+      'unrelated accepted versions add zero association index cells',
+    );
+  }
+  for (const [name, entity] of indexes) {
+    const condition =
+      entity === 'note_links'
+        ? "json_extract(contents_json,'$.note_id')=?"
+        : "json_extract(contents_json,'$.owner_type')=? AND json_extract(contents_json,'$.owner_id')=?";
+    const parameters = entity === 'note_links' ? [note.id] : ['person', person.personId!];
+    const plan = f.db
+      .prepare(
+        `EXPLAIN QUERY PLAN SELECT contents_json FROM __record_versions WHERE profile_id=? AND entity='${entity}' AND ${condition} AND sequence<=? ORDER BY sequence DESC`,
+      )
+      .all(f.profileId, ...parameters, 10000);
+    assert.ok(
+      plan.some((row) => String(row.detail).includes(name)),
+      `${name} serves its owner lookup`,
+    );
+  }
+  const accepted = Buffer.from(f.objects.get('head')!),
+    objectCount = f.objects.size,
+    rows = f.db.prepare('SELECT * FROM __record_versions ORDER BY version_id').all(),
+    currentRevision = revision(f.db);
+  f.db.exec(`
+    DROP INDEX __record_link_owner;
+    DROP INDEX __record_attachment_owner;
+    CREATE INDEX __record_link_owner ON __record_versions(profile_id,entity,json_extract(contents_json,'$.note_id'),sequence DESC);
+    CREATE INDEX __record_attachment_owner ON __record_versions(profile_id,entity,json_extract(contents_json,'$.owner_type'),json_extract(contents_json,'$.owner_id'),sequence DESC);
+  `);
+  assert.ok(members().every((count) => count === rows.length));
+  attachRecordDurability(f.db, { profileId: f.profileId, storage: f.storage });
+  assert.deepEqual(members(), before);
+  assert.deepEqual(f.objects.get('head'), accepted);
+  assert.equal(f.objects.size, objectCount);
+  assert.equal(revision(f.db), currentRevision);
+  assert.deepEqual(f.db.prepare('SELECT * FROM __record_versions ORDER BY version_id').all(), rows);
+  const schemaVersion = f.db.prepare('PRAGMA main.schema_version').get()!.schema_version;
+  attachRecordDurability(f.db, { profileId: f.profileId, storage: f.storage });
+  assert.equal(f.db.prepare('PRAGMA main.schema_version').get()!.schema_version, schemaVersion);
+  const restored = apply(f, person.id, {
+    generationId: old,
+    fields: [],
+    associations: { attachments: [attachment.id] },
+    version: getNote(f.db, person.id).version,
+  });
+  assert.equal(restored.note.attachments[0]!.id, attachment.id);
+  assert.equal(restored.note.attachments[0]!.caption, 'Fictional original person attachment');
+  assert.deepEqual(getNote(f.rebuild(), person.id), restored.note);
+});
+
 test('indexed history groups explicit editing sessions and preserves every intervening A/B/A version', (t) => {
   const f = fixture(t),
     session = randomUUID();

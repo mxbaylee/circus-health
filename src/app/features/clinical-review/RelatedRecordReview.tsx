@@ -7,13 +7,13 @@ import type {
   RelatedRecordSearch,
 } from '../../../shared/clinical-review';
 import type {
-  IntakeClinicalMapping,
   IntakeEvidenceComparison,
   IntakePairDecision,
   IntakeReviewDecision,
   IntakeReviewRecord,
 } from '../../../shared/intake';
 import './clinical-review.css';
+import { ClinicalEvidencePair } from './ClinicalEvidencePair';
 
 const reasonLabels: Record<RelatedRecordReason, string> = {
   same_code: 'Same clinical code',
@@ -97,72 +97,6 @@ export function comparisonDecisionsNeedReview(
     if (!comparison || !sameIntakePairScope(local.get(id)?.scope, comparison.scope)) return true;
   }
   return false;
-}
-
-function facts(mapping: IntakeClinicalMapping) {
-  return [
-    mapping.valueText,
-    mapping.unit,
-    mapping.doseText,
-    mapping.eventKind && mapping.eventKind !== 'unknown'
-      ? mapping.eventKind.replaceAll('_', ' ')
-      : '',
-    mapping.status,
-  ]
-    .filter(Boolean)
-    .join(' · ');
-}
-
-function EvidenceSide({
-  heading,
-  label,
-  date,
-  mapping,
-  evidence,
-  onCorrect,
-  disabled = false,
-}: {
-  heading: string;
-  label: string;
-  date: string | null;
-  mapping: IntakeClinicalMapping;
-  evidence: IntakeReviewRecord['evidence'];
-  onCorrect?: () => void;
-  disabled?: boolean;
-}) {
-  return (
-    <section>
-      <h5>{heading}</h5>
-      <strong>{label}</strong>
-      <p>
-        {date || 'Unknown date'}
-        {facts(mapping) ? ` · ${facts(mapping)}` : ''}
-      </p>
-      {evidence.length ? (
-        evidence.map((item, index) => (
-          <p key={`${item.locator}-${index}`}>
-            {item.label}: {item.locator}
-            {item.contentUrl && (
-              <>
-                {' '}
-                ·{' '}
-                <a href={item.contentUrl} target="_blank" rel="noreferrer">
-                  Open original
-                </a>
-              </>
-            )}
-          </p>
-        ))
-      ) : (
-        <p>No original locator was supplied.</p>
-      )}
-      {onCorrect && (
-        <button type="button" className="button secondary" onClick={onCorrect} disabled={disabled}>
-          Correct this saved record
-        </button>
-      )}
-    </section>
-  );
 }
 
 export function RelatedRecordReview({
@@ -316,24 +250,17 @@ export function RelatedRecordReview({
                 {other.discoveryReasons.map((reason) => reasonLabels[reason]).join(' · ')}
               </p>
             )}
-            <div className="clinical-evidence-pair">
-              <EvidenceSide
-                heading="Incoming record"
-                label={record.title}
-                date={record.date}
-                mapping={decision.mapping}
-                evidence={record.evidence}
-              />
-              <EvidenceSide
-                heading="Previously accepted record"
-                label={other.title}
-                date={other.date}
-                mapping={other.mapping}
-                evidence={other.evidence}
-                onCorrect={onCorrectSaved ? () => onCorrectSaved(other) : undefined}
-                disabled={disabled}
-              />
-            </div>
+            <ClinicalEvidencePair
+              incoming={{
+                title: record.title,
+                date: record.date,
+                mapping: decision.mapping,
+                evidence: record.evidence,
+              }}
+              saved={other}
+              onCorrectSaved={onCorrectSaved}
+              disabled={disabled}
+            />
             {other.previousDecision && (
               <p>
                 Saved decision: {outcomeLabels[other.previousDecision.outcome]}.{' '}

@@ -8,7 +8,9 @@ import {
   rmSync,
   writeFileSync,
   readSync,
+  realpathSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
@@ -20,8 +22,13 @@ import { inspectPackageFile, PackageInspectionError } from '../intake-package-wo
 import { openDatabase } from '../database.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
-import { getIntake, getRetainedIntakeOriginalReference, uploadIntakeStream } from '../intake.ts';
-import { indexIntakePackage, readIntakePackageMember } from '../intake-package.ts';
+import {
+  getIntakeRead,
+  getRetainedIntakeOriginalReference,
+  uploadIntakeStream,
+} from '../intake.ts';
+import { inventoryIntakePackagePaged, readIntakePackageMember } from '../intake-package.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
 import { readIntakeEvidence } from '../intake-evidence.ts';
 import { createIntakeFileWorkCounters, withIntakeFileWork } from '../intake-file-work.ts';
 import {
@@ -52,7 +59,7 @@ test(
   'large stored and deflated ZIP members retain exact bytes with bounded worker chunks and direct PDF read parity',
   { timeout: 240_000 },
   async (t) => {
-    const root = mkdtempSync(join('/tmp', 'fictional-large-package-'));
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'fictional-large-package-'));
     const profileId = 'fictional-large-profile';
     const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
     attachPersonalDurability(db, { root, profileId });
@@ -128,8 +135,9 @@ test(
     for (const pdf of pdfs) direct.push(await upload(pdf.path, 'fictional.pdf'));
     const packageIntake = await upload(zipPath, 'fictional-large.zip');
     const context = { db, root, profileId, id: packageIntake.id };
-    const index = await indexIntakePackage(context);
+    const index = await inventoryIntakePackagePaged(context);
     assert.equal(index.members.length, 3);
+    assert.equal(index.nextOffset, null, 'the fixture reads its complete three-member inventory');
     assert.notEqual(index.members[1]!.memberId, index.members[2]!.memberId);
     const packageHash = hashFile(
       getRetainedIntakeOriginalReference(db, root, profileId, packageIntake.id).path,
@@ -137,10 +145,20 @@ test(
     const parentWork = [];
     const childIds: string[] = [];
     for (const [ordinal, member] of index.members.entries()) {
+      assert.ok(!('format' in member), 'fictional member metadata fits one inventory entry');
       const counters = createIntakeFileWorkCounters();
       const result = await withIntakeFileWork(counters, () =>
         readIntakePackageMember({ ...context, memberId: member.memberId, page: 2, pdf: true }),
       );
+      assert.equal(counters.packageWorkerAttempts, 1);
+      assert.equal(counters.packageWorkerIncomplete, 0);
+      assert.equal(counters.packageWorkerCentralDeclarations, 0);
+      assert.equal(counters.packageWorkerDescriptorReads, 1);
+      assert.equal(counters.packageWorkerMemberReadBytes, member.bytes);
+      assert.equal(counters.packageWorkerHashBytes, member.bytes);
+      assert.equal(counters.packageWorkerCrcBytes, member.bytes);
+      assert.equal(counters.packageWorkerWrittenBytes, member.bytes);
+      assert.ok(counters.packageWorkerPeakChunkBytes <= 256 * 1024);
       assert.ok('pdfContent' in result && result.pdfContent);
       assert.ok('metadata' in result && result.metadata.sourceFileId);
       const childId = result.metadata.sourceFileId;
@@ -151,9 +169,10 @@ test(
       assert.ok(counters.readBytes < MIB, 'member is never read into a whole parent buffer');
       assert.ok(counters.bufferHashBytes < MIB);
       assert.equal(counters.streamHashBytes, counters.streamReadBytes);
-      assert.equal(counters.inspectionBufferBytes, 3 * 256 * 1024);
-      assert.equal(counters.streamReadBytes, 3 * member.bytes);
-      const original = await readIntakeEvidence({
+      // Stage, publication, native-conversion lease, then evidence verification.
+      assert.equal(counters.inspectionBufferBytes, 4 * 256 * 1024);
+      assert.equal(counters.streamReadBytes, 4 * member.bytes);
+      const original: Awaited<ReturnType<typeof readIntakeEvidence>> = await readIntakeEvidence({
         db,
         root,
         profileId,
@@ -175,7 +194,11 @@ test(
       hashFile(getRetainedIntakeOriginalReference(db, root, profileId, packageIntake.id).path),
       packageHash,
     );
-    assert.equal(getIntake(db, root, profileId, packageIntake.id).proposals.length, 0);
+    const current = getIntakeRead(db, root, profileId, packageIntake.id);
+    assert.equal(
+      isIntakeSummary(current) ? current.collections.proposals.total : current.proposals.length,
+      0,
+    );
     receipt.success = {
       expandedBytes: expanded,
       fixtureGenerationPeakChunkBytes: Math.max(...fixture.members.map((m) => m.peakChunkBytes)),
@@ -191,7 +214,7 @@ test(
   'late large-member CRC failure retains original and exposes partial streamed work without publishing a child',
   { timeout: 120_000 },
   async (t) => {
-    const root = mkdtempSync(join('/tmp', 'fictional-large-corrupt-'));
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'fictional-large-corrupt-'));
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const pdfPath = join(root, 'fictional.pdf');
     const failurePdf = writeLargeFictionalPdf(pdfPath, 26 * MIB);
@@ -228,7 +251,7 @@ test(
         { filename: 'fictional-corrupt.zip', newProviderName: 'Fictional clinic' },
         createReadStream(path, { highWaterMark: 64 * 1024 }) as unknown as IncomingMessage,
       );
-      await assert.rejects(indexIntakePackage({ db, root, profileId, id: intake.id }), {
+      await assert.rejects(inventoryIntakePackagePaged({ db, root, profileId, id: intake.id }), {
         code: 'PACKAGE_LIMIT',
       });
       assert.equal(db.prepare('SELECT count(*) n FROM source_files').get()!.n, 1);
@@ -236,7 +259,11 @@ test(
         hashFile(getRetainedIntakeOriginalReference(db, root, profileId, intake.id).path),
         originalHash,
       );
-      assert.equal(getIntake(db, root, profileId, intake.id).proposals.length, 0);
+      const current = getIntakeRead(db, root, profileId, intake.id);
+      assert.equal(
+        isIntakeSummary(current) ? current.collections.proposals.total : current.proposals.length,
+        0,
+      );
     } finally {
       db.close();
     }

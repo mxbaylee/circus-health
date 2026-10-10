@@ -8,6 +8,13 @@ import {
 } from './large-import-review-grader.ts';
 import type { IntakeReportGroupMember, IntakeReviewRecord } from '../shared/intake.ts';
 
+function inlineReportGroups(record: IntakeReviewRecord) {
+  assert.ok(
+    Array.isArray(record.reportGroups),
+    'Fictional oracle snapshots contain complete inline report membership',
+  );
+  return record.reportGroups;
+}
 function snapshots(): LargeImportReviewInput {
   const oracle = createLargeImportOracle();
   const people = Object.fromEntries(
@@ -62,7 +69,7 @@ function snapshots(): LargeImportReviewInput {
   const authorities = oracle.reports.map((report) => {
     const bound = people[report.personKey]!;
     const members: IntakeReportGroupMember[] = records
-      .filter((record) => record.reportGroups![0]!.groupId === report.key)
+      .filter((record) => inlineReportGroups(record)[0]!.groupId === report.key)
       .map((record) => ({
         candidateId: record.candidateId!,
         candidateVersionId: record.candidateVersionId!,
@@ -186,6 +193,24 @@ function snapshots(): LargeImportReviewInput {
 }
 const grade = (input: LargeImportReviewInput) => gradeLargeImportReview(input);
 const first = (input: LargeImportReviewInput) => input.reviews[0]!.records[0]!;
+
+test('an unloaded membership reference cannot qualify from its navigation hint', () => {
+  const input = snapshots(),
+    record = first(input);
+  const firstGroup = inlineReportGroups(record)[0]!;
+  record.reportGroups = {
+    format: 'health-intake-report-group-links-v1',
+    count: 1,
+    first: firstGroup,
+    selection: {
+      candidateId: record.candidateId!,
+      candidateVersionId: record.candidateVersionId!,
+      recordId: record.id,
+      proposalId: input.reviews[0]!.proposalId,
+    },
+  };
+  assert.equal(grade(input).passed, false);
+});
 
 function scopedSelfSnapshots() {
   const input = snapshots();
@@ -338,7 +363,7 @@ test('another person cannot borrow the Self projection fallback', () => {
   record.mapping.personId = undefined;
   record.identityReview!.assignedPerson = undefined;
   const authority = input.authorities.find(
-    (item) => item.retained.id === record.reportGroups![0]!.groupId,
+    (item) => item.retained.id === inlineReportGroups(record)[0]!.groupId,
   )!;
   authority.identity.assignedPerson = undefined;
   assert.equal(grade(input).ownershipResolved, false);
@@ -434,7 +459,7 @@ test('wrong original, broad pages, missing split half and wrong report fail attr
       input.reviews[0]!.records.at(-1)!.evidence.pop();
     },
     (input: LargeImportReviewInput) => {
-      first(input).reportGroups![0]!.groupId = input.authorities[1]!.retained.id;
+      inlineReportGroups(first(input))[0]!.groupId = input.authorities[1]!.retained.id;
     },
     (input: LargeImportReviewInput) => {
       input.authorities[0]!.retained.report!.anchor.text = 'An unrelated heading';
@@ -526,7 +551,7 @@ test('wrong ownership, unresolved issues and conflicting/missing bindings cannot
 test('missing report authority cannot hide wrong or unresolved ownership', () => {
   for (const personId of [undefined, 'wrong-person']) {
     const input = snapshots();
-    first(input).reportGroups![0]!.groupId = 'missing-group';
+    inlineReportGroups(first(input))[0]!.groupId = 'missing-group';
     first(input).mapping.personId = personId;
     const result = grade(input);
     assert.equal(result.ownershipResolved, false);
@@ -595,9 +620,9 @@ test('valid older introducing versions pass but invented versions and membership
   authority.queue.groupVersionId = 'latest-version';
   authority.identity.scope!.groupVersionId = 'latest-version';
   assert.equal(grade(input).passed, true);
-  first(input).reportGroups![0]!.groupVersionId = 'unretained-version';
+  inlineReportGroups(first(input))[0]!.groupVersionId = 'unretained-version';
   assert.equal(grade(input).passed, false);
-  first(input).reportGroups![0]!.groupVersionId = authority.retained.versions[0]!.id;
+  inlineReportGroups(first(input))[0]!.groupVersionId = authority.retained.versions[0]!.id;
   authority.retained.versions[0]!.members = [];
   assert.equal(grade(input).passed, false);
 });

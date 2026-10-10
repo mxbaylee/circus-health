@@ -10,6 +10,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { currentTransactionToken } from './database.ts';
 import {
   initializeIntakeEnvelope,
+  intakeEnvelopeAuthorityBinding,
   prepareInitialIntakeEnvelope,
   readIntakeEnvelope,
   readIntakeEnvelopeMaterialized,
@@ -20,6 +21,24 @@ import { createSourceDetailsSearch } from './source-details-search.ts';
 import { reconcileActiveSourceTextProjection } from './source-text-projection.ts';
 import { withIntakeWork } from './intake-work-accounting.ts';
 import { recordIntakeFileHash } from './intake-file-work.ts';
+import { HttpError } from './database.ts';
+import { INTAKE_ENVELOPE_FORMAT, intakeEnvelopeProjectionFormatHint } from './intake-authority.ts';
+import {
+  hasIntakeCollectionEnvelope,
+  openIntakeCollectionEnvelope,
+  selectIntakeCollectionEnvelope,
+  intakeEnvelopeFilenameCell,
+} from './intake-collection-envelope.ts';
+import {
+  isIntakeCompactScalar,
+  isPreparedIntakeCompactScalar,
+  compactIntakeScalar,
+  type IntakeCompactScalar,
+} from './intake-compact-scalar.ts';
+import { parseIntakeFilenameFacts } from './intake-filename-facts.ts';
+import { schemaKey } from './intake-envelope-schema.ts';
+import { intakeLocatorKey } from './intake-locator-key.ts';
+import type { IntakeMetadataScalarReference } from '../shared/intake-summary.ts';
 import type {
   Intake,
   IntakeMetadata,
@@ -33,6 +52,7 @@ import type { IntakeIdentityReceipt } from '../shared/intake-identity.ts';
 import type { intakeWorkflow } from './intake-workflow.ts';
 import {
   parseIntakeSourcePin,
+  readIntakeSourcePin,
   withIntakeSourcePin,
   withoutIntakeSourcePin,
 } from './intake-source-pin.ts';
@@ -83,6 +103,272 @@ interface DetailsRow {
   kind?: string;
   details_json?: string | null;
   source_pin?: unknown;
+}
+export type IntakeSourceMetadata = Omit<
+  Pick<
+    IntakeDetails,
+    | 'originalName'
+    | 'acquisition'
+    | 'metadata'
+    | 'receivedMimeType'
+    | 'createdAt'
+    | 'parentSourceFileId'
+    | 'locator'
+    | 'derivative'
+    | 'sourceTextRevisionId'
+  >,
+  'originalName' | 'locator'
+> & {
+  originalName: string | IntakeCompactScalar;
+  locator?: string | IntakeCompactScalar;
+};
+/** Ancestry authorization depends on the exact parent, not presentation facts. */
+export function intakeSourceParent(db: DatabaseSync, id: string): unknown {
+  const source = db
+    .prepare("SELECT id,kind,sha256 FROM main.source_files WHERE id=? AND kind='intake_original'")
+    .get(id);
+  if (!source) throw Error('Source intake not found');
+  const selectedEnvelope = selectIntakeCollectionEnvelope(db, {
+    id,
+    sha256: source.sha256 as string,
+  });
+  const view = selectedEnvelope.view;
+  if (!view)
+    return (
+      JSON.parse(selectedEnvelope.source.details_json as string) as {
+        intake: IntakeSourceMetadata;
+      }
+    ).intake.parentSourceFileId;
+  const intake = view.child(view.root(), 'intake');
+  if (!intake) throw Error('Source intake header missing');
+  const selected = view.field(intake, 'parentSourceFileId', { bytes: 16384 });
+  if (selected.kind === 'missing') return undefined;
+  if (selected.kind === 'value') return selected.value;
+  // Preserve retained parent representations; this is not a new ID length cap.
+  return JSON.parse([...view.fieldChunks(intake, 'parentSourceFileId')].join(''));
+}
+
+/** A checked compact source header, independent of inventory/workflow size.
+ * Current authority and source identity are still checked on every call. The
+ * compact raw representation retains JSON's existing last-member semantics. */
+export function intakeSourceMetadata(db: DatabaseSync, id: string): IntakeSourceMetadata {
+  const source = db
+    .prepare(
+      "SELECT id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+    )
+    .get(id);
+  if (!source) throw Error('Source intake not found');
+  intakeEnvelopeAuthorityBinding(
+    db,
+    source as unknown as Parameters<typeof intakeEnvelopeAuthorityBinding>[1],
+  );
+  const native = hasIntakeCollectionEnvelope(
+    db,
+    source as unknown as Parameters<typeof openIntakeCollectionEnvelope>[1],
+  );
+  const view = native
+    ? openIntakeCollectionEnvelope(db, { id, sha256: source.sha256 as string })
+    : undefined;
+  if (
+    view &&
+    typeof source.details_json === 'string' &&
+    source.details_json.length > 16384 &&
+    intakeEnvelopeProjectionFormatHint(source.details_json) === INTAKE_ENVELOPE_FORMAT
+  ) {
+    const intake = view.child(view.root(), 'intake');
+    if (!intake) throw Error('Source intake header missing');
+    for (const field of ['originalName', 'locator'] as const) {
+      const scalar = view.field(intake, field, { bytes: 16384 });
+      if (
+        scalar.kind === 'fragmented' &&
+        view.fieldFragment(intake, field, { bytes: 4096 }).text.trimStart().startsWith('"')
+      )
+        throw new HttpError(
+          409,
+          'INTAKE_SUMMARY_UNAVAILABLE',
+          'Prepare the selected source metadata first.',
+        );
+    }
+  }
+  const value = JSON.parse(source.details_json as string) as { intake: IntakeSourceMetadata };
+  for (const field of ['originalName', 'locator'] as const) {
+    const scalar = value.intake?.[field];
+    if (!scalar || typeof scalar !== 'object') continue;
+    // Only a scalar cell can produce a compact string descriptor. Retained
+    // objects, including descriptor-shaped objects, remain ordinary values.
+    if (view) {
+      const intake = view.child(view.root(), 'intake');
+      if (intake) {
+        if (view.child(intake, field)) continue;
+        const selected = view.field(intake, field, { bytes: 16384 });
+        if (
+          selected.kind === 'value' &&
+          selected.value !== null &&
+          typeof selected.value === 'object'
+        )
+          continue;
+      }
+    } else continue;
+    if (!isIntakeCompactScalar(scalar) || scalar.field !== field)
+      throw Error('Source metadata scalar requires native evidence');
+    const intake = view.child(view.root(), 'intake');
+    if (!intake) throw Error('Source intake header missing');
+    const cell = intakeEnvelopeFilenameCell(view, intake, field);
+    if (cell.facts === undefined)
+      throw new HttpError(
+        409,
+        'INTAKE_SUMMARY_UNAVAILABLE',
+        'Prepare the selected source metadata first.',
+      );
+    const facts = parseIntakeFilenameFacts(cell.facts);
+    const prepared = compactIntakeScalar(field, facts);
+    if (
+      facts.binding !== cell.binding ||
+      facts.bytes !== cell.bytes ||
+      JSON.stringify(prepared) !== JSON.stringify(scalar)
+    )
+      throw Error('Source metadata scalar conflicts with exact evidence');
+    value.intake[field] = prepared;
+  }
+  return value.intake;
+}
+export function intakeMetadataScalarReference(
+  db: DatabaseSync,
+  id: string,
+  field: 'originalName' | 'locator',
+  metadata: IntakeSourceMetadata,
+): IntakeMetadataScalarReference | undefined {
+  const scalar = metadata[field];
+  if (!isPreparedIntakeCompactScalar(scalar)) return undefined;
+  const source = db.prepare('SELECT sha256 FROM main.source_files WHERE id=?').get(id);
+  const view = openIntakeCollectionEnvelope(db, { id, sha256: source?.sha256 as string });
+  const version = intakeSourceVersion(db, id);
+  return {
+    format: 'health-intake-metadata-scalar-reference-v1',
+    intakeId: id,
+    field,
+    pins: {
+      sourceHash: source?.sha256 as string,
+      logicalRoot: view.logical.root?.hash || '',
+      domainVersion: view.logical.domainVersion,
+      version: version.version,
+    },
+    scalarHash: scalar.scalarHash,
+    bytes: scalar.bytes,
+  };
+}
+/** SQLite JSON extraction selects the first raw occurrence, unlike JSON.parse. */
+function firstLocatorEvidence(
+  db: DatabaseSync,
+  id: string,
+): { literal: string } | { scalarHash: string } | undefined {
+  const source = db
+    .prepare(
+      "SELECT id,kind,sha256,details_json,json_type(details_json,'$.intake.locator') locatorType,json_extract(details_json,'$.intake.locator') locator FROM main.source_files WHERE id=?",
+    )
+    .get(id);
+  if (!source || source.kind !== 'intake_original') return undefined;
+  intakeEnvelopeAuthorityBinding(
+    db,
+    source as unknown as Parameters<typeof intakeEnvelopeAuthorityBinding>[1],
+  );
+  if (typeof source.locator !== 'string') return undefined;
+  const native = hasIntakeCollectionEnvelope(
+    db,
+    source as unknown as Parameters<typeof openIntakeCollectionEnvelope>[1],
+  );
+  if (!native) return source.locatorType === 'text' ? { literal: source.locator } : undefined;
+  const view = openIntakeCollectionEnvelope(
+    db,
+    { id, sha256: source.sha256 as string },
+    { fieldSelection: 'first' },
+  );
+  const intake = view.child(view.root(), 'intake');
+  if (!intake) return undefined;
+  if (source.locatorType === 'text') {
+    const selected = view.field(intake, 'locator', { bytes: 16384 });
+    if (selected.kind === 'fragmented')
+      throw new HttpError(
+        409,
+        'INTAKE_SUMMARY_UNAVAILABLE',
+        'Prepare the selected source metadata first.',
+      );
+    if (selected.kind !== 'value' || selected.value !== source.locator)
+      throw Error('Source locator conflicts with exact first-occurrence evidence');
+    return { literal: source.locator };
+  }
+  if (source.locatorType !== 'object') return undefined;
+  if (view.child(intake, 'locator')) return undefined;
+  const selected = view.field(intake, 'locator', { bytes: 16384 });
+  if (selected.kind === 'value' && selected.value !== null && typeof selected.value === 'object')
+    return undefined;
+  const value: unknown = JSON.parse(source.locator);
+  if (!isIntakeCompactScalar(value) || value.field !== 'locator') return undefined;
+  const cell = intakeEnvelopeFilenameCell(view, intake, 'locator');
+  if (cell.facts === undefined)
+    throw new HttpError(
+      409,
+      'INTAKE_SUMMARY_UNAVAILABLE',
+      'Prepare the selected source metadata first.',
+    );
+  const facts = parseIntakeFilenameFacts(cell.facts);
+  if (
+    facts.binding !== cell.binding ||
+    facts.bytes !== cell.bytes ||
+    JSON.stringify(compactIntakeScalar('locator', facts)) !== JSON.stringify(value)
+  )
+    throw Error('Source locator conflicts with exact first-occurrence evidence');
+  return { scalarHash: facts.scalarHash };
+}
+export function intakeFirstLocatorMatcher(
+  db: DatabaseSync,
+  id: string,
+): (exact: string) => boolean {
+  const evidence = firstLocatorEvidence(db, id);
+  return (exact) =>
+    !!evidence &&
+    ('literal' in evidence ? evidence.literal === exact : evidence.scalarHash === schemaKey(exact));
+}
+export function intakeFirstLocatorMatches(db: DatabaseSync, id: string, exact: string): boolean {
+  return intakeFirstLocatorMatcher(db, id)(exact);
+}
+export async function intakeFirstLocatorMatchesCooperatively(
+  db: DatabaseSync,
+  id: string,
+  exact: string,
+  assertRunning: () => void,
+): Promise<boolean> {
+  const hash = await intakeLocatorKey(db, exact, assertRunning);
+  assertRunning();
+  // Read authority after the last yield, never reuse an earlier locator selection.
+  const evidence = firstLocatorEvidence(db, id);
+  assertRunning();
+  return (
+    !!evidence &&
+    ('literal' in evidence ? evidence.literal === exact : evidence.scalarHash === hash)
+  );
+}
+
+/** Public stale-tab version without hydrating a selected V4 workflow. The
+ * separate source-text pin retains its existing additive version semantics. */
+export function intakeSourceVersion(db: DatabaseSync, id: string) {
+  const source = db
+    .prepare(
+      "SELECT id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",
+    )
+    .get(id);
+  if (!source) throw Error('Source intake not found');
+  const selected = source as unknown as Parameters<typeof intakeEnvelopeAuthorityBinding>[1];
+  const binding = intakeEnvelopeAuthorityBinding(db, selected);
+  const rawVersion =
+    binding.logicalHead === undefined
+      ? requireStoredIntakeDetails(db, selected).version
+      : (JSON.parse(binding.head!) as { logical: { domainVersion: number } }).logical.domainVersion;
+  const sourcePin = readIntakeSourcePin(db, id);
+  const version = rawVersion + (sourcePin?.version ?? 0);
+  if (!Number.isSafeInteger(rawVersion) || rawVersion < 0 || !Number.isSafeInteger(version))
+    throw Error('Intake version is invalid');
+  return { rawVersion, version, sourcePin, logicalBinding: binding.logicalHead };
 }
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);

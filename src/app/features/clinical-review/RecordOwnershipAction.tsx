@@ -1,3 +1,4 @@
+import { OwnershipBlockerEvidence, ownershipBlockerCount } from './OwnershipBlockerEvidence';
 import { ImportPersonChoice } from '../import/ImportPersonChoice';
 import { useEffect, useId, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -6,12 +7,21 @@ import { useProfile } from '../../data/profile';
 import { NoteDialog } from '../notes/NoteDialog';
 import { linkHref } from '../notes/NoteLinks';
 import { fieldsByKind } from './RecordCorrectionDialog';
+import { OwnershipOutcomeEvidence } from './OwnershipOutcomeEvidence';
+import { OwnershipReportEvidence } from './OwnershipReportEvidence';
+import { OwnershipContributions } from './OwnershipContributions';
+import type {
+  OwnershipReceiptView,
+  OwnershipOutcomeEvidenceItem,
+  OwnershipReportPreviewRecord,
+} from '../../../shared/ownership-report-reference';
+import { OwnershipNameEvidence } from './OwnershipNameEvidence';
+import type { OwnershipPreviewView } from '../../../shared/ownership-name-reference';
 import type { IntakeClinicalMapping } from '../../../shared/intake';
 import type { IntakeIdentityPerson } from '../../../shared/intake-identity';
 import type {
   OwnershipSelection,
   OwnershipRequest,
-  OwnershipPreview,
   OwnershipCommit,
   OwnershipReceipt,
 } from '../../../shared/record-ownership';
@@ -40,13 +50,17 @@ export function RecordOwnershipAction({
   const [fullName, setFullName] = useState(''),
     [relationship, setRelationship] = useState(''),
     [reason, setReason] = useState('');
-  const [preview, setPreview] = useState<OwnershipPreview | null>(null),
-    [result, setResult] = useState<OwnershipReceipt | null>(null);
+  const [preview, setPreview] = useState<OwnershipPreviewView | null>(null),
+    [result, setResult] = useState<OwnershipReceiptView | null>(null);
   const [decisions, setDecisions] = useState<OwnershipRequest['decisions']>([]),
     [names, setNames] = useState<OwnershipRequest['nameDecisions']>([]),
     [relationships, setRelationships] = useState<OwnershipRequest['relationshipDecisions']>([]);
   const [dirty, setDirty] = useState(false),
     [uncertain, setUncertain] = useState(false);
+  const [reportRelationship, setReportRelationship] = useState<{
+    relationshipId: string;
+    withdraw: boolean;
+  } | null>(null);
   const commit = useRef<OwnershipCommit | null>(null);
   const prefix = `/api/profiles/${encodeURIComponent(profile?.id || '')}/record-ownership`;
   const selectionKey =
@@ -66,7 +80,7 @@ export function RecordOwnershipAction({
   liveContext.current = contextKey;
   const message = (e: unknown) =>
     e instanceof Error ? e.message : 'The correction could not be completed.';
-  const completed = async (receipt: OwnershipReceipt, context: string) => {
+  const completed = async (receipt: OwnershipReceiptView, context: string) => {
     if (liveContext.current !== context) return;
     sessionStorage.removeItem(recoveryKey);
     setUncertain(false);
@@ -80,7 +94,7 @@ export function RecordOwnershipAction({
     setError('');
     try {
       await completed(
-        (await api<OwnershipReceipt>(`${prefix}/${encodeURIComponent(id)}`)).data,
+        (await api<OwnershipReceiptView>(`${prefix}/${encodeURIComponent(id)}`)).data,
         context,
       );
     } catch (e) {
@@ -109,6 +123,7 @@ export function RecordOwnershipAction({
     setDecisions([]);
     setNames([]);
     setRelationships([]);
+    setReportRelationship(null);
     setDirty(false);
     setReviewSelection(selection);
     commit.current = null;
@@ -160,19 +175,41 @@ export function RecordOwnershipAction({
     setBusy(true);
     setError('');
     try {
-      const { data } = await api<OwnershipPreview>(`${prefix}/preview`, {
-        method: 'POST',
-        body: JSON.stringify({
-          selection: selectedSelection,
-          destination: dest,
-          decisions: clearChoices ? [] : decisions,
-          nameDecisions: clearChoices ? [] : names,
-          relationshipDecisions: clearChoices ? [] : relationships,
-          reason: selectedReason,
-        }),
-      });
+      const ownedReport =
+        preview &&
+        'reportEvidence' in preview &&
+        !clearChoices &&
+        JSON.stringify(selectedSelection) === JSON.stringify(preview.request.selection) &&
+        JSON.stringify(dest) === JSON.stringify(preview.request.destination) &&
+        selectedReason === (preview.request.reason || '');
+      const choice =
+        ownedReport &&
+        (decisions?.length
+          ? { recordId: decisions[0]!.recordId, decision: decisions[0] }
+          : reportRelationship);
+      const { data } = await api<OwnershipPreviewView>(
+        choice && ownedReport ? preview.reportEvidence.url : `${prefix}/preview`,
+        {
+          method: 'POST',
+          body: JSON.stringify(
+            choice || {
+              selection: selectedSelection,
+              destination: dest,
+              decisions: clearChoices ? [] : decisions,
+              nameDecisions: clearChoices ? [] : names,
+              relationshipDecisions: clearChoices ? [] : relationships,
+              reason: selectedReason,
+            },
+          ),
+        },
+      );
       if (liveContext.current !== context) return;
       setPreview(data);
+      if ('reportEvidence' in data) {
+        setDecisions([]);
+        setRelationships([]);
+        setReportRelationship(null);
+      }
       setDirty(false);
       commit.current = {
         operationId: crypto.randomUUID(),
@@ -224,6 +261,14 @@ export function RecordOwnershipAction({
     recordId: string,
     patch: Partial<NonNullable<OwnershipRequest['decisions']>[number]>,
   ) {
+    if (
+      preview &&
+      'reportEvidence' in preview &&
+      (reportRelationship || decisions?.some((d) => d.recordId !== recordId))
+    ) {
+      setError('Update the current decision before editing another record.');
+      return;
+    }
     setDecisions((old) => [
       ...(old || []).filter((d) => d.recordId !== recordId),
       {
@@ -234,9 +279,26 @@ export function RecordOwnershipAction({
     ]);
     changed();
   }
-  const blocked = preview?.blockers.length || preview?.records.some((r) => r.blockers.length);
-  function reviewUndo(outcome: OwnershipReceipt['outcomes'][number]) {
-    const previous = preview?.records.find((record) => record.recordId === outcome.recordId);
+  const blocked =
+    (preview && ownershipBlockerCount(preview.blockers)) ||
+    (preview &&
+      ('reportEvidence' in preview
+        ? preview.reportEvidence.recordBlockerTotal
+        : preview.records.some((r) => ownershipBlockerCount(r.blockers))));
+  const destinationName =
+    preview &&
+    ('personId' in preview.destination
+      ? preview.destination.fullName
+      : preview.destination.newPerson.fullName);
+  function reviewUndo(
+    outcome: OwnershipReceipt['outcomes'][number] | OwnershipOutcomeEvidenceItem,
+  ) {
+    const previous =
+      preview && !('reportEvidence' in preview)
+        ? preview.records.find((record) => record.recordId === outcome.recordId)
+        : 'previousOwnerNoteId' in outcome
+          ? { owner: { noteId: outcome.previousOwnerNoteId }, sourceReport: outcome.sourceReport }
+          : undefined;
     const former = people.find((person) => person.noteId === previous?.owner.noteId);
     if (!previous || !former) return;
     const reverseSelection: OwnershipSelection =
@@ -254,6 +316,7 @@ export function RecordOwnershipAction({
     setDecisions([]);
     setNames([]);
     setRelationships([]);
+    setReportRelationship(null);
     void loadPreview(
       reverseSelection,
       { noteId: former.noteId, expectedVersion: former.version },
@@ -261,6 +324,214 @@ export function RecordOwnershipAction({
       true,
     );
   }
+  const renderRecord = (r: OwnershipReportPreviewRecord) => (
+    <section key={r.kind + r.recordId} className="panel">
+      <h3>{r.title}</h3>
+      <p>
+        {r.owner.fullName} → {destinationName} ·{' '}
+        {r.action === 'split'
+          ? 'Split this report’s contribution'
+          : r.action === 'link'
+            ? 'Link to the reviewed destination record'
+            : r.action === 'unchanged'
+              ? 'Already assigned here'
+              : 'Move saved record'}
+      </p>
+      {r.medicationActivity && (
+        <p>
+          {r.medicationActivity === 'inactive'
+            ? 'The destination prescription starts inactive. Activate it separately if appropriate.'
+            : 'The existing personal activity decision stays unchanged.'}
+        </p>
+      )}
+      {Array.isArray(r.contributions) ? (
+        <ul>
+          {r.contributions.map((c) => (
+            <li key={c.sourceRecordId}>
+              <a href={c.contentUrl} target="_blank" rel="noreferrer">
+                {c.selected ? 'Selected source' : 'Source staying with ' + r.owner.fullName}
+              </a>{' '}
+              — {typeof c.locator === 'string' ? c.locator : JSON.stringify(c.locator)}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <OwnershipContributions
+          reference={r.contributions}
+          ownerName={r.owner.fullName}
+          disabled={busy}
+        />
+      )}
+      {reviewSelection.type === 'records' && r.sourceReport && (
+        <p>
+          <Link
+            to={`/import?${new URLSearchParams({ intake: r.sourceReport.intakeId, group: r.sourceReport.groupId })}`}
+          >
+            Open the report to correct only that report’s contribution
+          </Link>
+        </p>
+      )}
+      {r.matches.length > 0 && (
+        <label>
+          Destination match
+          <select
+            disabled={busy}
+            value={
+              (decisions?.find((d) => d.recordId === r.recordId) || r.reviewedDecision)?.action ===
+              'link'
+                ? (decisions?.find((d) => d.recordId === r.recordId) || r.reviewedDecision)
+                    ?.targetRecordId
+                : (decisions?.find((d) => d.recordId === r.recordId) || r.reviewedDecision)
+                      ?.action === 'keep_both'
+                  ? 'keep_both'
+                  : ''
+            }
+            onChange={(e) =>
+              decide(
+                r.recordId,
+                e.target.value === 'keep_both'
+                  ? { action: 'keep_both', targetRecordId: undefined }
+                  : { action: 'link', targetRecordId: e.target.value },
+              )
+            }
+          >
+            <option value="">Choose after comparing</option>
+            <option value="keep_both">Keep both records</option>
+            {r.matches.map((m) => (
+              <option key={m.recordId} value={m.recordId}>
+                Link to {m.title} · {m.mapping.date || m.mapping.documentDate || 'date unknown'}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      {r.matches.map((m) => (
+        <details key={m.recordId}>
+          <summary>Compare {m.title}</summary>
+          {Array.isArray(m.evidence) ? (
+            <ul>
+              {m.evidence.map((e, i) => (
+                <li key={i}>
+                  <a href={e.contentUrl} target="_blank" rel="noreferrer">
+                    {e.label}
+                  </a>{' '}
+                  — {e.locator}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <OwnershipContributions
+              reference={m.evidence}
+              ownerName={destinationName || 'the destination person'}
+              disabled={busy}
+            />
+          )}
+          <MappingValues mapping={r.mapping} kind={r.kind} label="Incoming values" />
+          <MappingValues
+            mapping={m.mapping}
+            kind={r.kind}
+            label="Destination values (retained when linked)"
+          />
+        </details>
+      ))}
+      {r.splitReviewRequired && (
+        <>
+          <MappingEditor
+            label="Transferred clinical contents"
+            kind={r.kind}
+            mapping={
+              decisions?.find((d) => d.recordId === r.recordId)?.splitMapping ||
+              r.reviewedDecision?.splitMapping ||
+              r.mapping
+            }
+            disabled={busy}
+            onChange={(mapping) =>
+              decide(r.recordId, { splitMapping: mapping, reviewedSplit: false })
+            }
+          />
+          <MappingEditor
+            label={`Contents staying with ${r.owner.fullName}`}
+            kind={r.kind}
+            mapping={
+              decisions?.find((d) => d.recordId === r.recordId)?.remainingMapping ||
+              r.reviewedDecision?.remainingMapping ||
+              r.remainingMapping ||
+              {}
+            }
+            disabled={busy}
+            onChange={(mapping) =>
+              decide(r.recordId, { remainingMapping: mapping, reviewedSplit: false })
+            }
+          />
+          <label>
+            <input
+              type="checkbox"
+              checked={
+                (decisions?.find((d) => d.recordId === r.recordId) || r.reviewedDecision)
+                  ?.reviewedSplit || false
+              }
+              disabled={busy}
+              onChange={(e) =>
+                decide(r.recordId, {
+                  splitMapping:
+                    decisions?.find((d) => d.recordId === r.recordId)?.splitMapping || r.mapping,
+                  remainingMapping:
+                    decisions?.find((d) => d.recordId === r.recordId)?.remainingMapping ||
+                    r.remainingMapping,
+                  reviewedSplit: e.target.checked,
+                })
+              }
+            />
+            I reviewed both records’ exact contents against their sources.
+          </label>
+        </>
+      )}
+      <OwnershipBlockerEvidence
+        blockers={r.blockers}
+        disabled={busy || dirty}
+        onRefresh={() => void loadPreview()}
+      />
+    </section>
+  );
+  const renderRelationship = (
+    r: import('../../../shared/record-ownership').OwnershipRelationship,
+  ) => (
+    <label key={r.decisionId}>
+      <input
+        type="checkbox"
+        disabled={busy}
+        checked={
+          preview && 'reportEvidence' in preview
+            ? reportRelationship?.relationshipId === r.decisionId
+              ? reportRelationship.withdraw
+              : r.resolution === 'withdraw'
+            : relationships?.some((d) => d.decisionId === r.decisionId) || false
+        }
+        onChange={(e) => {
+          if (preview && 'reportEvidence' in preview) {
+            if (
+              decisions?.length ||
+              (reportRelationship && reportRelationship.relationshipId !== r.decisionId)
+            ) {
+              setError('Update the current decision before editing another relationship.');
+              return;
+            }
+            setReportRelationship({ relationshipId: r.decisionId, withdraw: e.target.checked });
+            changed();
+            return;
+          }
+          setRelationships((old) =>
+            e.target.checked
+              ? [...(old || []), { decisionId: r.decisionId, action: 'withdraw' }]
+              : (old || []).filter((d) => d.decisionId !== r.decisionId),
+          );
+          changed();
+        }}
+      />
+      Withdraw the {r.action.replaceAll('_', ' ')} relationship involving {r.recordId}. The prior
+      decision remains in history.
+    </label>
+  );
   return (
     <>
       <button
@@ -304,34 +575,39 @@ export function RecordOwnershipAction({
               {result.moved} saved records corrected; {result.pending} pending assignments updated.
               Originals and earlier assignments remain in history.
             </p>
-            {result.outcomes.some((o) => o.kind === 'medication' && o.action !== 'unchanged') && (
-              <p>
-                A moved prescription starts inactive. Open the moved medication to activate it
-                separately if appropriate.
-              </p>
+            {'outcomes' in result &&
+              result.outcomes.some((o) => o.kind === 'medication' && o.action !== 'unchanged') && (
+                <p>
+                  A moved prescription starts inactive. Open the moved medication to activate it
+                  separately if appropriate.
+                </p>
+              )}
+            {'outcomesIncluded' in result && (
+              <OwnershipOutcomeEvidence receipt={result} onUndo={reviewUndo} />
             )}
             <ul>
-              {result.outcomes.map((outcome) => (
-                <li key={outcome.recordId}>
-                  <Link
-                    to={linkHref({
-                      targetType: outcome.kind,
-                      targetId: outcome.destinationRecordId,
-                    })}
-                  >
-                    View corrected {outcome.kind} and its history
-                  </Link>{' '}
-                  <button
-                    type="button"
-                    className="button secondary"
-                    onClick={() => reviewUndo(outcome)}
-                  >
-                    Review undo
-                  </button>
-                </li>
-              ))}
+              {'outcomes' in result &&
+                result.outcomes.map((outcome) => (
+                  <li key={outcome.recordId}>
+                    <Link
+                      to={linkHref({
+                        targetType: outcome.kind,
+                        targetId: outcome.destinationRecordId,
+                      })}
+                    >
+                      View corrected {outcome.kind} and its history
+                    </Link>{' '}
+                    <button
+                      type="button"
+                      className="button secondary"
+                      onClick={() => reviewUndo(outcome)}
+                    >
+                      Review undo
+                    </button>
+                  </li>
+                ))}
             </ul>
-            {result.groups && (
+            {'groups' in result && result.groups && (
               <ul>
                 {result.groups.map((g, i) => (
                   <li key={g.id}>
@@ -342,7 +618,11 @@ export function RecordOwnershipAction({
                     {g.status === 'needs_review'
                       ? ': ' +
                         g.recordIds
-                          .map((id) => preview?.records.find((r) => r.recordId === id)?.title || id)
+                          .map((id) =>
+                            preview && !('reportEvidence' in preview)
+                              ? preview.records.find((r) => r.recordId === id)?.title || id
+                              : id,
+                          )
                           .join(', ')
                       : ` (${g.recordIds.length} records)`}
                   </li>
@@ -416,257 +696,125 @@ export function RecordOwnershipAction({
               <>
                 <p>
                   {preview.commitGroups.length} independent correction{' '}
-                  {preview.commitGroups.length === 1 ? 'group' : 'groups'}: {preview.records.length}{' '}
-                  saved records and {preview.pending.length} pending records. Each group saves
-                  atomically. If a later group fails, earlier committed groups remain saved.
+                  {preview.commitGroups.length === 1 ? 'group' : 'groups'}:{' '}
+                  {'reportEvidence' in preview
+                    ? preview.reportEvidence.recordTotal
+                    : preview.records.length}{' '}
+                  saved records and{' '}
+                  {'reportEvidence' in preview
+                    ? preview.reportEvidence.pendingTotal
+                    : preview.pending.length}{' '}
+                  pending records. Each group saves atomically. If a later group fails, earlier
+                  committed groups remain saved.
                 </p>
                 <ul>
-                  {preview.commitGroups.map((g, i) => (
-                    <li key={g.id}>
-                      Group {i + 1}:{' '}
-                      {g.recordIds
-                        .map((id) => preview.records.find((r) => r.recordId === id)?.title)
-                        .join(', ')}
-                      {g.pendingCount ? ' · ' + g.pendingCount + ' pending records' : ''}
-                    </li>
-                  ))}
+                  {!('reportEvidence' in preview) &&
+                    preview.commitGroups.map((g, i) => (
+                      <li key={g.id}>
+                        Group {i + 1}:{' '}
+                        {g.recordIds
+                          .map((id) => preview.records.find((r) => r.recordId === id)?.title)
+                          .join(', ')}
+                        {g.pendingCount ? ' · ' + g.pendingCount + ' pending records' : ''}
+                      </li>
+                    ))}
                 </ul>
-                {!!preview.reportHolds.length && (
+                {!!('reportHoldsIncluded' in preview
+                  ? preview.reportEvidence.reportHoldTotal
+                  : preview.reportHolds.length) && (
                   <p>
-                    Earlier person defaults for {preview.reportHolds.length} reports will require
-                    renewed identity review. Saved records outside this selection retain their
-                    owners.
+                    Earlier person defaults for{' '}
+                    {'reportHoldsIncluded' in preview
+                      ? preview.reportEvidence.reportHoldTotal
+                      : preview.reportHolds.length}{' '}
+                    reports will require renewed identity review. Saved records outside this
+                    selection retain their owners.
                   </p>
                 )}
                 <p>
                   Earlier packet inclusion is not recorded. If you shared a packet containing one of
                   these records, review the copy you sent and provide a corrected packet.
                 </p>
-                {preview.blockers.map((b) => (
-                  <p role="alert" key={b}>
-                    {b}
-                  </p>
-                ))}
-                {preview.records.map((r) => (
-                  <section key={r.kind + r.recordId} className="panel">
-                    <h3>{r.title}</h3>
-                    <p>
-                      {r.owner.fullName} →{' '}
-                      {'personId' in preview.destination
-                        ? preview.destination.fullName
-                        : preview.destination.newPerson.fullName}{' '}
-                      ·{' '}
-                      {r.action === 'split'
-                        ? 'Split this report’s contribution'
-                        : r.action === 'link'
-                          ? 'Link to the reviewed destination record'
-                          : r.action === 'unchanged'
-                            ? 'Already assigned here'
-                            : 'Move saved record'}
-                    </p>
-                    {r.medicationActivity && (
-                      <p>
-                        {r.medicationActivity === 'inactive'
-                          ? 'The destination prescription starts inactive. Activate it separately if appropriate.'
-                          : 'The existing personal activity decision stays unchanged.'}
-                      </p>
-                    )}
-                    <ul>
-                      {r.contributions.map((c) => (
-                        <li key={c.sourceRecordId}>
-                          <a href={c.contentUrl} target="_blank" rel="noreferrer">
-                            {c.selected
-                              ? 'Selected source'
-                              : 'Source staying with ' + r.owner.fullName}
-                          </a>{' '}
-                          — {typeof c.locator === 'string' ? c.locator : JSON.stringify(c.locator)}
-                        </li>
-                      ))}
-                    </ul>
-                    {reviewSelection.type === 'records' && r.sourceReport && (
-                      <p>
-                        <Link
-                          to={`/import?${new URLSearchParams({ intake: r.sourceReport.intakeId, group: r.sourceReport.groupId })}`}
-                        >
-                          Open the report to correct only that report’s contribution
-                        </Link>
-                      </p>
-                    )}
-                    {r.matches.length > 0 && (
-                      <label>
-                        Destination match
-                        <select
-                          disabled={busy}
-                          value={
-                            decisions?.find((d) => d.recordId === r.recordId)?.action === 'link'
-                              ? decisions.find((d) => d.recordId === r.recordId)?.targetRecordId
-                              : decisions?.some(
-                                    (d) => d.recordId === r.recordId && d.action === 'keep_both',
-                                  )
-                                ? 'keep_both'
-                                : ''
-                          }
-                          onChange={(e) =>
-                            decide(
-                              r.recordId,
-                              e.target.value === 'keep_both'
-                                ? { action: 'keep_both', targetRecordId: undefined }
-                                : { action: 'link', targetRecordId: e.target.value },
-                            )
-                          }
-                        >
-                          <option value="">Choose after comparing</option>
-                          <option value="keep_both">Keep both records</option>
-                          {r.matches.map((m) => (
-                            <option key={m.recordId} value={m.recordId}>
-                              Link to {m.title} ·{' '}
-                              {m.mapping.date || m.mapping.documentDate || 'date unknown'}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    )}
-                    {r.matches.map((m) => (
-                      <details key={m.recordId}>
-                        <summary>Compare {m.title}</summary>
-                        <ul>
-                          {m.evidence.map((e, i) => (
-                            <li key={i}>
-                              <a href={e.contentUrl} target="_blank" rel="noreferrer">
-                                {e.label}
-                              </a>{' '}
-                              — {e.locator}
-                            </li>
-                          ))}
-                        </ul>
-                        <MappingValues mapping={r.mapping} kind={r.kind} label="Incoming values" />
-                        <MappingValues
-                          mapping={m.mapping}
-                          kind={r.kind}
-                          label="Destination values (retained when linked)"
-                        />
-                      </details>
-                    ))}
-                    {r.splitReviewRequired && (
-                      <>
-                        <MappingEditor
-                          label="Transferred clinical contents"
-                          kind={r.kind}
-                          mapping={
-                            decisions?.find((d) => d.recordId === r.recordId)?.splitMapping ||
-                            r.mapping
-                          }
-                          disabled={busy}
-                          onChange={(mapping) =>
-                            decide(r.recordId, { splitMapping: mapping, reviewedSplit: false })
-                          }
-                        />
-                        <MappingEditor
-                          label={`Contents staying with ${r.owner.fullName}`}
-                          kind={r.kind}
-                          mapping={
-                            decisions?.find((d) => d.recordId === r.recordId)?.remainingMapping ||
-                            r.remainingMapping ||
-                            {}
-                          }
-                          disabled={busy}
-                          onChange={(mapping) =>
-                            decide(r.recordId, { remainingMapping: mapping, reviewedSplit: false })
-                          }
-                        />
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={
-                              decisions?.find((d) => d.recordId === r.recordId)?.reviewedSplit ||
-                              false
-                            }
-                            disabled={busy}
-                            onChange={(e) =>
-                              decide(r.recordId, {
-                                splitMapping:
-                                  decisions?.find((d) => d.recordId === r.recordId)?.splitMapping ||
-                                  r.mapping,
-                                remainingMapping:
-                                  decisions?.find((d) => d.recordId === r.recordId)
-                                    ?.remainingMapping || r.remainingMapping,
-                                reviewedSplit: e.target.checked,
-                              })
-                            }
-                          />
-                          I reviewed both records’ exact contents against their sources.
-                        </label>
-                      </>
-                    )}
-                    {r.blockers.map((b) => (
-                      <p key={b}>{b}</p>
-                    ))}
-                  </section>
-                ))}
-                {preview.names.map((n) => (
-                  <label key={n.key}>
-                    {n.name} — remembered by{' '}
-                    {preview.records.find((r) => r.owner.personId === n.personId)?.owner.fullName ||
-                      'the former person'}
-                    {n.unknownSupport
-                      ? ' (some historical support is unknown)'
-                      : n.independentSupport
-                        ? ' (independent support remains)'
-                        : ' (all supporting assignments move)'}
-                    <select
-                      disabled={busy}
-                      value={names?.find((d) => d.key === n.key)?.outcome || n.decision}
-                      onChange={(e) => {
-                        setNames((old) => [
-                          ...(old || []).filter((d) => d.key !== n.key),
-                          { key: n.key, outcome: e.target.value as typeof n.decision },
-                        ]);
-                        changed();
-                      }}
-                    >
-                      <option value="old">
-                        Keep for{' '}
-                        {preview.records.find((r) => r.owner.personId === n.personId)?.owner
-                          .fullName || 'the former person'}
-                      </option>
-                      <option value="destination">
-                        Remove from{' '}
-                        {preview.records.find((r) => r.owner.personId === n.personId)?.owner
-                          .fullName || 'the former person'}{' '}
-                        and use for{' '}
-                        {'personId' in preview.destination
-                          ? preview.destination.fullName
-                          : preview.destination.newPerson.fullName}
-                      </option>
-                      <option value="both">Use for both people</option>
-                      <option value="unresolved">
-                        Ask each time for later reports with this printed name
-                      </option>
-                    </select>
-                  </label>
-                ))}
-                {preview.relationships
-                  .filter((r) => r.resolution !== 'move_together')
-                  .map((r) => (
-                    <label key={r.decisionId}>
-                      <input
-                        type="checkbox"
+                <OwnershipBlockerEvidence
+                  blockers={preview.blockers}
+                  disabled={busy || dirty}
+                  onRefresh={() => void loadPreview()}
+                />
+                {'reportEvidence' in preview ? (
+                  <OwnershipReportEvidence
+                    reference={preview.reportEvidence}
+                    disabled={busy || dirty}
+                    renderRecord={renderRecord}
+                    renderRelationship={renderRelationship}
+                  />
+                ) : (
+                  preview.records.map(renderRecord)
+                )}
+                {'nameEvidence' in preview ? (
+                  <OwnershipNameEvidence
+                    reference={preview.nameEvidence}
+                    disabled={busy || dirty}
+                    onBusy={setBusy}
+                    onChoice={(updated) => {
+                      if (liveContext.current !== contextKey) return;
+                      setPreview(updated);
+                      setDirty(false);
+                      commit.current = {
+                        operationId: crypto.randomUUID(),
+                        request: updated.request,
+                        scopeToken: updated.scopeToken,
+                        version: updated.version,
+                      };
+                    }}
+                  />
+                ) : (
+                  preview.names.map((n) => (
+                    <label key={n.key}>
+                      {n.name} — remembered by{' '}
+                      {preview.records.find((r) => r.owner.personId === n.personId)?.owner
+                        .fullName || 'the former person'}
+                      {n.unknownSupport
+                        ? ' (some historical support is unknown)'
+                        : n.independentSupport
+                          ? ' (independent support remains)'
+                          : ' (all supporting assignments move)'}
+                      <select
                         disabled={busy}
-                        checked={relationships?.some((d) => d.decisionId === r.decisionId) || false}
+                        value={names?.find((d) => d.key === n.key)?.outcome || n.decision}
                         onChange={(e) => {
-                          setRelationships((old) =>
-                            e.target.checked
-                              ? [...(old || []), { decisionId: r.decisionId, action: 'withdraw' }]
-                              : (old || []).filter((d) => d.decisionId !== r.decisionId),
-                          );
+                          setNames((old) => [
+                            ...(old || []).filter((d) => d.key !== n.key),
+                            { key: n.key, outcome: e.target.value as typeof n.decision },
+                          ]);
                           changed();
                         }}
-                      />
-                      Withdraw the {r.action.replaceAll('_', ' ')} relationship involving{' '}
-                      {preview.records.find((i) => i.recordId === r.recordId)?.title}. The prior
-                      decision remains in history.
+                      >
+                        <option value="old">
+                          Keep for{' '}
+                          {preview.records.find((r) => r.owner.personId === n.personId)?.owner
+                            .fullName || 'the former person'}
+                        </option>
+                        <option value="destination">
+                          Remove from{' '}
+                          {preview.records.find((r) => r.owner.personId === n.personId)?.owner
+                            .fullName || 'the former person'}{' '}
+                          and use for{' '}
+                          {'personId' in preview.destination
+                            ? preview.destination.fullName
+                            : preview.destination.newPerson.fullName}
+                        </option>
+                        <option value="both">Use for both people</option>
+                        <option value="unresolved">
+                          Ask each time for later reports with this printed name
+                        </option>
+                      </select>
                     </label>
-                  ))}
+                  ))
+                )}
+                {!('reportEvidence' in preview) &&
+                  preview.relationships
+                    .filter((r) => r.resolution !== 'move_together')
+                    .map(renderRelationship)}
                 <button
                   className="button primary"
                   disabled={busy || dirty || !!blocked}

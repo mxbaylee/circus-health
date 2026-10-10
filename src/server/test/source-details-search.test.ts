@@ -30,10 +30,44 @@ import {
   clearSourceTextProjectionCache,
 } from '../source-text-projection.ts';
 import {
+  assertSourceDetailsSearchFunctionReady,
   createSourceDetailsSearch,
   clearSourceDetailsSearchCache,
   sourceDetailsSearchCounters,
 } from '../source-details-search.ts';
+
+test('fixed source search registration refuses later same-name overloads and setter replacement', (t) => {
+  const upper = fixture(t);
+  assert.doesNotThrow(() => assertSourceDetailsSearchFunctionReady(upper.db));
+  upper.db.function('__SOURCE_DETAILS_SEARCH_MATCH', () => 0);
+  assert.throws(
+    () => assertSourceDetailsSearchFunctionReady(upper.db),
+    /registration changed|prerequisite is unavailable/,
+  );
+
+  const failed = fixture(t);
+  assert.throws(() => failed.db.function('__SOURCE_DETAILS_SEARCH_MATCH', null as never));
+  assert.throws(
+    () => assertSourceDetailsSearchFunctionReady(failed.db),
+    /registration changed|prerequisite is unavailable/,
+  );
+
+  const overload = fixture(t);
+  overload.db.function('__SOURCE_DETAILS_SEARCH_MATCH', { varargs: true }, () => 0);
+  assert.throws(
+    () => assertSourceDetailsSearchFunctionReady(overload.db),
+    /registration changed|prerequisite is unavailable/,
+  );
+
+  const replaced = fixture(t);
+  const original = replaced.db.function;
+  replaced.db.function = ((...args: Parameters<typeof original>) =>
+    Reflect.apply(original, replaced.db, args)) as typeof original;
+  assert.throws(
+    () => assertSourceDetailsSearchFunctionReady(replaced.db),
+    /prerequisite is unavailable/,
+  );
+});
 
 function fixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-search-'));
@@ -186,7 +220,7 @@ test('source count/pages and complete DTOs equal independent SQL LIKE for exact 
     ),
   );
   const raw =
-    '{ "first": "Alpha Ω Ä 😀", "dup":"retained hidden", "dup":"visible", "escape":"\\u0041\\ud800", "last": "tail" }';
+    '{ "first": "Alpha Ω Ä 😀 \ufffd \ufffe \uffff", "dup":"retained hidden", "dup":"visible", "escape":"\\u0041\\ud800", "last": "tail" }';
   f.insert('a-raw', raw, 'derived', 'acquired');
   for (const [index, kind] of [
     'intake_original',
@@ -254,6 +288,11 @@ test('source count/pages and complete DTOs equal independent SQL LIKE for exact 
     'Ä',
     'ä',
     '😀',
+    '\ud800',
+    '\udc00',
+    '\ufffd',
+    '\ufffe',
+    '\uffff',
     'retained hidden',
     '\\u0041',
     '\\ud800',
@@ -454,6 +493,22 @@ test('scope tokens, lowered budgets, transaction invalidation and close cannot r
   );
   plan.dispose();
   assert.throws(() => run(plan), /active/);
+  const pathPlan = createSourceDetailsSearch(f.db, 'fictional/a');
+  assert.equal(run(pathPlan).length, 1);
+  assert.throws(
+    () =>
+      f.db
+        .prepare(`SELECT f.id FROM source_files f WHERE ${pathPlan.predicate}`)
+        .all(pathPlan.parameters[0]!, 'wrong-token', pathPlan.parameters[2]!),
+    /active/,
+  );
+  f.db
+    .prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'")
+    .run('fictional-other-profile');
+  assert.throws(() => run(pathPlan), /profile|binding/i);
+  f.db.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run('fictional-search');
+  pathPlan.dispose();
+  assert.throws(() => run(pathPlan), /active/);
   const limited = createSourceDetailsSearch(f.db, 'needle', { limits: { maxEvaluations: 0 } });
   assert.throws(() => run(limited), /limit/);
   limited.dispose();

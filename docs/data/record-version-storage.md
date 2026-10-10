@@ -12,9 +12,118 @@ Use complete versions of changed records rather than patches that require rerunn
 
 Relationships must have explicit versioned semantics too. Removing a link creates a new version showing the association as removed; it does not erase the old association. Archive/restore records visibility changes without deleting evidence. Version storage does not grant permission to edit imported originals or finished historical notes: existing source/finished-note restrictions still apply, including creating a linked correction note when required. Ordinary links retain the existing behavior of resolving the target's current version; an audit entry can identify the specific versions involved in an edit.
 
+## Bounded transaction manifests
+
+New accepted transactions use commit format `health-record-versions-v2`. Their complete changed-record JSONL envelopes remain `health-record-versions-v1`; the change is how the commit names its segments. A small `health-record-segment-index-v1` descriptor holds the total segment count and the final immutable manifest-page reference. Each `health-record-segment-page-v1` page contains at most 64 segment references, its first segment ordinal, the previous page reference, and the exact profile, schema, sequence and operation binding. Pages are limited to 32 KiB by this producer-controlled format.
+
+The writer verifies each segment and manifest page before publishing the small commit and then the existing accepted head. One transaction remains one atomic acceptance, regardless of its segment count; there is no operation-size cap or silent split. Failure or cancellation before head publication leaves the prior accepted state intact. A complete authenticated single-page manifest replays its at-most-64 references directly. Multiple pages use a temporary SQLite ordering index; both forms are disposable work and never recovery authority. Recovery checks every page's hash, byte length, binding, contiguous ordinals and total count before yielding references. Repeated links, missing pages and inconsistent counts refuse recovery. `segmentOrderingScratchOpened` counts ordering-index path entries separately from logical references spooled and replayed. Segment payload authentication and complete version validation are unchanged.
+
+Readers retain compatibility with v1 commits whose segment references are an inline array. Existing historical monolithic commit objects and individual legacy record values retain their existing whole-object decoding boundary; this format does not retroactively make those encrypted objects streamable or change their contents. New manifests keep the writer and reader's segment-reference windows bounded. Complete changed record values, transaction results and attribution remain the domain's responsibility; a domain must return a small receipt rather than a complete report in the transaction result.
+
+Older application builds refuse v2 accepted commits. Before the first candidate write, retain the checked pre-update backup and prior build described in [installation updates](../setup/release-updates.md). Recover that separate backup with the prior build if needed; do not remove new heads or manifest pages to force a downgrade. SQLite schemas and encrypted object framing are unchanged by the manifest format.
+
+Fictional journal tests cover hundreds of segments, exact forward row order, v1 compatibility, bounded reference counts, invalid page links/counts/profile/operation bindings, cancellation and interrupted publication. They do not qualify arbitrary installation capacity or remove the historical per-object decoding limit.
+
+## Prepared publication backing
+
+The private original-backed prepared-write path can retain authenticated vault
+version certificates across its own accepted writes. A cold preparation verifies
+the existing history. Subsequent preparations reuse that history only through the
+exact committed transaction's one-use grant, retaining the original namespace
+and physical identities plus that transaction's checked immutable additions.
+The successor is captured during HEAD installation, before outcome observers;
+a later filesystem state cannot become the reuse baseline. Uncertain or failed
+staging invalidates reuse. These certificates are disposable, never recovery
+authority, and ordinary full-record certificates do not authorize compact
+metadata-only publication.
+
+The two-write fictional regression checks exact accepted values and HEAD changes,
+business execution once per write, a cold first traversal and zero historical
+version decoding on the second. Complete physical verification still runs.
+This private-path result does not establish public ownership, prerequisite or
+group integration, nor changed-only physical verification or general capacity.
+
+Contributor and vault backing workers load recovery modules only for cold
+preparation. Later physical-only checks do not load the application database,
+storage adapter or record replay modules. Both complete signed physical passes,
+membership checks and owner checkpoints remain unchanged; this reduces worker
+initialization work, not the number of originals verified.
+
+Cold backing workers construct derivative certificate trees in batches of at most
+64 certificates. Each certificate retains its exact entity/key, version, tombstone,
+preimage and field digests; only final reachable shared tree paths are inserted for
+each batch. Earlier roots remain immutable. The temporary tree shape may differ
+from per-key construction, but membership, absence and certificate contents do not.
+Vault quoted-string and contributor raw-document predecessor digests remain distinct.
+This reduces private page writes without widening compact certificate scope,
+skipping accepted-history replay or removing complete physical verification. It
+does not bound the native SQLite column values read before digest construction.
+
+Preparatory recipes record both literal SQL and genuine native changeset effects,
+including their exact write counts. Before final physical verification, every
+retained literal replay statement is compiled again under the installed policy.
+The native changeset's recorded authorization sequence receives fresh policy
+evaluation before its final execution. If SQLite
+expires that bytecode during changeset application, final execution accepts only
+the same native statement's complete recorded authorization sequence; it does
+not call external policy or business callbacks inside publication. Changed
+methods, schemas, observer membership or authorization events refuse replay.
+The business callback runs only in preparation, which rolls back; the final
+transaction recreates its frozen effects. Disposal releases unused statement
+authorization receipts. This does not make arbitrary SQL enrollable. Changeset
+authorization observers run during preparation, and changes to their membership
+refuse replay; their mutable closure behavior is not freshly reevaluated during
+changeset preflight or final replay.
+
+The same private path supports verified plain intake-maintenance publications.
+It retains the exact preparatory capability across only its genuine rollback,
+then requires a distinct issuer-bound final token, unchanged source bindings and
+the frozen write roster. General revision advances while clinical-review
+revision stays unchanged. Explicit invalidation, lock and unrelated rollback
+still revoke retained preparations. Compact-metadata and legacy representation
+bridges retain their specialized paths.
+
+Native ownership commits capture the selected parent originals before prerequisite
+snapshot publication. Snapshot checkpoints and final adoption use that same
+capability. Each approved child executes its business intent in preparation once;
+final publication replays the frozen effects. Private one-use grants bind the
+parent, group, operation, reviewed choices and destination. Later children reuse
+the destination identity and version returned by the preceding accepted child,
+not a newly observed destination version. Fictional checks cover a single unit,
+two independent groups with an existing destination, and two groups creating one
+new destination. They do not qualify every clinical, name, link or report-selection
+combination, nor remove complete physical verification.
+
+Within one ownership preparation, fresh records with no prior issue authority use
+the existing inline `[]` representation after complete current policy inspection
+and unchanged-policy checks prove their issue set empty. A fresh empty report
+union uses the same representation. Original source and logical-envelope guards
+remain retained and checked; no empty catalog snapshot or prerequisite publication
+is needed. Nonempty sets and prior issue authority, including a prior inline empty
+set, retain their authenticated snapshot preparation paths. The accepted receipt
+retains the exact empty issue evidence; this avoids unused snapshot writes, not
+source evidence verification or final physical checks.
+
+Initial ownership preview construction forwards each host-verified clinical review
+context through a private one-use handoff, bound to its original session, database,
+profile, method epoch and SQL read interval. It avoids only the immediate duplicate
+per-session physical pass. Construction still copies the original artifact identities
+and verifies their complete union before the preview escapes. Later snapshot
+preparation retains its existing per-session checks and prerequisite-publication
+closures; cancellation or changed authority cannot recapture a newer proof.
+
+Ownership name-evidence hashing preserves the complete canonical order and
+membership while yielding at bounded piece and byte intervals. Individual hash
+updates retain surrogate pairs and consume at most 4,097 UTF-16 units; each digest
+interval consumes at most 64 KiB. Original plan and source guards run before and
+after each yield, and cancellation disposes the unpublished scratch plan. This
+does not remove final physical checks or bound every name-rendering operation.
+
 ## Current data and searchable history
 
 SQLite is a disposable, indexed projection containing both current records and retained version history. The current view selects the latest accepted version in committed order. Record history is a normal query, not an offline backup-restoration workflow. Index by profile, entity/record, version/sequence and time, with a field-change index or equivalent for queries such as **When did I change my birthday?**
+
+Association-owner history indexes contain only link or attachment versions, including their removal versions. Unrelated record versions add no entries to these two indexes. Attaching an older cache rebuilds these disposable indexes once without changing accepted objects, projected versions or the profile revision; this upgrade still scans retained versions. Subsequent attachment reuses the matching definitions.
 
 Both changes in A → B → A remain searchable. Returning to an earlier value does not deduplicate away the intervening edit. A network retry of the same operation must not create a second version; a distinct accepted edit is a different operation even if some contents repeat. Changed-field summaries can be derived from adjacent versions but must retain links to their full contents and attribution.
 
@@ -24,13 +133,15 @@ The working database and its encrypted persistent cache include current data and
 
 ### Compact history projection
 
-Projection 2 stores each indexed version's complete contents once. Its separate envelope contains attribution and identities without another contents copy. Changed-field rows contain the field name, predecessor version reference and before/after presence flags; they do not retain serialized before/after subtrees. In particular, a nested JSON edit does not copy its complete parent objects into every ancestor field-change row.
+Projection 3 stores each indexed version's complete contents once. Its separate envelope contains attribution and identities without another contents copy. Changed-field rows contain the field name, predecessor version reference and before/after presence flags; they do not retain serialized before/after subtrees. In particular, a nested JSON edit does not copy its complete parent objects into every ancestor field-change row.
+
+An initial, nondeleted `app_meta` version containing exactly string `key` and `value` fields needs no stored field-reference rows: both creation changes are reconstructed from its validated complete version, with absent-before and present-after flags. Selected history still requires its stored reference set to be empty; unexpected references refuse. Updates, tombstones, reinsertion after deletion and other content shapes retain ordinary exact field references. Key/value filtering includes initial metadata versions under the same profile, record and pagination predicates. Full versions, current pointers and accepted journal bytes remain unchanged.
 
 History pagination selects at most the requested page of versions plus one identifier indicating whether another page exists. Only selected versions and their immediate predecessors are loaded to reconstruct envelopes and changed-field values. Field filtering remains indexed. Responses preserve absent versus null, nested `_json` fields, complete array values, object ancestors, deletion/tombstones and the existing dotted-name traversal. Invalid JSON text remains literal for decoding; this does not relax current record validation. Selected-version lookup for restoration uses the same validated envelope reconstruction.
 
-The index is built atomically from committed versions and belongs to the authenticated encrypted cache. Selected history validates metadata against indexed identities, predecessor ownership/order and the exact changed-field reference set. Missing or inconsistent selected references fail explicitly. This is not a detector for arbitrary modifications to an unlocked SQLite file before a filtered query. Unsupported projection schemas require a fresh cache rebuild; they are not migrated or silently reused. Immutable accepted-record envelopes and originals are unchanged, and remain the recovery authority.
+The index is built atomically from committed versions and belongs to the authenticated encrypted cache. Selected history validates metadata against indexed identities, predecessor ownership/order and the exact changed-field reference set. Missing or inconsistent selected references fail explicitly. This is not a detector for arbitrary modifications to an unlocked SQLite file before a filtered query. Unsupported projection schemas, including projection 2, require a fresh cache rebuild; they are not relabeled or migrated in place. Encrypted unlock reconstructs an incompatible cache from authenticated accepted history. Direct contributor attachment refuses the old projection; its explicit staged recovery builds a new target while preserving the source, as described in [contributor authority](contributor-record-authority.md#runtime-writes-and-reconstruction). Immutable accepted-record envelopes and originals are unchanged, and remain the recovery authority.
 
-A fictional regression makes 300 actual source-file edits to a growing structured value. At 100, 200 and 300 edits, indexed contents occupy 566,950, 2,198,800 and 4,900,650 bytes; version metadata occupies 43,308, 86,308 and 129,308 bytes; changed-field reference metadata occupies 51,572, 102,072 and 152,572 bytes. SQLite allocation is 1,601,536, 3,944,448 and 7,417,856 bytes on that test setup. These counts distinguish the remaining complete-version contents from metadata that follows changed paths and edit counts. A seven-entry filtered page selects eight identifiers and reads only its seven versions and seven predecessors, without archive reads. They are scoped fixture measurements, not installation capacity targets.
+A fictional regression makes 300 actual source-file edits to a growing structured value. At 100, 200 and 300 edits, indexed contents occupy 566,950, 2,198,800 and 4,900,650 bytes; version metadata occupies 43,308, 86,308 and 129,308 bytes; changed-field reference metadata occupies 51,572, 102,072 and 152,572 bytes. SQLite allocation was 1,601,536, 3,944,448 and 7,417,856 bytes on the measured projection-2 setup; projection 3 leaves the source-file field representation unchanged, but these allocation measurements are not a new-cache measurement. These counts distinguish the remaining complete-version contents from metadata that follows changed paths and edit counts. A seven-entry filtered page selects eight identifiers and reads only its seven versions and seven predecessors, without archive reads. They are scoped fixture measurements, not installation capacity targets.
 
 The remaining contents copy still grows with the size of each retained record version. Production intake uses [selected contribution-backed envelopes](intake-envelope-authority.md) instead of repeatedly versioning its complete source row. [Application mutation qualification](intake-mutation-qualification.md) separates changed writes from retained contents and host work; broader capacity qualification remains open in pending [PR #35](https://github.com/mxbaylee/circus-health/pull/35). The separate [incremental encrypted vault index](../security/vault-index.md) publishes changed bindings and new object metadata rather than whole file/object maps. No historical versions are pruned, and no runtime-capacity increase is part of these changes.
 
@@ -41,6 +152,18 @@ Maintain the single-writer boundary and optimistic revision checks. Stage new ve
 Retries use a stable operation ID. A partial final append or an uncommitted segment cannot become accepted state. Refuse unexplained gaps, invalid version references, wrong profile ownership or unsupported schema rather than substituting another snapshot. Pin and test deterministic record/schema decoding across supported versions. JSONL by itself does not supply transactions, concurrency control or safe multi-machine writes.
 
 JSONL is the logical representation after decryption. Durable storage uses bounded authenticated encrypted segments/objects and commit metadata inside the vault. Segment rotation bounds file size and recovery work; it does not discard old versions or remove them from queries. Keep keys and credential changes outside the medical record history, with the secret-handling constraints in the encryption reference.
+
+### Rebuildable SQLite commit policy
+
+After accepted-record durability has successfully attached and its physical head matches the projection, WAL connections use `synchronous=NORMAL` and a 32,768-page automatic checkpoint threshold. Opening a database, a failed attachment, or a non-WAL connection does not select either policy. Earlier 1,000- and 8,192-page policies caused more repeated checkpoint work during changed-record publication; the larger threshold lets the disposable WAL retain more frames before an automatic PASSIVE checkpoint. Its file can grow beyond 32,768 pages when one transaction crosses the threshold or readers delay a complete checkpoint. This is a runtime disk-headroom and recovery-read tradeoff, not a fixed WAL file-size guarantee. The accepted journal owner still verifies and fsyncs immutable objects and the accepted head before the SQLite commit; encryption, exact operation replay, writer ownership and refusal of divergent authority are unchanged.
+
+SQLite can lose a recent NORMAL-mode WAL tail after an operating-system crash or power loss. That is a cache-loss case, not permission to lose acknowledged records: supported startup catches up or rebuilds the complete projection from the durable accepted history. A cache alone is never a backup. The [SQLite synchronous contract](https://www.sqlite.org/pragma.html#pragma_synchronous) distinguishes WAL consistency from per-commit cache durability. Restart into the reviewed build to use the new connection-local checkpoint threshold; no operator tuning, accepted-record migration or cache schema change is needed. An earlier compatible build retains its own connection policy and reads the same history.
+
+On 2026-10-08, the small fictional 4/8-artifact [diagnostic run](https://github.com/mxbaylee/circus-health/actions/runs/37823841607) on pre-policy revision `8f3ea3c` compared 1,000 and 8,192 pages sequentially on one Linux CI host, with a setup WAL drain and final explicit checkpoint included in whole-probe work. For the eight-artifact case, new-node counts differed by 1.4%, while process-reported write units per new node fell from 126.984 to 99.137; the four-artifact case fell from 116.144 to 87.011. The candidate's sampled WAL reached about 40.9 MB versus 14.4 MB at baseline, and both ended with a zero-length WAL after the final drain. A later [same-host diagnostic](https://github.com/mxbaylee/circus-health/actions/runs/37839356183) on revision `8946a2a` compared 8,192 and 32,768 pages with the same 16/32-artifact fixtures and final drain. Changed-batch counts and commit counts matched exactly; process-reported write units per new node, including the drain, fell from 117.590 to 98.145 at 16 and from 141.613 to 117.852 at 32. Sampled WAL peaks rose from about 48/52 MB to 150/151 MB. These kernel write units are process-wide, not attributable device bytes or a universal product bound. Counted regressions observe fewer actual WAL resets from the documented header salts, then check drained current contents and accepted-history rebuild. The original full retained-history and encrypted recovery gates remain required; the small diagnostics do not replace them.
+
+Record-version duplicate detection keeps its private disk-backed identity index in one explicit transaction for the lifetime of that validation scope. Its existing bounded page cache can spill to disk, and closing always discards the complete scratch index. Neither these scratch bytes nor a scratch commit become recovery evidence. Writer and recovery still inspect every version and reject duplicate identities and invalid predecessor references.
+
+Fictional regressions distinguish unattached and rejected/non-WAL attachment, failure before accepted-head publication, interruption after the durable head but before cache commit, complete replay and exact retry. Controlled interruption is not a physical power-loss test. The complete encrypted acceptance/cache-loss journey remains a separate required oracle.
 
 ## Source-text write amplification
 
@@ -61,6 +184,69 @@ Source text follows the rule for its own records:
 - **Historical measurement.** In fictional fixtures that capture one page per write, journal bytes per write were 64.6 KB at 30 pages and 221.9 KB at 120 pages before the change, and 16.5 KB, 19.5 KB and 19.7 KB at 30, 120 and 480 pages after it. With 400 fictional proposals (about 214 KB) on the intake, a capture at 120 pages wrote 264 KB before the pin moved and approximately 19.5 KB after that change. These figures have not been re-measured for consumed-source dependencies; current fictional regressions check counted journal growth instead. Archives written before the change keep their larger history; nothing is compacted (see [History retention](#history-retention)).
 
 Every new durable write path needs a fictional-fixture test asserting that journal growth stays linear in the number of changes, at two document sizes. A test that only checks correctness does not catch this.
+
+### Replay SQL reuse and the short debugging loop
+
+Cold reconstruction retains the original complete-version validation, reference verification, delete-before-insert ordering, historical indexing and final integrity checks. Within each replayed transaction, it prepares each touched table's delete/insert statement at most once per phase and executes that statement for every applicable record. The statement maps are local to that call and bounded by the configured table set; no records, authorization results or prepared statements are reused across replay calls or connections. Durable formats, encryption, accepted publication and cache compatibility are unchanged.
+
+Cold intake schema validation likewise prepares its ten fixed scratch SQL
+statements once per traversal. It still executes every property, ancestry,
+membership and descriptor check, including fresh source checks across cooperative
+yields. The statements belong only to the disposable validation database; normal
+completion, refusal and generator cancellation discard that database. Fictional
+four- and sixteen-candidate regressions retain 583 and 1,951 scratch executions
+while requiring ten compilations each. This reduces SQL compilation work, not
+authenticated reads or durable writes, and does not establish an unlock latency.
+
+Publication now also prepares a changed-row SELECT once per touched table within
+one collection traversal. Every changed identity still executes that SELECT and
+reads its current predecessor; no row, result or authorization is cached. The
+statement map is limited to the configured schema and discarded after that
+traversal, including early termination.
+
+The derived field-history index groups up to 32 changed-field rows from one
+complete validated version in one INSERT statement. It preserves field order,
+predecessor references and absent/null distinctions, flushes before the next
+version, and retains at most 32 statement shapes for that indexing call. The
+bounded parameter list contains references and presence metadata, not copies of
+record contents. Every required stored field row still executes; the initial
+metadata exception is described in [compact history projection](#compact-history-projection).
+The accepted version, segment
+and commit bytes, validation/readback order, transaction boundaries and SQLite
+projection format are unchanged by batching itself. A failure after a real field batch rolls back
+the entire publication before accepted HEAD advances. Replay uses the same
+indexer and reconstructs the exact current and historical rows.
+
+The publication regression uses four and 64 changed people plus nested source
+fields across inserts, updates and deletion. It checks actual SQL executions,
+exact operation replay, empty field deltas, interruption and two fresh rebuilds.
+For its 64-person insertion, row-SELECT compilation falls from 64 to one for the
+people table, retaining all 64 row reads; 342 field rows use 69 rather than 342
+INSERT calls. This trades a bounded set of statement shapes for fewer execution
+calls; it does not reduce field rows, authenticated journal reads or durable
+bytes, or establish a full import/identity latency improvement.
+
+The fictional replay-only regression rebuilds the same accepted archive into two fresh databases at both four and 64 people, preserving updates, tombstones, predecessor/field history and exact current/history index rows. For the 64-person history, SQL preparation falls from 130 deletes and 129 inserts to four deletes and three inserts, while all 259 corresponding row executions remain. Complete-version validation counts and archive bytes remain unchanged. These are scoped work counts, not an unlock latency or full HTTP acceptance claim.
+
+Ancestry and V2 segment-reference ordering indexes also keep their inserts in one
+private transaction per traversal, rather than an implicit pager transaction per
+reference. Their existing 2 MiB SQLite page cache and file-backed temporary storage
+remain unchanged. The transaction is discarded with the scratch connection on
+normal completion, refusal or iterator termination; it is never committed as
+recovery evidence. Every selected commit, manifest page and segment is still read
+from the original journal and authenticated in the same order. V1 decoding and
+accepted-database transaction boundaries are unchanged. The replay regression
+observes the actual scratch inserts inside a transaction, reconciles their counts
+with the existing replay counters, and verifies that the scratch files and
+connections are gone afterward.
+
+Run this checkpoint without repeating the import/review setup:
+
+```sh
+node --test src/server/test/record-replay-sql.test.ts
+```
+
+Then run the complete record-version and affected recovery tests. The separate `npm run test:acceptance` and `npm run test:continuation` scenarios still establish their end-to-end outcomes; this short regression does not replace either one.
 
 ## History retention
 
@@ -113,4 +299,4 @@ Conversation recovery uses its own [linked changed-content journal](conversation
 
 ## Incremental intake state primitive
 
-The [incremental intake state primitive](intake-state-storage.md) frames changed operational JSON into immutable source-scoped `app_meta` contributions with a bounded head and operation receipts. It uses the existing accepted-record transaction and compact history projection. Production intake has not cut over to this primitive; its current full workflow versions remain an open storage limitation.
+The [incremental intake state owner](intake-state-storage.md) stores operational evidence in immutable source-scoped `app_meta` contributions through the existing accepted-record transaction and compact history projection. Production intake uses its selected envelope authority. Retained V3 envelopes use changed-content frames; V4 envelopes use authenticated maps, sequences and chunked values with separate logical, receipt, history and incomplete-build roots. Selected V4 envelopes refuse whole-workflow hydration: consumers use explicit summaries, selected records, pages and fragments. The supported V3 bridge preserves exact retained evidence and public identities; it is counted cold compatibility work, not a constant-cost mutation. See the [bounded views contract](intake-bounded-views.md) for consumer and qualification boundaries.

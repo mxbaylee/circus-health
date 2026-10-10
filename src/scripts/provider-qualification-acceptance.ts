@@ -1,14 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import type { IntakeIdentityReview } from '../shared/intake-identity.ts';
 import type { Evidence, Medication, Observation, Procedure } from '../shared/api.ts';
 import type {
-  IntakeImportFeed,
   IntakeReportAcceptanceReceipt,
   IntakeReportAcceptanceResult,
   IntakeClinicalMapping,
-  IntakeImportFeedBlock,
   IntakeReportAcceptanceRequest,
 } from '../shared/intake.ts';
 import {
@@ -19,6 +16,8 @@ import {
   type QualificationRecord,
   type QualificationScenario,
 } from './provider-qualification-fixture.ts';
+import { readQualificationIdentity } from './qualification-intake-read.ts';
+import type { QualificationFeedBlock, QualificationFeedPage } from './qualification-intake-read.ts';
 function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw Error(message);
 }
@@ -100,7 +99,7 @@ export function acceptedQualificationRecord(
 /** Feed pages can repeat a proposal block across report groups. Consolidate exact
  * versions, preserve their tokens, and bound one explicitly selected transaction. */
 export function qualificationAcceptanceRequest(
-  blocks: readonly IntakeImportFeedBlock[],
+  blocks: readonly QualificationFeedBlock[],
 ): IntakeReportAcceptanceRequest {
   const byProposal = new Map<string, IntakeReportAcceptanceRequest['blocks'][number]>();
   const seen = new Set<string>();
@@ -153,7 +152,7 @@ export interface QualificationAcceptanceOptions {
   request: <T>(path: string, input?: unknown) => Promise<T>;
   collectFeed: (
     prefix: string,
-  ) => Promise<{ blocks: IntakeImportFeedBlock[]; feed: IntakeImportFeed }>;
+  ) => Promise<{ blocks: QualificationFeedBlock[]; feed: QualificationFeedPage }>;
   originalHash: (prefix: string, originalId: string) => Promise<string>;
   afterAcceptedBeforeRecovery?: () => Promise<void>;
 }
@@ -236,6 +235,14 @@ export async function performQualificationAcceptance({
         .flatMap((candidateBlock) => candidateBlock.records)
         .find((candidate) => candidate.candidateVersionId === initialRecord.candidateVersionId);
       check(record, 'Qualification candidate disappeared during identity review.');
+      check(
+        Array.isArray(record.reportGroups),
+        'Qualification requires fully inspected inline report membership; a paged reference is not proof.',
+      );
+      check(
+        !record.issuesReference && !record.questionsReference,
+        'Qualification requires complete question and issue evidence.',
+      );
       const unresolved = (record.issues ?? []).filter(
         (issue) => issue.blocking && issue.status === 'unresolved',
       );
@@ -266,10 +273,11 @@ export async function performQualificationAcceptance({
         'Qualification identity resolution requires one exact report and candidate version.',
       );
       const groupId = record.reportGroups[0]!.groupId;
-      const review = await request<IntakeIdentityReview>(
+      const inspected = await readQualificationIdentity(
+        request,
         prefix + `/intakes/${originalId}/identity-review?groupId=${encodeURIComponent(groupId)}`,
       );
-      const scope = review.scope;
+      const { review, inspectedScope: scope, confirmationScope } = inspected;
       check(
         scope &&
           review.status !== 'conflict' &&
@@ -309,7 +317,7 @@ export async function performQualificationAcceptance({
       await request(prefix + `/intakes/${originalId}/identity-scope`, {
         version: scope.intakeVersion,
         operationId: randomUUID(),
-        scope,
+        scope: confirmationScope,
         outcome: 'this_is_me',
         attestation: 'confirmed_displayed_identity_questions',
       });

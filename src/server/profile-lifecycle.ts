@@ -2,7 +2,7 @@ import { personDisplayKey } from '../shared/person-display.ts';
 import { onboardingIdentity } from './profile-onboarding.ts';
 import { profileDefinition } from './profiles.ts';
 import { seedSyntheticPlacebo, SYNTHETIC_PLACEBO_SEED } from './synthetic-placebo.ts';
-import { backup, DatabaseSync } from 'node:sqlite';
+import { backup } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import {
   cpSync,
@@ -21,10 +21,19 @@ import { resolve, dirname } from 'node:path';
 import { openDatabase, HttpError, transaction, type Database } from './database.ts';
 import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
 import { stageIntakeStateCopy } from './intake-state-bootstrap.ts';
-import { prepareManualSourceCopy, stageManualSourceCopy } from './intake-manual-copy.ts';
 import {
-  preparePortableIntakeCopy,
+  prepareManualSourceCopyAsync,
+  stageManualSourceCopy,
+  disposeManualSourceCopyPlan,
+} from './intake-manual-copy.ts';
+import {
+  preparePortableIntakeCopyAsync,
+  disposePortableIntakeCopyPlan,
+  beginPortableIntakeCopyStaging,
   assertPortableCopyCoherence,
+  assertPortableIntakeCopySourceCurrent,
+  verifyPortableIntakeCopySourceForPublication,
+  consumePortableIntakeCopyPublicationSeal,
 } from './intake-state-portable-copy.ts';
 import {
   copyOperationId,
@@ -39,7 +48,7 @@ import { ensureProfileDirectories, profilePaths } from './profile-storage.ts';
 import { contributorAuthorityPath, hasContributorAuthority } from './contributor-record-storage.ts';
 import {
   rebuildContributorDatabase,
-  assertContributorCopyCoherence,
+  assertContributorCopyCoherenceAsync,
   selectedContributorHead,
 } from './contributor-durability.ts';
 import {
@@ -51,10 +60,9 @@ import {
   attachPersonalDurability,
   flushPersonal,
   writePortableSources,
-  loadPortable,
+  openPortableRows,
   durableWrite,
   syncDirectory,
-  type CompleteLoadedPortable,
 } from './portable.ts';
 import { registerProfileDisplayGuard, selfIdentity, getNote, saveNote } from './notes.ts';
 export interface ProfileRegistryEntry {
@@ -136,6 +144,18 @@ export interface ProfileLifecycle {
   close(): void;
 }
 type SaveProfileNote = (db: Database, id: string, input: Record<string, unknown>) => unknown;
+const lifecycleOwners = new WeakMap<
+  ProfileLifecycle,
+  { locks: Set<string>; lifetime: { closed: boolean } }
+>();
+const nativeLockHas = Set.prototype.has;
+/** Only lifecycle instances constructed here carry private lock provenance. */
+export function profileLifecycleAvailable(lifecycle: ProfileLifecycle, profileId: string): boolean {
+  const owner = lifecycleOwners.get(lifecycle);
+  return (
+    !!owner && !owner.lifetime.closed && !Reflect.apply(nativeLockHas, owner.locks, [profileId])
+  );
+}
 const nameOf = (input: unknown): string => {
   if (
     typeof input !== 'string' ||
@@ -168,6 +188,7 @@ export function createProfileLifecycle({
   const locks = new Set<string>();
   const copyLocks = new Set<string>();
   let closed = false;
+  const preparationAbort = new AbortController();
   const assertOpen = (): void => {
     if (closed)
       throw new HttpError(
@@ -219,6 +240,7 @@ export function createProfileLifecycle({
         targetProfileId: operation.targetProfileId,
         stageRoot,
       });
+    assertOpen();
   }
   function rebindCopyReceipts(
     copy: Database,
@@ -308,8 +330,14 @@ export function createProfileLifecycle({
       flushPersonal(active);
       return { ...profileInfo(active, entry), operationId: operation.operationId };
     }
-    if (!entry) verifyCopyHeads(operation, loadPortable(root, id) as CompleteLoadedPortable, root);
-    else if (!operation.published || entry.placebo)
+    if (!entry) {
+      const portable = openPortableRows(root, id);
+      try {
+        verifyCopyHeads(operation, portable, root);
+      } finally {
+        portable.close();
+      }
+    } else if (!operation.published || entry.placebo)
       throw new HttpError(409, 'PROFILE_COPY_OPERATION', 'Private copy registry binding conflicts');
     operation = { ...operation, published: true };
     writeCopyOperation(root, operation);
@@ -321,7 +349,7 @@ export function createProfileLifecycle({
       if (!existsSync(location)) rebuildContributorDatabase(location, root, id);
       recovered = openDatabase(location, id);
       attachPersonalDurability(recovered, { root, profileId: id, initialize: false });
-      assertPortableCopyCoherence(recovered, root, id);
+      assertPortableCopyCoherence(recovered, root, id)?.close();
       const identity = selfIdentity(recovered);
       if (!entry && identity.name !== operation.name)
         throw new HttpError(
@@ -410,6 +438,15 @@ export function createProfileLifecycle({
     const stage = resolve(root, 'data/operations/profile-staging', id);
     let db: Database | null | undefined,
       registered = false;
+    let copyPlan: Awaited<ReturnType<typeof preparePortableIntakeCopyAsync>> | undefined,
+      manualPlan: Awaited<ReturnType<typeof prepareManualSourceCopyAsync>> | undefined;
+    const copySource = sourceId ? databases.get(sourceId)! : undefined;
+    const assertCopySourceCurrent = () => {
+      if (!copyPlan) return;
+      if (databases.get(sourceId!) !== copySource)
+        throw Error('Copy original source database changed');
+      assertPortableIntakeCopySourceCurrent(copyPlan, copySource!);
+    };
     let finalDb: string | undefined;
     try {
       if (operation) writeCopyOperation(root, operation);
@@ -424,18 +461,28 @@ export function createProfileLifecycle({
         }
         await backup(databases.get(sourceId)!, paths.database);
         assertOpen();
-        const copy = new DatabaseSync(paths.database);
+        const copy = openDatabase(paths.database, sourceId);
         try {
-          const plan = preparePortableIntakeCopy(
+          const plan = (copyPlan = await preparePortableIntakeCopyAsync(
             databases.get(sourceId)!,
             copy,
             root,
             sourceId,
             id,
+            { signal: preparationAbort.signal },
+          ));
+          assertOpen();
+          manualPlan = await prepareManualSourceCopyAsync(
+            databases.get(sourceId)!,
+            root,
+            sourceId,
+            id,
+            { intakePlan: plan, signal: preparationAbort.signal },
           );
-          const manualPlan = prepareManualSourceCopy(databases.get(sourceId)!, root, sourceId, id);
+          assertOpen();
           checkpoint(operation, stage, 'validated');
           transaction(copy, () => {
+            beginPortableIntakeCopyStaging(plan, databases.get(sourceId)!, copy);
             copy.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
             const before = `data/profiles/${sourceId}/`,
               after = `data/profiles/${id}/`;
@@ -473,7 +520,7 @@ export function createProfileLifecycle({
               },
             };
             stageIntakeStateCopy(copy, plan, publication);
-            stageManualSourceCopy(copy, manualPlan, publication);
+            stageManualSourceCopy(copy, manualPlan!, publication);
             rebindCopyReceipts(copy, sourceId, id);
             copy
               .prepare(
@@ -482,6 +529,7 @@ export function createProfileLifecycle({
               .run();
           });
           checkpoint(operation, stage, 'staged');
+          assertCopySourceCurrent();
         } finally {
           copy.close();
         }
@@ -498,6 +546,7 @@ export function createProfileLifecycle({
         },
         version: self.version,
       });
+      assertCopySourceCurrent();
       if (placebo)
         seedSyntheticPlacebo(db, {
           root: stage,
@@ -506,10 +555,13 @@ export function createProfileLifecycle({
           seed: SYNTHETIC_PLACEBO_SEED,
         });
       checkpoint(operation, stage, 'before-export');
+      assertCopySourceCurrent();
       attachPersonalDurability(db, { root: stage, profileId: id, initialize: true });
+      assertCopySourceCurrent();
       // One-time portable copy/export artifact. Subsequent runtime writes select
       // only the record journal and never refresh these complete snapshots.
-      writePortableSources(db, stage, id, stage);
+      writePortableSources(db, stage, id, stage, { onFile: () => {} });
+      assertCopySourceCurrent();
       if (operation) {
         mkdirSync(resolve(paths.root, 'mappings'), { recursive: true });
         durableWrite(
@@ -532,12 +584,19 @@ export function createProfileLifecycle({
         );
       }
       checkpoint(operation, stage, 'exported');
-      assertContributorCopyCoherence(db, stage, id);
+      assertCopySourceCurrent();
+      await assertContributorCopyCoherenceAsync(db, stage, id, undefined, preparationAbort.signal);
+      assertOpen();
+      assertCopySourceCurrent();
       const acceptedHead = selectedContributorHead(stage, id);
-      const portable = loadPortable(stage, id) as CompleteLoadedPortable;
-      if (operation) {
-        operation = selectCopyHeads(operation, portable, stage);
-        writeCopyOperation(root, operation);
+      const portable = openPortableRows(stage, id);
+      try {
+        if (operation) {
+          operation = selectCopyHeads(operation, portable, stage);
+          writeCopyOperation(root, operation);
+        }
+      } finally {
+        portable.close();
       }
       const createdIdentity = selfIdentity(db);
       db.close();
@@ -574,6 +633,7 @@ export function createProfileLifecycle({
       assertOpen();
       requireDistinctProfile(createdIdentity.name, createdIdentity.icon);
       checkpoint(operation, stage, 'before-publication');
+      assertCopySourceCurrent();
       if (selectedContributorHead(stage, id) !== acceptedHead)
         throw Error('Prepared contributor authority changed before target publication');
       if (existsSync(final.root))
@@ -585,6 +645,17 @@ export function createProfileLifecycle({
       if (operation) {
         operation = { ...operation, publicationAttempted: true };
         writeCopyOperation(root, operation);
+      }
+      if (copyPlan) {
+        const seal = await verifyPortableIntakeCopySourceForPublication(
+          copyPlan,
+          copySource!,
+          preparationAbort.signal,
+        );
+        assertOpen();
+        if (databases.get(sourceId!) !== copySource)
+          throw Error('Copy original source database changed');
+        consumePortableIntakeCopyPublicationSeal(copyPlan, copySource!, seal);
       }
       renameSync(paths.root, final.root);
       checkpoint(operation, stage, 'renamed');
@@ -619,12 +690,25 @@ export function createProfileLifecycle({
           writeCopyOperation(root, unpublished);
         }
       } finally {
-        if (sourceId) locks.delete(sourceId);
-        if (operationId) copyLocks.delete(operationId);
-        db?.close();
-        rmSync(stage, { recursive: true, force: true });
-        if (!registered && finalDb && databaseDirectory && !existsSync(profilePaths(root, id).root))
-          rmSync(finalDb, { force: true });
+        try {
+          try {
+            if (manualPlan) disposeManualSourceCopyPlan(manualPlan);
+          } finally {
+            if (copyPlan) disposePortableIntakeCopyPlan(copyPlan);
+          }
+        } finally {
+          if (sourceId) locks.delete(sourceId);
+          if (operationId) copyLocks.delete(operationId);
+          db?.close();
+          rmSync(stage, { recursive: true, force: true });
+          if (
+            !registered &&
+            finalDb &&
+            databaseDirectory &&
+            !existsSync(profilePaths(root, id).root)
+          )
+            rmSync(finalDb, { force: true });
+        }
       }
     }
   }
@@ -677,13 +761,18 @@ export function createProfileLifecycle({
       if (!existsSync(receipt)) locks.delete(id);
     }
   }
-  return {
+  const lifetime = { closed: false };
+  const lifecycle: ProfileLifecycle = {
     list,
     create,
     remove,
     isLocked: (id: string) => locks.has(id),
     close() {
       closed = true;
+      preparationAbort.abort(Error('Profile lifecycle closed during copy preparation'));
+      lifetime.closed = true;
     },
   };
+  lifecycleOwners.set(lifecycle, { locks, lifetime });
+  return lifecycle;
 }

@@ -10,7 +10,11 @@ import { fictionalModel } from './fictional-model.ts';
 import { HttpError, openDatabase } from '../database.ts';
 import { profilePaths } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
-import { uploadIntake, getIntake } from '../intake.ts';
+import { uploadIntake, getIntakeRead } from '../intake.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
+import { selectedFixturePlan } from './helpers/selected-plan.ts';
+import { setCollectionProcessingException } from '../intake-processing-exceptions.ts';
+
 import { createAssistant } from '../assistant.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
 import { DEFAULT_INTAKE_READING_LIMITS } from '../intake-reading-budget.ts';
@@ -28,9 +32,12 @@ import {
 import { getIntakeSourceText, publishIntakeSourceText } from '../intake-source-text.ts';
 import type { IntakeBatch } from '../../shared/intake-batch.ts';
 
-async function until(check: () => boolean, harnessTimeoutMs = 8000) {
-  const end = Date.now() + harnessTimeoutMs;
-  while (!check() && Date.now() < end) await new Promise((r) => setTimeout(r, 5));
+async function until(t: TestContext, check: () => boolean) {
+  // Native admission publishes real preparation; the whole-test guard bounds a hang.
+  while (!check()) {
+    t.signal.throwIfAborted();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
   assert.ok(check(), 'automatic recovery reached its durable checkpoint');
 }
 function fixture(
@@ -111,6 +118,7 @@ function fixture(
   >[0];
   const calls: Callbacks[] = [];
   const units: string[] = [];
+  let contexts = 0;
   const assistant = createAssistant({
     root,
     databases: new Map([[profileId, db]]),
@@ -118,29 +126,37 @@ function fixture(
     availability: () => ({ available: true, readiness: 'ready' }),
     connectionCheck: async () => ({ available: true, readiness: 'ready' }),
     bridgeFactory(callbacks) {
-      calls.push(callbacks);
-      const n = calls.length;
+      const n = ++contexts;
       return {
         async start() {
           return { model: 'fictional', backend: 'synthetic' };
         },
-        async turn() {
-          callbacks.beforeRequest?.();
-          const current = getIntake(db, root, profileId, source.id);
-          const unit = current
-            .workflow!.plans.find((p) => p.status === 'active')!
-            .units.find((u) => !u.processingException)!;
+        async turn(prompt) {
+          if (mode === 'pdf' || mode === 'zip') {
+            const context = JSON.parse(prompt.slice(prompt.indexOf('{')));
+            assert.match(context.conversion.instructions, /This automatic slice owns only/);
+            assert.match(context.conversion.instructions, /only this unit coverage/);
+            assert.match(context.conversion.instructions, /never accept\/import/);
+            assert.doesNotMatch(context.conversion.instructions, /Otherwise finish and publish/);
+          }
+          await callbacks.beforeRequest?.();
+          const unit = selectedFixturePlan(db, root, profileId, source.id).units.find(
+            (u) => !u.processingException,
+          )!;
           units.push(unit.id);
-          callbacks.onEvent?.('model/requestStarted', {
+          await callbacks.onEvent?.('model/requestStarted', {
             requestId: 'fictional-request-' + n,
             model: 'fictional',
             attempt: n,
             requestBytes: 1,
             requestDigest: 'b'.repeat(64),
           });
+          // Expose only an admitted request, not a bridge whose native startup
+          // is still awaiting its selected checkpoint and source preparation.
+          calls.push(callbacks);
           if (mode === 'pdf' || mode === 'zip') return;
           if (mode === 'initial') {
-            callbacks.onEvent?.('model/requestFinished', {
+            await callbacks.onEvent?.('model/requestFinished', {
               requestId: 'fictional-request-' + n,
               outcome: 'rejected',
               classification: 'context_limit',
@@ -153,7 +169,7 @@ function fixture(
           }
           if (mode === 'unknown') {
             if (n === 1) {
-              callbacks.onEvent?.('model/requestFinished', {
+              await callbacks.onEvent?.('model/requestFinished', {
                 requestId: 'fictional-request-1',
                 outcome: 'unknown',
                 failed: true,
@@ -163,7 +179,7 @@ function fixture(
             return;
           }
           now += 101;
-          callbacks.onEvent?.('model/requestFinished', {
+          await callbacks.onEvent?.('model/requestFinished', {
             requestId: 'fictional-request-' + n,
             outcome: 'response',
             failed: false,
@@ -173,7 +189,7 @@ function fixture(
             callbacks.onExit?.(
               new ModelContextLimitError('Fictional bounded slice ended', 'slice'),
             );
-          else callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+          else await callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
         },
         async cancel() {},
         close() {},
@@ -238,61 +254,74 @@ function fixture(
   };
 }
 
-test('successful model calls without unique progress retry each exact unit three times, retain exceptions, and reopen explicitly', async (t) => {
-  const f = fixture(t, 'model');
-  const batch = f.manager.list(f.profileId)[0]!;
-  await until(() => f.manager.get(f.profileId, batch.id).status === 'complete');
-  const result = f.manager.get(f.profileId, batch.id);
-  assert.equal(result.reason, 'exceptions');
-  const units = getIntake(f.db, f.root, f.profileId, f.source.id).workflow!.plans[0].units;
-  assert.ok(units.length > 1);
-  for (const unit of units) {
-    assert.equal(f.units.filter((id) => id === unit.id).length, 3);
-    assert.equal(unit.processingException?.reason, 'processing_stalled');
-    assert.notEqual(
-      unit.coverage?.kind,
-      'unreadable',
-      'model stuckness is not evidence about source readability',
+test(
+  'successful model calls without unique progress retry each exact unit three times, retain exceptions, and reopen explicitly',
+  // Host-only durable retry/reopen work; exact request counts below are the behavioral bound.
+  { timeout: 120_000 },
+  async (t) => {
+    const f = fixture(t, 'model');
+    const batch = f.manager.list(f.profileId)[0]!;
+    await until(t, () => f.manager.get(f.profileId, batch.id).status === 'complete');
+    const result = f.manager.get(f.profileId, batch.id);
+    assert.equal(result.reason, 'exceptions');
+    const units = selectedFixturePlan(f.db, f.root, f.profileId, f.source.id).units;
+    assert.ok(units.length > 1);
+    for (const unit of units) {
+      assert.equal(f.units.filter((id) => id === unit.id).length, 3);
+      assert.equal(unit.processingException?.reason, 'processing_stalled');
+      assert.notEqual(
+        unit.coverage?.kind,
+        'unreadable',
+        'model stuckness is not evidence about source readability',
+      );
+    }
+    assert.equal(result.items[0].reading!.accountedUnits, 0);
+    await f.manager.retryExceptions(f.profileId, batch.id);
+    assert.equal(f.manager.get(f.profileId, batch.id).status, 'running');
+    assert.equal(
+      selectedFixturePlan(f.db, f.root, f.profileId, f.source.id).units.some(
+        (u) => u.processingException,
+      ),
+      false,
     );
-  }
-  assert.equal(result.items[0].reading!.accountedUnits, 0);
-  f.manager.retryExceptions(f.profileId, batch.id);
-  assert.equal(f.manager.get(f.profileId, batch.id).status, 'running');
-  assert.equal(
-    getIntake(f.db, f.root, f.profileId, f.source.id).workflow!.plans[0].units.some(
-      (u) => u.processingException,
-    ),
-    false,
-  );
-  await until(() => f.manager.get(f.profileId, batch.id).status === 'complete');
-  assert.equal(f.manager.get(f.profileId, batch.id).items[0].exceptions!.length, units.length);
-  for (const unit of units) assert.equal(f.units.filter((id) => id === unit.id).length, 6);
-});
+    await until(t, () => f.manager.get(f.profileId, batch.id).status === 'complete');
+    assert.equal(f.manager.get(f.profileId, batch.id).items[0].exceptions!.length, units.length);
+    for (const unit of units) assert.equal(f.units.filter((id) => id === unit.id).length, 6);
+  },
+);
 
-test('default no-progress windows retain an exception after 48 usable responses per unit', async (t) => {
-  const allowance = DEFAULT_INTAKE_READING_LIMITS.requests!;
-  // One located unit proves the default 3 × 16 bound; the preceding test
-  // separately covers moving between multiple units and explicit exception retry.
-  const f = fixture(t, 'model', allowance, 1);
-  const batch = f.manager.list(f.profileId)[0]!;
-  // This synthetic bridge performs no inference; allow its durable host writes to finish.
-  await until(() => f.manager.get(f.profileId, batch.id).status === 'complete', 120_000);
-  const result = f.manager.get(f.profileId, batch.id);
-  assert.equal(result.reason, 'exceptions');
-  const units = getIntake(f.db, f.root, f.profileId, f.source.id).workflow!.plans[0].units;
-  assert.equal(units.length, 1);
-  for (const unit of units) {
-    assert.equal(f.units.filter((id) => id === unit.id).length, 3 * allowance);
-    assert.equal(unit.processingException?.reason, 'processing_stalled');
-  }
-  assert.equal(result.items[0].reading!.usableModelResponses, units.length * 3 * allowance);
-  assert.equal(result.items[0].reading!.accountedUnits, 0);
-});
+test(
+  'default no-progress windows retain an exception after 48 usable responses per unit',
+  // The synthetic bridge has no model latency. This only bounds a hung host fixture.
+  { timeout: 120_000 },
+  async (t) => {
+    const allowance = DEFAULT_INTAKE_READING_LIMITS.requests!;
+    // One located unit proves the default 3 × 16 bound; the preceding test
+    // separately covers moving between multiple units and explicit exception retry.
+    const f = fixture(t, 'model', allowance, 1);
+    const batch = f.manager.list(f.profileId)[0]!;
+    // This synthetic bridge performs no inference; allow its durable host writes to finish.
+    await until(t, () => f.manager.get(f.profileId, batch.id).status === 'complete');
+    const result = f.manager.get(f.profileId, batch.id);
+    assert.equal(result.reason, 'exceptions');
+    const units = selectedFixturePlan(f.db, f.root, f.profileId, f.source.id).units;
+    assert.equal(units.length, 1);
+    for (const unit of units) {
+      assert.equal(f.units.filter((id) => id === unit.id).length, 3 * allowance);
+      assert.equal(unit.processingException?.reason, 'processing_stalled');
+    }
+    assert.equal(result.items[0].reading!.usableModelResponses, units.length * 3 * allowance);
+    assert.equal(result.items[0].reading!.accountedUnits, 0);
+  },
+);
 
 test('source revision races persist an item backoff and retry without review', async (t) => {
   const f = fixture(t, 'source-race');
   const batch = f.manager.list(f.profileId)[0]!;
-  await until(() => f.manager.get(f.profileId, batch.id).items[0].reason === 'retrying_extraction');
+  await until(
+    t,
+    () => f.manager.get(f.profileId, batch.id).items[0].reason === 'retrying_extraction',
+  );
   const waiting = readIntakeBatch(f.root, f.profileId, batch.id).items[0];
   assert.equal(waiting.status, 'queued');
   assert.ok(waiting.retryAt);
@@ -300,6 +329,7 @@ test('source revision races persist an item backoff and retry without review', a
   f.tick(2_000);
   f.manager.wake(f.profileId);
   await until(
+    t,
     () => (f.manager.get(f.profileId, batch.id).items[0].sourceExtraction?.progress || 0) > 0,
   );
   f.manager.stop(f.profileId, batch.id);
@@ -312,11 +342,12 @@ test('non-default local source watchdog locates a stalled inventory after three 
     f.manager.wake(f.profileId);
     if (attempt < 3)
       await until(
+        t,
         () =>
           (f.manager.get(f.profileId, batch.id).items[0].sourceExtraction?.stalls || 0) >= attempt,
       );
   }
-  await until(() => !!f.manager.get(f.profileId, batch.id).items[0].exceptions?.length);
+  await until(t, () => !!f.manager.get(f.profileId, batch.id).items[0].exceptions?.length);
   const item = f.manager.get(f.profileId, batch.id).items[0];
   assert.equal(item.exceptions?.[0]?.reason, 'processing_stalled');
   assert.match(item.exceptions?.[0]?.locator || '', /inventory unavailable/);
@@ -325,7 +356,7 @@ test('non-default local source watchdog locates a stalled inventory after three 
 test('ordinary context slices continue beyond two boundaries without becoming an unsupported context', async (t) => {
   const f = fixture(t, 'slice');
   const batch = f.manager.list(f.profileId)[0]!;
-  await until(() => f.manager.get(f.profileId, batch.id).status === 'complete');
+  await until(t, () => f.manager.get(f.profileId, batch.id).status === 'complete');
   assert.ok(f.calls.length > 3, 'a bounded context yield is not a document-wide allowance');
   const result = f.manager.get(f.profileId, batch.id);
   assert.equal(result.reason, 'exceptions');
@@ -337,7 +368,7 @@ test('ordinary context slices continue beyond two boundaries without becoming an
 test('unknown replacement retains its predecessor, and superseded tools cannot publish after late success or Stop', async (t) => {
   const f = fixture(t, 'unknown');
   const batch = f.manager.list(f.profileId)[0]!;
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 2;
   });
@@ -345,8 +376,8 @@ test('unknown replacement retains its predecessor, and superseded tools cannot p
   let chat = f.assistant.get(f.profileId, item.chatId!);
   assert.equal(chat.intakeModelAttempts![0].outcome, 'unknown');
   assert.equal(chat.intakeModelAttempts![0].recovery!.replacementRequestId, 'fictional-request-2');
-  const current = getIntake(f.db, f.root, f.profileId, f.source.id);
-  const plan = current.workflow!.plans.find((plan) => plan.status === 'active')!;
+  const current = getIntakeRead(f.db, f.root, f.profileId, f.source.id);
+  const plan = selectedFixturePlan(f.db, f.root, f.profileId, f.source.id);
   const unit = plan.units[0];
   const sourceText = (await f.calls[1].onTool!({
     tool: 'health_intake_source_text',
@@ -391,13 +422,13 @@ test('unknown replacement retains its predecessor, and superseded tools cannot p
     /no longer running|authoriz/,
   );
   await f.calls[1].onTool!(structuredClone(valid));
-  const published = getIntake(f.db, f.root, f.profileId, f.source.id);
+  const published = getIntakeRead(f.db, f.root, f.profileId, f.source.id);
   assert.equal(
-    published.proposals.length,
+    isIntakeSummary(published) ? published.collections.proposals.total : published.proposals.length,
     1,
     'the current replacement can publish this exact valid mutation',
   );
-  f.calls[0].onEvent?.('model/requestFinished', {
+  await f.calls[0].onEvent?.('model/requestFinished', {
     requestId: 'fictional-request-1',
     outcome: 'response',
     failed: false,
@@ -416,7 +447,7 @@ test('unknown replacement retains its predecessor, and superseded tools cannot p
     /no longer running|authoriz/,
   );
   assert.equal(
-    getIntake(f.db, f.root, f.profileId, f.source.id).version,
+    getIntakeRead(f.db, f.root, f.profileId, f.source.id).version,
     published.version,
     'late results preserve usage but cannot create another local result',
   );
@@ -470,7 +501,7 @@ test('batch journal changes are proportional to the edited state and replay the 
 
 test('three local failures isolate page two and preserve completed and later pages', async (t) => {
   const f = fixture(t, 'source');
-  await until(() => {
+  await until(t, () => {
     f.tick();
     const source = getIntakeSourceText(f.db, f.root, f.profileId, f.source.id);
     return source.status === 'available' && locateSourceExtractionProgress(source).page === 0;
@@ -544,9 +575,9 @@ test("finishing one batch preserves another batch's future wake without browser 
     },
   });
   try {
-    await until(() => manager.get(f.profileId, first.id).status === 'complete');
+    await until(t, () => manager.get(f.profileId, first.id).status === 'complete');
     schedulerNow += 1000;
-    await until(() => dispatched.includes(otherSource.id));
+    await until(t, () => dispatched.includes(otherSource.id));
     assert.equal(manager.get(f.profileId, first.id).status, 'complete');
     assert.deepEqual(dispatched, [f.source.id, otherSource.id]);
   } finally {
@@ -584,7 +615,7 @@ function pdf() {
 test('repeated initial-context rejection waits for a repaired prerequisite without clearing intent', async (t) => {
   const f = fixture(t, 'initial');
   const batch = f.manager.list(f.profileId)[0]!;
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.manager.get(f.profileId, batch.id).items[0].reason === 'provider_rejected';
   });
@@ -597,7 +628,7 @@ test('repeated initial-context rejection waits for a repaired prerequisite witho
   f.fixPrerequisite();
   f.tick(31000);
   f.manager.wake(f.profileId);
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 3;
   });
@@ -605,13 +636,13 @@ test('repeated initial-context rejection waits for a repaired prerequisite witho
 
 test('automatic PDF units after page one can read their exact unit and source passage', async (t) => {
   const f = fixture(t, 'pdf');
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 1;
   });
   const batch = f.manager.list(f.profileId)[0]!;
-  const current = getIntake(f.db, f.root, f.profileId, f.source.id);
-  const plan = current.workflow!.plans[0];
+  const current = getIntakeRead(f.db, f.root, f.profileId, f.source.id);
+  const plan = selectedFixturePlan(f.db, f.root, f.profileId, current.id);
   // Retain a first-group exception so the next dispatch owns later pages.
   const unit = plan.units[0];
   const source = (await f.calls[0].onTool!({
@@ -625,25 +656,19 @@ test('automatic PDF units after page one can read their exact unit and source pa
     callId: 'first-unit',
   });
   // This fixture exercises later-unit admission independently of OCR availability.
-  const { workflowMutation } = await import('../intake.ts');
-  workflowMutation(
-    f.db,
-    f.root,
-    f.profileId,
-    current.id,
-    { operationId: 'fictional-first-accounted', version: current.version },
-    (workflow) => {
-      const selected = workflow.plans[0].units[0];
-      selected.processingException = { reason: 'processing_stalled', at: new Date().toISOString() };
-    },
-  );
+  await setCollectionProcessingException(f.db, f.root, f.profileId, current.id, {
+    operationId: 'fictional-first-accounted',
+    version: current.version,
+    unitId: unit.id,
+    exception: { reason: 'processing_stalled', at: new Date().toISOString() },
+  });
   f.calls[0].onExit?.(new ModelContextLimitError('Fictional bounded slice ended', 'slice'));
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 2;
   });
   const next = f.manager.get(f.profileId, batch.id).items[0].reading!.workUnit!;
-  const nextUnit = getIntake(f.db, f.root, f.profileId, current.id).workflow!.plans[0].units.find(
+  const nextUnit = selectedFixturePlan(f.db, f.root, f.profileId, current.id).units.find(
     (unit) => unit.id === next.id,
   )!;
   assert.ok(nextUnit.pages![0] > 1);
@@ -671,20 +696,28 @@ test('automatic PDF units after page one can read their exact unit and source pa
 
 test('an automatic ZIP media member permits follow-up reads of its verified retained child', async (t) => {
   const f = fixture(t, 'zip');
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 1;
   });
-  const current = getIntake(f.db, f.root, f.profileId, f.source.id);
-  const unit = current.workflow!.plans[0].units[0];
-  const { retainIntakeChildren } = await import('../intake.ts');
-  const [child] = retainIntakeChildren(f.db, f.root, f.profileId, current.id, [
-    { filename: unit.filename!, locator: unit.locator, bytes: pdf() },
-  ]);
-  publishIntakeSourceText(f.db, f.root, f.profileId, child!.id, {
+  const current = getIntakeRead(f.db, f.root, f.profileId, f.source.id);
+  const unit = selectedFixturePlan(f.db, f.root, f.profileId, current.id).units[0];
+  const { readIntakePackageMember } = await import('../intake-package.ts');
+  const retained = await readIntakePackageMember({
+    db: f.db,
+    root: f.root,
+    profileId: f.profileId,
+    id: current.id,
+    memberId: unit.memberId!,
+    page: 1,
+  });
+  assert.ok('metadata' in retained && retained.metadata?.sourceFileId);
+  const childId = retained.metadata.sourceFileId;
+  publishIntakeSourceText(f.db, f.root, f.profileId, childId, {
     operationId: randomUUID(),
-    sourceHash: getIntake(f.db, f.root, f.profileId, child!.id).sha256,
-    expectedRevisionId: null,
+    sourceHash: getIntakeRead(f.db, f.root, f.profileId, childId).sha256,
+    expectedRevisionId:
+      getIntakeSourceText(f.db, f.root, f.profileId, childId).revision?.id ?? null,
     evidence: {
       adapter: { name: 'fictional-capture', version: '1' },
       pages: [1, 2, 3].map((page) => ({
@@ -702,7 +735,7 @@ test('an automatic ZIP media member permits follow-up reads of its verified reta
     arguments: { id: current.id, action: 'read_member', memberId: unit.memberId, page: 1 },
     callId: 'package-media',
   })) as { metadata: { sourceFileId: string } };
-  assert.ok(media.metadata.sourceFileId);
+  assert.equal(media.metadata.sourceFileId, childId);
   const text = (await f.calls[0].onTool!({
     tool: 'health_intake_source_text',
     arguments: { id: media.metadata.sourceFileId, page: 1 },
@@ -757,11 +790,11 @@ test('one explicit Resume restores every previously automatic prerequisite wait'
 
 test('a model-correctable wrong-unit call retries automatically in a fresh scoped slice', async (t) => {
   const f = fixture(t, 'unknown');
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 2;
   });
-  f.calls[1].onEvent?.('model/requestFinished', {
+  await f.calls[1].onEvent?.('model/requestFinished', {
     requestId: 'fictional-request-2',
     outcome: 'response',
     failed: false,
@@ -775,12 +808,14 @@ test('a model-correctable wrong-unit call retries automatically in a fresh scope
       }),
     { code: 'INTAKE_WORK_UNIT_SCOPE' },
   );
-  await until(() => {
+  await until(t, () => {
     f.tick();
     return f.calls.length === 3;
   });
-  const current = getIntake(f.db, f.root, f.profileId, f.source.id);
-  const unit = current.workflow!.plans[0].units.find((unit) => !unit.processingException)!;
+  const current = getIntakeRead(f.db, f.root, f.profileId, f.source.id);
+  const unit = selectedFixturePlan(f.db, f.root, f.profileId, current.id).units.find(
+    (unit) => !unit.processingException,
+  )!;
   await f.calls[2].onTool!({
     tool: 'health_intake_plan',
     arguments: { id: current.id, action: 'read_unit', unitId: unit.id },
@@ -791,7 +826,7 @@ test('a model-correctable wrong-unit call retries automatically in a fresh scope
 
 test('repeated local capacity interruptions preserve pending pages without spending the stall streak', async (t) => {
   const f = fixture(t, 'capacity');
-  await until(() => {
+  await until(t, () => {
     f.tick(1001);
     return f.calls.length > 0;
   });

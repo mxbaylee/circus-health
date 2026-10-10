@@ -1,5 +1,12 @@
 import { launchBrowser, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
+import {
+  fixtureApi,
+  fixtureAssertNoAccepted,
+  fixtureBrowserResponse,
+  fixtureNativeRecordReady,
+} from './native-intake-fixture.ts';
+import type { ManualSourceRecordResult } from '../../shared/intake-manual-source-record.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
@@ -62,6 +69,7 @@ test(
       return profile.id as string;
     });
     const prefix = `/api/profiles/${profileId}`;
+    const api = fixtureApi(page, url);
     const original =
       'Fictional administrative wording.\nNo fever; value 0.05 mg.\nRepeated source footer.';
     const upload = await page.request.post(url + prefix + '/intakes', {
@@ -110,7 +118,18 @@ test(
     await open(second);
     await second.getByRole('textbox', { name: /Passage 1/ }).waitFor();
     await passage.fill(original + '\nHuman verified missing administrative annotation.');
+    const savedCorrection = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          `${prefix}/intakes/${encodeURIComponent(intake.id)}/source-text` &&
+        response.request().postDataJSON().action === 'correct',
+    );
     await page.getByRole('button', { name: 'Save transcription correction', exact: true }).click();
+    const correctionResponse = await savedCorrection;
+    assert.equal(correctionResponse.status(), 200, await correctionResponse.text());
+    assert.equal(await correctionResponse.finished(), null);
     await page
       .getByText(
         'Correction saved. Other source questions remain until you explicitly inspect this page. Accepted clinical record versions are unchanged.',
@@ -119,8 +138,11 @@ test(
     const corrected = await get(`/intakes/${encodeURIComponent(intake.id)}/source-text`);
     assert.notEqual(corrected.revision.id, initial.revision.id);
     assert.equal(corrected.revision.parentRevisionId, initial.revision.id);
-    assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).imported, null);
-    assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).proposals.length, 0);
+    await fixtureAssertNoAccepted(api, prefix, intake.id);
+    assert.equal(
+      (await get(`/intakes/${encodeURIComponent(intake.id)}`)).collections.proposals.total,
+      0,
+    );
     await page.getByRole('button', { name: 'Source text revision history', exact: true }).click();
     await page.getByText(/Historical revision/).waitFor();
     assert.equal(
@@ -166,7 +188,7 @@ test(
       ),
       'source review does not restart the stopped upload job',
     );
-    assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).imported, null);
+    await fixtureAssertNoAccepted(api, prefix, intake.id);
     // A real non-square image exercises browser layout/rotation. OCR availability is
     // not asserted here; the retained pixel view and explicit exceptions suffice.
     const canvas = createCanvas(360, 180);
@@ -236,14 +258,41 @@ test(
     await manual
       .getByRole('textbox', { name: 'Literal source wording', exact: true })
       .fill('No fever; value 0.05 mg.');
+    const createdResponse = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          prefix + '/intakes/' + encodeURIComponent(intake.id) + '/source-records',
+    );
     await manual.getByRole('button', { name: 'Create review draft', exact: true }).click();
-    assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).imported, null);
-    await page.getByRole('link', { name: 'Review the new record', exact: true }).click();
+    const created = await createdResponse;
+    assert.equal(created.status(), 200, await created.text());
+    assert.equal(await created.finished(), null);
+    const manualRecord = (await created.json()).data as ManualSourceRecordResult;
+    assert.equal(manualRecord.intake.id, intake.id);
+    assert.ok(manualRecord.proposalId && manualRecord.recordId && manualRecord.groupId);
+    await fixtureAssertNoAccepted(api, prefix, intake.id);
+    const reviewNewRecord = page.getByRole('link', { name: 'Review the new record', exact: true });
+    assert.equal(await reviewNewRecord.getAttribute('href'), '#' + manualRecord.reviewUrl);
+    const selected = await fixtureNativeRecordReady(
+      page,
+      prefix,
+      {
+        intakeId: intake.id,
+        proposalId: manualRecord.proposalId,
+        recordId: manualRecord.recordId,
+      },
+      () => reviewNewRecord.click(),
+    );
+    assert.equal(selected.record.kind, 'record');
+    assert.ok(selected.record.kind === 'record');
+    assert.equal(selected.record.record.mapping.testLabel, 'Cookie Doe fictional measurement');
     const inline = page.locator('.import-record-accordion');
     await inline
       .getByRole('heading', { name: 'Cookie Doe fictional measurement', exact: true })
       .waitFor();
-    assert.equal((await get(`/intakes/${encodeURIComponent(intake.id)}`)).imported, null);
+    await fixtureAssertNoAccepted(api, prefix, intake.id);
     const screenshots = process.env.CRS_SCREENSHOTS_DIR;
     if (screenshots) {
       mkdirSync(screenshots, { recursive: true });
@@ -288,12 +337,39 @@ test(
       sourceRequests.push(pending);
       return pending;
     });
+    let releaseInitialFeed!: () => void;
+    const heldInitialFeed = new Promise<void>((resolve) => {
+      releaseInitialFeed = resolve;
+    });
+    const initialFeedRoute = '**/intakes/import-feed?*';
+    await page.route(initialFeedRoute, async (route) => {
+      await heldInitialFeed;
+      await route.continue();
+    });
+    const sourceResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'GET' &&
+        new URL(response.url()).pathname === `${prefix}/intakes/${encodeURIComponent(intake.id)}`,
+    );
+    const feedResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'GET' &&
+        new URL(response.url()).pathname === `${prefix}/intakes/import-feed`,
+    );
     const attentionInAll = page.getByRole('region', {
       name: 'Text review for fictional-source-review.txt',
       exact: true,
     });
     try {
       await page.reload();
+      await page.getByText('Opening import review…', { exact: true }).waitFor();
+      assert.equal(
+        await page.locator('#import-review-title').count(),
+        0,
+        'The initial unknown feed must not expose a review tree that a native response replaces',
+      );
+      releaseInitialFeed();
+      assert.equal(await (await feedResponse).finished(), null);
       await page.getByRole('tab', { name: /^Needs attention/ }).waitFor();
       await requestedSource;
       assert.equal(
@@ -302,11 +378,14 @@ test(
         'Queue count does not imply the source section has loaded',
       );
       releaseSource();
+      assert.equal(await (await sourceResponse).finished(), null);
       await attentionInAll.waitFor({ state: 'visible' });
       assert(await attentionInAll.isVisible(), 'Source sections are visible in All');
     } finally {
+      releaseInitialFeed();
       releaseSource();
       await Promise.all(sourceRequests);
+      await page.unroute(initialFeedRoute);
       await page.unroute(intakeRoute);
     }
     await attentionInAll.getByText('1 section not reviewed', { exact: true }).waitFor();
@@ -375,7 +454,7 @@ test(
     );
     const afterApproval = await get('/intakes/' + encodeURIComponent(intake.id));
     assert.equal(afterApproval.version, beforeApproval.version);
-    assert.equal(afterApproval.imported, null);
+    await fixtureAssertNoAccepted(api, prefix, intake.id);
     assert.equal(
       (await get('/intake-batches')).filter(
         (batch: { status: string }) => batch.status === 'running',

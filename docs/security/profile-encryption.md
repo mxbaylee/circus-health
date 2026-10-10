@@ -67,6 +67,87 @@ Clients clear a selected profile after a scoped `PROFILE_LOCKED` response and re
 
 Start the app by reading public cards only. Open a selected profile through passkey or recovery, then show unlocking/loading progress. Validate and reuse that profile's encrypted SQLite cache against its committed record-version sequence and projection/schema version; catch up new committed versions atomically or rebuild when necessary. SQLite includes both current data and searchable history. The [compact history projection](../data/record-version-storage.md#compact-history-projection) retains version contents once and small changed-field references, reconstructing only selected history pages. Unsupported projections fail explicitly and require rebuilding the disposable cache; accepted authority is unchanged. Deterministic indexing of accepted versions uses no AI. An invalid cache is disposable; corrupt authoritative data must produce an error rather than a guessed database. There is no compaction scheduler or periodic full-archive checkpoint feature.
 
+Ordinary recovery and passkey unlock prepare the existing accepted profile in a
+private worker. The worker performs the same encrypted index, materialization,
+cache/original, accepted-history and production intake validation before handing
+over a closed SQLite projection. The HTTP process never opens that database while
+the preparation worker owns it. Its vault construction cooperates in groups of at
+most 64 tree/index/digest steps, and its durability attachment requires the exact
+prepared indexed head to equal the original selected head before attachment.
+Unrelated requests to the current authorized profile remain serviceable until
+successful activation applies the ordinary switch rule.
+
+Each attempt retains the original target registry entry, keyring, encrypted
+manifest, directory and prepared database identities. A private disk-backed
+witness records the original vault file/container identities and complete
+membership. A terminal worker checks every current entry against those original
+rows; equal-byte replacement of a consumed original with an unchanged manifest
+still refuses admission. SQLite witness rows are disposable attempt evidence,
+never recovery authority. The final admission rechecks ownership, cancellation,
+authorization, selected/indexed heads, root/database/WAL identity and the original
+managed-filesystem epoch without another await. It never renews a changed proof.
+
+HTTP and passkey unlocks retain private issuer-owned authorization tokens bound
+to the original manager, profile and live session or verified challenge. Their
+closing checks read only that issuer's retained lifecycle state; they do not run
+caller callbacks or reread storage. Contributor authorization callbacks remain
+supported during preparation, but their effects finish before both the source
+and target closing physical rosters. The final database reads reuse statements
+compiled under the installed authorization policy before those rosters. A
+private synchronous barrier refuses policy re-entry, custom SQL callbacks or
+automatic statement re-preparation rather than bypassing the installed policy.
+No caller callback, storage adapter read or database compilation follows the
+closing seal before activation.
+
+The target preparation lease rejects concurrent target opens and is cancelled by
+target lock, removal, keyring writes or application closure. No target app, batch
+publisher or original resolver can use its prepared runtime before attachment.
+Cancellation drains the worker before clearing keys and removing runtime and
+witness files. The terminal physical sweep uses a narrow global managed mutation
+epoch: an unrelated profile write during that sweep may conservatively refuse the
+new unlock and require retry, while the existing profile's request continues.
+This is a sequential physical check, not an atomic filesystem snapshot against
+arbitrary external processes.
+
+Setup recovery inspects the original encrypted setup identity offhost. Resumed
+setups with an accepted head use the same ordinary preparation and exact-head
+admission, without cloning the archive or reinitializing records. Fresh setup and
+first private-copy initialization prepare candidate ciphertext offhost on the
+archive filesystem. The private copy reconstructs its original selected source
+head in an isolated runtime, never by opening the live source SQLite from another
+thread. Source requests remain serviceable; source lock, removal or keyring changes
+cancel dependent preparation, and later accepted source writes refuse the target
+attempt rather than renew its source proof. Current source-session authorization,
+selected head, manifest and complete original physical witness remain pinned
+through first target publication and activation.
+
+The original target physical rows remain immutable. A separate owned overlay
+certifies only complete newly created immutable ciphertext and the associated
+directory changes; exclusive file creation cannot overwrite an existing name.
+The original setup manifest stays selected while those additions are staged.
+After original input and candidate output checks, one atomic, directory-synced
+manifest rename selects the first accepted target head. Before that transition,
+interruption may leave harmless unselected additions and setup can retry. After
+it, an inactive target resumes its accepted head with its own saved kit without
+recopying later source changes. The preparation lease also covers keyring and
+registry activation failure. A failed attempt drains workers, clears cloned keys
+and removes private runtime/candidate staging; published target evidence remains.
+Beginning setup writes only its bounded empty archive, setup identity and wrapped
+key. Synchronous manager APIs remain contributor/test compatibility facilities;
+HTTP verification, setup resume, recovery unlock and passkey unlock use the
+cooperative runtime paths.
+
+Fixed-purpose diagnostic ciphertext, including performance summaries and event
+chunks, is not original evidence, accepted history or recovery authority. Its
+authenticated atomic writes through the unlocked vault's private, fixed-destination
+writer do not invalidate evidence physical witnesses. Opening a vault establishes
+its diagnostic directories, if absent, before exposing retained proofs; this
+bounded initialization does not publish a manifest or accepted-record head. Warm
+writes retain the original canonical profile, ancestor and diagnostic directory
+identities and refuse replacement or symbolic-link redirection. Standalone
+diagnostic stores, originals, manifests and accepted-record encryption remain
+tracked; this is not a general cache or arbitrary-file exemption.
+
 Durable acknowledgments still require encrypted portable writes; cached SQLite never becomes the sole owner of an accepted edit. Publish an authenticated cache from a consistent committed state with a manifest/version check. Cache failure or total loss must not lose acknowledged data. Record nonclinical timing metrics for unwrap/load/rebuild and cache hits/misses. Startup does not rebuild every profile.
 
 Keep working decrypted SQLite, WAL/SHM, extraction previews and other temporary plaintext outside the durable/synced directory in a restricted runtime area. Locking must close the profile database, stop or safely suspend its jobs, invalidate session/tool/file access, and clear plaintext UI/runtime caches. Bind every API, stream, preview, assistant operation and export to an authorized unlocked profile; a publicly enumerable ID is not authorization. Do not claim protection from a compromised host, the unlocked app, swap/core dumps or data intentionally sent to a configured model. Specify and test supported runtime cleanup rather than promising perfect memory erasure.

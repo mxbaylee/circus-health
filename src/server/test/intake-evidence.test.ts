@@ -26,6 +26,8 @@ import {
   readPdfEvidencePage,
   indexPdfEvidence,
   pdfPageCountEvidence,
+  searchPdfEvidence,
+  searchPdfEvidencePage,
 } from '../intake-pdf-session.ts';
 
 test('PDF inventory spans bounded worker chunks without losing later pages', async (t) => {
@@ -45,6 +47,25 @@ test('PDF inventory spans bounded worker chunks without losing later pages', asy
   assert.equal(index.pages, 65);
   assert.equal(index.sections.length, 65);
   assert.equal(index.sections.at(-1)?.locator, 'page 65');
+});
+
+test('addressed PDF page search preserves literal search semantics without an offset replay', async (t) => {
+  const f = fixture(t);
+  t.after(() => disposePdfEvidenceSessions(f.profileId));
+  const item = uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-search.pdf',
+    bytes: syntheticPdf(['Fictional first', 'Fictional middle', 'Fictional MATCH last']),
+  });
+  const source = {
+    ...getRetainedIntakeOriginalReference(f.db, f.root, f.profileId, item.id),
+    profileId: f.profileId,
+  };
+  const selected = await searchPdfEvidencePage(source, 3, 'match');
+  const legacy = await searchPdfEvidence(source, 'match', 0);
+  assert.deepEqual({ page: selected.page, snippet: selected.snippet }, legacy.results[0]);
+  assert.equal(selected.totalPages, 3);
+  assert.equal((await searchPdfEvidencePage(source, 1, 'match')).snippet, null);
+  await assert.rejects(searchPdfEvidencePage(source, 4, 'match'), { code: 'PDF_PAGE' });
 });
 
 function fixture(t: TestContext) {
@@ -292,8 +313,10 @@ test('native PDF package evidence and fallback preserve the exact member and sel
   });
   assert.ok('pdfContent' in result && result.pdfContent && result.pdfFallback);
   assert.equal(result.metadata.member.memberId, memberId);
+  assert.ok('page' in result.metadata.original);
   assert.equal(result.metadata.original.page, 2);
   assert.equal(result.metadata.original.complete, false);
+  assert.ok(typeof result.metadata.original.text === 'string');
   assert.match(result.metadata.original.text, /selected member page/);
   assert.ok('pdfBytes' in result.hostTimings && result.hostTimings.pdfBytes);
   const fallback = await result.pdfFallback();
@@ -521,6 +544,8 @@ test('PDF evidence returns a transient page preview while retaining only the ori
   assert.ok('results' in search);
   assert.equal(search.results.length, 1);
   assert.equal(search.results[0].page, 2);
+  assert.equal(typeof search.results[0].snippet, 'string');
+  assert.ok(typeof search.results[0].snippet === 'string');
   assert.match(search.results[0].snippet, /Second page/);
   const index = await indexIntakeEvidence({ ...f, id: intake.id });
   assert.ok(index.references);
@@ -649,8 +674,10 @@ test('ZIP evidence retains safe members as scoped child sources without changing
   assert.ok('original' in result && result.original && 'members' in result.original);
   assert.equal(result.original.complete, false);
   assert.equal(result.original.members.length, 2);
-  const member = result.original.members.find((item) => item.filename === 'folder/report.txt');
-  assert.ok(member);
+  const member = result.original.members.find(
+    (item) => 'filename' in item && item.filename === 'folder/report.txt',
+  );
+  assert.ok(member && 'locator' in member);
   assert.equal(member.locator, 'ZIP member folder/report.txt');
   const child = await readIntakePackageMember({ ...f, id: intake.id, memberId: member.memberId });
   assert.ok(child.sourceFileId);

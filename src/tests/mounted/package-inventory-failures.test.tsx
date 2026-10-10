@@ -2,6 +2,7 @@ import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
 import type { Intake, IntakePackageFailure, IntakePackageMember } from '../../shared/intake';
+import type { IntakeSummaryV2 } from '../../shared/intake-summary';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
 import { PackageInventory } from '../../app/features/intake/PackageInventory';
 
@@ -71,6 +72,574 @@ const inventory = (members = [member]) =>
 beforeEach(() => {
   replaceProfiles([profile]);
   selectProfile(profile);
+});
+
+it('labels a shortened original name and loads its exact pinned fragment on demand', async () => {
+  const reference: NonNullable<IntakeSummaryV2['filenameReference']> = {
+    format: 'health-intake-filename-reference-v1',
+    intakeId: intake.id,
+    field: 'originalName',
+    pins: { sourceHash: 'b'.repeat(64), logicalRoot: 'c'.repeat(64), domainVersion: 1, version: 1 },
+    scalarHash: 'd'.repeat(64),
+    bytes: 40000,
+  };
+  const requests: unknown[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, options: RequestInit = {}) => {
+      const path = String(input);
+      if (path.includes('/package?')) return inventory();
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      if (path.endsWith('/filename-fragment')) {
+        requests.push(JSON.parse(String(options.body)));
+        return json({
+          format: 'health-intake-filename-fragment-v1',
+          reference,
+          encoding: 'json-string',
+          text: '"Fictional retained name fragment',
+          complete: false,
+          nextCursor: 'fictional-name-continuation',
+        });
+      }
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  const { filename: _omittedName, ...header } = intake;
+  render(
+    <PackageInventory
+      intake={
+        {
+          ...header,
+          format: 'health-intake-summary-v2',
+          filenamePreview: 'Fictional delivery',
+          filenameTruncated: true,
+          filenameReference: reference,
+          packageSource: true,
+          retainOnly: false,
+        } as unknown as IntakeSummaryV2
+      }
+    />,
+  );
+  expect(
+    screen.getByRole('link', { name: 'Open original: Fictional delivery… (shortened)' }),
+  ).toHaveAttribute('href', intake.contentUrl);
+  expect(requests).toEqual([]);
+  await userEvent.setup().click(screen.getByText('Full retained filename'));
+  expect(await screen.findByText('"Fictional retained name fragment')).toBeVisible();
+  expect(screen.getByText('Part of the retained filename')).toBeVisible();
+  expect(requests).toEqual([{ reference, limit: 32768 }]);
+});
+
+it('returns to actual variable member pages and rejects stale results after profile, source or version changes', async () => {
+  const requests: string[] = [];
+  let delayed: ((response: Response) => void) | undefined;
+  let delayNext = false;
+  const pageResponse = (offset: number) =>
+    json({
+      format: 'health-intake-package-inventory-v2',
+      inventoryId: 'fictional-variable-inventory',
+      totalMembers: 100,
+      totalExpandedBytes: 200,
+      uniqueByteContents: 100,
+      members: Array.from({ length: offset === 80 ? 20 : 40 }, (_, index) => ({
+        ...member,
+        memberId: `member:${offset + index}`,
+        filename: `fictional-page-member-${offset + index}`,
+      })),
+      offset,
+      nextOffset: offset === 80 ? null : offset + 40,
+    });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      requests.push(path);
+      if (path.includes('/package?')) {
+        const offset = Number(new URL(path, 'http://fictional.local').searchParams.get('offset'));
+        if (delayNext && offset === 40) {
+          delayNext = false;
+          return new Promise<Response>((resolve) => {
+            delayed = resolve;
+          });
+        }
+        return pageResponse(offset);
+      }
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  const native = { ...intake, format: 'health-intake-summary-v2' } as unknown as IntakeSummaryV2;
+  const view = render(<PackageInventory intake={native} />);
+  const user = userEvent.setup();
+  const next = () => screen.getByRole('button', { name: 'Next members' });
+  const previous = () => screen.getByRole('button', { name: 'Previous members' });
+  expect(await screen.findByText('1–40 of 100')).toBeVisible();
+  await user.click(next());
+  expect(await screen.findByText('41–80 of 100')).toBeVisible();
+  await user.click(next());
+  expect(await screen.findByText('81–100 of 100')).toBeVisible();
+  await user.click(previous());
+  expect(await screen.findByText('41–80 of 100')).toBeVisible();
+  await user.click(previous());
+  expect(await screen.findByText('1–40 of 100')).toBeVisible();
+  expect(previous()).toBeDisabled();
+  expect(
+    requests
+      .filter((path) => path.includes('/package?'))
+      .map((path) => Number(new URL(path, 'http://fictional.local').searchParams.get('offset'))),
+  ).toEqual([0, 40, 80, 40, 0]);
+
+  delayNext = true;
+  await user.click(next());
+  await waitFor(() => expect(delayed).toBeDefined());
+  view.rerender(<PackageInventory intake={{ ...native, version: 2 }} />);
+  expect(await screen.findByText('1–40 of 100')).toBeVisible();
+  expect(previous()).toBeDisabled();
+  await act(async () => {
+    delayed!(pageResponse(40));
+  });
+  expect(screen.queryByText('41–80 of 100')).not.toBeInTheDocument();
+  expect(requests.some((path) => path.includes('offset=40') && path.includes('version=2'))).toBe(
+    false,
+  );
+  delayed = undefined;
+  delayNext = true;
+  await user.click(next());
+  await waitFor(() => expect(delayed).toBeDefined());
+  const otherSource = { ...native, id: 'fictional-other-package', version: 2 };
+  view.rerender(<PackageInventory intake={otherSource} />);
+  expect(await screen.findByText('1–40 of 100')).toBeVisible();
+  expect(previous()).toBeDisabled();
+  expect(requests.some((path) => path.includes('/fictional-other-package/package?offset=40'))).toBe(
+    false,
+  );
+  await act(async () => delayed!(pageResponse(40)));
+  expect(screen.queryByText('41–80 of 100')).not.toBeInTheDocument();
+
+  delayed = undefined;
+  delayNext = true;
+  await user.click(next());
+  await waitFor(() => expect(delayed).toBeDefined());
+  const otherProfile = { ...profile, id: 'fictional-other-package-profile' };
+  await act(async () => {
+    replaceProfiles([profile, otherProfile]);
+    selectProfile(otherProfile);
+  });
+  expect(await screen.findByText('1–40 of 100')).toBeVisible();
+  expect(previous()).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'First members' })).toBeDisabled();
+  expect(
+    requests.some(
+      (path) => path.includes('/profiles/' + otherProfile.id + '/') && path.includes('offset=40'),
+    ),
+  ).toBe(false);
+  await act(async () => delayed!(pageResponse(40)));
+  expect(screen.queryByText('41–80 of 100')).not.toBeInTheDocument();
+});
+
+it.each(['profile', 'source', 'version'] as const)(
+  'drops a late member read when the %s changes, even if the member ID is reused',
+  async (change) => {
+    const oldMember = { ...member, filename: 'fictional-old-member.json' };
+    const newMember = { ...member, filename: 'fictional-new-member.json' };
+    let changed = false;
+    let releaseOld!: (response: Response) => void;
+    let reads = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, options: RequestInit = {}) => {
+        const path = String(input);
+        if (path.includes('/package?'))
+          return json({
+            intakeId: changed ? 'fictional-new-package' : intake.id,
+            version: changed ? 2 : 1,
+            totalMembers: 1,
+            totalExpandedBytes: 2,
+            uniqueByteContents: 1,
+            members: [changed ? newMember : oldMember],
+            offset: 0,
+            nextOffset: null,
+          });
+        if (path.includes('/package-failures?'))
+          return json({ entries: [], total: 0, complete: true, nextCursor: null });
+        if (path.endsWith('/package-member') && options.method === 'POST') {
+          reads++;
+          if (reads === 1)
+            return new Promise<Response>((resolve) => {
+              releaseOld = resolve;
+            });
+          return json({ member: newMember, original: { text: 'Current fictional member text' } });
+        }
+        throw Error('Unexpected request ' + path);
+      }),
+    );
+    const view = render(<PackageInventory intake={intake} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: oldMember.filename }));
+    await waitFor(() => expect(reads).toBe(1));
+    changed = true;
+    if (change === 'profile') {
+      const nextProfile = { ...profile, id: 'fictional-new-profile' };
+      await act(async () => {
+        replaceProfiles([profile, nextProfile]);
+        selectProfile(nextProfile);
+      });
+    } else
+      view.rerender(
+        <PackageInventory
+          intake={
+            change === 'source'
+              ? { ...intake, id: 'fictional-new-package', version: 2 }
+              : { ...intake, version: 2 }
+          }
+        />,
+      );
+    expect(await screen.findByRole('button', { name: newMember.filename })).toBeVisible();
+    expect(screen.queryByRole('region', { name: 'Selected package member' })).toBeNull();
+    expect(screen.queryByText('Reading selected member…')).toBeNull();
+    await act(async () =>
+      releaseOld(
+        change === 'profile'
+          ? new Response(JSON.stringify({ error: { message: 'Old fictional read refused' } }), {
+              status: 409,
+            })
+          : json({ member: oldMember, original: { text: 'Old fictional member text' } }),
+      ),
+    );
+    expect(screen.queryByText('Old fictional member text')).toBeNull();
+    expect(screen.queryByText('Old fictional read refused')).toBeNull();
+    expect(screen.queryByRole('link', { name: 'Open retained member' })).toBeNull();
+    await user.click(screen.getByRole('button', { name: newMember.filename }));
+    expect(await screen.findByText('Current fictional member text')).toBeVisible();
+  },
+);
+
+it('clears selected detail, history and error when the intake version changes', async () => {
+  let reads = 0;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, options: RequestInit = {}) => {
+      const path = String(input);
+      if (path.includes('/package?')) return inventory();
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      if (path.endsWith('/package-member') && options.method === 'POST') {
+        reads++;
+        if (reads === 3)
+          return new Response(JSON.stringify({ error: { message: 'Fictional read refused' } }), {
+            status: 409,
+          });
+        return json({
+          member,
+          structure: {
+            jsonPointer: reads === 1 ? '' : '/section',
+            type: 'object',
+            totalChildren: reads === 1 ? 1 : 0,
+            children:
+              reads === 1
+                ? [
+                    {
+                      key: 'Fictional section',
+                      jsonPointer: '/section',
+                      type: 'string',
+                      totalChildren: 0,
+                    },
+                  ]
+                : [],
+            literal: reads === 1 ? null : 'Fictional old section',
+            offset: 0,
+            nextOffset: reads === 1 ? null : 1,
+            nextJSONOffset: null,
+          },
+        });
+      }
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  const view = render(<PackageInventory intake={intake} />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole('button', { name: member.filename }));
+  await user.click(await screen.findByRole('button', { name: 'Fictional section' }));
+  expect(await screen.findByText('Fictional old section')).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Back to parent section' })).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Continue literal text' }));
+  expect(await screen.findByText('Fictional read refused')).toBeVisible();
+  view.rerender(<PackageInventory intake={{ ...intake, version: 2 }} />);
+  expect(screen.queryByRole('region', { name: 'Selected package member' })).toBeNull();
+  expect(screen.queryByText('Fictional read refused')).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Back to parent section' })).toBeNull();
+  expect(screen.queryByText('Reading selected member…')).toBeNull();
+});
+
+it('bounds recent member navigation, preserves variable windows after back and forward, and offers an honest return to the first page', async () => {
+  const sizes = [3, 5, 2, 7, 4, 1, 6, 3, 2, 5, 1, 4];
+  const starts = sizes.map((_, index) =>
+    sizes.slice(0, index).reduce((sum, size) => sum + size, 0),
+  );
+  const total = sizes.reduce((sum, size) => sum + size, 0);
+  const requests: number[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes('/package?')) {
+        const offset = Number(new URL(path, 'http://fictional.local').searchParams.get('offset'));
+        const page = starts.indexOf(offset);
+        if (page < 0) throw Error('Guessed or skipped member page: ' + offset);
+        requests.push(offset);
+        return json({
+          format: 'health-intake-package-inventory-v2',
+          inventoryId: 'fictional-many-variable-pages',
+          totalMembers: total,
+          totalExpandedBytes: total * 2,
+          uniqueByteContents: total,
+          members: Array.from({ length: sizes[page] }, (_, index) => ({
+            ...member,
+            ordinal: offset + index,
+            memberId: `member:${offset + index}`,
+            filename: `fictional-window-member-${offset + index}`,
+          })),
+          offset,
+          nextOffset: starts[page + 1] ?? null,
+        });
+      }
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  render(
+    <PackageInventory
+      intake={{ ...intake, format: 'health-intake-summary-v2' } as unknown as IntakeSummaryV2}
+    />,
+  );
+  const user = userEvent.setup();
+  const next = () => screen.getByRole('button', { name: 'Next members' });
+  const previous = () => screen.getByRole('button', { name: 'Previous members' });
+  const first = () => screen.getByRole('button', { name: 'First members' });
+  async function expectPage(page: number) {
+    expect(
+      await screen.findByText(`${starts[page] + 1}–${starts[page] + sizes[page]} of ${total}`),
+    ).toBeVisible();
+    const region = screen.getByRole('region', { name: 'Package contents' });
+    const rows = within(region).getAllByRole('listitem');
+    expect(rows).toHaveLength(sizes[page]);
+    expect(rows.map((row) => within(row).getByRole('button').textContent)).toEqual(
+      Array.from(
+        { length: sizes[page] },
+        (_, index) => `fictional-window-member-${starts[page] + index}`,
+      ),
+    );
+  }
+  await expectPage(0);
+  expect(previous()).toBeDisabled();
+  for (let page = 1; page < sizes.length; page++) {
+    await user.click(next());
+    await expectPage(page);
+  }
+  expect(next()).toBeDisabled();
+  for (const page of [10, 9]) {
+    await user.click(previous());
+    await expectPage(page);
+  }
+  for (const page of [10, 11]) {
+    await user.click(next());
+    await expectPage(page);
+  }
+  for (const page of [10, 9, 8, 7, 6, 5, 4, 3]) {
+    expect(previous()).toBeEnabled();
+    await user.click(previous());
+    await expectPage(page);
+  }
+  expect(previous()).toBeDisabled();
+  expect(first()).toBeEnabled();
+  expect(screen.getByText(/Earlier pages are outside your recent history/)).toHaveTextContent(
+    'Choose First members to return to the start.',
+  );
+  await user.click(first());
+  await expectPage(0);
+  expect(first()).toBeDisabled();
+  expect(previous()).toBeDisabled();
+  expect(
+    screen.queryByText(/Earlier pages are outside your recent history/),
+  ).not.toBeInTheDocument();
+  await user.click(next());
+  await expectPage(1);
+  await user.click(previous());
+  await expectPage(0);
+  expect(previous()).toBeDisabled();
+  expect(requests).toEqual([
+    ...starts,
+    ...[10, 9, 10, 11, 10, 9, 8, 7, 6, 5, 4, 3, 0, 1, 0].map((page) => starts[page]),
+  ]);
+});
+
+it('keeps First members available when a later member page fails', async () => {
+  const offsets: number[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes('/package?')) {
+        const offset = Number(new URL(path, 'http://fictional.local').searchParams.get('offset'));
+        offsets.push(offset);
+        if (offset === 1)
+          return new Response(
+            JSON.stringify({
+              error: { code: 'PACKAGE_WINDOW', message: 'Fictional next page is unavailable.' },
+            }),
+            { status: 409 },
+          );
+        return json({
+          format: 'health-intake-package-inventory-v2',
+          inventoryId: 'fictional-failed-next-page',
+          totalMembers: 2,
+          totalExpandedBytes: 4,
+          uniqueByteContents: 2,
+          members: [member],
+          offset: 0,
+          nextOffset: 1,
+        });
+      }
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  render(
+    <PackageInventory
+      intake={{ ...intake, format: 'health-intake-summary-v2' } as unknown as IntakeSummaryV2}
+    />,
+  );
+  const user = userEvent.setup();
+  expect(await screen.findByText('1–1 of 2')).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Next members' }));
+  expect(await screen.findByText('Fictional next page is unavailable.')).toBeVisible();
+  const first = screen.getByRole('button', { name: 'First members' });
+  expect(first).toBeEnabled();
+  await user.click(first);
+  expect(await screen.findByText('1–1 of 2')).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Previous members' })).toBeDisabled();
+  expect(offsets).toEqual([0, 1, 0]);
+});
+
+it('loads native processing issues as selected pages without fetching a complete intake', async () => {
+  const requests: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      requests.push(path);
+      if (path.includes('/package?')) return inventory();
+      if (path.includes('/package-failures?'))
+        return json({
+          format: 'health-intake-package-failure-page-v1',
+          intakeId: intake.id,
+          pins: {
+            sourceHash: 'b'.repeat(64),
+            logicalRoot: 'fictional-root',
+            domainVersion: 1,
+            version: 1,
+          },
+          entries: [{ key: 'exact', failure: failure('exact', 'read_member') }],
+          total: 10001,
+          complete: false,
+          nextCursor: 'fictional-next',
+        });
+      throw Error('Unexpected complete intake request: ' + path);
+    }),
+  );
+  render(
+    <PackageInventory
+      intake={{ ...intake, format: 'health-intake-summary-v2' } as unknown as IntakeSummaryV2}
+    />,
+  );
+  expect(await screen.findByText(/10001 unfinished operations/)).toBeVisible();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Next unfinished operations' }));
+  await waitFor(() =>
+    expect(requests.some((path) => path.includes('cursor=fictional-next'))).toBe(true),
+  );
+  expect(requests.some((path) => path.endsWith('/intakes/' + intake.id))).toBe(false);
+});
+
+it('keeps oversized member details in selected fragments and never uses the shortened name as identity', async () => {
+  const reference = {
+    format: 'health-intake-metadata-reference-v1',
+    kind: 'package_member',
+    intakeId: intake.id,
+    inventoryId: 'fictional-inventory',
+    memberId: member.memberId,
+    ordinal: member.ordinal,
+    sourceHash: 'b'.repeat(64),
+    version: 1,
+    metadataHash: 'c'.repeat(64),
+    bytes: 100,
+  };
+  const requests: Record<string, unknown>[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, options: RequestInit = {}) => {
+      const path = String(input);
+      if (path.includes('/package?'))
+        return json({
+          format: 'health-intake-package-inventory-v2',
+          inventoryId: reference.inventoryId,
+          totalMembers: 1,
+          totalExpandedBytes: 2,
+          uniqueByteContents: 1,
+          members: [
+            {
+              format: 'health-intake-package-member-reference-v1',
+              memberId: member.memberId,
+              ordinal: 17,
+              filenamePreview: 'fictional-long-name',
+              filenameTruncated: true,
+              metadata: reference,
+            },
+          ],
+          offset: 0,
+          nextOffset: null,
+        });
+      if (path.includes('/package-failures?'))
+        return json({ entries: [], total: 0, complete: true, nextCursor: null });
+      if (path.endsWith('/package-metadata')) {
+        const body = JSON.parse(String(options.body));
+        requests.push(body);
+        return json({
+          format: 'health-intake-metadata-fragment-v1',
+          reference,
+          text: body.offset === 0 ? 'first retained section' : 'second retained section',
+          offset: body.offset,
+          nextOffset: body.offset === 0 ? 50 : null,
+          totalBytes: 100,
+          complete: body.offset !== 0,
+        });
+      }
+      if (path.endsWith('/package-member')) {
+        requests.push(JSON.parse(String(options.body)));
+        return json({ member });
+      }
+      throw Error('Unexpected request ' + path);
+    }),
+  );
+  render(
+    <PackageInventory
+      intake={{ ...intake, format: 'health-intake-summary-v2' } as unknown as IntakeSummaryV2}
+    />,
+  );
+  expect(await screen.findByText('File name shortened for display')).toBeVisible();
+  await userEvent.setup().click(screen.getByText('Full retained file details'));
+  expect(await screen.findByText('first retained section')).toBeVisible();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Next part of file details' }));
+  expect(await screen.findByText('second retained section')).toBeVisible();
+  expect(screen.queryByText('first retained section')).not.toBeInTheDocument();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'fictional-long-name…' }));
+  await waitFor(() =>
+    expect(requests.some((body) => body.memberId === member.memberId)).toBe(true),
+  );
+  expect(requests.some((body) => body.memberId === 'fictional-long-name')).toBe(false);
 });
 
 it.each(['read_member', 'read_structure'] as const)(

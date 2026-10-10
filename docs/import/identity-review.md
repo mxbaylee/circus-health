@@ -42,6 +42,68 @@ When another extraction group claims a different subject at the same report boun
 
 The same identity policy controls individual and bulk clinical acceptance. Editing a clinical value does not resolve identity. Stale scopes and unconfirmed identity questions remain blocking, and accepted history is not silently reassigned.
 
+Large collection intakes expose an explicit complete identity scope reference. The
+sidebar shows the full affected-record, retained-membership and question counts;
+the records, membership and alternative subject claims are available a page at a
+time. Every identity-question page and any large question fragments must be
+displayed before confirming. An unloaded page never establishes absence of a
+conflict. Advisory warning lists also use an explicit count and bounded reader
+when they do not fit the inline view.
+
+Without a usable printed subject boundary, distinct model-suggested names are
+deduplicated in disposable disk-backed scratch, preserving first occurrence
+order. A conflict longer than 8 KiB displays its complete name count and directs
+the reviewer to the individual records' identity questions. Its explicit
+reference commits the complete ordered conflict text by byte count and hash;
+review commitments still stream that full text. This presentation does not
+authorize common identity confirmation or treat an unopened question as absent.
+
+If unrelated background progress advances only the intake version while a person
+confirms, Import can read one fresh identity review and retry that same explicit
+action once. Native reviews require equal complete server evidence commitments
+before rebinding the version-specific scope reference. The proof includes every
+retained member and occurrence, pending assignment and question, competing claim,
+original/header pin and advisory warning, including content outside loaded pages.
+Self, offers, people and all other review fields must also remain equal. Changed,
+missing or malformed proof requires another review. An uncertain save keeps the
+exact request for recovery and never starts a freshness retry. Older reviews
+without this proof remain readable but require review after a version conflict.
+
+Complete warning references also pin the warning content. A saved Person edit can
+change model-only warnings while the report scope stays the same. Inline warnings
+show the current reading; large lists use a distinct immutable content snapshot,
+bound to every warning page, cursor and fragment. Earlier references stay
+readable. New reviews share unchanged retained rows while checking complete
+evidence; a changed warning is not hidden by an older scope snapshot. Scope
+publication changes only differing rows or removed tails, although an ordinal
+shift can affect many rows. Text changes at stable aligned positions can reuse
+unchanged fragments; insertions or deletions may rewrite the changed field's
+remaining fragments. Neither sharing nor a freshness retry confirms unseen
+changes or changes the report's accepted history.
+
+Large identity evidence opens one exact byte window at a time. Import follows a bound continuation for each next window and marks a question inspected only after the complete byte sequence has loaded. A refreshed report, expired continuation or changed source requires opening the evidence again; no incomplete or stale window enables confirmation.
+
+Confirmation pins the displayed reference and applies the complete current
+target set in the same durable transaction as the receipt and any selected blank
+Self-field or Family Person update. A lost response can be retried with the exact
+same operation and request. The collection may show preparation pending while
+the complete derived review is rebuilt; this does not create a partial identity
+decision. Losing disposable indexes reconstructs the retained membership,
+question evidence, drafts and receipt before current identity policy is applied.
+
+Native confirmations retain `health-intake-identity-receipt-v2` receipts with
+immutable scope and draft references in the existing accepted intake authority.
+Use a build that understands these references to inspect and reconstruct this
+history. Earlier inline-only readers cannot recover newly referenced receipts;
+cache deletion does not convert them. No operator setting changes. Keep the
+checked pre-update backup for recovery with the prior build.
+
+A single unusually large clinical text field can instead return its exact
+retained fragment reference and remain pending for individual review. Reading
+those fragments does not enable common confirmation or turn a truncated claim
+into verified identity evidence. This individual text-byte boundary is separate
+from the number of collection members, issues or competing subjects.
+
 ## Relatives' medications
 
 Relatives follow the same medication rules as Self. Imported prescriptions remain clinical history and default to inactive, regardless of a provider's reported status. The profile owner can confirm current use on a relative's behalf. This personal assertion stays separate from provider evidence and does not rewrite the original prescription.

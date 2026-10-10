@@ -1,3 +1,4 @@
+import { fixtureApi, fixtureReview, fixtureSourcePath } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -33,6 +34,19 @@ test(
     const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
+    const failureDetails = async () => {
+      return JSON.stringify({
+        pageErrors: errors,
+        dialogs: await page
+          .getByRole('dialog')
+          .allTextContents()
+          .catch(() => []),
+        alerts: await page
+          .getByRole('alert')
+          .allTextContents()
+          .catch(() => []),
+      });
+    };
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
     await page.goto(url);
     const seed = await page.evaluate(async () => {
@@ -91,17 +105,19 @@ test(
         .join('\n');
       const intake = await request(prefix + '/intakes', undefined, original);
       const path = prefix + '/intakes/' + encodeURIComponent(intake.id);
-      const review = await request(path + '/review');
-      await request(path + '/import', {
-        version: review.version,
-        reviewToken: review.reviewToken,
-        decisions: review.records.map((r: { id: string }) => ({
-          recordId: r.id,
-          action: 'accept',
-          mapping: {},
-        })),
-      });
-      return { prefix, person, original, contentUrl: intake.contentUrl, intakeId: intake.id };
+      return { prefix, path, person, original, contentUrl: intake.contentUrl, intakeId: intake.id };
+    });
+    const api = fixtureApi(page, url);
+    const path = seed.path;
+    const review = await fixtureReview(api, path + '/review');
+    await api(path + '/import', {
+      version: review.version,
+      reviewToken: review.reviewToken,
+      decisions: review.records.map((r: { id: string }) => ({
+        recordId: r.id,
+        action: 'accept',
+        mapping: {},
+      })),
     });
     await page.goto(url + '/#/tests');
     await page.reload();
@@ -117,7 +133,16 @@ test(
     });
     await dialog.getByLabel('Destination person').selectOption({ label: 'Robin Lane' });
     await dialog.getByRole('button', { name: 'Preview correction', exact: true }).click();
-    await dialog.getByRole('button', { name: 'Confirm person correction', exact: true }).waitFor();
+    try {
+      await dialog
+        .getByRole('button', { name: 'Confirm person correction', exact: true })
+        .waitFor();
+    } catch (cause) {
+      throw new Error(
+        'Native ownership preview did not offer confirmation: ' + (await failureDetails()),
+        { cause },
+      );
+    }
     assert.match(await dialog.innerText(), /2 saved records and 0 pending/);
     for (const viewport of [
       { width: 390, height: 844 },
@@ -134,7 +159,13 @@ test(
       await route.abort('failed');
     });
     await dialog.getByRole('button', { name: 'Confirm person correction', exact: true }).click();
-    await page.getByRole('dialog', { name: 'Person correction saved' }).waitFor();
+    try {
+      await page.getByRole('dialog', { name: 'Person correction saved' }).waitFor();
+    } catch (cause) {
+      throw new Error('Native ownership save did not reconcile: ' + (await failureDetails()), {
+        cause,
+      });
+    }
     assert.ok(operationId);
     await page.unroute('**/record-ownership');
     const state = await page.evaluate(
@@ -161,7 +192,7 @@ test(
         prefix: seed.prefix,
         personId: seed.person.personId,
         operationId,
-        originalUrl: seed.contentUrl,
+        originalUrl: fixtureSourcePath(seed.prefix, seed.contentUrl),
       },
     );
     assert.equal(state.self.length, 0);

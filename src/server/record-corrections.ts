@@ -1,13 +1,16 @@
 import { createHash } from 'node:crypto';
 import { HttpError, json, now, revision, type Database, type SqliteRow } from './database.ts';
 import type { SQLInputValue } from 'node:sqlite';
-import type {
-  CorrectionSupportingEvidence,
-  CorrectionSupportingReference,
-} from '../shared/record-correction.ts';
+import type { CorrectionSupportingEvidence } from '../shared/record-correction.ts';
 import { getIntake, reviewIntake } from './intake.ts';
 import { verifyIntakeFileHash } from './intake-files.ts';
 import { profileOriginal } from './profile-storage.ts';
+import {
+  readPreparedCorrectionSupport,
+  correctionSupportingReferences,
+  correctionSupportingSourceRoot,
+  type PreparedCorrectionSupportingEvidence,
+} from './record-correction-support.ts';
 import { validClinicalFieldValue } from './optical-prescription.ts';
 import {
   clinicalFields,
@@ -33,9 +36,8 @@ export interface RecordCorrectionInput {
 export interface CorrectionEvidenceContext {
   root: string;
   profileId: string;
+  supporting?: PreparedCorrectionSupportingEvidence;
 }
-const object = (value: unknown): value is Record<string, unknown> =>
-  value !== null && typeof value === 'object' && !Array.isArray(value);
 
 function retainedOriginal(db: Database, context: CorrectionEvidenceContext, sourceFileId: string) {
   const file = db
@@ -57,63 +59,27 @@ function retainedOriginal(db: Database, context: CorrectionEvidenceContext, sour
   return { sha256: String(file.sha256), path: String(file.path), details };
 }
 
-function sourceRoot(db: Database, id: string): string {
-  const seen = new Set<string>();
-  while (!seen.has(id) && seen.size < 10) {
-    seen.add(id);
-    const row = db
-      .prepare(
-        "SELECT json_extract(details_json,'$.intake.parentSourceFileId') parent FROM source_files WHERE id=?",
-      )
-      .get(id);
-    if (!row?.parent) return id;
-    id = String(row.parent);
-  }
-  throw new HttpError(409, 'CORRECTION_EVIDENCE', 'Supporting source ancestry is invalid');
-}
-
 function supportingOriginals(
   db: Database,
   input: unknown,
   context?: CorrectionEvidenceContext,
 ): CorrectionSupportingEvidence[] {
   if (input === undefined) return [];
+  if (context?.supporting)
+    return readPreparedCorrectionSupport(
+      context.supporting,
+      db,
+      context.root,
+      context.profileId,
+      input,
+    );
   if (!context || !Array.isArray(input) || input.length > 8)
     throw new HttpError(
       400,
       'CORRECTION_EVIDENCE',
       'Choose at most eight scoped supporting originals',
     );
-  const seen = new Set<string>();
-  return input.map((value) => {
-    const keys = [
-      'intakeId',
-      'proposalId',
-      'recordId',
-      'candidateId',
-      'candidateVersionId',
-      'originalSourceFileId',
-    ];
-    if (
-      !object(value) ||
-      Object.keys(value).some((key) => !keys.includes(key)) ||
-      keys.some((key) =>
-        key === 'proposalId'
-          ? value[key] !== null &&
-            (typeof value[key] !== 'string' || !value[key] || value[key].length > 500)
-          : typeof value[key] !== 'string' || !value[key] || value[key].length > 500,
-      )
-    )
-      throw new HttpError(
-        400,
-        'CORRECTION_EVIDENCE',
-        'Supply the exact incoming candidate, proposal and original reference',
-      );
-    const ref = value as unknown as CorrectionSupportingReference;
-    const key = JSON.stringify(keys.map((key) => value[key]));
-    if (seen.has(key))
-      throw new HttpError(400, 'CORRECTION_EVIDENCE', 'Choose each supporting occurrence once');
-    seen.add(key);
+  return correctionSupportingReferences(input).map((ref) => {
     const intake = getIntake(db, context.root, context.profileId, ref.intakeId);
     const candidate = intake.workflow?.candidates.find(
       (candidate) => candidate.id === ref.candidateId,
@@ -164,7 +130,8 @@ function supportingOriginals(
       file.sha256 === member.sourceHash;
     if (
       (!evidence && !exactMember) ||
-      sourceRoot(db, ref.originalSourceFileId) !== sourceRoot(db, ref.intakeId)
+      correctionSupportingSourceRoot(db, context.profileId, ref.originalSourceFileId) !==
+        correctionSupportingSourceRoot(db, context.profileId, ref.intakeId)
     )
       throw new HttpError(
         409,

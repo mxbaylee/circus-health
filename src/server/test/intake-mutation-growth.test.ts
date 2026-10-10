@@ -145,7 +145,13 @@ for (const fullQualification of [false, true]) {
                   if (name !== 'head') {
                     try {
                       const value = JSON.parse(bytes.toString());
-                      if (Array.isArray(value.segments)) kind = 'record-commit';
+                      if (value.format === 'health-record-segment-page-v1')
+                        kind = 'record-segment-index';
+                      else if (
+                        Array.isArray(value.segments) ||
+                        value.format === 'health-record-versions-v2'
+                      )
+                        kind = 'record-commit';
                     } catch {
                       /* Segments can divide a version's JSON bytes. */
                     }
@@ -249,7 +255,10 @@ for (const fullQualification of [false, true]) {
                 oracle.map((row) => row.id),
               );
               assert.deepEqual(
-                actual.map((row) => JSON.stringify(row.details)),
+                actual.map((row) => {
+                  assert.ok('details' in row, 'legacy mutation fixture retains its complete DTO');
+                  return JSON.stringify(row.details);
+                }),
                 oracle.map((row) => JSON.stringify(JSON.parse(String(row.text)))),
               );
             }

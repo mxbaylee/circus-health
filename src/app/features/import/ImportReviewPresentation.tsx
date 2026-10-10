@@ -72,6 +72,8 @@ export interface ImportReviewRecord {
   /** Similar literal/date in the same original; does not establish a duplicate. */
   possibleOverlap?: boolean;
   originalUrl?: string;
+  /** The retained link is still loading or failed; never substitute demo evidence. */
+  originalUnavailable?: boolean;
   detailUrl?: string;
   savedDestination?: IntakeAcceptedRecord;
   savedPersonDestination?: SavedPersonDestination;
@@ -144,6 +146,8 @@ export interface ImportReviewReport {
 
 export interface ImportReviewModel {
   contextKey?: string;
+  /** Page identity: replaces approval snapshots without replacing the open editor. */
+  selectionWindowKey?: string;
   /** No settled feed for the requested filters yet; absence is not an empty result. */
   loading?: boolean;
   confirmedSavedIds?: string[];
@@ -200,6 +204,11 @@ export interface ImportReviewModel {
 
 export interface ImportReviewActions {
   busy?: boolean;
+  peopleBusy?: boolean;
+  /** A stale review window does not prevent retaining a new original. */
+  uploadBusy?: boolean;
+  /** Upload prerequisites can load independently from the review queue. */
+  uploadUnavailable?: string;
   onFiles?: (files: File[]) => void | Promise<void>;
   onSave?: (
     recordIds: string[],
@@ -250,6 +259,12 @@ type SheetState =
   | { type: 'correct'; recordIds: string[] }
   | null;
 
+interface PinnedReview {
+  record: ImportReviewRecord;
+  report: ImportReviewReport;
+  contextKey?: string;
+}
+
 const kindIcons: Record<ImportReviewKind | 'All', typeof List> = {
   All: List,
   'Test results': FlaskConical,
@@ -296,6 +311,8 @@ export function ImportReviewPresentation({
   renderRecordReview,
   beforeReviewChange,
   renderReportSourceReview,
+  renderReportContext,
+  renderSavedDestination,
   renderSourceAttention,
   requestedRecordId,
   preserveSourceReview = false,
@@ -303,6 +320,13 @@ export function ImportReviewPresentation({
   renderRecordReview?: (record: ImportReviewRecord, close: () => void) => ReactNode;
   beforeReviewChange?: () => Promise<boolean>;
   renderReportSourceReview?: (report: ImportReviewReport) => ReactNode;
+  renderSavedDestination?: (record: ImportReviewRecord) => ReactNode;
+  renderReportContext?: (
+    tab: 'identity' | 'source',
+    report: ImportReviewReport,
+    close: () => void,
+    onPending: (pending: boolean) => void,
+  ) => ReactNode;
   renderSourceAttention?: (onCount: (count: number) => void) => ReactNode;
   requestedRecordId?: string;
   preserveSourceReview?: boolean;
@@ -329,21 +353,66 @@ export function ImportReviewPresentation({
   const [fileDragActive, setFileDragActive] = useState(false);
   const [notice, setNotice] = useState('');
   const [expandedRecord, setExpandedRecord] = useState<string | null>(null);
-  const pinnedReview = useRef<{
-    record: ImportReviewRecord;
-    report: ImportReviewReport;
-    contextKey?: string;
-  } | null>(null);
+  const pinnedReview = useRef<PinnedReview | null>(null);
+  const [savedReviewToClose, setSavedReviewToClose] = useState<PinnedReview | null>(null);
   const confirmedSaved = useRef(new Set<string>());
+  useEffect(() => {
+    if (model?.selectionWindowKey === undefined) return;
+    approvalSelection.clearContext();
+    confirmedSaved.current.clear();
+  }, [model?.selectionWindowKey]);
   const reviewChangeGeneration = useRef(0);
+  function closeRecordReview() {
+    pinnedReview.current = null;
+    setExpandedRecord(null);
+  }
+  async function openReportContext(type: 'identity' | 'source', reportId: string) {
+    if (actions.busy || (beforeReviewChange && !(await beforeReviewChange()))) return;
+    closeRecordReview();
+    setSheet({ type, reportId });
+  }
   async function openRecordReview(record: ImportReviewRecord) {
     const generation = ++reviewChangeGeneration.current;
     if (beforeReviewChange && !(await beforeReviewChange())) return;
     if (generation !== reviewChangeGeneration.current) return;
+    if (expandedRecord === record.id) {
+      closeRecordReview();
+      return;
+    }
     const report = reports.find((item) => item.id === record.reportId);
     if (report) pinnedReview.current = { record, report, contextKey: model?.contextKey };
-    setExpandedRecord((current) => (current === record.id ? null : record.id));
+    setExpandedRecord(record.id);
   }
+  useEffect(() => {
+    if (!savedReviewToClose) return;
+    if (
+      pinnedReview.current !== savedReviewToClose ||
+      expandedRecord !== savedReviewToClose.record.id ||
+      model?.contextKey !== savedReviewToClose.contextKey
+    ) {
+      setSavedReviewToClose(null);
+      return;
+    }
+    // The save itself marks the embedded editor pending. Wait for that operation
+    // to settle before asking its current guard whether it is safe to close.
+    // A newer unfinished edit still keeps the exact editor mounted.
+    if (actions.busy) return;
+    let current = true;
+    void (async () => {
+      if (beforeReviewChange && !(await beforeReviewChange())) return;
+      if (!current || pinnedReview.current !== savedReviewToClose) return;
+      setRecords((records) =>
+        records.map((record) =>
+          record.id === savedReviewToClose.record.id ? { ...record, status: 'saved' } : record,
+        ),
+      );
+      closeRecordReview();
+      setSavedReviewToClose(null);
+    })();
+    return () => {
+      current = false;
+    };
+  }, [savedReviewToClose, actions.busy, beforeReviewChange, expandedRecord, model?.contextKey]);
   useEffect(() => {
     if (!model) return;
     const contextChanged = presentedContext.current !== model.contextKey;
@@ -354,6 +423,12 @@ export function ImportReviewPresentation({
       setSourceAttention(false);
     }
     if (preserveSourceReview && !contextChanged) return;
+    if (model.selectionWindowKey !== undefined) {
+      const shown = new Set(model.records.map((record) => record.id));
+      approvalSelection.retainShown(shown);
+      for (const id of confirmedSaved.current)
+        if (!shown.has(id)) confirmedSaved.current.delete(id);
+    }
     for (const id of model.confirmedSavedIds || []) confirmedSaved.current.add(id);
     approvalSelection.removeSaved([...confirmedSaved.current]);
     // A background feed refresh must not unmount a draft whose version was
@@ -361,6 +436,17 @@ export function ImportReviewPresentation({
     const pinned = pinnedReview.current;
     const retain =
       pinned && pinned.contextKey === model.contextKey && expandedRecord === pinned.record.id;
+    if (retain && renderReportContext) {
+      const report = model.reports.find((item) => item.id === pinned.report.id);
+      if (report) pinned.report = report;
+      const row = model.records.find((item) => item.id === pinned.record.id);
+      if (row)
+        pinned.record = {
+          ...pinned.record,
+          originalUrl: row.originalUrl,
+          originalUnavailable: row.originalUnavailable,
+        };
+    }
     const currentRecords = model.records.map((record) =>
       confirmedSaved.current.has(record.id) ? { ...record, status: 'saved' as const } : record,
     );
@@ -395,7 +481,7 @@ export function ImportReviewPresentation({
     if (model?.contextKey) {
       approvalSelection.clearSelected();
       setSheet(null);
-      setExpandedRecord(null);
+      closeRecordReview();
     }
   }, [model?.contextKey]);
   useEffect(() => {
@@ -417,7 +503,7 @@ export function ImportReviewPresentation({
       sheetReturnFocus.current = document.activeElement;
   }, [sheet]);
   useEffect(() => {
-    if (sheet?.type !== 'identity') {
+    if (renderReportContext || sheet?.type !== 'identity') {
       lastIdentitySheet.current = null;
       return;
     }
@@ -442,7 +528,7 @@ export function ImportReviewPresentation({
     if (beforeReviewChange && !(await beforeReviewChange())) return;
     if (generation !== reviewChangeGeneration.current) return;
     const next = { view, kind, query, editedOnly, ...patch };
-    setExpandedRecord(null);
+    closeRecordReview();
     setSourceAttention(false);
     setView(next.view);
     setKind(next.kind);
@@ -558,6 +644,7 @@ export function ImportReviewPresentation({
             : actions.onResume;
     if (model && action) {
       const context = model.contextKey;
+      const reviewedPin = pinnedReview.current;
       const approvals = approvalSelection.approvals(ids);
       const succeeded =
         status === 'saved'
@@ -577,15 +664,18 @@ export function ImportReviewPresentation({
       if (status === 'saved' && savedIds.length && presentedContext.current === context) {
         for (const id of savedIds) confirmedSaved.current.add(id);
         if (
-          pinnedReview.current &&
-          savedIds.includes(pinnedReview.current.record.id) &&
-          (!beforeReviewChange || (await beforeReviewChange()))
+          reviewedPin &&
+          pinnedReview.current === reviewedPin &&
+          savedIds.includes(reviewedPin.record.id)
         ) {
-          pinnedReview.current = null;
-          setExpandedRecord(null);
+          setSavedReviewToClose(reviewedPin);
         }
         setRecords((current) =>
-          current.map((record) => (savedIds.includes(record.id) ? { ...record, status } : record)),
+          current.map((record) =>
+            savedIds.includes(record.id) && pinnedReview.current?.record.id !== record.id
+              ? { ...record, status }
+              : record,
+          ),
         );
         approvalSelection.removeSaved(savedIds);
       }
@@ -652,8 +742,11 @@ export function ImportReviewPresentation({
     return Array.from(dataTransfer.types).includes('Files');
   }
 
+  const uploadUnavailable =
+    actions.uploadUnavailable ||
+    ((actions.uploadBusy ?? actions.busy) ? 'Please wait for the current action to finish.' : '');
   function submitFiles(files: File[]) {
-    if (files.length) void actions.onFiles?.(files);
+    if (!uploadUnavailable && files.length) void actions.onFiles?.(files);
   }
 
   return (
@@ -670,7 +763,7 @@ export function ImportReviewPresentation({
         className={`import-upload-card${fileDragActive ? ' is-dragging' : ''}`}
         aria-label="Upload reports"
         onDragEnter={(event) => {
-          if (!hasDraggedFiles(event.dataTransfer)) return;
+          if (!hasDraggedFiles(event.dataTransfer) || uploadUnavailable) return;
           event.preventDefault();
           dragDepth.current += 1;
           setFileDragActive(true);
@@ -678,6 +771,10 @@ export function ImportReviewPresentation({
         onDragOver={(event) => {
           if (!hasDraggedFiles(event.dataTransfer)) return;
           event.preventDefault();
+          if (uploadUnavailable) {
+            event.dataTransfer.dropEffect = 'none';
+            return;
+          }
           event.dataTransfer.dropEffect = 'copy';
           setFileDragActive(true);
         }}
@@ -698,6 +795,7 @@ export function ImportReviewPresentation({
           <input
             type="file"
             multiple
+            disabled={!!uploadUnavailable}
             accept=".pdf,.png,.jpg,.jpeg,.zip,.jsonl"
             onChange={(event) => {
               const files = [...(event.target.files || [])];
@@ -708,7 +806,9 @@ export function ImportReviewPresentation({
           <FileSearch aria-hidden="true" />
           <span>
             <strong>Drop reports here</strong>
-            <small>PDF, photos, ZIP or JSONL · up to 128 MB per file</small>
+            <small>
+              {uploadUnavailable || 'PDF, photos, ZIP or JSONL · up to 128 MB per file'}
+            </small>
           </span>
           <span className="button secondary">Browse files</span>
         </label>
@@ -740,7 +840,7 @@ export function ImportReviewPresentation({
             <span className="sr-only">Review status</span>
             <select
               value={view}
-              disabled={sourceAttention}
+              disabled={sourceAttention || actions.busy}
               onChange={(event) => {
                 void changeFilters({ view: event.target.value as ImportReviewStatus });
               }}
@@ -773,7 +873,7 @@ export function ImportReviewPresentation({
                 <button
                   type="button"
                   role="tab"
-                  disabled={approvingSections}
+                  disabled={approvingSections || actions.busy}
                   aria-selected={!sourceAttention && kind === item}
                   onClick={() => {
                     void changeFilters({ kind: item });
@@ -794,12 +894,12 @@ export function ImportReviewPresentation({
             <button
               type="button"
               role="tab"
-              disabled={approvingSections}
+              disabled={approvingSections || actions.busy}
               aria-selected={sourceAttention}
               onClick={() =>
                 void (async () => {
                   if (beforeReviewChange && !(await beforeReviewChange())) return;
-                  setExpandedRecord(null);
+                  closeRecordReview();
                   approvalSelection.clearSelected();
                   sourceSelection.files.forEach((file) => file.select(false));
                   setSourceAttention(true);
@@ -943,7 +1043,7 @@ export function ImportReviewPresentation({
                       <button
                         className="button primary"
                         type="button"
-                        disabled={actions.busy}
+                        disabled={actions.busy || actions.peopleBusy}
                         onClick={() =>
                           move(
                             readyPeople.map((record) => record.id),
@@ -1016,7 +1116,7 @@ export function ImportReviewPresentation({
                                   ? 'Add source'
                                   : `Change source for ${report.reportType}`
                             }
-                            onClick={() => setSheet({ type: 'source', reportId: report.id })}
+                            onClick={() => void openReportContext('source', report.id)}
                           >
                             <span className="import-source">{report.source}</span>
                             <span className="import-source-action">
@@ -1033,7 +1133,7 @@ export function ImportReviewPresentation({
                             type="button"
                             disabled={actions.busy}
                             aria-label={`${report.subject.confirmed && !report.subject.nameOnlyMatch ? 'Change' : 'Review'} person for ${report.reportType}`}
-                            onClick={() => setSheet({ type: 'identity', reportId: report.id })}
+                            onClick={() => void openReportContext('identity', report.id)}
                           >
                             <UserRound size={14} aria-hidden="true" />
                             <span className="import-source">
@@ -1067,9 +1167,7 @@ export function ImportReviewPresentation({
                         {showIdentity && (
                           <ImportIdentityWarnings
                             warnings={report.subject.warnings}
-                            onReviewPerson={() =>
-                              setSheet({ type: 'identity', reportId: report.id })
-                            }
+                            onReviewPerson={() => void openReportContext('identity', report.id)}
                             reviewLabel={
                               report.subject.confirmed && !report.subject.nameOnlyMatch
                                 ? 'Change person'
@@ -1161,7 +1259,11 @@ export function ImportReviewPresentation({
                                 <button
                                   className="button primary"
                                   type="button"
-                                  disabled={!record.eligible || actions.busy}
+                                  disabled={
+                                    !record.eligible ||
+                                    actions.busy ||
+                                    (record.kind === 'People' && actions.peopleBusy)
+                                  }
                                   aria-describedby={
                                     !record.eligible && record.saveBlockReason
                                       ? saveBlockDescriptionId(record.id)
@@ -1217,7 +1319,7 @@ export function ImportReviewPresentation({
                                   type="button"
                                   onClick={() =>
                                     record.saveBlockReview === 'identity'
-                                      ? setSheet({ type: 'identity', reportId: report.id })
+                                      ? void openReportContext('identity', report.id)
                                       : void openRecordReview(record)
                                   }
                                 >
@@ -1261,6 +1363,9 @@ export function ImportReviewPresentation({
                               </a>
                             </div>
                           )}
+                        {view === 'saved' &&
+                          !record.savedDestination &&
+                          renderSavedDestination?.(record)}
                         {view === 'saved' && record.savedDestination && (
                           <div className="import-record-destination">
                             <SavedRecordDestinationLink record={record.savedDestination} />
@@ -1278,7 +1383,7 @@ export function ImportReviewPresentation({
                             className="import-record-accordion"
                             id={`record-review-${encodeURIComponent(record.id)}`}
                           >
-                            {renderRecordReview(record, () => setExpandedRecord(null))}
+                            {renderRecordReview(record, closeRecordReview)}
                           </div>
                         )}
                       </article>
@@ -1332,6 +1437,7 @@ export function ImportReviewPresentation({
         returnFocus={sheetReturnFocus}
         busy={!!actions.busy}
         reviewSource={actions.onReviewSource}
+        renderReportContext={renderReportContext}
         close={() => setSheet(null)}
         confirmIdentity={(
           reportId,
@@ -1615,6 +1721,7 @@ function ImportSheet({
   returnFocus,
   busy,
   reviewSource,
+  renderReportContext,
   close,
   confirmIdentity,
   changeSource,
@@ -1630,6 +1737,12 @@ function ImportSheet({
   returnFocus: RefObject<HTMLElement | null>;
   busy: boolean;
   reviewSource?: (reportId: string) => Promise<IntakeReportSourceReview>;
+  renderReportContext?: (
+    tab: 'identity' | 'source',
+    report: ImportReviewReport,
+    close: () => void,
+    onPending: (pending: boolean) => void,
+  ) => ReactNode;
   close: () => void;
   confirmIdentity: (
     reportId: string,
@@ -1650,6 +1763,10 @@ function ImportSheet({
   correctDrafts?: ImportReviewActions['onCorrectDrafts'];
   askDraftRepair?: ImportReviewActions['onAskDraftRepair'];
 }) {
+  const [contextPending, setContextPending] = useState(false);
+  const closeContext = () => {
+    if (!contextPending) close();
+  };
   const [metadataTab, setMetadataTab] = useState<'identity' | 'source'>(
     initialSheet?.type === 'source' ? 'source' : 'identity',
   );
@@ -1659,12 +1776,16 @@ function ImportSheet({
       : initialSheet;
   const record =
     sheet && 'recordId' in sheet ? records.find((item) => item.id === sheet.recordId) : undefined;
-  const report =
+  const matchingReport =
     sheet && 'reportId' in sheet
       ? reports.find((item) => item.id === sheet.reportId)
       : record
         ? reports.find((item) => item.id === record.reportId)
         : undefined;
+  const retainedContextReport = useRef<ImportReviewReport | undefined>(undefined);
+  if (renderReportContext && matchingReport) retainedContextReport.current = matchingReport;
+  const report =
+    matchingReport || (renderReportContext ? retainedContextReport.current : undefined);
   const correctionRecords =
     sheet?.type === 'correct'
       ? sheet.recordIds.flatMap((id) => {
@@ -1739,13 +1860,19 @@ function ImportSheet({
     <Dialog.Root
       open={Boolean(sheet)}
       onOpenChange={(open) => {
-        if (!open) close();
+        if (!open && !contextPending) close();
       }}
     >
       <Dialog.Portal>
         <Dialog.Overlay className="import-sheet-overlay" />
         <Dialog.Content
           className="import-sheet"
+          onEscapeKeyDown={(event) => {
+            if (contextPending) event.preventDefault();
+          }}
+          onInteractOutside={(event) => {
+            if (contextPending) event.preventDefault();
+          }}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
             returnFocus.current?.focus();
@@ -1769,7 +1896,7 @@ function ImportSheet({
                           ? 'Review record'
                           : 'Manually edit record'}
             </Dialog.Title>
-            <Dialog.Close className="icon-button" aria-label="Close">
+            <Dialog.Close disabled={contextPending} className="icon-button" aria-label="Close">
               <X size={18} />
             </Dialog.Close>
           </div>
@@ -1779,7 +1906,10 @@ function ImportSheet({
                 type="button"
                 aria-pressed={sheet.type === 'source'}
                 disabled={
-                  busy || sourceBusy || !(report.sourceLabelAvailable || report.sourceSuggested)
+                  busy ||
+                  sourceBusy ||
+                  contextPending ||
+                  !(report.sourceLabelAvailable || report.sourceSuggested)
                 }
                 onClick={() => setMetadataTab('source')}
               >
@@ -1788,7 +1918,7 @@ function ImportSheet({
               <button
                 type="button"
                 aria-pressed={sheet.type === 'identity'}
-                disabled={busy || sourceBusy}
+                disabled={busy || sourceBusy || contextPending}
                 onClick={() => setMetadataTab('identity')}
               >
                 Person
@@ -1809,6 +1939,11 @@ function ImportSheet({
                 >
                   Open retained original <ArrowUpRight size={15} />
                 </a>
+              ) : record.originalUnavailable ? (
+                <p role="status">
+                  The retained original link is not available yet. Close this dialog and retry the
+                  report details.
+                </p>
               ) : (
                 <div className="import-original-paper">
                   <span>FICTIONAL ORIGINAL · PAGE 1</span>
@@ -1838,7 +1973,11 @@ function ImportSheet({
               ask={askDraftRepair}
             />
           )}
-          {sheet?.type === 'identity' && report && (
+          {renderReportContext &&
+            (sheet?.type === 'identity' || sheet?.type === 'source') &&
+            report &&
+            renderReportContext(sheet.type, report, closeContext, setContextPending)}
+          {!renderReportContext && sheet?.type === 'identity' && report && (
             <ImportIdentitySheetControls
               report={report}
               busy={busy}
@@ -1856,18 +1995,20 @@ function ImportSheet({
               setFutureNameOwner={setFutureNameOwner}
             />
           )}
-          {(sheet?.type === 'source' || sheet?.type === 'identity') && report && (
-            <ImportSourceSheetControls
-              key={report.id}
-              active={sheet.type === 'source'}
-              report={report}
-              reviewSource={reviewSource}
-              changeSource={changeSource}
-              close={close}
-              sourceBusy={sourceBusy}
-              setSourceBusy={setSourceBusy}
-            />
-          )}
+          {!renderReportContext &&
+            (sheet?.type === 'source' || sheet?.type === 'identity') &&
+            report && (
+              <ImportSourceSheetControls
+                key={report.id}
+                active={sheet.type === 'source'}
+                report={report}
+                reviewSource={reviewSource}
+                changeSource={changeSource}
+                close={close}
+                sourceBusy={sourceBusy}
+                setSourceBusy={setSourceBusy}
+              />
+            )}
           {sheet?.type === 'edit' && record && (
             <>
               <Dialog.Description>

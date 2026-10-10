@@ -1,6 +1,7 @@
+import type { IntakeClinicalReviewContext } from '../../../shared/intake-clinical-review';
 import type { IntakePairScope } from '../../../shared/clinical-review';
+import type { IntakeReviewDraftTransition } from '../../../shared/intake-review-draft-transition';
 import type {
-  IntakeReview,
   IntakeReviewDecision,
   IntakeReviewDraftUpdate,
   IntakeReviewRecord,
@@ -14,6 +15,31 @@ export interface ReviewDraftPairCommit {
   request: IntakeReviewDraftUpdate;
   version: number;
   revision: number;
+  transition?: IntakeReviewDraftTransition;
+}
+
+export function ownRevisionTransition(commit: ReviewDraftPairCommit, priorRevision: number) {
+  const transition = commit.transition;
+  if (transition === undefined) return priorRevision + 1 === commit.revision;
+  return (
+    transition !== null &&
+    transition.format === 'health-intake-own-draft-transition-v1' &&
+    transition.profileId === commit.profileId &&
+    transition.intakeId === commit.intakeId &&
+    transition.proposalId === commit.request.proposalId &&
+    transition.recordId === commit.request.recordId &&
+    transition.candidateId === commit.candidateId &&
+    transition.candidateVersionId === commit.request.candidateVersionId &&
+    transition.operationId === commit.request.operationId &&
+    transition.fromVersion === commit.request.version &&
+    transition.toVersion === commit.version &&
+    Number.isSafeInteger(transition.fromRevision) &&
+    transition.fromRevision >= 0 &&
+    Number.isSafeInteger(transition.toRevision) &&
+    transition.toRevision > transition.fromRevision &&
+    transition.fromRevision === priorRevision &&
+    transition.toRevision === commit.revision
+  );
 }
 
 function sorted(value: unknown): unknown {
@@ -58,7 +84,7 @@ function unchangedPair(before: IntakePairScope | undefined, after: IntakePairSco
  */
 export function refreshPairScopesAfterOwnDraft(
   profileId: string,
-  review: IntakeReview,
+  review: IntakeClinicalReviewContext,
   record: IntakeReviewRecord,
   decision: IntakeReviewDecision,
   commit?: ReviewDraftPairCommit,
@@ -113,7 +139,7 @@ export function refreshPairScopesAfterOwnDraft(
       prior.profileId !== profileId ||
       prior.intakeVersion !== request.version ||
       fresh.intakeVersion !== commit.version ||
-      prior.requestRevision + 1 !== commit.revision ||
+      !ownRevisionTransition(commit, prior.requestRevision) ||
       fresh.requestRevision !== commit.revision ||
       !prior.token ||
       !fresh.token ||

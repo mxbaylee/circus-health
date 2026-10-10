@@ -113,14 +113,15 @@ function aliases(value: HealthRecordEnvelope): string[] {
   ].filter((item): item is string => !!item);
 }
 
-function packageScope(workflow: IntakeWorkflow): {
+export interface ReportContextPackageScope {
   packageEvidence: boolean;
-  members: Set<string>;
-} {
-  const members = new Set(
-    workflow.plans.flatMap((plan) => (plan.index.members || []).map((member) => member.memberId)),
-  );
-  return { packageEvidence: members.size > 0, members };
+  /** Complete selected inventory lookup, never membership in a presentation page. */
+  hasMember(memberId: string): boolean;
+}
+
+export interface ReportContextLookup {
+  /** All distinct context entries with this alias in the complete selected proposal. */
+  contexts(alias: string): Iterable<IntakeEntry>;
 }
 
 /**
@@ -132,22 +133,63 @@ export function resolveReportContexts(
   workflow: IntakeWorkflow,
   entries: IntakeEntry[],
 ): Map<number, ResolvedReportContext> {
+  return resolveReportContextsInScope(
+    {
+      packageEvidence:
+        file.mime_type === 'application/zip' ||
+        workflow.plans.some((plan) => !!plan.index.members?.length),
+      hasMember: (memberId) =>
+        workflow.plans.some((plan) =>
+          plan.index.members?.some((member) => member.memberId === memberId),
+        ),
+    },
+    entries,
+  );
+}
+
+/** Entries must cover the complete proposal context scope, not an arbitrary display page. */
+export function resolveReportContextsInScope(
+  packageInfo: ReportContextPackageScope,
+  entries: IntakeEntry[],
+): Map<number, ResolvedReportContext> {
+  return resolveReportContextsWithLookup(packageInfo, entries, buildReportContextLookup(entries));
+}
+
+/** Complete bounded proposal-input scope; preserves exact alias and ambiguity rules. */
+export function buildReportContextLookup(entries: readonly IntakeEntry[]): ReportContextLookup {
   const byAlias = new Map<string, IntakeEntry[]>();
-  for (const entry of entries.filter((item) => item.value.kind === 'context'))
+  for (const entry of entries) {
+    if (entry.value.kind !== 'context') continue;
     for (const alias of aliases(entry.value)) {
       const existing = byAlias.get(alias) || [];
       existing.push(entry);
       byAlias.set(alias, existing);
     }
-  const packageInfo = packageScope(workflow);
-  packageInfo.packageEvidence ||= file.mime_type === 'application/zip';
+  }
+  return {
+    contexts: (alias) => byAlias.get(alias) || [],
+  };
+}
+
+/** A bounded presentation window with alias/conflict checks over its complete proposal. */
+export function resolveReportContextsWithLookup(
+  packageInfo: ReportContextPackageScope,
+  entries: readonly IntakeEntry[],
+  lookup: ReportContextLookup,
+): Map<number, ResolvedReportContext> {
   const results = new Map<number, ResolvedReportContext>();
   for (const entry of entries) {
     if (entry.value.kind === 'context') continue;
     const claim = contextIdClaim(entry.value);
     const contextId = claim.id;
     if (!contextId) continue;
-    const matches = [...new Set(byAlias.get(contextId) || [])];
+    // Two distinct matches suffice to prove ambiguity; retain no full alias scope.
+    const matches: IntakeEntry[] = [];
+    for (const context of lookup.contexts(contextId)) {
+      if (matches[0] === context) continue;
+      matches.push(context);
+      if (matches.length === 2) break;
+    }
     const unresolved = (detail: string, envelopeId = contextId): void => {
       results.set(entry.line, {
         report: null,
@@ -215,7 +257,7 @@ export function resolveReportContexts(
       (!contextMember ||
         !recordMember ||
         contextMember !== recordMember ||
-        !packageInfo.members.has(contextMember))
+        !packageInfo.hasMember(contextMember))
     ) {
       unresolved(
         'The linked context does not have the same host-verified package member as this record. Review it separately.',

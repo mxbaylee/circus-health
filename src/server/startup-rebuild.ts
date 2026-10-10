@@ -17,17 +17,18 @@ import { performance } from 'node:perf_hooks';
 import { REPO_ROOT, LATEST_SCHEMA_VERSION, openDatabase } from './database.ts';
 import { hasContributorAuthority } from './contributor-record-storage.ts';
 import { rebuildContributorDatabase, selectedContributorHead } from './contributor-durability.ts';
-import { profilePaths, profileOriginal } from './profile-storage.ts';
+import { profilePaths } from './profile-storage.ts';
 import {
-  loadPortable,
+  openPortableRows,
+  verifyPortableOriginal,
   recoverPendingProfile,
   projectPortableDatabase,
   durableWrite,
   syncDirectory,
-  publishedPersonalLineage,
+  publishedPersonalHeaders,
   logicalDatabaseHash,
 } from './portable.ts';
-import { listChats } from './assistant-journal.ts';
+import { countChats } from './assistant-journal.ts';
 
 export interface GenerationManifest {
   format: 'circus-health-generation-v1';
@@ -37,15 +38,6 @@ export interface GenerationManifest {
   file: string;
   sha256: string;
   bytes: number;
-}
-
-interface PortableGeneration {
-  manifest: GenerationManifest;
-  value: {
-    revision: number;
-    createdAt: string;
-    tables: Record<string, Array<Record<string, unknown>>>;
-  };
 }
 
 export interface MappingVersion {
@@ -58,32 +50,6 @@ export interface ProfileInputPins {
   personal: GenerationManifest;
   curation: GenerationManifest;
   mappings: MappingVersion;
-}
-
-interface OriginalMetadata {
-  path: string;
-  sha256: string;
-  bytes: number;
-}
-
-interface LoadedPortable {
-  personal: PortableGeneration;
-  curation: PortableGeneration;
-  rows: Record<string, Array<Record<string, unknown>>> & {
-    source_records: Array<Record<string, unknown>>;
-  };
-  originals: Map<string, OriginalMetadata>;
-}
-
-interface ProjectionResult {
-  database: string;
-  profileId: string;
-  revision: number;
-  schemaVersion: number;
-  files: number;
-  counts: Record<string, number>;
-  logicalSha256: string;
-  databaseBytes: number;
 }
 
 export interface StartupProgress {
@@ -151,19 +117,6 @@ export interface RebuildStartupResult {
   receipt: StartupReceipt;
   databases: Array<[string, string]>;
 }
-
-type LoadPortable = (root: string, profileId: string, pins: ProfileInputPins) => LoadedPortable;
-type PersonalLineage = (
-  root: string,
-  profileId: string,
-  options: { manifest: GenerationManifest },
-) => Iterable<PortableGeneration>;
-type ProjectPortable = (
-  database: string,
-  profileId: string,
-  portable: LoadedPortable,
-  options: { phase: (name: string) => void },
-) => ProjectionResult;
 
 const hash = (bytes: BinaryLike): string => createHash('sha256').update(bytes).digest('hex');
 const jsonBytes = (value: unknown): Buffer => Buffer.from(JSON.stringify(value, null, 2) + '\n');
@@ -414,7 +367,7 @@ export function rebuildStartup({
             totalMs: performance.now() - profileStart,
             logicalSha256: logicalDatabaseHash(db),
             databaseBytes: statSync(database).size,
-            chats: listChats(root, profileId).length,
+            chats: countChats(root, profileId),
             peakMemoryBytes: process.resourceUsage().maxRSS * 1024,
           });
         } finally {
@@ -429,64 +382,62 @@ export function rebuildStartup({
         activeMetric = null;
         continue;
       }
-      const portable = (loadPortable as unknown as LoadPortable)(root, profileId, pins);
-      let historyBytes = 0,
-        historyGenerations = 0;
-      for (const generation of (publishedPersonalLineage as unknown as PersonalLineage)(
-        root,
-        profileId,
-        { manifest: pins.personal },
-      )) {
-        historyBytes += generation.manifest.bytes;
-        historyGenerations++;
+      const portable = openPortableRows(root, profileId, pins);
+      try {
+        let historyBytes = 0,
+          historyGenerations = 0;
+        for (const generation of publishedPersonalHeaders(root, profileId, {
+          manifest: pins.personal,
+        })) {
+          historyBytes += generation.manifest.bytes;
+          historyGenerations++;
+        }
+        // Conversations stay in place, but corrupt current journals block startup.
+        const chats = countChats(root, profileId);
+        const acceptedDigest = createHash('sha256');
+        let originalBytes = 0,
+          firstOriginal = true;
+        acceptedDigest.update('[');
+        // originals() follows the same path-first tuple ordering as the legacy
+        // Array.sort() hash, without retaining the complete tuple list.
+        for (const file of portable.originals()) {
+          if (!firstOriginal) acceptedDigest.update(',');
+          firstOriginal = false;
+          acceptedDigest.update(JSON.stringify([file.path, file.sha256, file.bytes]));
+          originalBytes += file.bytes;
+        }
+        acceptedDigest.update(']');
+        const acceptedSourcesSha256 = acceptedDigest.digest('hex');
+        const database = resolve(staged, `${profileId}.sqlite`);
+        const result = projectPortableDatabase(database, profileId, portable, { phase });
+        for (const file of portable.originals()) verifyPortableOriginal(root, profileId, file);
+        if (JSON.stringify(pins) !== JSON.stringify(pinProfileInputs(root, profileId)))
+          throw new Error('Pinned generations or mapping inputs changed during startup');
+        phases[currentPhase!] = (phases[currentPhase!] || 0) + performance.now() - phaseStart;
+        Object.assign(activeMetric, {
+          outcome: 'success',
+          totalMs: performance.now() - profileStart,
+          personal: pins.personal,
+          curation: pins.curation,
+          mappings: pins.mappings,
+          acceptedSourcesSha256,
+          inputBytes: originalBytes + pins.curation.bytes + historyBytes + pins.mappings.bytes,
+          inputRecords: portable
+            .tableNames()
+            .reduce((sum, table) => sum + portable.rowCount(table), 0),
+          sourceRecords: portable.rowCount('source_records'),
+          originalFiles: portable.originalCount,
+          historyGenerations,
+          chats,
+          counts: result.counts,
+          databaseBytes: result.databaseBytes,
+          logicalSha256: result.logicalSha256,
+          peakMemoryBytes: process.resourceUsage().maxRSS * 1024,
+        });
+        activeMetric = null;
+      } finally {
+        portable.close();
       }
-      // Conversations stay in place, but corrupt current journals block startup.
-      const chats = listChats(root, profileId).length;
-      const acceptedSourcesSha256 = hash(
-        JSON.stringify(
-          [...portable.originals.values()]
-            .map((file) => [file.path, file.sha256, file.bytes])
-            .sort(),
-        ),
-      );
-      const database = resolve(staged, `${profileId}.sqlite`);
-      const result = (projectPortableDatabase as unknown as ProjectPortable)(
-        database,
-        profileId,
-        portable,
-        { phase },
-      );
-      for (const file of portable.originals.values()) {
-        const bytes = readFileSync(profileOriginal(root, file.path, profileId));
-        if (bytes.length !== file.bytes || hash(bytes) !== file.sha256)
-          throw new Error('Accepted originals changed during startup');
-      }
-      if (JSON.stringify(pins) !== JSON.stringify(pinProfileInputs(root, profileId)))
-        throw new Error('Pinned generations or mapping inputs changed during startup');
-      phases[currentPhase!] = (phases[currentPhase!] || 0) + performance.now() - phaseStart;
-      Object.assign(activeMetric, {
-        outcome: 'success',
-        totalMs: performance.now() - profileStart,
-        personal: pins.personal,
-        curation: pins.curation,
-        mappings: pins.mappings,
-        acceptedSourcesSha256,
-        inputBytes:
-          [...portable.originals.values()].reduce((sum, file) => sum + file.bytes, 0) +
-          pins.curation.bytes +
-          historyBytes +
-          pins.mappings.bytes,
-        inputRecords: Object.values(portable.rows).reduce((sum, rows) => sum + rows.length, 0),
-        sourceRecords: portable.rows.source_records.length,
-        originalFiles: portable.originals.size,
-        historyGenerations,
-        chats,
-        counts: result.counts,
-        databaseBytes: result.databaseBytes,
-        logicalSha256: result.logicalSha256,
-        peakMemoryBytes: process.resourceUsage().maxRSS * 1024,
-      });
-      activeMetric = null;
     }
     currentProfile = null;
     announce('activate');

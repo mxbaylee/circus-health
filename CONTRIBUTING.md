@@ -6,7 +6,7 @@ Thank you for helping improve Circus Health. This repository handles sensitive s
 
 Install Node.js 24.19 or newer for contributor checks. Root npm commands launch the product through Docker Compose and LiteLLM. Read the [code organization reference](docs/architecture/code-organization.md), [security model](docs/security/model.md), and the maintained contract related to your change.
 
-Native server, browser and benchmark-tooling checks also require `qpdf` on `PATH` for scoped original PDF extraction: install it with `brew install qpdf` on macOS or `sudo apt-get install qpdf` on Debian/Ubuntu. These checks must exercise native PDF extraction rather than skip it when the executable is missing. The application image includes qpdf, and the Linux test jobs install it before the relevant suites.
+Native server, browser, acceptance and benchmark-tooling checks also require `qpdf` on `PATH` for scoped original PDF extraction: install it with `brew install qpdf` on macOS or `sudo apt-get install qpdf` on Debian/Ubuntu. These checks must exercise native PDF extraction rather than skip it when the executable is missing. The application image includes qpdf, and the Linux test jobs install it before the relevant suites.
 
 Server source-capture fixtures also require Tesseract and English language data: `brew install tesseract` on macOS or `sudo apt-get install tesseract-ocr tesseract-ocr-eng` on Debian/Ubuntu. `tesseract --list-langs` must include `eng`. The application image and CI server jobs install these prerequisites; this does not replace the separately opted-in packaged OCR qualification.
 
@@ -70,19 +70,100 @@ Routine Node suites use `src/scripts/test-suite.ts`. It clears inherited model/p
 
 `npm run test:browser` builds and runs the browser suite. `npm run test:browser:run` uses an already built frontend; finish builds before starting journeys in that checkout. Each file runs alone locally, with isolated app/storage state and a fresh Chromium. The shared browser harness supplies unavailable model/connection stubs unless a journey explicitly provides a scripted bridge. Browser tests require the app and its storage, not a third-party service. Real rendering, focus, PDF workers and WebAuthn stay browser tests; ordinary component and state behavior belongs in `test:ui` or `test:state`.
 
-Routine Node tests default to a 30-second hang guard, browser tests to 60 seconds. Browser actions wait up to five seconds and navigation up to ten; the scope-specific source-review tabs also set their own bounded waits. A whole-test budget covers multiple steps and is not a performance target. The controlled 100-page continuation regression has a separate 180-second budget. Any longer fixture-specific budget needs a concrete integration reason. The runner reports the ten slowest tests above one second, including passes, so rising runtime remains visible. There are no automatic whole-test retries: fix the failed assertion, fixture ordering or infrastructure cause, then rerun explicitly.
+The encrypted Import holdout closes each fixture-controller API connection after its response, starting with the first upload. Its Node-based Playwright API client otherwise retains idle sockets beyond the server's advertised lifetime. This policy covers setup, assertion and fixture-forwarded acknowledgement-loss requests, not ordinary Chromium requests; it adds no retries and preserves request failures, session authorization and server timeouts. It prevents re-pooling rather than purging an already populated client pool, so use it from the first API request to a fresh fixture origin. Separate transport diagnostics still exercise reused connections and resets. A passing fixture does not establish that synchronous server work is responsive.
+
+Routine Node tests default to a 30-second hang guard, browser tests to 60 seconds. Browser actions wait up to five seconds and navigation up to ten; the scope-specific source-review tabs also set their own bounded waits. A whole-test budget covers multiple steps and is not a performance target. The controlled 100-page continuation regression uses a test-local 900-second host hang guard and an 840-second completion wait for 100 durable page reads against an immediate fictional upstream. Its request, page, coverage, no-acceptance and original-hash assertions remain the correctness requirements; these guards do not measure model latency. The continuation runner retains its 180-second default for cases without an explicit timeout, while this case overrides that default. The CI continuation job allows 20 minutes, including dependency setup. The three-step field-correction browser case uses 120 seconds for its three durable edits, intervening reloads and refusal checks, final acceptance and complete saved history. Any longer fixture-specific budget needs a concrete integration reason. The runner reports the ten slowest tests above one second, including passes, so rising runtime remains visible. There are no automatic whole-test retries: fix the failed assertion, fixture ordering or infrastructure cause, then rerun explicitly.
+
+The deferred-unit acceptance fixture uses 90 seconds for real encrypted publication, exact retry and database reconstruction. Each counted-acceptance race has its own host-integration guard and preserves the accepted records and receipt while proving refusal of a stale retry. The four-cycle assistant recovery and three-context private-trace fixtures use 90 seconds for their complete durable host sequences; their request, refusal and redaction assertions are unchanged. The 270KB manual-receipt copy uses 90 seconds for author/source certification, journal reconstruction and replay; the HTTP PDF workflow uses 120 seconds for conversion, review, mapping changes and encrypted reconstruction after SQLite deletion. The 33-record draft handoff fixture uses 120 seconds for native proposal and draft publication, complete policy comparison and two review sessions across cache disposal; reconstruction and handoff counts establish the reuse claim. These controlled fixtures make no model network requests.
+
+The complete 140-question fixture uses a test-local 450-second host guard. Its controlled run took about 351 seconds through exact policy and tokens, late-blocker refusal, answering, cache-loss recovery and final acceptance. Every original assertion is retained; this is neither a model-latency target nor evidence of acceptable interactive performance. Counted collection and physical-head reads remain substantial and are documented in [bounded intake views](docs/data/intake-bounded-views.md).
+
+The off-page package recovery and retained queue-window fixtures each use a
+300-second host hang guard. The former preserves real role/model review,
+clinical acceptance, backup reconstruction and exact retries across 61 members;
+the latter retains 13 groups, complete cursor traversal and changed-source work
+counts. Queue setup omits unused preparations and traverses the same groups in
+two pages. Neither fixture makes live model requests, and these guards do not
+change the original history, acceptance, continuation or browser budgets.
+
+The 257-artifact identity fixture uses a 450-second host guard. Its 449 occurrence
+checks, exact membership, payload-work counters, cancellation and same-byte
+replacement refusal remain the oracle. Retained-history preparation has exceeded
+that guard in required CI; a local pass or an earlier head's timing is not current
+qualification. Diagnose publication separately with the small fictional
+`intake-history-publication.test.ts` before rerunning the original full history.
+The probe separates tree preparation, staging, maintenance, SQL and filesystem API
+work. Its instrumented timings include probe overhead; byte totals, retained
+journal growth and process/connection high-water marks are distinct measurements.
+
+The retained-plan retry fixture uses 300 seconds to publish 65 plans, clear their selected catalog in one version and verify units after cache loss. The off-page proposal-closure fixture uses 180 seconds for 65 questions and 65 unrelated versions, cancellation, atomic publication and reconstruction. The corrected-ownership fixture uses 180 seconds for a committed person correction, 97 retained identity receipts, exact policy comparison, in-history request progress and cancellation cleanup. Their work counts, retained evidence and exact replay assertions determine correctness; these budgets only bound a stalled host fixture.
+
+Browser journeys that need only HTTP access can run the actual server in a separate process so synchronous storage work cannot block the browser controller's event loop. The profile journey uses 180 seconds for four imports, relationship review, encrypted reopen and a second isolated profile. The draft journey also uses 180 seconds for consecutive corrections to two document shapes, restoration after encrypted SQLite cache deletion and resumed acceptance; its cache-rebuilding unlock request shares this whole-test guard. The two-upload batch journey uses 180 seconds for Stop/reload/Resume, two reviewed acceptances and recovery of a lost acknowledgement. The grounding journey uses 120 seconds for original checks before and after a real process restart, encrypted profile reopen and final acceptance. The exact clinical-destination journey uses 120 seconds for three reviewed destinations, their saved pages and DTOs, retained original bytes, and a final encrypted reload; its five-second Saved-link assertion remains unchanged. Browser action deadlines remain unchanged.
+
+After the first batch acceptance, the browser fixture observes the fresh pending
+feed request caused by Back to Import and requires its successful completion
+before checking the next card. An older record-scoped response cannot satisfy
+that barrier. The existing card deadline and whole-test guard still apply.
+
+The server suite includes the real encrypted 5,001-file/10,002-entry package qualification. It validates interrupted inventory, public upload/plan activation and reconstruction after deleting the encrypted SQLite cache; its explicit longer hang guard accommodates that complete integration. Server CI jobs allow 30 minutes including the other tests and setup. Work counts and exact recovered evidence determine correctness, not completion within a product latency target. Run this focused file when changing its authority or activation path; do not repeat it unchanged during unrelated UI iteration.
 
 Browser assertions wait for the state they inspect: a queue count or network response can arrive before the associated view renders. Use bounded locator waits and controlled response ordering. Chromium closes when a test is cancelled, and the runtime registers writer cleanup before browser launch.
 
+The draft-recovery upload assertion includes child-process diagnostics only on
+failure. Its checkpoint selects output received since the upload began from the
+existing 8,000-character buffer. A single event-loop turn allows queued output to
+arrive; it is not a child-process barrier or proof that concurrent output belongs
+to the failed request.
+
 Coordinator tests should observe published journal checkpoints before asserting state or simulating the next model result. A dispatch callback can run before its `running` checkpoint is saved. Await terminal publication and assert whether it is `complete` or `paused`, rather than polling for one assumed outcome until a short wall-clock deadline expires. Keep a whole-test timeout as a hang guard, and explicitly set and restore any environment variable whose absence is part of the fixture.
 
-Node suites run at most two files concurrently, and browser suites run one. These fixtures perform real PDF extraction, encryption and archive rebuilds; allowing concurrency to grow with the host CPU count can starve their bounded waits. HTTP upload tests should observe the automatically queued conversion rather than start a competing conversion immediately after upload. Large report fixtures establish each report-wide identity once; they retain representative row/version counts and full acceptance/rebuild assertions.
+Batch coordinator waits use the owning test's cancellation signal across native host preparation. The appended-selection restart fixture has a 120-second guard for its complete accepted-journal reconstruction and exact operation replay; that recovery measured about a minute on the qualification host. Proposal counts, model-job counts and the recovered selections remain the correctness checks.
 
-The workflows in `.github/workflows/` run the full validation lanes on pull requests and remain useful for reproducing individual jobs or shards locally when CI failures persist. Server and browser lanes each use two deterministic file shards in the workflow, with fail-fast disabled so one failure does not hide another lane's results. Each browser runner builds assets once; the unit lane owns type checking. The ordinary `build` command still includes type checking. To reproduce a workflow shard locally, append `-- --test-shard=1/2` (or `2/2`) to the corresponding Node suite command. Console logs retain assertions and the slow-test summary. On GitHub Actions, the reporter also publishes up to 50 bounded failure annotations containing test names and error causes, with an explicit omission notice if more failures occur. These help identify failures when full logs are unavailable; they do not change test results or budgets. Reruns are explicit validation runs, not a mechanism to turn a flaky test green.
+The explicit partial Resume fixture uses 90 seconds for six synthetic request
+windows, three retained stalls, coordinator recreation and another exact proposal;
+its cumulative request accounting and no-acceptance checks stay intact. The native
+fallback-reference fixture uses 120 seconds for publication of 96 unrelated
+candidates and 96 historical occurrences, complete policy/token parity and
+cancellation cleanup. Their complete host runs measured about 44 and 68 seconds,
+respectively; these guards do not constrain model response time.
+
+The native repair-scope fixture uses 120 seconds for repeated complete policy
+preparations over 96 retained drafts, including cancellation, cross-source
+invalidation and scratch cleanup. Its complete host run measured about 36 seconds;
+the policy parity and refusal assertions establish correctness.
+
+The malformed-plan-envelope fixture uses 120 seconds for 17 independent native
+conversion setups followed by validation and unchanged-state checks. Its complete
+host run measured about 46 seconds; every malformed request must still be rejected
+before dispatch.
+
+The superseded identity-receipt fixture uses 300 seconds for publishing 70
+retained historical receipts, complete public review, fresh confirmation and exact
+replay. Its complete host run measured about 235 seconds; the original 120-second
+guard did not cover that sequence. Header visits, counted read bytes and exact
+confirmation/replay results remain the evidence. This guard is not a response-time
+target or a claim of constant history cost.
+
+Node suites run at most two files concurrently; browser and retained-history suites run one. These fixtures perform real PDF extraction, encryption and archive rebuilds; allowing concurrency to grow with the host CPU count can starve their bounded waits. HTTP upload tests should observe the automatically queued conversion rather than start a competing conversion immediately after upload. Large report fixtures establish each report-wide identity once; they retain representative row/version counts and full acceptance/rebuild assertions.
+
+The workflows in `.github/workflows/` run the full validation lanes on pull requests and remain useful for reproducing individual jobs or shards locally when CI failures persist. Server tests use sixteen deterministic file shards and browser tests use six, with fail-fast disabled so one failure does not hide another lane's results. Server jobs retain a 30-minute budget; browser jobs allow 20 minutes including setup. These finite host budgets cover large encrypted recovery and browser journeys and do not establish product latency. Each browser runner builds assets once; the unit lane owns type checking. The ordinary `build` command still includes type checking. To reproduce a server shard locally, append `-- --test-shard=1/16` through `16/16` to `npm run test:server`; for a browser shard, append `-- --test-shard=1/6` through `6/6` to `npm run test:browser:run`. Console logs retain assertions and the slow-test summary. On GitHub Actions, the reporter also publishes up to 50 bounded failure annotations containing test names and error causes, with an explicit omission notice if more failures occur. These help identify failures when full logs are unavailable; they do not change test results or budgets. Reruns are explicit validation runs, not a mechanism to turn a flaky test green.
+
+The complete artifact-history and superseded-receipt fixtures run serially in
+`npm run test:history`, separate from server shards so they do not compete with
+another test file on the same runner. Both remain in `npm test` and in the
+aggregate-required `history` CI job. The 257-artifact/449-occurrence and 70-receipt
+fixtures, their 450/300-second case guards, and all assertions are unchanged.
+The history job has a 20-minute setup/execution budget and uses the same sanitized
+routine environment; it needs no live provider or extra native dependency.
+The suite-partition regression checks that server, history and continuation cover
+every routine server file exactly once. This is execution isolation, not a claim
+that fixture work is constant or that an earlier isolated pass qualifies CI.
 
 Static-render fixtures using Vite middleware mode disable both `hmr` and `ws`. Disabling hot reload alone leaves the WebSocket server enabled in the pinned Vite version, causing concurrent fixtures to compete for its default port.
 
-Local validation includes `npm run test:tools` for the qualification/benchmark oracles and `npm run test:continuation` for the controlled 100-page automatic-continuation regression. The latter explicitly sets `CRS_PDF_CONTROLLED_TEST=1` and requires qpdf. It verifies the first real 64-request boundary, productive continuation at later unit boundaries, exact page delivery and final coverage; a fixed total number of contexts is not the contract. These use fictional local fixtures and a scripted upstream; real-provider qualification remains a separate opt-in command described in [import performance diagnostics](docs/import/import-performance.md#representative-provider-qualification).
+Local validation includes `npm run test:tools` for qualification/benchmark oracles and `npm run test:acceptance` for the complete fictional HTTP acceptance and encrypted-cache recovery fixture. The acceptance file runs exactly once in its dedicated suite and remains included in `npm test`. Its required CI job installs qpdf and has a finite 25-minute budget including dependency setup. This isolates acceptance from the unit job's tools/state sequence. The complete 64-record fixture uses a 1,200-second case guard and a 360-second request guard for actual HTTP acceptance, exact retry, encrypted-cache removal and complete recovered-state checks. The controlled qualification takes about 1,170 seconds; these are finite host hang guards, not product latency targets, and all original assertions remain. Reproduce the lane locally with `npm run test:acceptance`; it uses the same environment sanitization as other routine Node suites and needs no live model, provider account, LiteLLM or Compose service.
+
+`npm run test:continuation` runs the controlled 100-page automatic-continuation regression. It explicitly sets `CRS_PDF_CONTROLLED_TEST=1` and requires qpdf. It verifies the first real 64-request boundary, productive continuation at later unit boundaries, exact page delivery and final coverage; a fixed total number of contexts is not the contract. These use fictional local fixtures and a scripted upstream; real-provider qualification remains a separate opt-in command described in [import performance diagnostics](docs/import/import-performance.md#representative-provider-qualification).
 
 The [intake mutation qualification](docs/data/intake-mutation-qualification.md#accounting-boundaries) has a small actual-application regression in ordinary server CI and a dedicated 300-cycle host check enabled by `CRS_INTAKE_MUTATION_QUALIFY=1` with its documented direct Node command. Routine suite launchers clear that opt-in. A small CI pass does not replace current 100/200/300 receipts, later small-mutation evidence and reconstruction checks when claiming full growth qualification; retain partial or failed runs as partial evidence.
 
@@ -90,7 +171,7 @@ For work-count qualification, detach mutable counters, including nested groups, 
 
 The offline local proxy checks build the pinned LiteLLM compatibility image and run its response, native PDF translation, diagnostics and fictional OAuth tests without external network access. These test the adapter and persistence logic, not real account authentication or provider PDF acceptance. Deployment/container and real-provider qualification remain separately opt-in procedures.
 
-The [hosted passkey checker](docs/security/hosted-passkey-checker.md) has an independent static build (`npm run build:passkey-checker`) and a manual publication workflow restricted to reviewed `main`. Its generated assets belong only on `gh-pages`; it does not build or deploy the health application. Controlled checker tests are development evidence, never physical qualification receipts.
+The [hosted passkey checker](docs/security/hosted-passkey-checker.md) has an independent static build (`npm run build:passkey-checker`) and a publication workflow that runs on pushes to reviewed `main` or manual dispatch from `main`. Its generated assets belong only on `gh-pages`; it does not build or deploy the health application. Controlled checker tests are development evidence, never physical qualification receipts.
 
 Update documentation with contract changes. Cite current implementation and tests for security or durability claims. Keep open requirements and evidence limits intact; fixture tests do not prove real provider, device, filesystem, or model behavior.
 

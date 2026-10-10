@@ -3,6 +3,7 @@ import {
   previewRecordCorrection,
   correctClinicalRecord,
   type RecordCorrectionInput,
+  type CorrectionEvidenceContext,
 } from './record-corrections.ts';
 import {
   previewDuplicateDecision,
@@ -196,7 +197,13 @@ export function applyClinicalDecision(
   profileId: string,
   kind: ReviewKind,
   input: ClinicalDecisionInput,
-  { exportFn = exportCuration }: { exportFn?: ExportCuration } = {},
+  {
+    exportFn = exportCuration,
+    supporting,
+  }: {
+    exportFn?: ExportCuration;
+    supporting?: CorrectionEvidenceContext['supporting'];
+  } = {},
 ) {
   owner(db, profileId);
   if (!reviewedKinds.has(kind))
@@ -227,6 +234,7 @@ export function applyClinicalDecision(
         ? previewRecordCorrection(db, reviewInput(input) as RecordCorrectionInput, {
             root,
             profileId,
+            supporting,
           })
         : previewDuplicateDecision(db, reviewInput(input) as unknown as DuplicatePreviewInput);
     if (preview.token !== input.previewToken || preview.version !== input.version)
@@ -240,7 +248,7 @@ export function applyClinicalDecision(
       () => {
         result =
           kind === 'clinical_correction'
-            ? correctClinicalRecord(db, input, operationId, { root, profileId })
+            ? correctClinicalRecord(db, input, operationId, { root, profileId, supporting })
             : saveDuplicateDecision(
                 db,
                 (preview as DuplicatePreview).left,

@@ -1,23 +1,46 @@
 import { clearSourceContextClassificationCache } from './intake-source-context-classification.ts';
 import { archiveRefusal } from './archive-refusal.ts';
+import { vaultSessionUnlockAuthorized } from './vault-app.ts';
+import { passkeyUnlockAuthorized } from './profile-passkeys.ts';
+import { authorizationSignalAborted } from './authorization-signal.ts';
 import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
-import { prepareManualSourceCopy, stageManualSourceCopy } from './intake-manual-copy.ts';
+import { clearIdentityGrounding } from './intake-identity-grounding.ts';
+import { clearPackageSourceSession } from './intake-package-session.ts';
+import {
+  prepareManualSourceCopy,
+  stageManualSourceCopy,
+  disposeManualSourceCopyPlan,
+} from './intake-manual-copy.ts';
 import { personDisplayKey } from '../shared/person-display.ts';
 import { randomUUID, randomBytes } from 'node:crypto';
 import {
-  mkdirSync,
+  mkdirSync as rawMkdirSync,
   readFileSync,
   existsSync,
   readdirSync,
   lstatSync,
-  rmSync,
-  cpSync,
+  rmSync as rawRmSync,
+  cpSync as rawCpSync,
   statSync,
   realpathSync,
+  renameSync,
+  openSync,
+  fsyncSync,
+  closeSync,
 } from 'node:fs';
+import {
+  withManagedPhysicalMutation,
+  captureManagedPhysicalEpoch,
+  managedPhysicalEpochCurrent,
+} from './clinical-review-physical-epoch.ts';
+
+const mkdirSync: typeof rawMkdirSync = (...args) =>
+  withManagedPhysicalMutation(() => rawMkdirSync(...args));
+const rmSync: typeof rawRmSync = (...args) => withManagedPhysicalMutation(() => rawRmSync(...args));
+const cpSync: typeof rawCpSync = (...args) => withManagedPhysicalMutation(() => rawCpSync(...args));
 import { resolve, relative, isAbsolute } from 'node:path';
 import {
   importDiagnostics,
@@ -25,6 +48,18 @@ import {
   type ImportDiagnostics,
 } from './import-diagnostics.ts';
 import { performance } from 'node:perf_hooks';
+import { rm as removeRuntime, opendir, lstat, mkdtemp } from 'node:fs/promises';
+import { Worker } from 'node:worker_threads';
+import {
+  prepareEncryptedUnlock,
+  unlockAuthorityWitness,
+  assertUnlockAuthority,
+  unlockPathIdentity,
+  type PreparedUnlock,
+  type UnlockAuthorityWitness,
+} from './encrypted-profile-preparation.ts';
+import type { UnlockPhysicalWitness } from './encrypted-unlock-physical.ts';
+import { unlockPhysicalDigest, unlockPhysicalIdentity } from './encrypted-unlock-physical.ts';
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite';
 import type { Server, ServerResponse } from 'node:http';
 import {
@@ -32,6 +67,9 @@ import {
   HttpError,
   LATEST_SCHEMA_VERSION,
   transaction,
+  managedDatabaseMethodEpoch,
+  withoutManagedDatabaseCallbacks,
+  prepareManagedDatabaseCallbackBarrier,
   type Database,
 } from './database.ts';
 import { durableWrite, attachPersonalDurability } from './portable.ts';
@@ -57,12 +95,19 @@ import {
   type VaultKey,
   type WrappedKey,
 } from './vault-crypto.ts';
-import { openVault, hashFile, type Vault, type VaultRecordStorage } from './vault-store.ts';
+import {
+  openVault,
+  openVaultAsync,
+  hashFile,
+  type Vault,
+  type VaultRecordStorage,
+} from './vault-store.ts';
 import { onboardingIdentity } from './profile-onboarding.ts';
 import { validPersonIcon } from '../shared/person-icon.ts';
 import {
   rebuildRecordDatabase,
   verifyRecordAuthorityHead,
+  flushRecordDurability,
   type DurableRecordVersion,
 } from './record-versions.ts';
 import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
@@ -73,6 +118,7 @@ import {
 } from './intake-batch-journal.ts';
 import {
   prepareProductionIntakeStateCopy,
+  disposeIntakeStateCopyPlan,
   stageIntakeStateCopy,
   validateProductionIntakeAuthority,
 } from './intake-state-bootstrap.ts';
@@ -127,6 +173,13 @@ export interface OpenedProfile {
   db: Database;
   recordStorage: VaultRecordStorage;
   metrics: { cacheHit: boolean; loadMs: number };
+  /** Fixed numeric cold/recovery work, distinct from current operation counters. */
+  recoveryWork?: PreparedUnlock['work'] & {
+    physicalWitnessEntries: number;
+    physicalWitnessMetadataBytes: number;
+    physicalCheckedEntries: number;
+    mainVaultCheckpoints: number;
+  };
   app: { server: Server; close(reason?: string): void } | null;
   requests: Set<ServerResponse>;
   closing: boolean;
@@ -158,6 +211,7 @@ interface OpenOptions {
   placebo?: boolean;
   copyState?: OpenedProfile;
   pendingActivation?: boolean;
+  readonlyAuthority?: boolean;
 }
 
 type RecordVersion = DurableRecordVersion;
@@ -179,6 +233,9 @@ interface VerifyInput {
 interface VerifyOptions {
   /** The HTTP caller enforces its current source-session authorization here. */
   authorizeCopySource?: (profileId: string) => void;
+  signal?: AbortSignal;
+  assertAuthorized?: () => void;
+  authorization?: object;
 }
 
 interface RemoveInput {
@@ -202,6 +259,8 @@ export interface CreateEncryptedProfilesOptions {
   diagnostics?: ImportDiagnostics;
   /** Injectable filesystem observation for controlled capacity tests. */
   availableRuntimeBytes?: () => number | null;
+  /** Payload-free controlled host checkpoints for runtime qualification. */
+  unlockCheckpoint?: (phase: 'preparation' | 'vault' | 'publication') => void;
 }
 
 const idValid = (id: unknown): id is string =>
@@ -242,7 +301,43 @@ export function createEncryptedProfiles({
   runtimeDirectory,
   diagnostics = importDiagnostics,
   availableRuntimeBytes = () => runtimeCapacity(runtimeDirectory).reportedAvailableBytes,
+  unlockCheckpoint,
 }: CreateEncryptedProfilesOptions) {
+  let managerApi: object;
+  const setupUnlockAuthorizations = new WeakMap<
+    object,
+    {
+      setupId: string;
+      setup: SetupState;
+      owner?: object;
+      signal?: AbortSignal;
+      source?: OpenedProfile;
+      sourceId?: string;
+      sourceDirectory?: string;
+      sourceAuthority?: UnlockAuthorityWitness;
+    }
+  >();
+  const setupUnlockAuthorization = (
+    setupId: string,
+    setup: SetupState,
+    owner?: object,
+    signal?: AbortSignal,
+    source?: OpenedProfile,
+    sourceAuthority?: UnlockAuthorityWitness,
+  ) => {
+    const token = Object.freeze({});
+    setupUnlockAuthorizations.set(token, {
+      setupId,
+      setup,
+      owner,
+      signal,
+      source,
+      sourceId: source?.id,
+      sourceDirectory: source ? pathFor(source.id) : undefined,
+      sourceAuthority,
+    });
+    return token;
+  };
   const data = realpathSync(dataDirectory),
     registryPath = resolve(data, 'profiles.json'),
     profilesDir = resolve(data, 'profiles'),
@@ -317,7 +412,14 @@ export function createEncryptedProfiles({
   };
   const opened = new Map<string, OpenedProfile>(),
     setups = new Map<string, SetupState>();
+  const preparing = new Map<string, AbortController>();
+  const copyDependents = new Map<string, Set<AbortController>>();
+  const cancelCopies = (id: string) => {
+    for (const attempt of copyDependents.get(id) ?? [])
+      attempt.abort(Error('Copy source access changed'));
+  };
   let registryPublished = !!registryStat;
+  let registryIdentity = registryStat ? unlockPathIdentity(registryPath) : null;
   const pathFor = (id: unknown): string => {
     if (!idValid(id)) throw new HttpError(404, 'PROFILE_NOT_FOUND', 'Profile not found');
     const p = resolve(profilesDir, id);
@@ -329,6 +431,7 @@ export function createEncryptedProfiles({
     durableWrite(registryPath, jsonBytes(published));
     registry = published;
     registryPublished = true;
+    registryIdentity = unlockPathIdentity(registryPath);
   };
   const keyring = (id: string): ProfileKeyring => {
     const path = resolve(pathFor(id), 'keyring.json');
@@ -340,8 +443,11 @@ export function createEncryptedProfiles({
       throw archiveRefusal('Profile keyring', 'This profile cannot be unlocked.');
     }
   };
-  const writeKeyring = (id: string, value: ProfileKeyring): void =>
+  const writeKeyring = (id: string, value: ProfileKeyring): void => {
+    preparing.get(id)?.abort(Error('Profile keyring changed'));
+    cancelCopies(id);
     durableWrite(resolve(pathFor(id), 'keyring.json'), jsonBytes(value));
+  };
   function bytesBelow(path: string): number {
     if (!existsSync(path)) return 0;
     const s = lstatSync(path);
@@ -355,12 +461,24 @@ export function createEncryptedProfiles({
     if (!c) throw new HttpError(404, 'PROFILE_NOT_FOUND', 'Profile not found');
     return { ...c, locked: !opened.has(id), storageBytes: bytesBelow(pathFor(id)) };
   }
-  function refreshCard(state: OpenedProfile): void {
-    const identity = selfIdentity(state.db) as {
+  async function storageBytesAsync(path: string, signal?: AbortSignal): Promise<number> {
+    signal?.throwIfAborted();
+    const stat = await lstat(path);
+    if (stat.isSymbolicLink()) throw Error('Profile storage cannot contain links');
+    if (!stat.isDirectory()) return stat.size;
+    let bytes = 0;
+    for await (const entry of await opendir(path))
+      bytes += await storageBytesAsync(resolve(path, entry.name), signal);
+    return bytes;
+  }
+  function refreshCard(
+    state: OpenedProfile,
+    identity = selfIdentity(state.db) as {
       name: string;
       icon: string;
       nameVersion: number;
-    };
+    },
+  ): void {
     const c = registry.profiles.find((p) => p.id === state.id);
     if (
       c &&
@@ -404,8 +522,13 @@ export function createEncryptedProfiles({
       placebo = false,
       copyState,
       pendingActivation = false,
+      readonlyAuthority = false,
     }: OpenOptions = {},
   ): OpenedProfile {
+    if (preparing.has(id)) {
+      key.fill(0);
+      throw new HttpError(409, 'PROFILE_PREPARING', 'This profile is already opening');
+    }
     if (opened.has(id)) {
       key.fill(0);
       return opened.get(id)!;
@@ -415,13 +538,17 @@ export function createEncryptedProfiles({
       root = resolve(runtime, id),
       workspace = resolve(root, 'data/profiles', id),
       dbPath = resolve(root, 'db/database.sqlite');
+    const stage = <T>(phase: string, operation: () => T): T =>
+      measureImportPhase(phase, operation, {}, { profileId: id }, diagnostics);
     // A previous process's runtime is never an authority.
     rmSync(root, { recursive: true, force: true });
     mkdirSync(root, { recursive: true, mode: 0o700 });
     ensureProfileDirectories(root, id);
     let vault: Vault;
     try {
-      vault = openVault({ directory, profileId: id, key, initialize: initial });
+      vault = stage('profile_vault_open', () =>
+        openVault({ directory, profileId: id, key, initialize: initial }),
+      );
     } catch (error) {
       key.fill(0);
       rmSync(root, { recursive: true, force: true });
@@ -434,6 +561,8 @@ export function createEncryptedProfiles({
     let disposeOriginalResolver = () => {};
     let disposeBatchPublication = () => {};
     try {
+      if (readonlyAuthority && vault.recordStorage().read('head') === null)
+        throw Error('Selected accepted record history is missing');
       // A selected accepted head always wins, including publication followed by
       // an exception before verification/activation acknowledged its success.
       if (vault.recordStorage().read('head') !== null) {
@@ -455,7 +584,9 @@ export function createEncryptedProfiles({
         'PROFILE_RUNTIME_CAPACITY',
         'to unlock this profile with its required workspace and one configured upload',
       );
-      vault.materialize(workspace, { exclude: deferredOriginal });
+      stage('profile_workspace_materialize', () =>
+        vault.materialize(workspace, { exclude: deferredOriginal }),
+      );
       disposeBatchPublication = registerIntakeBatchPublication(root, id, (names) =>
         vault.trackWorkspaceFiles(workspace, names),
       );
@@ -476,8 +607,9 @@ export function createEncryptedProfiles({
             'The original file is missing from the encrypted archive',
           );
       });
-      const recordStorage = vault.recordStorage(() =>
-        vault.syncWorkspace(workspace, { ...workspaceSyncOptions, publishNow: false }),
+      const recordStorage = vault.recordStorage(
+        () => vault.syncWorkspace(workspace, { ...workspaceSyncOptions, publishNow: false }),
+        workspace,
       );
       const verifyReferences = (versions: RecordVersion[]): void => {
         for (const v of versions) {
@@ -511,11 +643,13 @@ export function createEncryptedProfiles({
       };
       const rebuildHistory = () => {
         try {
-          return rebuildRecordDatabase(dbPath, {
-            profileId: id,
-            storage: recordStorage,
-            verifyReferences,
-          });
+          return stage('profile_record_replay', () =>
+            rebuildRecordDatabase(dbPath, {
+              profileId: id,
+              storage: recordStorage,
+              verifyReferences,
+            }),
+          );
         } catch {
           throw archiveRefusal(
             'Profile accepted record history',
@@ -527,44 +661,45 @@ export function createEncryptedProfiles({
       if (initial) {
         if (copyState) {
           const intakePlan = prepareProductionIntakeStateCopy(copyState.db, copyState.id, id);
-          const manualPlan = prepareManualSourceCopy(
-            copyState.db,
-            copyState.root,
-            copyState.id,
-            id,
-          );
-          copyState.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-          mkdirSync(resolve(root, 'db'), { recursive: true, mode: 0o700 });
-          cpSync(copyState.db.location()!, dbPath);
-          // Rebind projection ownership before opening under the new profile.
-          const copied = new DatabaseSync(dbPath);
+          let manualPlan: ReturnType<typeof prepareManualSourceCopy> | undefined;
           try {
-            transaction(copied, () => {
-              copied.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
-              for (const [table, column] of [
-                ['source_files', 'path'],
-                ['assets', 'stored_path'],
-              ])
-                copied
-                  .prepare(`UPDATE ${table} SET ${column}=replace(${column},?,?)`)
-                  .run(`data/profiles/${copyState!.id}/`, `data/profiles/${id}/`);
-              rebindCopiedIntakeSourceText(copied, copyState!.id, id);
-              for (const t of copied
-                .prepare(
-                  "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'",
-                )
-                .all())
-                copied.exec(`DROP TABLE IF EXISTS "${(t.name as string).replaceAll('"', '""')}"`);
-              const publication = {
-                profileId: id,
-                readSelectedHead: () => recordStorage.read('head'),
-              };
-              stageIntakeStateCopy(copied, intakePlan, publication);
-              stageManualSourceCopy(copied, manualPlan, publication);
-              validateProductionIntakeAuthority(copied, id);
-            });
+            manualPlan = prepareManualSourceCopy(copyState.db, copyState.root, copyState.id, id);
+            copyState.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+            mkdirSync(resolve(root, 'db'), { recursive: true, mode: 0o700 });
+            cpSync(copyState.db.location()!, dbPath);
+            // Rebind projection ownership before opening under the new profile.
+            const copied = new DatabaseSync(dbPath);
+            try {
+              transaction(copied, () => {
+                copied.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
+                for (const [table, column] of [
+                  ['source_files', 'path'],
+                  ['assets', 'stored_path'],
+                ])
+                  copied
+                    .prepare(`UPDATE ${table} SET ${column}=replace(${column},?,?)`)
+                    .run(`data/profiles/${copyState!.id}/`, `data/profiles/${id}/`);
+                rebindCopiedIntakeSourceText(copied, copyState!.id, id);
+                for (const t of copied
+                  .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'",
+                  )
+                  .all())
+                  copied.exec(`DROP TABLE IF EXISTS "${(t.name as string).replaceAll('"', '""')}"`);
+                const publication = {
+                  profileId: id,
+                  readSelectedHead: () => recordStorage.read('head'),
+                };
+                stageIntakeStateCopy(copied, intakePlan, publication);
+                stageManualSourceCopy(copied, manualPlan!, publication);
+                validateProductionIntakeAuthority(copied, id);
+              });
+            } finally {
+              copied.close();
+            }
           } finally {
-            copied.close();
+            if (manualPlan) disposeManualSourceCopyPlan(manualPlan);
+            disposeIntakeStateCopyPlan(intakePlan);
           }
           // Copy selected durable evidence only. Plaintext workspace changes
           // cannot silently publish new source authority while making a copy.
@@ -658,7 +793,9 @@ export function createEncryptedProfiles({
             cacheHit = true;
           } catch {
             if (db) {
+              clearPackageSourceSession(db);
               clearIntakeStateCache(db);
+              clearIdentityGrounding(db);
               clearIntakeLookupCache(db);
               clearSourceContextClassificationCache(db);
               clearSourceTextProjectionCache(db);
@@ -686,13 +823,15 @@ export function createEncryptedProfiles({
         }
       }
       try {
-        validateProductionIntakeAuthority(db, id);
-        (attachPersonalDurability as unknown as AttachVaultDurability)(db, {
-          root,
-          profileId: id,
-          recordStorage,
-          verifyReferences,
-        });
+        stage('profile_intake_validation', () => validateProductionIntakeAuthority(db!, id));
+        stage('profile_durability_attach', () =>
+          (attachPersonalDurability as unknown as AttachVaultDurability)(db!, {
+            root,
+            profileId: id,
+            recordStorage,
+            verifyReferences,
+          }),
+        );
       } catch (error) {
         if (!cacheHit) {
           if (initial) throw error;
@@ -701,7 +840,9 @@ export function createEncryptedProfiles({
             'This profile’s records and history are unavailable.',
           );
         }
+        clearPackageSourceSession(db);
         clearIntakeStateCache(db);
+        clearIdentityGrounding(db);
         clearIntakeLookupCache(db);
         clearSourceContextClassificationCache(db);
         clearSourceTextProjectionCache(db);
@@ -710,13 +851,15 @@ export function createEncryptedProfiles({
         for (const suffix of ['', '-wal', '-shm']) rmSync(dbPath + suffix, { force: true });
         rebuildHistory();
         db = openDatabase(dbPath, id);
-        validateProductionIntakeAuthority(db, id);
-        (attachPersonalDurability as unknown as AttachVaultDurability)(db, {
-          root,
-          profileId: id,
-          recordStorage,
-          verifyReferences,
-        });
+        stage('profile_intake_validation', () => validateProductionIntakeAuthority(db!, id));
+        stage('profile_durability_attach', () =>
+          (attachPersonalDurability as unknown as AttachVaultDurability)(db!, {
+            root,
+            profileId: id,
+            recordStorage,
+            verifyReferences,
+          }),
+        );
         cacheHit = false;
       }
       writeProfileRegistry(root, [
@@ -737,7 +880,7 @@ export function createEncryptedProfiles({
         disposeOriginalResolver,
         disposeBatchPublication,
       };
-      if (!pendingActivation) installOpened(state);
+      if (!pendingActivation) stage('profile_runtime_install', () => installOpened(state));
       return state;
     } catch (e) {
       discardFailedOpen(
@@ -752,11 +895,16 @@ export function createEncryptedProfiles({
     );
     refreshCard(state);
     opened.set(state.id, state);
+    attachOpenedDiagnostics(state);
+  }
+  function attachOpenedDiagnostics(state: OpenedProfile, checkpoint?: () => void): void {
     diagnostics.attachSummaryStore(state.id, {
       read: () => state.vault.readPerformanceSummary(),
       write: (bytes) => state.vault.writePerformanceSummary(bytes),
     });
+    checkpoint?.();
     diagnostics.attachEventStore(state.id, state.vault.diagnosticChunks());
+    checkpoint?.();
   }
   function discardFailedOpen(
     state: Pick<
@@ -782,7 +930,9 @@ export function createEncryptedProfiles({
     cleanup(() => clearIntakeBatchJournalCache(state.root, state.id));
     if (state.db) {
       const db = state.db;
+      cleanup(() => clearPackageSourceSession(db));
       cleanup(() => clearIntakeStateCache(db));
+      cleanup(() => clearIdentityGrounding(db));
       cleanup(() => clearIntakeLookupCache(db));
       cleanup(() => clearSourceContextClassificationCache(db));
       cleanup(() => clearSourceTextProjectionCache(db));
@@ -974,11 +1124,761 @@ export function createEncryptedProfiles({
       throw error;
     }
   }
+  async function setupWorker<T>(
+    id: string,
+    key: VaultKey,
+    authority: UnlockAuthorityWitness,
+    controller: AbortController,
+    witnessDirectory: string,
+    setup: object,
+    checkpoint: () => void,
+    sourceKey?: VaultKey,
+  ): Promise<T> {
+    return prepareEncryptedUnlock<T>(
+      {
+        dataDirectory: data,
+        runtimeDirectory: runtime,
+        profileId: id,
+        key,
+        authority,
+        signal: controller.signal,
+        availableRuntimeBytes: availableRuntimeBytes(),
+        witnessDirectory,
+        checkpoint,
+      },
+      (workerData, transferList) => {
+        const sourceCopy = sourceKey ? Uint8Array.from(sourceKey) : undefined;
+        try {
+          return new Worker(new URL('./encrypted-setup-worker.ts', import.meta.url), {
+            workerData: { ...(workerData as object), setup: { ...setup, sourceKey: sourceCopy } },
+            transferList: sourceCopy ? [...transferList, sourceCopy.buffer] : transferList,
+          });
+        } catch (error) {
+          sourceCopy?.fill(0);
+          throw error;
+        }
+      },
+    );
+  }
+  interface InspectedSetup {
+    details: SetupDetails;
+    published: boolean;
+    physicalWitness: UnlockPhysicalWitness;
+  }
+  async function verifyAsync(
+    setupId: string,
+    input: VerifyInput,
+    { signal, assertAuthorized, authorizeCopySource, authorization }: VerifyOptions = {},
+  ) {
+    const setup = setups.get(setupId);
+    if (!setup || setup.expires < Date.now())
+      throw new HttpError(410, 'SETUP_EXPIRED', 'Restart profile setup.');
+    if (input.acknowledged !== true)
+      throw new HttpError(
+        400,
+        'RECOVERY_ACKNOWLEDGMENT',
+        'Download and acknowledge your recovery key first',
+      );
+    if (registry.profiles.some((p) => p.id === setup.id))
+      return unlockWithKeyAsync(setup.id, secretKey(setup.id, input.recovery), {
+        signal,
+        authorization: setupUnlockAuthorization(setupId, setup, authorization, signal),
+        assertAuthorized: () => {
+          assertAuthorized?.();
+          if (setups.get(setupId) !== setup || setup.expires < Date.now())
+            throw Error('Setup access changed');
+        },
+      });
+    const id = setup.id,
+      key = secretKey(id, input.recovery),
+      controller = new AbortController();
+    if (preparing.has(id)) {
+      key.fill(0);
+      throw new HttpError(409, 'PROFILE_PREPARING', 'This profile is already opening');
+    }
+    preparing.set(id, controller);
+    const abort = () => controller.abort(signal?.reason);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    let stageData: string | undefined;
+    let witnessDirectory: string | undefined,
+      source: OpenedProfile | undefined,
+      sourceAuthority: UnlockAuthorityWitness | undefined,
+      sourceHead: string | undefined;
+    let adopted = false,
+      sourcePhysicalWitness: UnlockPhysicalWitness | undefined;
+    try {
+      if (!registryPublished) writeRegistry();
+      let authority = unlockAuthorityWitness(pathFor(id));
+      const check = (effects = true) => {
+        if (authorizationSignalAborted(controller.signal)) throw Error('Setup access changed');
+        if (effects) assertAuthorized?.();
+        if (
+          preparing.get(id) !== controller ||
+          setups.get(setupId) !== setup ||
+          setup.expires < Date.now() ||
+          registry.profiles.some((p) => p.id === id) ||
+          unlockPathIdentity(registryPath) !== registryIdentity
+        )
+          throw Error('Setup access changed');
+        if (
+          !effects &&
+          authorization &&
+          !vaultSessionUnlockAuthorized(authorization, managerApi, 'setup:' + setupId)
+        )
+          throw Error('Setup authorization changed');
+        assertUnlockAuthority(pathFor(id), authority);
+        if (source) {
+          if (effects) authorizeCopySource?.(source.id);
+          if (
+            opened.get(source.id) !== source ||
+            Object.getOwnPropertyDescriptor(source, 'closing')?.value !== false ||
+            (effects && source.recordStorage.read('head')?.toString('utf8') !== sourceHead)
+          )
+            throw Error('Copy source changed');
+          assertUnlockAuthority(pathFor(source.id), sourceAuthority!);
+          if (effects) flushRecordDurability(source.db);
+        }
+      };
+      const checkPublication = () => check();
+      check();
+      witnessDirectory = await mkdtemp(resolve(runtime, '.unlock-physical-'));
+      const inspected = await setupWorker<InspectedSetup>(
+        id,
+        key,
+        authority,
+        controller,
+        witnessDirectory,
+        { task: 'inspect' },
+        check,
+      );
+      check();
+      const details = inspected.details;
+      if (details.profileId !== id || typeof details.name !== 'string' || !details.name.trim())
+        throw new HttpError(400, 'SETUP_INVALID', 'This recovery file could not resume setup');
+      requireDistinctProfile(details.name, details.icon || 'person', id);
+      let physicalWitness = inspected.physicalWitness;
+      if (!inspected.published) {
+        if (details.copyFrom) {
+          authorizeCopySource?.(details.copyFrom);
+          source = opened.get(details.copyFrom);
+          if (!source || source.closing)
+            throw new HttpError(
+              423,
+              'PROFILE_LOCKED',
+              'Unlock the original profile before completing its copy',
+            );
+          flushRecordDurability(source.db);
+          sourceAuthority = unlockAuthorityWitness(pathFor(source.id));
+          sourceHead = source.recordStorage.read('head')?.toString('utf8');
+          if (!sourceHead) throw Error('Copy source history missing');
+          let dependents = copyDependents.get(source.id);
+          if (!dependents) copyDependents.set(source.id, (dependents = new Set()));
+          dependents.add(controller);
+        }
+        // Ciphertext staging shares the archive filesystem so immutable moves
+        // and the selected-manifest transition remain atomic across mounts.
+        stageData = resolve(pathFor(id), `.setup-stage-${randomUUID()}`);
+        mkdirSync(stageData, { mode: 0o700 });
+        check();
+        const staged = await setupWorker<{
+          physicalWitness: UnlockPhysicalWitness;
+          sourcePhysicalWitness?: UnlockPhysicalWitness;
+          manifestPath: string;
+          manifestIdentity: string;
+          manifestDigest: string;
+          originalRootIdentity: string;
+          selectedHead: string;
+        }>(
+          id,
+          key,
+          authority,
+          controller,
+          witnessDirectory,
+          {
+            task: 'prepare',
+            physicalWitness,
+            details,
+            stageData,
+            sourceId: source?.id,
+            sourceAuthority,
+            sourceHead,
+          },
+          check,
+          source?.key,
+        );
+        sourcePhysicalWitness = staged.sourcePhysicalWitness;
+        check();
+        unlockCheckpoint?.('publication');
+        checkPublication();
+        const physicalEpoch = captureManagedPhysicalEpoch();
+        if (!physicalEpoch) throw Error('Setup physical evidence is being changed');
+        const verifyPhysical = async (
+          profileId: string,
+          witness: UnlockPhysicalWitness,
+          witnessName: string,
+        ) => {
+          const result = await prepareEncryptedUnlock<{ checked: number }>(
+            {
+              dataDirectory: data,
+              runtimeDirectory: runtime,
+              profileId,
+              key: Buffer.alloc(32),
+              authority,
+              signal: controller.signal,
+              availableRuntimeBytes: null,
+              witnessDirectory,
+            },
+            (workerData, transferList) =>
+              new Worker(new URL('./encrypted-unlock-physical-worker.ts', import.meta.url), {
+                workerData: { ...(workerData as object), physicalWitness: witness, witnessName },
+                transferList,
+              }),
+          );
+          if (result.checked !== witness.entries) throw Error('Setup physical evidence changed');
+        };
+        await verifyPhysical(id, staged.physicalWitness, 'physical.sqlite');
+        if (source) await verifyPhysical(source.id, staged.sourcePhysicalWitness!, 'source.sqlite');
+        check(false);
+        if (
+          !managedPhysicalEpochCurrent(physicalEpoch) ||
+          unlockPhysicalIdentity(resolve(pathFor(id), 'vault')).value !==
+            staged.originalRootIdentity ||
+          unlockPhysicalIdentity(staged.manifestPath).value !== staged.manifestIdentity ||
+          unlockPhysicalDigest(staged.manifestPath) !== staged.manifestDigest
+        )
+          throw Error('Setup physical evidence changed');
+        // Immutable additions are unselected until this single durable authority
+        // transition. A crash afterward resumes the accepted, inactive profile.
+        withManagedPhysicalMutation(() => {
+          renameSync(staged.manifestPath, resolve(pathFor(id), 'vault/manifest.enc'));
+          const fd = openSync(resolve(pathFor(id), 'vault'), 'r');
+          try {
+            fsyncSync(fd);
+          } finally {
+            closeSync(fd);
+          }
+        });
+        const ownedRootIdentity = unlockPhysicalIdentity(resolve(pathFor(id), 'vault')).value;
+        if (
+          ownedRootIdentity.split(':').slice(0, 2).join(':') !==
+          staged.originalRootIdentity.split(':').slice(0, 2).join(':')
+        )
+          throw Error('Setup publication changed');
+        const publishedManifestIdentity = unlockPhysicalIdentity(
+          resolve(pathFor(id), 'vault/manifest.enc'),
+        ).value;
+        if (
+          publishedManifestIdentity.split(':').slice(0, 4).join(':') !==
+          staged.manifestIdentity.split(':').slice(0, 4).join(':')
+        )
+          throw Error('Setup publication changed');
+        authority = unlockAuthorityWitness(pathFor(id));
+        if (!authority.manifest.endsWith(`:${staged.manifestDigest}`))
+          throw Error('Setup publication changed');
+        const finished = await setupWorker<{ physicalWitness: UnlockPhysicalWitness }>(
+          id,
+          key,
+          authority,
+          controller,
+          witnessDirectory,
+          {
+            task: 'finish',
+            physicalWitness: staged.physicalWitness,
+            manifestIdentity: publishedManifestIdentity,
+            ownedRootIdentity,
+          },
+          check,
+        );
+        physicalWitness = finished.physicalWitness;
+        await removeRuntime(stageData, { recursive: true, force: true });
+        stageData = undefined;
+      }
+      check();
+      const pendingEntry = {
+        id,
+        name: details.name,
+        icon: details.icon || 'person',
+        placebo: details.placebo,
+        nameVersion: 1,
+        version: 1,
+      };
+      const result = await unlockWithKeyAsync(
+        id,
+        key,
+        {
+          signal: controller.signal,
+          assertAuthorized: check,
+          authorization: setupUnlockAuthorization(
+            setupId,
+            setup,
+            authorization,
+            controller.signal,
+            source,
+            sourceAuthority,
+          ),
+        },
+        {
+          entry: pendingEntry,
+          authority,
+          physicalWitness,
+          witnessDirectory,
+          controller,
+          async terminalVerification() {
+            if (!source) return;
+            const result = await prepareEncryptedUnlock<{ checked: number }>(
+              {
+                dataDirectory: data,
+                runtimeDirectory: runtime,
+                profileId: source.id,
+                key: Buffer.alloc(32),
+                authority: sourceAuthority!,
+                signal: controller.signal,
+                availableRuntimeBytes: null,
+                witnessDirectory,
+              },
+              (workerData, transferList) =>
+                new Worker(new URL('./encrypted-unlock-physical-worker.ts', import.meta.url), {
+                  workerData: {
+                    ...(workerData as object),
+                    physicalWitness: sourcePhysicalWitness,
+                    witnessName: 'source.sqlite',
+                  },
+                  transferList,
+                }),
+            );
+            if (result.checked !== sourcePhysicalWitness!.entries)
+              throw Error('Copy source physical evidence changed');
+          },
+          commit() {
+            const ring = keyring(id);
+            ring.active = true;
+            durableWrite(resolve(pathFor(id), 'keyring.json'), jsonBytes(ring));
+            writeRegistry({ ...registry, profiles: [...registry.profiles, pendingEntry] });
+          },
+        },
+      );
+      adopted = true;
+      return result;
+    } finally {
+      if (!adopted) key.fill(0);
+      if (source) {
+        const dependents = copyDependents.get(source.id);
+        dependents?.delete(controller);
+        if (!dependents?.size) copyDependents.delete(source.id);
+      }
+      if (preparing.get(id) === controller) preparing.delete(id);
+      signal?.removeEventListener('abort', abort);
+      if (stageData) await removeRuntime(stageData, { recursive: true, force: true });
+      if (witnessDirectory) await removeRuntime(witnessDirectory, { recursive: true, force: true });
+    }
+  }
   function unlock(id: string, recovery: unknown) {
     card(id);
     const key = secretKey(id, recovery);
     const state = open(id, key);
     return { ...card(id), metrics: state.metrics };
+  }
+  async function unlockWithKeyAsync(
+    id: string,
+    key: VaultKey,
+    {
+      signal,
+      assertAuthorized,
+      authorization,
+    }: {
+      signal?: AbortSignal;
+      assertAuthorized?: () => void;
+      authorization?: object;
+    } = {},
+    activation?: {
+      entry: ProfileRegistry['profiles'][number];
+      authority: UnlockAuthorityWitness;
+      physicalWitness: UnlockPhysicalWitness;
+      witnessDirectory: string;
+      controller: AbortController;
+      terminalVerification?(): Promise<void>;
+      commit(): void;
+    },
+  ) {
+    const entry = activation?.entry ?? registry.profiles.find((profile) => profile.id === id);
+    if (!entry) {
+      key.fill(0);
+      throw new HttpError(404, 'PROFILE_NOT_FOUND', 'Profile not found');
+    }
+    if (opened.has(id)) {
+      key.fill(0);
+      signal?.throwIfAborted();
+      assertAuthorized?.();
+      const state = opened.get(id)!;
+      const storageBytes = await storageBytesAsync(pathFor(id), signal);
+      signal?.throwIfAborted();
+      assertAuthorized?.();
+      if (opened.get(id) !== state || state.closing)
+        throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+      return {
+        ...registry.profiles.find((p) => p.id === id)!,
+        locked: false,
+        storageBytes,
+        metrics: state.metrics,
+      };
+    }
+    if (preparing.has(id) && preparing.get(id) !== activation?.controller) {
+      key.fill(0);
+      throw new HttpError(409, 'PROFILE_PREPARING', 'This profile is already opening');
+    }
+    let directory: string;
+    try {
+      directory = pathFor(id);
+    } catch (error) {
+      key.fill(0);
+      throw error;
+    }
+    const controller = activation?.controller ?? new AbortController();
+    preparing.set(id, controller);
+    const abort = () => controller.abort(signal?.reason);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    const root = resolve(runtime, id),
+      workspace = resolve(root, 'data/profiles', id),
+      dbPath = resolve(root, 'db/database.sqlite');
+    let vault: Vault | undefined;
+    let db: Database | undefined;
+    let disposeOriginalResolver = () => {};
+    let disposeBatchPublication = () => {};
+    let installed = false;
+    let diagnosticsPrepared = false;
+    let witnessDirectory: string | undefined;
+    try {
+      const authority = activation?.authority ?? unlockAuthorityWitness(directory);
+      const entryCurrent = () =>
+        activation
+          ? !registry.profiles.some((p) => p.id === id)
+          : registry.profiles.find((p) => p.id === id) === entry;
+      const ownerCurrent = () => {
+        if (!authorization) return true;
+        const setup = setupUnlockAuthorizations.get(authorization);
+        if (setup)
+          return (
+            setup.setup.id === id &&
+            (!setup.signal || !authorizationSignalAborted(setup.signal)) &&
+            setups.get(setup.setupId) === setup.setup &&
+            setup.setup.expires >= Date.now() &&
+            (!setup.source ||
+              (Map.prototype.get.call(opened, setup.sourceId) === setup.source &&
+                Object.getOwnPropertyDescriptor(setup.source, 'closing')?.value === false)) &&
+            (!setup.owner ||
+              vaultSessionUnlockAuthorized(setup.owner, managerApi, 'setup:' + setup.setupId))
+          );
+        return (
+          vaultSessionUnlockAuthorized(authorization, managerApi, 'profile:' + id) ||
+          passkeyUnlockAuthorized(authorization, managerApi, id)
+        );
+      };
+      const checkpoint = (phase: 'preparation' | 'vault' | 'publication' = 'preparation') => {
+        controller.signal.throwIfAborted();
+        if (
+          preparing.get(id) !== controller ||
+          !entryCurrent() ||
+          registryIdentity === null ||
+          unlockPathIdentity(registryPath) !== registryIdentity
+        )
+          throw Error('Encrypted profile preparation changed');
+        assertAuthorized?.();
+        if (!ownerCurrent()) throw Error('Encrypted profile authorization changed');
+        assertUnlockAuthority(directory, authority);
+        unlockCheckpoint?.(phase);
+        controller.signal.throwIfAborted();
+        if (!entryCurrent() || unlockPathIdentity(registryPath) !== registryIdentity)
+          throw Error('Encrypted profile preparation changed');
+        assertAuthorized?.();
+        assertUnlockAuthority(directory, authority);
+      };
+      checkpoint();
+      witnessDirectory =
+        activation?.witnessDirectory ?? (await mkdtemp(resolve(runtime, '.unlock-physical-')));
+      checkpoint();
+      const prepared = await prepareEncryptedUnlock({
+        dataDirectory: data,
+        runtimeDirectory: runtime,
+        profileId: id,
+        key,
+        authority,
+        signal: controller.signal,
+        availableRuntimeBytes: availableRuntimeBytes(),
+        checkpoint,
+        witnessDirectory,
+        physicalWitness: activation?.physicalWitness,
+      });
+      checkpoint();
+      let mainVaultCheckpoints = 0;
+      const preparedCheckpoint = () => {
+        mainVaultCheckpoints++;
+        checkpoint('vault');
+        if (
+          unlockPathIdentity(root, true) !== prepared.rootIdentity ||
+          unlockPathIdentity(dbPath) !== prepared.databaseIdentity
+        )
+          throw Error('Encrypted profile preparation changed');
+      };
+      vault = await openVaultAsync({ directory, profileId: id, key }, preparedCheckpoint);
+      preparedCheckpoint();
+      const recordStorage = vault.recordStorage(
+        () => vault!.syncWorkspace(workspace, { ...workspaceSyncOptions, publishNow: false }),
+        workspace,
+      );
+      if (recordStorage.read('head')?.toString('utf8') !== prepared.selectedHead)
+        throw Error('Encrypted profile preparation changed');
+      db = openDatabase(dbPath, id);
+      const indexed = db.prepare('SELECT head_json FROM __record_state WHERE singleton=1').get();
+      const selected = JSON.parse(prepared.selectedHead) as unknown;
+      if (
+        !indexed ||
+        JSON.stringify(JSON.parse(String(indexed.head_json))) !== JSON.stringify(selected)
+      )
+        throw Error('Prepared projection does not match selected history');
+      const verifyReferences = (versions: RecordVersion[]) => {
+        for (const version of versions) {
+          if (version.deleted) continue;
+          const row = version.contents;
+          const path = (
+            version.entity === 'source_files'
+              ? row.path
+              : version.entity === 'assets'
+                ? row.stored_path
+                : null
+          ) as string | null;
+          if (!path) continue;
+          const prefix = `data/profiles/${id}/`;
+          if (
+            !path.startsWith(prefix) ||
+            path.includes('\\') ||
+            path.split('/').some((part) => part === '.' || part === '..')
+          )
+            throw Error('Original reference escaped its profile');
+          const target = resolve(root, path);
+          if (existsSync(target)) {
+            if (
+              realpathSync(target) !== target ||
+              statSync(target).size !== row.bytes ||
+              hashFile(target) !== row.sha256
+            )
+              throw Error('Original evidence is missing or changed');
+          } else if (
+            !vault!.verifyFile(path.slice(prefix.length), Number(row.bytes), String(row.sha256))
+          )
+            throw Error('Original evidence is missing or changed');
+        }
+      };
+      (attachPersonalDurability as unknown as AttachVaultDurability)(db, {
+        root,
+        profileId: id,
+        recordStorage,
+        verifyReferences,
+      });
+      disposeBatchPublication = registerIntakeBatchPublication(root, id, (names) =>
+        vault!.trackWorkspaceFiles(workspace, names),
+      );
+      disposeOriginalResolver = registerProfileOriginalResolver(root, id, (path) => {
+        const name = path.slice(`data/profiles/${id}/`.length);
+        const object = vault!.fileMetadata(name);
+        if (!object)
+          throw new HttpError(
+            404,
+            'MISSING_FILE',
+            'The original file is missing from the encrypted archive',
+          );
+        requireRuntime(object.bytes, 'ORIGINAL_RUNTIME_CAPACITY', 'to open this retained original');
+        if (!vault!.materializeFile(name, workspace))
+          throw new HttpError(
+            404,
+            'MISSING_FILE',
+            'The original file is missing from the encrypted archive',
+          );
+      });
+      const state: OpenedProfile = {
+        id,
+        key,
+        vault,
+        root,
+        workspace,
+        db,
+        recordStorage,
+        metrics: prepared.metrics,
+        recoveryWork: {
+          ...prepared.work,
+          physicalWitnessEntries: prepared.physicalWitness.entries,
+          physicalWitnessMetadataBytes: prepared.physicalWitness.metadataBytes,
+          physicalCheckedEntries: 0,
+          mainVaultCheckpoints,
+        },
+        app: null,
+        requests: new Set(),
+        closing: false,
+        disposeOriginalResolver,
+        disposeBatchPublication,
+      };
+      const identity = selfIdentity(db) as { name: string; icon: string; nameVersion: number };
+      registerProfileDisplayGuard(db, (name, icon) => requireDistinctProfile(name, icon, id));
+      // Injectable installation effects run while the target remains private;
+      // terminal validation and cancellation checks follow every callback.
+      const attachedDatabaseIdentity = unlockPathIdentity(dbPath);
+      const dataVersion = db.prepare('PRAGMA data_version').get()!.data_version;
+      const walIdentity = () =>
+        existsSync(dbPath + '-wal') ? unlockPathIdentity(dbPath + '-wal') : null;
+      const attachedWalIdentity = walIdentity();
+      diagnosticsPrepared = true;
+      attachOpenedDiagnostics(state, () => {
+        checkpoint();
+        if (
+          unlockPathIdentity(root, true) !== prepared.rootIdentity ||
+          unlockPathIdentity(dbPath) !== attachedDatabaseIdentity ||
+          walIdentity() !== attachedWalIdentity ||
+          db!.prepare('PRAGMA data_version').get()!.data_version !== dataVersion
+        )
+          throw Error('Encrypted profile preparation changed');
+      });
+      checkpoint('publication');
+      // Caller effects finish before either original physical roster is closed.
+      assertAuthorized?.();
+      if (!ownerCurrent()) throw Error('Encrypted profile authorization changed');
+      prepareManagedDatabaseCallbackBarrier(db);
+      const terminalSql = {
+        data: db.prepare('PRAGMA data_version'),
+        main: db.prepare('PRAGMA main.schema_version'),
+        temp: db.prepare('PRAGMA temp.schema_version'),
+        changes: db.prepare('SELECT CAST(total_changes() AS TEXT) AS n'),
+        head: db.prepare('SELECT head_json FROM __record_state WHERE singleton=1'),
+      };
+      const terminalState = {
+        main: terminalSql.main.get()!.schema_version,
+        temp: terminalSql.temp.get()!.schema_version,
+        changes: terminalSql.changes.get()!.n,
+        methods: managedDatabaseMethodEpoch(db),
+        prepare: db.prepare,
+        exec: db.exec,
+      };
+      if (
+        !terminalState.methods ||
+        terminalSql.data.get()!.data_version !== dataVersion ||
+        JSON.stringify(JSON.parse(String(terminalSql.head.get()?.head_json))) !==
+          JSON.stringify(selected)
+      )
+        throw Error('Encrypted profile preparation changed');
+      const physicalEpoch = captureManagedPhysicalEpoch();
+      if (!physicalEpoch) throw Error('Encrypted profile physical evidence is being changed');
+      await activation?.terminalVerification?.();
+      const checked = await prepareEncryptedUnlock<{ checked: number }>(
+        {
+          dataDirectory: data,
+          runtimeDirectory: runtime,
+          profileId: id,
+          // Physical verification needs no profile decryption key.
+          key: Buffer.alloc(32),
+          authority,
+          signal: controller.signal,
+          availableRuntimeBytes: null,
+          witnessDirectory,
+        },
+        (workerData, transferList) =>
+          new Worker(new URL('./encrypted-unlock-physical-worker.ts', import.meta.url), {
+            workerData: { ...(workerData as object), physicalWitness: prepared.physicalWitness },
+            transferList,
+          }),
+      );
+      if (checked.checked !== prepared.physicalWitness.entries)
+        throw Error('Encrypted profile physical evidence changed');
+      await removeRuntime(witnessDirectory, { recursive: true, force: true });
+      witnessDirectory = undefined;
+      // No callbacks or await after this closing seal. Opening the prepared DB
+      // may change its timestamps, but never its original file identity.
+      controller.signal.throwIfAborted();
+      if (
+        preparing.get(id) !== controller ||
+        !ownerCurrent() ||
+        !entryCurrent() ||
+        unlockPathIdentity(registryPath) !== registryIdentity ||
+        !managedPhysicalEpochCurrent(physicalEpoch)
+      )
+        throw Error('Encrypted profile preparation changed');
+      assertUnlockAuthority(directory, authority);
+      const setupOwner = authorization && setupUnlockAuthorizations.get(authorization);
+      if (setupOwner?.sourceDirectory && setupOwner.sourceAuthority)
+        assertUnlockAuthority(setupOwner.sourceDirectory, setupOwner.sourceAuthority);
+      if (
+        unlockPathIdentity(root, true) !== prepared.rootIdentity ||
+        unlockPathIdentity(dbPath) !== attachedDatabaseIdentity ||
+        attachedDatabaseIdentity.split(':').slice(0, 2).join(':') !==
+          prepared.databaseIdentity.split(':').slice(0, 2).join(':') ||
+        walIdentity() !== attachedWalIdentity ||
+        db.prepare !== terminalState.prepare ||
+        db.exec !== terminalState.exec ||
+        managedDatabaseMethodEpoch(db) !== terminalState.methods ||
+        !withoutManagedDatabaseCallbacks(
+          db,
+          () =>
+            terminalSql.main.get()!.schema_version === terminalState.main &&
+            terminalSql.temp.get()!.schema_version === terminalState.temp &&
+            terminalSql.changes.get()!.n === terminalState.changes &&
+            terminalSql.data.get()!.data_version === dataVersion &&
+            JSON.stringify(JSON.parse(String(terminalSql.head.get()?.head_json))) ===
+              JSON.stringify(selected),
+        ) ||
+        managedDatabaseMethodEpoch(db) !== terminalState.methods ||
+        !managedPhysicalEpochCurrent(physicalEpoch) ||
+        !ownerCurrent()
+      )
+        throw Error('Encrypted profile preparation changed');
+      state.recoveryWork!.physicalCheckedEntries = checked.checked;
+      activation?.commit();
+      refreshCard(state, identity);
+      opened.set(id, state);
+      installed = true;
+      return {
+        ...registry.profiles.find((p) => p.id === id)!,
+        locked: false,
+        storageBytes: prepared.storageBytes,
+        metrics: prepared.metrics,
+      };
+    } catch (error) {
+      const errors = [error];
+      const cleanup = (operation: () => void) => {
+        try {
+          operation();
+        } catch (failure) {
+          errors.push(failure);
+        }
+      };
+      const partial = opened.get(id);
+      if (partial?.key === key) {
+        opened.delete(id);
+      }
+      cleanup(disposeOriginalResolver);
+      cleanup(disposeBatchPublication);
+      if (db?.isOpen) cleanup(() => db!.close());
+      cleanup(() => vault?.close());
+      key.fill(0);
+      if (diagnosticsPrepared) cleanup(() => diagnostics.detachSummaryStore(id));
+      try {
+        await removeRuntime(root, { recursive: true, force: true });
+      } catch (failure) {
+        errors.push(failure);
+      }
+      if (witnessDirectory) {
+        try {
+          await removeRuntime(witnessDirectory, { recursive: true, force: true });
+        } catch (failure) {
+          errors.push(failure);
+        }
+      }
+      if (errors.length > 1)
+        throw new AggregateError(errors, 'Encrypted profile opening failed during cleanup');
+      throw error;
+    } finally {
+      if (!installed) key.fill(0);
+      if (preparing.get(id) === controller) preparing.delete(id);
+      signal?.removeEventListener('abort', abort);
+    }
   }
   function flush(id: string, { duringLock = false }: { duringLock?: boolean } = {}): void {
     const state = opened.get(id);
@@ -996,6 +1896,8 @@ export function createEncryptedProfiles({
     );
   }
   function lock(id: string) {
+    cancelCopies(id);
+    preparing.get(id)?.abort(new HttpError(423, 'PROFILE_LOCKED', 'Profile opening was cancelled'));
     const state = opened.get(id);
     if (!state) return card(id);
     state.closing = true;
@@ -1008,7 +1910,9 @@ export function createEncryptedProfiles({
         schemaVersion: LATEST_SCHEMA_VERSION,
       });
     } finally {
+      clearPackageSourceSession(state.db);
       clearIntakeStateCache(state.db);
+      clearIdentityGrounding(state.db);
       clearIntakeLookupCache(state.db);
       clearSourceContextClassificationCache(state.db);
       clearSourceTextProjectionCache(state.db);
@@ -1070,11 +1974,115 @@ export function createEncryptedProfiles({
       key.fill(0);
     }
   }
-  return {
+  async function resumeAsync(
+    recovery: unknown,
+    {
+      signal,
+      assertAuthorized,
+      authorization,
+    }: {
+      signal?: AbortSignal;
+      assertAuthorized?: () => void;
+      authorization?: object;
+    } = {},
+  ) {
+    const ownerCurrent = () =>
+      !authorization || vaultSessionUnlockAuthorized(authorization, managerApi, 'resume');
+    const id = (recovery as Partial<RecoveryKit> | null)?.profileId;
+    if (!idValid(id))
+      throw new HttpError(
+        400,
+        'RECOVERY_FILE',
+        'Use the downloaded recovery file to resume interrupted setup',
+      );
+    const key = secretKey(id, recovery),
+      entry = registry.profiles.find((p) => p.id === id);
+    if (entry) {
+      key.fill(0);
+      signal?.throwIfAborted();
+      assertAuthorized?.();
+      if (!ownerCurrent()) throw Error('Setup authorization changed');
+      return { profileId: id, active: true, name: entry.name };
+    }
+    if (preparing.has(id)) {
+      key.fill(0);
+      throw new HttpError(409, 'PROFILE_PREPARING', 'This profile is already opening');
+    }
+    const controller = new AbortController(),
+      abort = () => controller.abort(signal?.reason);
+    preparing.set(id, controller);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    let witnessDirectory: string | undefined;
+    try {
+      const authority = unlockAuthorityWitness(pathFor(id));
+      const check = () => {
+        controller.signal.throwIfAborted();
+        assertAuthorized?.();
+        if (!ownerCurrent()) throw Error('Setup authorization changed');
+        if (preparing.get(id) !== controller || registry.profiles.some((p) => p.id === id))
+          throw Error('Setup access changed');
+        assertUnlockAuthority(pathFor(id), authority);
+      };
+      check();
+      witnessDirectory = await mkdtemp(resolve(runtime, '.unlock-physical-'));
+      check();
+      const inspected = await setupWorker<InspectedSetup>(
+        id,
+        key,
+        authority,
+        controller,
+        witnessDirectory,
+        { task: 'inspect' },
+        check,
+      );
+      check();
+      if (
+        inspected.details.profileId !== id ||
+        typeof inspected.details.name !== 'string' ||
+        !inspected.details.name.trim()
+      )
+        throw new HttpError(400, 'SETUP_INVALID', 'This recovery file could not resume setup');
+      const setupId = randomBytes(32).toString('base64url');
+      if (!ownerCurrent()) throw Error('Setup authorization changed');
+      setups.set(setupId, { id, expires: Date.now() + 30 * 60 * 1000 });
+      return { setupId, profileId: id, active: false, name: inspected.details.name };
+    } finally {
+      key.fill(0);
+      if (preparing.get(id) === controller) preparing.delete(id);
+      signal?.removeEventListener('abort', abort);
+      if (witnessDirectory) await removeRuntime(witnessDirectory, { recursive: true, force: true });
+    }
+  }
+  const api = {
     begin,
     resume,
+    resumeAsync,
     verify,
+    verifyAsync,
     unlock,
+    unlockAsync(id: string, recovery: unknown, options?: Parameters<typeof unlockWithKeyAsync>[2]) {
+      return unlockWithKeyAsync(id, secretKey(id, recovery), options);
+    },
+    unlockWithKeyAsync,
+    prepareUnlockWithKey(id: string, key: VaultKey) {
+      return open(id, key, { pendingActivation: true, readonlyAuthority: true });
+    },
+    prepareSetupWithKey(
+      id: string,
+      key: VaultKey,
+      details: SetupDetails,
+      copyState?: OpenedProfile,
+    ) {
+      return open(id, key, { ...details, initial: true, copyState, pendingActivation: true });
+    },
+    preparationStorageBytes(id: string) {
+      return bytesBelow(pathFor(id));
+    },
+    assertProfileExists(id: string) {
+      if (!registry.profiles.some((profile) => profile.id === id))
+        throw new HttpError(404, 'PROFILE_NOT_FOUND', 'Profile not found');
+    },
     lock,
     remove,
     flush,
@@ -1090,6 +2098,7 @@ export function createEncryptedProfiles({
       return card(id);
     },
     close(): void {
+      for (const attempt of preparing.values()) attempt.abort(Error('Application is stopping'));
       const errors: unknown[] = [];
       for (const id of [...opened.keys()])
         try {
@@ -1104,4 +2113,6 @@ export function createEncryptedProfiles({
         );
     },
   };
+  managerApi = api;
+  return api;
 }

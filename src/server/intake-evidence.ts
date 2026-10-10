@@ -1,3 +1,8 @@
+import { currentClinicalOperation } from './clinical-operation.ts';
+import { intakeSourceMetadata } from './intake-state-access.ts';
+import { reviewReadStamp } from './intake-clinical-review-read-cache.ts';
+import { collectionModelIntakePins } from './intake-model-collection-backend.ts';
+import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 import { HttpError } from './database.ts';
 import { isRetainOnlyIntake } from './intake-source-policy.ts';
 import { currentIntakeSourceTextRevisionId, getIntakeSourceText } from './intake-source-text.ts';
@@ -16,8 +21,12 @@ import {
   getIntakeOriginal,
   getRetainedIntakeOriginalReference,
   retainIntakeChildren,
+  ensureNativeIntakeSchema,
   getIntake,
   readIntake,
+  getIntakeEvidenceHeader,
+  verifyIntakeOriginal,
+  readIntakeLiteralWindow,
 } from './intake.ts';
 import {
   indexPdfEvidence,
@@ -30,7 +39,15 @@ import { encodeIntakeImage, intakeImageDataUrl, type IntakeImageMimeType } from 
 import { activeMappingRules } from './clinical-import.ts';
 import { INTAKE_SCHEMA_INSTRUCTIONS } from './intake-format.ts';
 import { modelIntakeEvidenceContext } from './intake-model-context.ts';
-import { inventoryIntakePackage, indexIntakePackage } from './intake-package.ts';
+import {
+  inventoryIntakePackage,
+  inventoryIntakePackagePaged,
+  indexIntakePackage,
+} from './intake-package.ts';
+import {
+  collectionEvidenceModelContext,
+  evidenceSuppliedTarget,
+} from './intake-evidence-collection.ts';
 import {
   diagnosticReasonCode,
   importDiagnostics,
@@ -38,6 +55,7 @@ import {
 } from './import-diagnostics.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type { NavigationIndex } from './intake-navigation.ts';
+import { navigateCollectionEvidence } from './intake-evidence-navigation.ts';
 
 export interface SourceTextCaptureTransition {
   intakeId: string;
@@ -61,12 +79,93 @@ interface EvidenceContext {
   /** Host-negotiated PDF support; direct UI reads leave this disabled. */
   pdf?: boolean;
   diagnostics?: ImportDiagnosticSink;
+  /** Host-selected paged evidence contract; never copied from tool arguments. */
+  pagedContext?: boolean;
+}
+
+type ValidatedText = { stamp: string; revisionId: string; sourceHash: string };
+type NativePdfReceipt = {
+  context: EvidenceContext;
+  stamp: string;
+  binding: string;
+  mappingVersion: string;
+  encodedModel: string;
+  text?: ValidatedText;
+};
+type PdfMediaResult<T> = T &
+  ('imageContent' extends keyof T ? object : { imageContent?: undefined }) &
+  ('pdfContent' extends keyof T ? object : { pdfContent?: undefined }) &
+  ('pdfFallback' extends keyof T ? object : { pdfFallback?: undefined });
+// Receipts follow one actual result, including each separately emitted fallback.
+// They never keep a revision graph or a reader/session alive.
+const nativePdfReceipts = new WeakMap<object, NativePdfReceipt>();
+const countedJson = (db: DatabaseSync, value: unknown) =>
+  withIntakeWork(db, 'warm', () => {
+    const encoded = JSON.stringify(value);
+    recordIntakeWork('serializationCalls');
+    recordIntakeWork('serializedBytes', Buffer.byteLength(encoded));
+    return encoded;
+  });
+function pdfReceiptBinding(context: EvidenceContext, mappingVersion: string) {
+  const { db, root, profileId, id } = context;
+  context.assertRunning?.();
+  const header = getIntakeEvidenceHeader(db, root, profileId, id),
+    pins = collectionModelIntakePins(db, { id }, mappingVersion),
+    revision = currentIntakeSourceTextRevisionId(db, profileId, id);
+  if ([header.filename, header.providerId].some((value) => Buffer.byteLength(value) > 4096))
+    throw Error('Native PDF receipt source metadata changed beyond its bound');
+  verifyIntakeOriginal(db, root, profileId, id);
+  const durability = recordDurabilityStatus(db);
+  if (!durability?.configured || durability.dirty || durability.conflicted || durability.lastError)
+    throw Error('Native PDF evidence requires current accepted authority');
+  const encoded = countedJson(db, [
+    header,
+    pins,
+    revision,
+    durability.sequence,
+    durability.persistedRevision,
+  ]);
+  return withIntakeWork(db, 'warm', () => {
+    recordIntakeWork('hashCalls');
+    recordIntakeWork('hashedBytes', Buffer.byteLength(encoded));
+    return createHash('sha256').update(encoded).digest('hex');
+  });
+}
+function selectPdfReceipt(receipt: NativePdfReceipt) {
+  const { context } = receipt;
+  context.assertRunning?.();
+  // A miss is decided before selecting reuse. Once selected, every guard error
+  // or drift propagates; no callback can turn failed verification into a miss.
+  if (reviewReadStamp(context.db) !== receipt.stamp) return false;
+  const binding = pdfReceiptBinding(context, receipt.mappingVersion);
+  if (binding !== receipt.binding || reviewReadStamp(context.db) !== receipt.stamp)
+    throw Error('Native PDF evidence changed during receipt verification');
+  return true;
+}
+/** Host-only post-read validation. Foreign results and changed-before-admission
+ * receipts retain the original complete source-text validation path. */
+export function assertIntakeEvidenceSourceTextCurrent(
+  context: Pick<EvidenceContext, 'db' | 'root' | 'profileId' | 'id'>,
+  result: unknown,
+) {
+  const receipt = result && typeof result === 'object' ? nativePdfReceipts.get(result) : undefined;
+  if (
+    receipt?.text &&
+    receipt.context.db === context.db &&
+    receipt.context.root === context.root &&
+    receipt.context.profileId === context.profileId &&
+    receipt.context.id === context.id &&
+    selectPdfReceipt(receipt)
+  )
+    return;
+  getIntakeSourceText(context.db, context.root, context.profileId, context.id);
 }
 
 interface NavigateEvidenceContext extends EvidenceContext {
   action: string;
   query?: unknown;
   referenceId?: string;
+  navigationCursor?: string;
 }
 
 interface HtmlSection {
@@ -93,6 +192,8 @@ async function captureForReader(
   context: Parameters<typeof extractIntakeSourceText>[0],
   assertRunning: () => void,
 ) {
+  if (currentClinicalOperation(context.db))
+    throw new Error('Source extraction cannot start or join inside a clinical operation');
   assertRunning();
   let captures = automaticCaptures.get(context.db);
   if (!captures) automaticCaptures.set(context.db, (captures = new Map()));
@@ -153,6 +254,7 @@ export async function captureIntakeSourceTextForRead({
   // than a top-level batch. Capture bounded local evidence before taking the
   // metadata/version snapshot, while leaving original preview reads read-only.
   if (modelContext && captureSourceText && recordDurabilityStatus(db)) {
+    const before = reviewReadStamp(db);
     const prior = getIntakeSourceText(db, root, profileId, id);
     if (sourceTextExtractionPending(prior)) {
       assertRunning();
@@ -172,6 +274,12 @@ export async function captureIntakeSourceTextForRead({
         priorRevisionId: prior.revision?.id ?? null,
         revisionId: captured.sourceText.revision?.id ?? null,
       });
+    } else if (prior.revision && before && reviewReadStamp(db) === before) {
+      return {
+        stamp: before,
+        revisionId: prior.revision.id,
+        sourceHash: prior.revision.sourceHash,
+      } satisfies ValidatedText;
     }
   }
 }
@@ -184,21 +292,80 @@ export function sourceTextReadMetadata(db: DatabaseSync, profileId: string, id: 
   };
 }
 
-export async function readIntakeEvidence({
-  db,
-  root,
-  profileId,
-  id,
-  page = 1,
-  offset = 0,
-  limit,
-  assertRunning = () => {},
-  modelContext = false,
-  captureSourceText = true,
-  onSourceTextCaptured,
-  pdf = false,
-}: EvidenceContext) {
-  await captureIntakeSourceTextForRead({
+function legacyIntakeEvidence(context: EvidenceContext) {
+  const { db, root, profileId, id, offset, limit } = context;
+  return readEvidenceCore(context, {
+    header: () => getIntake(db, root, profileId, id),
+    model: (intake, options) => modelIntakeEvidenceContext(intake, options),
+    window: (model: boolean) =>
+      model
+        ? literalWindow(readIntake(db, root, profileId, id, { offset: offset as number, limit }))
+        : readIntake(db, root, profileId, id, { offset: offset as number, limit }),
+    inventory: inventoryIntakePackage,
+  });
+}
+function pagedIntakeEvidence(context: EvidenceContext) {
+  const { db, root, profileId, id, offset, limit } = context;
+  return readEvidenceCore(context, {
+    header: () => getIntakeEvidenceHeader(db, root, profileId, id),
+    model: (_intake, options) =>
+      collectionEvidenceModelContext(db, profileId, id, options.mappingRulesVersion, options.page),
+    window: () =>
+      readIntakeLiteralWindow(db, root, profileId, id, { offset: offset as number, limit }),
+    inventory: inventoryIntakePackagePaged,
+  });
+}
+export function readIntakeEvidence(
+  context: EvidenceContext & { pagedContext: true },
+): ReturnType<typeof pagedIntakeEvidence>;
+export function readIntakeEvidence(
+  context: EvidenceContext,
+): ReturnType<typeof pagedIntakeEvidence> | ReturnType<typeof legacyIntakeEvidence>;
+export function readIntakeEvidence(context: EvidenceContext) {
+  const paged =
+    context.pagedContext ||
+    getIntakeEvidenceHeader(context.db, context.root, context.profileId, context.id)
+      .workflowState === 'selected';
+  return paged
+    ? pagedIntakeEvidence({ ...context, pagedContext: true })
+    : legacyIntakeEvidence(context);
+}
+
+async function readEvidenceCore<
+  THeader extends { filename: string; mimeType: string; providerId: string },
+  TModel,
+  TWindow,
+  TInventory,
+>(
+  {
+    db,
+    root,
+    profileId,
+    id,
+    page = 1,
+    offset = 0,
+    assertRunning = () => {},
+    modelContext = false,
+    captureSourceText = true,
+    onSourceTextCaptured,
+    pdf = false,
+    pagedContext = false,
+  }: EvidenceContext,
+  access: {
+    header(): THeader;
+    model(
+      header: THeader,
+      options: {
+        page?: number;
+        mappingRules: ReturnType<typeof activeMappingRules>;
+        mappingRulesVersion: string;
+      },
+    ): TModel;
+    window(model: boolean): TWindow;
+    inventory(context: Parameters<typeof inventoryIntakePackage>[0]): Promise<TInventory>;
+  },
+) {
+  const validatedText = await captureIntakeSourceTextForRead({
     db,
     root,
     profileId,
@@ -208,7 +375,7 @@ export async function readIntakeEvidence({
     captureSourceText,
     onSourceTextCaptured,
   });
-  const intake = getIntake(db, root, profileId, id);
+  const intake = access.header();
   if (modelContext && isRetainOnlyIntake(intake))
     throw new HttpError(
       409,
@@ -228,7 +395,7 @@ export async function readIntakeEvidence({
     return {
       instructions: INTAKE_SCHEMA_INSTRUCTIONS,
       mappingRules: modelContext ? modelMappingRules : mappingRules,
-      original: await inventoryIntakePackage({
+      original: await access.inventory({
         db,
         root,
         profileId,
@@ -239,13 +406,12 @@ export async function readIntakeEvidence({
     };
   const isPdf = intake.mimeType === 'application/pdf';
   const file = isPdf ? null : getIntakeOriginal(db, root, profileId, id);
+  const beforeModel = isPdf && modelContext && pagedContext ? reviewReadStamp(db) : undefined;
   const metadata = {
     instructions: INTAKE_SCHEMA_INSTRUCTIONS,
     sourceText: sourceTextReadMetadata(db, profileId, id),
     mappingRules: modelContext ? modelMappingRules : mappingRules,
-    intake: modelContext
-      ? modelIntakeEvidenceContext(intake, { mappingRules, mappingRulesVersion })
-      : intake,
+    intake: modelContext ? access.model(intake, { mappingRules, mappingRulesVersion }) : intake,
     original: isPdf
       ? {
           ...(modelContext ? {} : { intake }),
@@ -256,9 +422,57 @@ export async function readIntakeEvidence({
           complete: false,
           note: 'Original retained. PDF text and visuals are read from bounded page ranges.',
         }
-      : modelContext
-        ? literalWindow(readIntake(db, root, profileId, id, { offset: offset as number, limit }))
-        : readIntake(db, root, profileId, id, { offset: offset as number, limit }),
+      : access.window(modelContext),
+  };
+  let nativeReceipt: NativePdfReceipt | undefined;
+  const initialModel = metadata.intake as unknown as {
+    format?: string;
+    pins?: { sourceHash?: string };
+  };
+  if (
+    beforeModel &&
+    initialModel?.format === 'health-intake-model-evidence-context-v2' &&
+    [root, profileId, id, intake.filename, intake.providerId].every(
+      (value) => Buffer.byteLength(value) <= 4096,
+    ) &&
+    reviewReadStamp(db) === beforeModel
+  ) {
+    const encodedModel = countedJson(db, metadata.intake);
+    if (Buffer.byteLength(encodedModel) <= 16 * 1024) {
+      const context = { db, root, profileId, id, assertRunning },
+        binding = pdfReceiptBinding(context, mappingRulesVersion);
+      if (reviewReadStamp(db) === beforeModel)
+        nativeReceipt = {
+          context,
+          stamp: beforeModel,
+          binding,
+          mappingVersion: mappingRulesVersion,
+          encodedModel,
+          ...(validatedText?.stamp === beforeModel &&
+          validatedText.sourceHash === initialModel.pins?.sourceHash &&
+          currentIntakeSourceTextRevisionId(db, profileId, id) === validatedText.revisionId &&
+          reviewReadStamp(db) === beforeModel
+            ? { text: validatedText }
+            : {}),
+        };
+    }
+  }
+  const rememberPdf = <T extends object>(result: T): PdfMediaResult<T> => {
+    if (nativeReceipt) nativePdfReceipts.set(result, nativeReceipt);
+    return result as PdfMediaResult<T>;
+  };
+  const modelForPdf = () => {
+    if (nativeReceipt && selectPdfReceipt(nativeReceipt))
+      return withIntakeWork(db, 'warm', () => {
+        recordIntakeWork('jsonParseCalls');
+        recordIntakeWork('jsonParseBytes', Buffer.byteLength(nativeReceipt!.encodedModel));
+        return JSON.parse(nativeReceipt!.encodedModel) as TModel;
+      });
+    return access.model(intake, {
+      page: pageNumber,
+      mappingRules,
+      mappingRulesVersion,
+    });
   };
   if (file && ['image/png', 'image/jpeg', 'image/webp'].includes(file.mimeType)) {
     const { loadImage, createCanvas } = await import('@napi-rs/canvas');
@@ -298,7 +512,7 @@ export async function readIntakeEvidence({
   const start = Math.max(0, Math.trunc(Number(offset) || 0));
   const source = { ...retained, profileId };
   let failedNativeReadMs: number | undefined;
-  const present = (
+  const present = async (
     result: PdfEvidencePage | PdfNativeEvidencePage,
     base64Ms: number,
     nativePdfFallback = false,
@@ -308,6 +522,10 @@ export async function readIntakeEvidence({
       ...asset,
       bytes: Buffer.from(asset.bytes),
     }));
+    const children = retainIntakeChildren(db, root, profileId, id, embedded);
+    if (pagedContext)
+      for (const child of children)
+        await ensureNativeIntakeSchema(db, profileId, child.id, { assertRunning });
     // Both visual forms are transient. Retain the exact original page reference,
     // never a generated single-page PDF or image as new durable source evidence.
     const assets = [
@@ -318,7 +536,7 @@ export async function readIntakeEvidence({
         mimeType: 'application/pdf',
         derivative: false,
       },
-      ...retainIntakeChildren(db, root, profileId, id, embedded),
+      ...children,
     ];
     assertRunning();
     const native = 'pdf' in result;
@@ -331,13 +549,7 @@ export async function readIntakeEvidence({
                 'Native PDF input was unavailable for this page; a raster preview of the same original page is supplied.',
             }
           : {}),
-        intake: modelContext
-          ? modelIntakeEvidenceContext(intake, {
-              page: pageNumber,
-              mappingRules,
-              mappingRulesVersion,
-            })
-          : intake,
+        intake: modelContext ? modelForPdf() : intake,
         original: {
           page: pageNumber,
           totalPages: result.totalPages,
@@ -391,7 +603,7 @@ export async function readIntakeEvidence({
     const base64Started = performance.now();
     const imageContent = intakeImageDataUrl(result.image, result.mimeType);
     const base64Ms = Math.max(0, performance.now() - base64Started);
-    return { imageContent, ...present(result, base64Ms, nativePdfFallback) };
+    return rememberPdf({ imageContent, ...(await present(result, base64Ms, nativePdfFallback)) });
   };
   if (!pdf) return raster();
   let result: PdfNativeEvidencePage;
@@ -414,13 +626,13 @@ export async function readIntakeEvidence({
   const base64Started = performance.now();
   const pdfContent = `data:application/pdf;base64,${Buffer.from(result.pdf).toString('base64')}`;
   const base64Ms = Math.max(0, performance.now() - base64Started);
-  return {
+  return rememberPdf({
     pdfContent,
-    ...present(result, base64Ms),
+    ...(await present(result, base64Ms)),
     // Host-only lazy fallback. The bridge invokes this only after an explicit
     // PDF transport rejection; no raster encode is paid on the successful path.
     pdfFallback: () => raster(true),
-  };
+  });
 }
 
 // A navigable index into retained bytes; indexing is not extraction or acceptance.
@@ -431,8 +643,17 @@ export async function indexIntakeEvidence({
   id,
   assertRunning = () => {},
   diagnostics = importDiagnostics,
+  pagedContext = false,
 }: EvidenceContext): Promise<NavigationIndex> {
-  if (getIntake(db, root, profileId, id).mimeType === 'application/zip')
+  const intake = getIntakeEvidenceHeader(db, root, profileId, id);
+  pagedContext ||= intake.workflowState === 'selected';
+  if (pagedContext && intake.mimeType === 'application/zip')
+    throw new HttpError(
+      409,
+      'PACKAGE_PAGED_INVENTORY',
+      'Read the selected package through its bounded inventory pages',
+    );
+  if (intake.mimeType === 'application/zip')
     return (await indexIntakePackage({
       db,
       root,
@@ -440,7 +661,6 @@ export async function indexIntakeEvidence({
       id,
       assertRunning,
     })) as NavigationIndex;
-  const intake = getIntake(db, root, profileId, id);
   if (['image/png', 'image/jpeg', 'image/webp'].includes(intake.mimeType))
     return {
       kind: 'image',
@@ -485,7 +705,8 @@ export async function indexIntakeEvidence({
     return { kind: 'unsupported', sections: [], missingAssets: [], coverage: 'unreadable_binary' };
   }
   const html =
-    /\.html?$/i.test(original.filename) || /<(?:html|table|body)\b/i.test(text.slice(0, 4096));
+    /\.html?$/i.test(original.filenameDescriptor?.suffix ?? original.filename) ||
+    /<(?:html|table|body)\b/i.test(text.slice(0, 4096));
   if (!html)
     return {
       kind: 'text',
@@ -543,7 +764,20 @@ export async function indexIntakeEvidence({
       });
     cursor = range.end;
   }
-  const navigation = htmlNavigationIndex({ db, id, filename: original.filename, text: inert });
+  const parentId = intakeSourceMetadata(db, id).parentSourceFileId;
+  const nativeReferences =
+    pagedContext ||
+    (!!parentId &&
+      getIntakeEvidenceHeader(db, root, profileId, parentId).workflowState === 'selected');
+  const navigation = htmlNavigationIndex({
+    db,
+    id,
+    filename: original.filename,
+    text: inert,
+    ...(nativeReferences
+      ? { suppliedTarget: evidenceSuppliedTarget(db, root, profileId, id) }
+      : {}),
+  });
   missingAssets.push(...navigation.references.filter((reference) => reference.asset));
   for (const section of sections)
     section.sharedHeadings = [
@@ -586,7 +820,30 @@ export async function navigateIntakeEvidence({
   referenceId,
   offset = 0,
   assertRunning = () => {},
+  pagedContext = false,
+  navigationCursor,
 }: NavigateEvidenceContext) {
+  pagedContext ||= getIntakeEvidenceHeader(db, root, profileId, id).workflowState === 'selected';
+  if (pagedContext) {
+    if (offset !== 0 && offset !== undefined)
+      throw new HttpError(
+        400,
+        'NAVIGATION_CURSOR',
+        'Use the version 2 navigation cursor instead of a legacy offset',
+      );
+    if (action !== 'search' && action !== 'follow')
+      throw new HttpError(400, 'NAVIGATION_ACTION', 'Choose search or follow');
+    return navigateCollectionEvidence(
+      { db, root, profileId, id, assertRunning },
+      {
+        format: 'health-intake-navigation-request-v2',
+        action,
+        ...(query === undefined ? {} : { query: typeof query === 'string' ? query : '' }),
+        ...(navigationCursor === undefined ? {} : { cursor: navigationCursor }),
+        ...(referenceId === undefined ? {} : { referenceId }),
+      },
+    );
+  }
   const intake = getIntake(db, root, profileId, id);
   const index: NavigationIndex =
     (intake.workflow!.plans.find((plan) => plan.status === 'active')?.index as NavigationIndex) ||

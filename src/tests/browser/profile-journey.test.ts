@@ -1,36 +1,59 @@
-import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { launchBrowser, newTestPage } from './harness.ts';
+import { startProcessRuntime } from './process-runtime.ts';
+import { fetchFixtureApi } from './fixture-api-request.ts';
+import { stopFixtureImport } from './manual-import-fixture.ts';
+import {
+  fixtureApi,
+  fixtureBrowserResponse,
+  fixtureNativeFeedReady,
+  fixtureNativeRecordReady,
+  fixtureReview,
+} from './native-intake-fixture.ts';
+import type {
+  ClinicalRecordAction,
+  ClinicalRecordSectionPage,
+} from '../../shared/intake-clinical-record-sections.ts';
+import type { IntakeReportAcceptanceResult } from '../../shared/intake.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { NoteHistoryEntry } from '../../shared/api.ts';
-import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
-const unavailableLiteLlm = () => ({
-  available: false,
-  backend: 'litellm',
-  model: 'fictional-browser-alias',
-  readiness: 'unavailable',
-  capabilities: { tools: null, images: null },
-});
-
 test(
   'real browser creates, edits, imports originals, locks and recovers encrypted profiles',
-  { timeout: 60000 },
+  // Four imports, retained relationship review, encrypted reopen and a second
+  // isolated profile form one host journey. Browser action deadlines stay at 5s.
+  { timeout: 180000 },
   async (t) => {
+    const started = performance.now();
+    let phase = 'runtime startup',
+      completed = false;
+    t.after(() => {
+      if (!completed)
+        console.error(
+          'Fictional profile journey interrupted',
+          JSON.stringify({ phase, elapsedMs: Math.round(performance.now() - started) }),
+        );
+    });
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-'));
     const visuals = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');
     mkdirSync(visuals, { recursive: true });
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startBrowserRuntime(t, {
+    const runtime = await startProcessRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       port: 0,
       host: '127.0.0.1',
-      assistantOptions: { availability: unavailableLiteLlm },
+      unavailableModelAlias: 'fictional-browser-alias',
+    });
+    const journeyDiagnostics = runtime.captureDiagnostics();
+    t.after(async () => {
+      if (!completed)
+        console.error('Fictional profile runtime diagnostics', await journeyDiagnostics());
     });
     const browser = await launchBrowser(t);
     t.after(async () => {
@@ -42,21 +65,38 @@ test(
     const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } }),
       errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
-    const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
+    const url = `http://127.0.0.1:${runtime.port}`;
     async function chooseFiles(file: { name: string; mimeType: string; buffer: Buffer }) {
       await page.locator('input[type=file]').waitFor();
       await page.waitForFunction(() => {
         const input = document.querySelector('input[type=file]');
         return input && !(input as HTMLInputElement).disabled;
       });
-      const uploaded = page.waitForResponse(
+      const failedUploadDiagnostics = runtime.captureDiagnostics();
+      const uploaded = fixtureBrowserResponse(
+        page,
         (response) => response.request().method() === 'POST' && response.url().endsWith('/intakes'),
       );
       await page.locator('input[type=file]').setInputFiles(file);
       const response = await uploaded;
-      assert(response.ok(), await response.text());
+      assert(
+        response.ok(),
+        response.ok()
+          ? undefined
+          : JSON.stringify({
+              serverDiagnostics: await failedUploadDiagnostics(),
+              fixture: 'fictional profile journey upload',
+              status: response.status(),
+              error: await response.text(),
+            }),
+      );
+      // This journey reviews known JSONL manually. Finish any admitted background
+      // capture before selecting evidence; an unavailable model must not race it.
+      await stopFixtureImport(page, url, prefix, (await response.json()).data.id);
+      await fixtureNativeFeedReady(page, prefix, () => page.reload());
     }
 
+    phase = 'first profile creation';
     await page.goto(url);
     await page.getByRole('button', { name: 'Create profile', exact: true }).click();
     await page
@@ -114,6 +154,7 @@ test(
       }
       await setupDialog.waitFor({ state: 'hidden' });
     }
+    phase = 'assistant connection';
     await page.getByRole('button', { name: 'Open assistant' }).click();
     const assistant = page.getByRole('dialog', { name: 'Moxie the Assistant' });
     const connection = assistant.getByRole('button', { name: 'Connection: unavailable' });
@@ -150,6 +191,7 @@ test(
     assert.equal(await page.getByText('Annual Planning', { exact: true }).count(), 1);
     await page.goto(url);
     await page.getByPlaceholder('Name shown throughout the app').waitFor();
+    phase = 'profile editing and restoration';
     const saveNow = page.getByRole('button', { name: 'Save now', exact: true });
     assert.equal(await saveNow.isDisabled(), true, 'unchanged Self has nothing to save');
     for (const theme of ['light', 'dark'])
@@ -230,7 +272,28 @@ test(
     await page.getByLabel('Pronouns', { exact: true }).waitFor();
     assert.equal(await page.getByLabel('Pronouns', { exact: true }).inputValue(), 'they/them');
 
+    const profile = (await (await fetchFixtureApi(page.request, url + '/api/profiles')).json())
+      .data[0];
+    const prefix = `/api/profiles/${profile.id}`;
+    async function saveOneRecord(buttonName = 'Confirm & save') {
+      const pending = fixtureBrowserResponse(
+        page,
+        (response) =>
+          response.request().method() === 'POST' &&
+          new URL(response.url()).pathname === prefix + '/intakes/report-acceptance',
+      );
+      await page.getByRole('button', { name: buttonName, exact: true }).click();
+      const response = await pending;
+      assert.equal(response.status(), 200, await response.text());
+      assert.equal(await response.finished(), null);
+      const result = (await response.json()).data as IntakeReportAcceptanceResult;
+      assert.equal(result.receipt.operationId, response.request().postDataJSON().operationId);
+      assert.equal(result.receipt.selectedCount, 1);
+      assert.equal(result.receipt.acceptedCount, 1);
+    }
+
     await page.goto(url + '/#/import');
+    phase = 'first record import';
     const envelope = {
       format: 'health-record-v1',
       id: 'browser-result',
@@ -265,23 +328,25 @@ test(
     const uploadResponse = await receipt;
     assert(uploadResponse.ok(), await uploadResponse.text());
     assert.equal((await uploadResponse.json()).data.state, 'ready');
-    await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
+    await saveOneRecord();
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByRole('status')
       .getByText('1 saved', { exact: true })
       .waitFor();
-    const profile = (await (await page.request.get(url + '/api/profiles')).json()).data[0];
     const deliveries = (
-      await (await page.request.get(`${url}/api/profiles/${profile.id}/intakes`)).json()
+      await (
+        await fetchFixtureApi(page.request, `${url}/api/profiles/${profile.id}/intakes`)
+      ).json()
     ).data;
-    const downloaded = await page.request.get(url + deliveries[0].contentUrl);
+    const downloaded = await fetchFixtureApi(page.request, url + deliveries[0].contentUrl);
     assert(downloaded.ok());
     assert.deepEqual(await downloaded.body(), original);
 
     // Newly accepted prescriptions are inactive until this profile owner enables
     // one. A repeated import must keep that personal selection.
     await page.goto(url + '/#/import');
+    phase = 'prescription import and activation';
     const prescriptionEnvelope = {
       format: 'health-record-v1',
       id: 'browser-prescription',
@@ -310,7 +375,7 @@ test(
       mimeType: 'application/x-ndjson',
       buffer: prescriptionOriginal,
     });
-    await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
+    await saveOneRecord();
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByRole('status')
@@ -368,7 +433,7 @@ test(
     });
     // A different filename retains a new source occurrence; linking its matching
     // clinical record still requires explicit acceptance.
-    await page.getByRole('button', { name: 'Confirm & save', exact: true }).click();
+    await saveOneRecord();
     await page
       .getByRole('region', { name: 'Save outcomes' })
       .getByRole('status')
@@ -389,6 +454,7 @@ test(
     // Similar dates/labels only offer paired evidence; the explicit decision
     // retains both conflicting assertions and both original downloads.
     await page.goto(url + '/#/import');
+    phase = 'related record import and review';
     const secondEnvelope = {
       ...envelope,
       id: 'browser-second-result',
@@ -414,46 +480,111 @@ test(
       await relatedSummary.click();
     const paired = page.getByRole('region', { name: 'Paired evidence review' });
     await paired.locator('summary').click();
-    await paired.getByLabel('Relationship to Fictional Example').selectOption('distinct');
     await paired
-      .getByLabel('What the originals establish')
+      .getByRole('group', { name: 'Relationship with this record', exact: true })
+      .getByRole('combobox')
+      .selectOption('distinct');
+    await paired
+      .getByLabel('Reason for this relationship', { exact: true })
       .fill('Two separate source record identifiers; retain both literal values.');
     const links = await paired
-      .getByRole('link', { name: 'Open original' })
+      .locator('.clinical-evidence-pair')
+      .getByRole('link')
       .evaluateAll((elements) => elements.map((element) => (element as HTMLAnchorElement).href));
     assert.equal(links.length, 2);
     const originals = await Promise.all(
       links.map(async (link) =>
-        Buffer.from(await (await page.request.get(link)).body()).toString(),
+        Buffer.from(await (await fetchFixtureApi(page.request, link)).body()).toString(),
       ),
     );
     assert(originals.includes(original.toString()));
     assert(originals.includes(secondOriginal.toString()));
-    await page.getByRole('button', { name: 'Confirm and save record', exact: true }).click();
+    const selectedRecord = new URLSearchParams(new URL(page.url()).hash.split('?')[1]),
+      selectedIntake = selectedRecord.get('intake'),
+      selectedId = selectedRecord.get('record');
+    assert.ok(selectedIntake && selectedId);
+    const relationshipSaved = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          prefix + '/intakes/' + encodeURIComponent(selectedIntake) + '/review-record-action',
+    );
+    await fixtureNativeRecordReady(
+      page,
+      prefix,
+      { intakeId: selectedIntake, recordId: selectedId },
+      async () => {
+        await paired.getByRole('button', { name: 'Save this relationship', exact: true }).click();
+        const response = await relationshipSaved;
+        assert.equal(response.status(), 200, await response.text());
+        assert.equal(await response.finished(), null);
+        const command = response.request().postDataJSON() as ClinicalRecordAction;
+        assert.equal(command.recordId, selectedId);
+        assert.ok(command.pair);
+        assert.equal(command.pair.outcome, 'distinct');
+        assert.equal(
+          command.pair.reason,
+          'Two separate source record identifiers; retain both literal values.',
+        );
+      },
+    );
+    phase = 'related record acceptance and reload';
+    await saveOneRecord('Confirm and save record');
     await page.getByText('This exact record was saved to your profile.', { exact: true }).waitFor();
-    await page.reload();
+    await fixtureNativeRecordReady(
+      page,
+      prefix,
+      { intakeId: selectedIntake, recordId: selectedId },
+      () => page.reload(),
+    );
     await page
       .getByText('This exact record is already saved to your profile.', { exact: true })
       .waitFor();
+    phase = 'retained comparison reads';
     const retained = (
-      await (await page.request.get(`${url}/api/profiles/${profile.id}/intakes`)).json()
-    ).data.find((item: { filename: string }) => item.filename === 'fictional-second-results.jsonl');
-    const savedReview = (
       await (
-        await page.request.get(
-          `${url}/api/profiles/${profile.id}/intakes/${encodeURIComponent(retained.id)}/review`,
-        )
+        await fetchFixtureApi(page.request, `${url}/api/profiles/${profile.id}/intakes`)
       ).json()
-    ).data;
-    assert.equal(savedReview.records[0].comparisons[0].previousDecision.outcome, 'distinct');
+    ).data.find((item: { filename: string }) => item.filename === 'fictional-second-results.jsonl');
+    const api = fixtureApi(page, url);
+    const retainedPath = prefix + '/intakes/' + encodeURIComponent(retained.id);
+    const savedReview = await fixtureReview(api, retainedPath + '/review');
+    assert.equal(savedReview.records.length, 1);
+    const savedRecord = savedReview.records[0]!;
+    const comparisons = (await api(retainedPath + '/related-records', {
+      proposalId: savedReview.proposalId,
+      recordId: savedRecord.id,
+      candidateVersionId: savedRecord.candidateVersionId,
+    })) as ClinicalRecordSectionPage;
+    assert.equal(comparisons.format, 'health-clinical-record-section-page-v1');
+    assert.equal(comparisons.section, 'comparisons');
+    assert.equal(comparisons.nextCursor, null);
+    assert.equal(comparisons.total, 1);
+    assert.equal(comparisons.items.length, 1);
+    const pair = comparisons.items[0]!.control;
+    assert.equal(pair.kind, 'pair');
+    assert.ok(pair.kind === 'pair');
+    assert.equal(pair.previousDecision?.outcome, 'distinct');
     await page.goto(url);
     await page.getByLabel('Pronouns', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Fictional Browser Person', exact: true }).click();
+    phase = 'encrypted lock and recovery';
     await page.getByRole('button', { name: 'Lock profile', exact: true }).click();
     await page.getByRole('button', { name: 'Choose profile', exact: true }).click();
     await page.getByRole('button', { name: /Fictional Browser Person.*Locked/ }).click();
     await page.getByLabel('Recovery key', { exact: true }).fill(recovery);
+    const reopened = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname === prefix + '/unlock',
+    );
     await page.getByRole('button', { name: 'Open profile', exact: true }).click();
+    const reopenedResponse = await reopened;
+    assert.equal(reopenedResponse.status(), 200, await reopenedResponse.text());
+    assert.equal(await reopenedResponse.finished(), null);
+    assert.equal((await reopenedResponse.json()).data.id, profile.id);
     await page
       .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
       .getByRole('button', { name: 'Add passkey', exact: true })
@@ -472,6 +603,7 @@ test(
       .getByRole('dialog')
       .getByLabel('Display name', { exact: true })
       .fill('Second Fictional Person');
+    phase = 'second profile creation';
     await profileCreation.getByLabel('Your name').fill('Second Fictional Person');
     await profileCreation.getByLabel('Date of birth', { exact: true }).fill('1982-04-17');
     await page.getByRole('button', { name: 'Continue to recovery key' }).click();
@@ -480,7 +612,21 @@ test(
     await page.getByLabel('I have saved my recovery key').check();
     await page.getByRole('button', { name: 'Verify recovery key', exact: true }).click();
     await page.getByLabel('Recovery key').fill(secondRecovery);
+    const secondOpened = fixtureBrowserResponse(page, (response) => {
+      const path = new URL(response.url()).pathname;
+      return (
+        response.request().method() === 'POST' &&
+        path.startsWith('/api/profile-setups/') &&
+        path.endsWith('/verify')
+      );
+    });
     await page.getByRole('button', { name: 'Open profile' }).click();
+    phase = 'second profile verification response';
+    const secondOpenedResponse = await secondOpened;
+    assert.equal(secondOpenedResponse.status(), 201, await secondOpenedResponse.text());
+    assert.equal(await secondOpenedResponse.finished(), null);
+    assert.notEqual((await secondOpenedResponse.json()).data.id, profile.id);
+    phase = 'second profile onboarding';
     await recoveryChoice.getByRole('button', { name: 'Add passkey', exact: true }).waitFor();
     await recoveryChoice.getByRole('button', { name: 'Skip', exact: true }).click();
     {
@@ -499,15 +645,21 @@ test(
     await page.goto(url + '/#/sources');
     await page.getByRole('heading', { name: 'Sources', exact: true }).waitFor();
     assert.equal(await page.getByText('fictional-results.jsonl', { exact: true }).count(), 0);
-    const allProfiles = (await (await page.request.get(url + '/api/profiles')).json()).data;
+    phase = 'second profile isolation';
+    const allProfiles = (await (await fetchFixtureApi(page.request, url + '/api/profiles')).json())
+      .data;
     const second = allProfiles.find(
       (p: { id: string; name: string }) => p.name === 'Second Fictional Person',
     );
     assert.equal(
-      (await (await page.request.get(`${url}/api/profiles/${second.id}/intakes`)).json()).data
-        .length,
+      (
+        await (
+          await fetchFixtureApi(page.request, `${url}/api/profiles/${second.id}/intakes`)
+        ).json()
+      ).data.length,
       0,
     );
     assert.deepEqual(errors, []);
+    completed = true;
   },
 );

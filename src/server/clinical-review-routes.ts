@@ -1,8 +1,13 @@
 import type { IncomingMessage } from 'node:http';
 import { HttpError, json, type Database } from './database.ts';
 import { previewRecordCorrection } from './record-corrections.ts';
+import {
+  prepareCorrectionSupportingEvidence,
+  type PreparedCorrectionSupportingEvidence,
+} from './record-correction-support.ts';
 import { applyClinicalDecision } from './mapping-actions.ts';
 import { clinicalFields } from './clinical-import.ts';
+import { readSavedDuplicateEvidence } from './duplicate-evidence-index.ts';
 import { clinicalNavigation, resolveClinicalReference } from './clinical-references.ts';
 import {
   acceptedMeasurement,
@@ -106,10 +111,11 @@ export function previewDirectRecordCorrection(
   root: string,
   profileId: string,
   input: unknown,
+  supporting?: PreparedCorrectionSupportingEvidence,
 ): RecordCorrectionPreview {
   owner(db, profileId);
   const selected = request(input);
-  const preview = previewRecordCorrection(db, { ...selected }, { root, profileId });
+  const preview = previewRecordCorrection(db, { ...selected }, { root, profileId, supporting });
   return {
     request: selected,
     version: preview.version,
@@ -133,6 +139,7 @@ export function applyDirectRecordCorrection(
   root: string,
   profileId: string,
   input: unknown,
+  supporting?: PreparedCorrectionSupportingEvidence,
 ): RecordCorrectionApplyResult {
   owner(db, profileId);
   const selected = request(input, true) as RecordCorrectionApplyRequest;
@@ -140,9 +147,16 @@ export function applyDirectRecordCorrection(
   const replayed = !!db.prepare('SELECT 1 FROM manual_batches WHERE id=?').get(receiptId);
   // The existing accepted-operation engine handles stale previews, lost replies,
   // changed-request conflicts and portable publication. Never create another store.
-  const result = applyClinicalDecision(db, root, profileId, 'clinical_correction', {
-    ...selected,
-  }) as RecordCorrectionApplyResult['receipt']['result'] &
+  const result = applyClinicalDecision(
+    db,
+    root,
+    profileId,
+    'clinical_correction',
+    {
+      ...selected,
+    },
+    { supporting },
+  ) as RecordCorrectionApplyResult['receipt']['result'] &
     Pick<RecordCorrectionApplyResult, 'durability'>;
   const stored = json(
     db.prepare('SELECT coverage_json FROM manual_batches WHERE id=?').get(receiptId)!.coverage_json,
@@ -165,6 +179,45 @@ export function applyDirectRecordCorrection(
     receipt: { id: receiptId, appliedRevision: stored.appliedRevision, result: stored.result },
     ...(result.durability ? { durability: result.durability } : {}),
   };
+}
+export async function previewDirectRecordCorrectionPrepared(
+  db: Database,
+  root: string,
+  profileId: string,
+  input: unknown,
+): Promise<RecordCorrectionPreview> {
+  owner(db, profileId);
+  const selected = request(input);
+  const supporting = selected.supportingEvidence?.length
+    ? await prepareCorrectionSupportingEvidence(db, root, profileId, selected.supportingEvidence)
+    : undefined;
+  try {
+    return previewDirectRecordCorrection(db, root, profileId, input, supporting);
+  } finally {
+    supporting?.dispose();
+  }
+}
+export async function applyDirectRecordCorrectionPrepared(
+  db: Database,
+  root: string,
+  profileId: string,
+  input: unknown,
+): Promise<RecordCorrectionApplyResult> {
+  owner(db, profileId);
+  const selected = request(input, true) as RecordCorrectionApplyRequest;
+  // Lost-reply replay uses the accepted receipt, even if incoming evidence subsequently changed.
+  const replay = db
+    .prepare('SELECT 1 FROM manual_batches WHERE id=?')
+    .get('clinical_correction:' + selected.operationId);
+  const supporting =
+    !replay && selected.supportingEvidence?.length
+      ? await prepareCorrectionSupportingEvidence(db, root, profileId, selected.supportingEvidence)
+      : undefined;
+  try {
+    return applyDirectRecordCorrection(db, root, profileId, input, supporting);
+  } finally {
+    supporting?.dispose();
+  }
 }
 interface ClinicalReviewRouteContext {
   resource?: string;
@@ -192,10 +245,15 @@ export async function handleClinicalReviewRoute(
       'measurement',
       'measurement-preview',
       'measurement-apply',
+      'saved-evidence',
     ].includes(id || '')
   )
     return false;
   owner(db, profileId);
+  if (id === 'saved-evidence' && method === 'GET' && !action) {
+    respond(readSavedDuplicateEvidence(db, context.params || new URLSearchParams()));
+    return true;
+  }
   if (id === 'measurement' && method === 'GET' && !action) {
     const kind = context.params?.get('kind'),
       recordId = context.params?.get('recordId');
@@ -216,9 +274,9 @@ export async function handleClinicalReviewRoute(
     throw new HttpError(400, 'INVALID_JSON', 'Expected a JSON object');
   }
   if (id === 'correction-preview')
-    respond(previewDirectRecordCorrection(db, root, profileId, input));
+    respond(await previewDirectRecordCorrectionPrepared(db, root, profileId, input));
   else if (id === 'correction-apply')
-    respond(applyDirectRecordCorrection(db, root, profileId, input));
+    respond(await applyDirectRecordCorrectionPrepared(db, root, profileId, input));
   else if (id === 'measurement-preview')
     respond(previewMeasurementSemantics(db, root, profileId, input));
   else if (id === 'measurement-apply')

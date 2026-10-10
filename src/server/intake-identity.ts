@@ -1,3 +1,5 @@
+import { assertClinicalOperation, currentClinicalOperation } from './clinical-operation.ts';
+import type { NativeIdentityReadOptions } from './intake-identity-native.ts';
 import {
   effectiveKnownNames,
   challengedKnownNames,
@@ -6,6 +8,8 @@ import {
   rememberFutureNameOwner,
   activeIdentityReceipts,
 } from './name-associations.ts';
+import { selectedSequence, type SelectedSequence } from './intake-selected-sequence.ts';
+import type { IdentityPolicyReceipt, IdentityPolicyTargets } from './intake-identity-policy.ts';
 import { matchesSelfIdentityName } from '../shared/self-identity.ts';
 import {
   decodeOriginalIdentityText,
@@ -22,7 +26,14 @@ import { identityPeopleSnapshots } from './intake-identity-people.ts';
 import { measureImportPhase } from './import-diagnostics.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { HttpError, json, now } from './database.ts';
+import {
+  HttpError,
+  clinicalReviewRevision,
+  managedDatabaseMethodEpoch,
+  json,
+  now,
+} from './database.ts';
+import { prepareIntakeFilenameSummary } from './intake-summary-name.ts';
 import { canonicalLiteral } from './intake-format.ts';
 import {
   getIntake,
@@ -70,6 +81,19 @@ import type {
   IntakeIdentitySelfSnapshot,
 } from '../shared/intake-identity.ts';
 
+import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
+import { assertIntakeOwner } from './intake.ts';
+function isNativeIdentitySource(db: DatabaseSync, profileId: string, id: string) {
+  assertIntakeOwner(db, profileId);
+  const source = db
+    .prepare("SELECT id,kind,details_json FROM source_files WHERE id=? AND kind='intake_original'")
+    .get(id);
+  if (!source) throw new HttpError(404, 'NOT_FOUND', 'Source intake not found');
+  return hasIntakeCollectionEnvelope(
+    db,
+    source as { id: string; kind: string; details_json: string },
+  );
+}
 const hash = (value: unknown) => createHash('sha256').update(canonicalLiteral(value)).digest('hex');
 const reject = (message: string): never => {
   throw new HttpError(409, 'IDENTITY_SCOPE', message);
@@ -102,6 +126,25 @@ const groupFor = (intake: Intake, groupId: string): IntakeReportGroup => {
 /** Existence is evidence location only; neither mode supplies identity authority. */
 async function identityEvidence(context: Context, groupId: string): Promise<Evidence> {
   const { db, root, profileId, id } = context;
+  const operation = currentClinicalOperation(db),
+    revision = clinicalReviewRevision(db),
+    methods = managedDatabaseMethodEpoch(db),
+    before = db.prepare('SELECT sha256,details_json FROM main.source_files WHERE id=?').get(id);
+  const assertCurrent = () => {
+    if (operation) assertClinicalOperation(db, operation);
+    assertIntakeOwner(db, profileId);
+    const current = db
+      .prepare('SELECT sha256,details_json FROM main.source_files WHERE id=?')
+      .get(id);
+    if (
+      clinicalReviewRevision(db) !== revision ||
+      managedDatabaseMethodEpoch(db) !== methods ||
+      current?.sha256 !== before?.sha256 ||
+      current?.details_json !== before?.details_json
+    )
+      reject('The identity scope changed; review the current original and exact members again');
+  };
+  assertCurrent();
   const intake = getIntake(db, root, profileId, id);
   const group = groupFor(intake, groupId);
   let evidenceId = id;
@@ -109,13 +152,28 @@ async function identityEvidence(context: Context, groupId: string): Promise<Evid
     const inventory = intake.workflow!.plans.flatMap((plan) => plan.index.members || []);
     const member = inventory.find((item) => item.memberId === group.memberId);
     if (!member) return reject('This package occurrence is not in the retained inventory');
+    const locatorHash = await intakeLocatorKey(db, member.locator, assertCurrent);
+    assertCurrent();
     // Bind parent, exact occurrence locator and bytes; equal bytes in another member do not qualify.
     const child = db
       .prepare(
-        "SELECT id FROM source_files WHERE sha256=? AND json_extract(details_json,'$.intake.parentSourceFileId')=? AND json_extract(details_json,'$.intake.locator')=?",
+        "SELECT id FROM source_files WHERE sha256=? AND json_extract(details_json,'$.intake.parentSourceFileId')=? AND (json_extract(details_json,'$.intake.locator')=? OR (json_extract(details_json,'$.intake.locator.format')=? AND json_extract(details_json,'$.intake.locator.field')='locator' AND json_extract(details_json,'$.intake.locator.scalarHash')=?))",
       )
-      .get(member.sourceHash, id, member.locator) as { id: string } | undefined;
-    if (!child)
+      .get(member.sourceHash, id, member.locator, COMPACT_SCALAR_FORMAT, locatorHash) as
+      { id: string } | undefined;
+    if (child) {
+      await prepareIntakeFilenameSummary(
+        db,
+        { id: child.id, sha256: member.sourceHash },
+        { assertRunning: assertCurrent },
+      );
+      assertCurrent();
+    }
+    const matches =
+      child &&
+      (await intakeFirstLocatorMatchesCooperatively(db, child.id, member.locator, assertCurrent));
+    assertCurrent();
+    if (!child || !matches)
       return reject('Open and retain this exact package member before confirming its identity');
     evidenceId = child.id;
   } else if (intake.mimeType === 'application/zip') {
@@ -148,7 +206,10 @@ async function identityEvidence(context: Context, groupId: string): Promise<Evid
       // Keep decoded JSON keys, roles and object boundaries with the retained
       // string values. Flattening values alone makes guardian names look like
       // patient names and hides a structured patient's DOB key.
-      text = decodeOriginalIdentityText(text, reference.filename);
+      text = decodeOriginalIdentityText(
+        text,
+        reference.filenameDescriptor?.suffix ?? reference.filename,
+      );
       // Do not match hidden HTML instructions as visible subject evidence.
       if (original.mimeType === 'text/html')
         text = text
@@ -175,6 +236,14 @@ async function identityEvidence(context: Context, groupId: string): Promise<Evid
     patientNameGrounded: originalSubjectNameGrounded(text, subject.text, anchor.text),
   };
 }
+export type IdentityConfirmationScope = Omit<
+  IntakeIdentityScope,
+  'targets' | 'assignmentTargets' | 'membership'
+> & {
+  targets: IdentityPolicyTargets;
+  assignmentTargets?: IdentityPolicyTargets;
+  membership: Parameters<typeof identityReceiptAppliesToCurrentBoundary>[1]['membership'];
+};
 interface BuiltScope {
   scope: IntakeIdentityScope;
   evidenceConflicts: IntakeIdentityConflict[];
@@ -522,7 +591,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
   };
 }
 
-function selfSnapshot(db: DatabaseSync): IntakeIdentitySelfSnapshot {
+export function selfSnapshot(db: DatabaseSync): IntakeIdentitySelfSnapshot {
   const self = getNote(db, 'person-note:self');
   const fullName =
     typeof self.person.fullName === 'string' && self.person.fullName.trim()
@@ -628,7 +697,16 @@ export async function getIntakeIdentityReview(
   profileId: string,
   id: string,
   groupId: string,
+  options: NativeIdentityReadOptions = {},
 ): Promise<IntakeIdentityReview> {
+  options.signal?.throwIfAborted();
+  if (isNativeIdentitySource(db, profileId, id)) {
+    const { getNativeIntakeIdentityReview } = await import('./intake-identity-native.ts');
+    return getNativeIntakeIdentityReview(db, root, profileId, id, groupId, {
+      ...options,
+      operation: options.operation ?? currentClinicalOperation(db),
+    });
+  }
   return measureImportPhase(
     'review_identity_grounding',
     async () => {
@@ -841,8 +919,11 @@ export async function getIntakeIdentityScope(
   profileId: string,
   id: string,
   groupId: string,
-): Promise<IntakeIdentityScope> {
+): Promise<
+  IntakeIdentityScope | import('../shared/intake-identity.ts').IntakeIdentityScopeReference
+> {
   const review = await getIntakeIdentityReview(db, root, profileId, id, groupId);
+  if (review.scopeReference) return review.scopeReference;
   if (!review.scope)
     return reject(
       review.status === 'conflict'
@@ -874,6 +955,10 @@ export async function confirmIntakeIdentityScope(
       'IDENTITY_CONFIRMATION',
       'Explicit confirmation of the displayed report subject or original review is required',
     );
+  if (isNativeIdentitySource(db, profileId, id)) {
+    const { confirmNativeIntakeIdentityScope } = await import('./intake-identity-native.ts');
+    return confirmNativeIntakeIdentityScope(db, root, profileId, id, input);
+  }
   const context = { db, root, profileId, id };
   // Reconcile a committed lost response against its operation fingerprint before
   // inspecting any later evidence. A receipt never applies to later candidates.
@@ -889,52 +974,8 @@ export async function confirmIntakeIdentityScope(
   return workflowMutation(db, root, profileId, id, input, (workflow) => {
     const built = buildScope(context, evidence);
     const current = built.scope;
-    const currentSelf = selfSnapshot(db);
-    const answers = input.identityAnswers;
-    const yearAnswerAllowed =
-      typeof answers?.birthDate === 'string' &&
-      /^\d{4}$/.test(answers.birthDate) &&
-      current.birthDateReview?.choices.some((choice) => /^\d{4}$/.test(choice)) &&
-      Number(answers.birthDate) >= 1 &&
-      answers.birthDate <= new Date().toISOString().slice(0, 4);
-    if (
-      answers !== undefined &&
-      (!answers ||
-        typeof answers !== 'object' ||
-        Array.isArray(answers) ||
-        Object.keys(answers).some((key) => key !== 'birthDate') ||
-        !current.birthDateReview ||
-        (answers.birthDate !== null &&
-          !validOnboardingBirthDate(answers.birthDate) &&
-          !yearAnswerAllowed))
-    )
-      throw new HttpError(
-        400,
-        'IDENTITY_BIRTH_DATE',
-        current.birthDateReview?.choices.some((choice) => /^\d{4}$/.test(choice))
-          ? 'Confirm a birth year from the original, or explicitly keep it unknown.'
-          : 'Confirm a complete birth date from the original, or explicitly keep it unknown.',
-      );
-    if (current.birthDateReview?.choices.length && !Object.hasOwn(answers || {}, 'birthDate'))
-      throw new HttpError(
-        400,
-        'IDENTITY_BIRTH_DATE',
-        'Review the suggested birth date before confirming this report.',
-      );
-    const reviewedBirthDate = answers?.birthDate || current.evidencedIdentity?.birthDate;
-    if (
-      input.outcome === 'this_is_me' &&
-      reviewedBirthDate &&
-      currentSelf.birthDate &&
-      !compatibleIdentityBirthDates(reviewedBirthDate, currentSelf.birthDate)
-    )
-      throw new HttpError(
-        409,
-        'IDENTITY_CONFLICT',
-        'The reviewed birth date differs from Self. Choose another person or add a new person.',
-      );
     const assessment = assessIdentityPolicy({
-      self: currentSelf,
+      self: selfSnapshot(db),
       people: identityPeopleSnapshots(db),
       nameEvidenceGrounded: built.patientNameGrounded,
       evidence: current.evidencedIdentity || {},
@@ -949,334 +990,23 @@ export async function confirmIntakeIdentityScope(
       explicitlyConfirmedOperationId: built.explicitlyConfirmedOperationId,
       currentRefusal: built.currentRefusal,
     });
-    if (input.outcome === 'this_is_me' && assessment.selfBirthDateConflict)
-      throw new HttpError(
-        409,
-        'IDENTITY_CONFLICT',
-        'The report birth date differs from Self. Choose another person or add a new person.',
-      );
-    if (assessment.conflicts.some((conflict) => conflict.reason === 'evidence_disagreement'))
-      throw new HttpError(
-        409,
-        'IDENTITY_CONFLICT',
-        'The report contains contradictory identity evidence; review its individual entries first',
-      );
-    if (input.scope.selfVersion !== undefined && input.scope.selfVersion !== currentSelf.version)
-      throw new HttpError(
-        409,
-        'SELF_VERSION_CONFLICT',
-        'Self changed while identity was being reviewed; refresh before confirming',
-      );
-    if (
-      input.outcome === 'this_is_me' &&
-      assessment.status === 'confirmation_required' &&
-      !current.targets.length
-    )
-      throw new HttpError(
-        409,
-        'IDENTITY_SCOPE_EMPTY',
-        'Identity confirmation requires a current displayed identity question',
-      );
-    const confirmationTargets = current.assignmentTargets || current.targets;
-    if (!confirmationTargets.length && input.outcome === 'this_is_person')
-      throw new HttpError(
-        409,
-        'IDENTITY_SCOPE_EMPTY',
-        'Identity confirmation requires at least one exact current record and issue',
-      );
-    // HTTP responses qualify evidence URLs for the active profile. Compare that
-    // presentation-only prefix canonically without changing the durable request.
-    const profilePrefix = `/api/profiles/${encodeURIComponent(profileId)}/`;
-    const submittedUrl = input.scope.original?.contentUrl;
-    const submitted = {
-      ...input.scope,
-      original: {
-        ...input.scope.original,
-        contentUrl: submittedUrl?.startsWith(profilePrefix)
-          ? '/api/' + submittedUrl.slice(profilePrefix.length)
-          : submittedUrl,
-      },
-    };
-    if (canonicalLiteral(current) !== canonicalLiteral(submitted))
-      return reject(
-        'The identity scope changed; review the current original and exact members again',
-      );
-    if (current.questions?.length && input.attestation !== 'confirmed_displayed_identity_questions')
-      throw new HttpError(
-        400,
-        'IDENTITY_CONFIRMATION',
-        'Read and explicitly confirm every displayed identity question for this report',
-      );
-    const confirmedPrintedName =
-      current.evidencedIdentity?.fullName ||
-      (typeof input.printedName === 'string'
-        ? input.printedName.trim()
-        : /[;\n]/.test(current.subject.text)
-          ? undefined
-          : printedIdentityName(current.subject.text));
-    if (
-      !confirmedPrintedName ||
-      (input.printedName !== undefined &&
-        (typeof input.printedName !== 'string' ||
-          (current.evidencedIdentity?.fullName
-            ? input.printedName.trim() !== current.evidencedIdentity.fullName
-            : !current.subject.text.includes(input.printedName.trim())))) ||
-      (!current.evidencedIdentity?.fullName &&
-        printedIdentityName(confirmedPrintedName) !== confirmedPrintedName)
-    )
-      throw new HttpError(
-        400,
-        'IDENTITY_PRINTED_NAME',
-        'Select the exact printed person name from the displayed subject before confirming; demographic sentences are not names',
-      );
-    const futureChoice = input.futureNameOwner || { outcome: 'ask' as const };
-    if (
-      input.futureNameOwner &&
-      (!assessment.challengedName ||
-        !['self', 'person', 'ask'].includes(futureChoice.outcome) ||
-        (futureChoice.outcome === 'person' &&
-          (typeof futureChoice.noteId !== 'string' ||
-            !Number.isSafeInteger(futureChoice.expectedVersion))) ||
-        (futureChoice.outcome !== 'person' && futureChoice.noteId !== undefined))
-    )
-      throw new HttpError(
-        400,
-        'IDENTITY_NAME_CHOICE',
-        'Choose how later reports should use the challenged printed name.',
-      );
-    let futureTarget: { noteId: string; personId: string } | null = null;
-    if (assessment.challengedName && futureChoice.outcome === 'self')
-      futureTarget = { noteId: 'person-note:self', personId: 'patient' };
-    if (assessment.challengedName && futureChoice.outcome === 'person') {
-      const note = getNote(db, futureChoice.noteId!);
-      if (
-        note.kind !== 'person' ||
-        note.archived ||
-        note.version !== futureChoice.expectedVersion ||
-        !note.personId ||
-        note.personId === 'patient'
-      )
-        throw new HttpError(
-          409,
-          'IDENTITY_NAME_CHOICE',
-          'The selected future name owner changed. Refresh the identity review.',
-        );
-      futureTarget = { noteId: note.id, personId: note.personId };
-    }
-    const challengedNotes = assessment.challengedName
-      ? challengedNameNoteIds(db, confirmedPrintedName)
-      : [];
-    if (
-      ['prior_confirmation', 'evidenced_match'].includes(assessment.status) &&
-      input.selfUpdate === undefined &&
-      input.outcome === 'this_is_me' &&
-      (getNote(db, 'person-note:self').person.fullName === confirmedPrintedName ||
-        getNote(db, 'person-note:self').person.sourceKnownNames?.some(
-          (entry) => entry.name === confirmedPrintedName,
-        )) &&
-      activeIdentityReceipts(db, workflow.identityConfirmations)?.some(
-        (receipt) =>
-          receipt.outcome === 'this_is_me' &&
-          identityReceiptAppliesToCurrentBoundary(receipt, {
-            ...current,
-            evidenceOriginalFingerprint: current.evidenceOriginalFingerprint || null,
-          }) &&
-          (current.assignmentTargets || current.targets).every((target) =>
-            (receipt.scope.assignmentTargets || receipt.scope.targets).some(
-              (prior) =>
-                prior.candidateId === target.candidateId &&
-                prior.candidateVersionId === target.candidateVersionId &&
-                prior.proposalId === target.proposalId &&
-                prior.recordId === target.recordId,
-            ),
-          ),
-      )
-    )
-      throw new HttpError(
-        409,
-        'IDENTITY_ALREADY_RESOLVED',
-        'This report identity is already resolved; no additional confirmation is needed',
-      );
-    let assignedPerson: IntakeIdentityPerson | undefined;
-    if (input.outcome === 'this_is_person') {
-      if (input.selfUpdate !== undefined)
-        throw new HttpError(
-          400,
-          'IDENTITY_SELECTION',
-          'Self fields cannot be changed when assigning another person',
-        );
-      const selection = input.personSelection;
-      if (!selection || typeof selection !== 'object')
-        throw new HttpError(
-          400,
-          'IDENTITY_SELECTION',
-          'Choose an existing person or create a family person',
-        );
-      let note;
-      if ('noteId' in selection && !('newPerson' in selection)) {
-        if (
-          typeof selection.noteId !== 'string' ||
-          !Number.isSafeInteger(selection.expectedVersion)
-        )
-          throw new HttpError(400, 'IDENTITY_SELECTION', 'Choose the displayed person version');
-        note = getNote(db, selection.noteId);
-        if (
-          note.kind !== 'person' ||
-          !note.personId ||
-          note.personId === 'patient' ||
-          note.archived
-        )
-          throw new HttpError(
-            400,
-            'IDENTITY_SELECTION',
-            'Choose an available person other than Self',
-          );
-        if (note.version !== selection.expectedVersion)
-          throw new HttpError(
-            409,
-            'PERSON_VERSION_CONFLICT',
-            'This person changed; review the current person before confirming',
-          );
-        const printedBirthDate = reviewedBirthDate;
-        const savedBirthDate =
-          typeof note.person.birthDate === 'string' ? note.person.birthDate : null;
-        if (
-          printedBirthDate &&
-          savedBirthDate &&
-          !compatibleIdentityBirthDates(printedBirthDate, savedBirthDate)
-        )
-          throw new HttpError(
-            409,
-            'IDENTITY_CONFLICT',
-            'The report birth date differs from this person. Choose another person or add a new person.',
-          );
-      } else if ('newPerson' in selection && !('noteId' in selection)) {
-        const person = selection.newPerson;
-        if (
-          !person ||
-          typeof person.fullName !== 'string' ||
-          !person.fullName.trim() ||
-          person.fullName.trim().length > 200 ||
-          /[\x00-\x1f]/.test(person.fullName) ||
-          (person.relationship !== undefined &&
-            (typeof person.relationship !== 'string' || person.relationship.length > 200))
-        )
-          throw new HttpError(
-            400,
-            'IDENTITY_SELECTION',
-            'Enter a name and an optional relationship for this family person',
-          );
-        const self = getNote(db, 'patient');
-        if (
-          matchesSelfIdentityName(person.fullName, [
-            String(self.person.fullName || ''),
-            ...effectiveKnownNames(db, self.id, self.person),
-          ])
-        )
-          throw new HttpError(
-            409,
-            'INTAKE_PERSON_SELF',
-            'This name belongs to Self. Choose Me (Self) rather than creating another Person.',
-          );
-        note = createIntakeFamilyPersonInTransaction(
-          db,
-          person.fullName.trim(),
-          person.relationship?.trim(),
-        );
-      } else
-        throw new HttpError(400, 'IDENTITY_SELECTION', 'Choose exactly one person destination');
-      assignedPerson = {
-        noteId: note.id,
-        personId: note.personId!,
-        version: note.version,
-        fullName:
-          typeof note.person.fullName === 'string' && note.person.fullName.trim()
-            ? note.person.fullName.trim()
-            : note.title,
-      };
-    } else if (input.personSelection !== undefined)
-      throw new HttpError(
-        400,
-        'IDENTITY_SELECTION',
-        'A separate person cannot be selected when confirming Self',
-      );
-    let selfUpdate:
-      | {
-          noteId: 'person-note:self';
-          versionBefore: number;
-          versionAfter: number;
-          fields: NonNullable<IntakeIdentityConfirmation['selfUpdate']>['fields'];
-        }
-      | undefined;
-    if (input.selfUpdate !== undefined) {
-      const selected = input.selfUpdate;
-      if (
-        !selected ||
-        typeof selected !== 'object' ||
-        Array.isArray(selected) ||
-        !Number.isSafeInteger(selected.expectedVersion) ||
-        selected.expectedVersion < 1 ||
-        !selected.fields ||
-        typeof selected.fields !== 'object' ||
-        Array.isArray(selected.fields)
-      )
-        throw new HttpError(
-          400,
-          'SELF_IDENTITY_UPDATE',
-          'Select one or both displayed blank Self identity fields',
-        );
-      if (selected.expectedVersion !== currentSelf.version)
-        throw new HttpError(
-          409,
-          'SELF_VERSION_CONFLICT',
-          'Self changed while identity was being reviewed; refresh before confirming',
-        );
-      if (
-        !Object.keys(selected.fields).length ||
-        Object.keys(selected.fields).some((key) => !['fullName', 'birthDate'].includes(key)) ||
-        (Object.keys(selected.fields) as ('fullName' | 'birthDate')[]).some(
-          (key) => selected.fields[key] !== assessment.offeredSelfFields[key],
-        )
-      )
-        throw new HttpError(
-          409,
-          'SELF_IDENTITY_UPDATE',
-          'Select only the unchanged blank Self values displayed with this identity scope',
-        );
-      const updated = updateBlankSelfIdentityFieldsInTransaction(
-        db,
-        selected.expectedVersion,
-        selected.fields,
-      );
-      selfUpdate = {
-        noteId: 'person-note:self',
-        ...updated,
-        fields: structuredClone(selected.fields),
-      };
-    }
-    const selectedNote = getNote(db, assignedPerson?.noteId || 'person-note:self');
-    const knownNameAdded =
-      safeSourceIdentityName(confirmedPrintedName) &&
-      confirmedPrintedName !== selectedNote.person.fullName
-        ? rememberSourceNameInTransaction(db, assignedPerson?.noteId || 'person-note:self', {
-            name: confirmedPrintedName,
-            operationId: input.operationId,
-            intakeId: id,
-            sourceHash: current.sourceHash,
-            groupId: current.groupId,
-            subjectText: current.subject.text,
-          })
-        : undefined;
-    if (assessment.challengedName && safeSourceIdentityName(confirmedPrintedName))
-      rememberFutureNameOwner(
-        db,
-        confirmedPrintedName,
-        futureTarget,
-        input.operationId,
-        challengedNotes,
-      );
-    if (assignedPerson) assignedPerson.version = getNote(db, assignedPerson.noteId).version;
-    if (selfUpdate) selfUpdate.versionAfter = getNote(db, 'person-note:self').version;
+    const {
+      answers,
+      confirmationTargets,
+      assignedPerson,
+      knownNameAdded,
+      confirmedPrintedName,
+      selfUpdate,
+    } = applyIdentityConfirmationPeople(
+      db,
+      profileId,
+      id,
+      input,
+      current,
+      current,
+      assessment,
+      selectedSequence(activeIdentityReceipts(db, workflow.identityConfirmations)),
+    );
     const at = now();
     const draftIds: string[] = [];
     // All validation precedes mutation; one durable transaction appends every exact draft and receipt.
@@ -1301,7 +1031,7 @@ export async function confirmIntakeIdentityScope(
         mapping: { ...previous?.mapping, ...correction },
         resolutions: [
           ...(previous?.resolutions || []),
-          ...(target.issueIds || [target.issueId]).map((issueId) => ({
+          ...Array.from(target.issueIds || [target.issueId], (issueId) => ({
             issueId,
             outcome: assignedPerson ? ('other_person' as const) : ('this_is_me' as const),
             mapping: correction,
@@ -1329,3 +1059,396 @@ export async function confirmIntakeIdentityScope(
     });
   });
 }
+
+/** Shared exact identity validation and People writes; the host owns its transaction. */
+export function applyIdentityConfirmationPeople(
+  db: DatabaseSync,
+  profileId: string,
+  id: string,
+  input: IntakeIdentityConfirmation,
+  current: IdentityConfirmationScope,
+  displayedScope: unknown,
+  assessment: ReturnType<typeof assessIdentityPolicy>,
+  receipts: SelectedSequence<IdentityPolicyReceipt>,
+  preparedPerson?: { noteId: string; personId: string; icon?: string },
+) {
+  const currentSelf = selfSnapshot(db);
+  const answers = input.identityAnswers;
+  const yearAnswerAllowed =
+    typeof answers?.birthDate === 'string' &&
+    /^\d{4}$/.test(answers.birthDate) &&
+    current.birthDateReview?.choices.some((choice) => /^\d{4}$/.test(choice)) &&
+    Number(answers.birthDate) >= 1 &&
+    answers.birthDate <= new Date().toISOString().slice(0, 4);
+  if (
+    answers !== undefined &&
+    (!answers ||
+      typeof answers !== 'object' ||
+      Array.isArray(answers) ||
+      Object.keys(answers).some((key) => key !== 'birthDate') ||
+      !current.birthDateReview ||
+      (answers.birthDate !== null &&
+        !validOnboardingBirthDate(answers.birthDate) &&
+        !yearAnswerAllowed))
+  )
+    throw new HttpError(
+      400,
+      'IDENTITY_BIRTH_DATE',
+      current.birthDateReview?.choices.some((choice) => /^\d{4}$/.test(choice))
+        ? 'Confirm a birth year from the original, or explicitly keep it unknown.'
+        : 'Confirm a complete birth date from the original, or explicitly keep it unknown.',
+    );
+  if (current.birthDateReview?.choices.length && !Object.hasOwn(answers || {}, 'birthDate'))
+    throw new HttpError(
+      400,
+      'IDENTITY_BIRTH_DATE',
+      'Review the suggested birth date before confirming this report.',
+    );
+  const reviewedBirthDate = answers?.birthDate || current.evidencedIdentity?.birthDate;
+  if (
+    input.outcome === 'this_is_me' &&
+    reviewedBirthDate &&
+    currentSelf.birthDate &&
+    !compatibleIdentityBirthDates(reviewedBirthDate, currentSelf.birthDate)
+  )
+    throw new HttpError(
+      409,
+      'IDENTITY_CONFLICT',
+      'The reviewed birth date differs from Self. Choose another person or add a new person.',
+    );
+  if (input.outcome === 'this_is_me' && assessment.selfBirthDateConflict)
+    throw new HttpError(
+      409,
+      'IDENTITY_CONFLICT',
+      'The report birth date differs from Self. Choose another person or add a new person.',
+    );
+  if (assessment.conflicts.some((conflict) => conflict.reason === 'evidence_disagreement'))
+    throw new HttpError(
+      409,
+      'IDENTITY_CONFLICT',
+      'The report contains contradictory identity evidence; review its individual entries first',
+    );
+  if (input.scope.selfVersion !== undefined && input.scope.selfVersion !== currentSelf.version)
+    throw new HttpError(
+      409,
+      'SELF_VERSION_CONFLICT',
+      'Self changed while identity was being reviewed; refresh before confirming',
+    );
+  if (
+    input.outcome === 'this_is_me' &&
+    assessment.status === 'confirmation_required' &&
+    !current.targets.length
+  )
+    throw new HttpError(
+      409,
+      'IDENTITY_SCOPE_EMPTY',
+      'Identity confirmation requires a current displayed identity question',
+    );
+  const confirmationTargets = current.assignmentTargets || current.targets;
+  if (!confirmationTargets.length && input.outcome === 'this_is_person')
+    throw new HttpError(
+      409,
+      'IDENTITY_SCOPE_EMPTY',
+      'Identity confirmation requires at least one exact current record and issue',
+    );
+  // HTTP responses qualify evidence URLs for the active profile. Compare that
+  // presentation-only prefix canonically without changing the durable request.
+  const profilePrefix = `/api/profiles/${encodeURIComponent(profileId)}/`;
+  const submittedUrl = input.scope.original?.contentUrl;
+  const submitted = {
+    ...input.scope,
+    original: {
+      ...input.scope.original,
+      contentUrl: submittedUrl?.startsWith(profilePrefix)
+        ? '/api/' + submittedUrl.slice(profilePrefix.length)
+        : submittedUrl,
+    },
+  };
+  if (canonicalLiteral(displayedScope) !== canonicalLiteral(submitted))
+    return reject(
+      'The identity scope changed; review the current original and exact members again',
+    );
+  if (current.questions?.length && input.attestation !== 'confirmed_displayed_identity_questions')
+    throw new HttpError(
+      400,
+      'IDENTITY_CONFIRMATION',
+      'Read and explicitly confirm every displayed identity question for this report',
+    );
+  const confirmedPrintedName =
+    current.evidencedIdentity?.fullName ||
+    (typeof input.printedName === 'string'
+      ? input.printedName.trim()
+      : /[;\n]/.test(current.subject.text)
+        ? undefined
+        : printedIdentityName(current.subject.text));
+  if (
+    !confirmedPrintedName ||
+    (input.printedName !== undefined &&
+      (typeof input.printedName !== 'string' ||
+        (current.evidencedIdentity?.fullName
+          ? input.printedName.trim() !== current.evidencedIdentity.fullName
+          : !current.subject.text.includes(input.printedName.trim())))) ||
+    (!current.evidencedIdentity?.fullName &&
+      printedIdentityName(confirmedPrintedName) !== confirmedPrintedName)
+  )
+    throw new HttpError(
+      400,
+      'IDENTITY_PRINTED_NAME',
+      'Select the exact printed person name from the displayed subject before confirming; demographic sentences are not names',
+    );
+  const futureChoice = input.futureNameOwner || { outcome: 'ask' as const };
+  if (
+    input.futureNameOwner &&
+    (!assessment.challengedName ||
+      !['self', 'person', 'ask'].includes(futureChoice.outcome) ||
+      (futureChoice.outcome === 'person' &&
+        (typeof futureChoice.noteId !== 'string' ||
+          !Number.isSafeInteger(futureChoice.expectedVersion))) ||
+      (futureChoice.outcome !== 'person' && futureChoice.noteId !== undefined))
+  )
+    throw new HttpError(
+      400,
+      'IDENTITY_NAME_CHOICE',
+      'Choose how later reports should use the challenged printed name.',
+    );
+  let futureTarget: { noteId: string; personId: string } | null = null;
+  if (assessment.challengedName && futureChoice.outcome === 'self')
+    futureTarget = { noteId: 'person-note:self', personId: 'patient' };
+  if (assessment.challengedName && futureChoice.outcome === 'person') {
+    const note = getNote(db, futureChoice.noteId!);
+    if (
+      note.kind !== 'person' ||
+      note.archived ||
+      note.version !== futureChoice.expectedVersion ||
+      !note.personId ||
+      note.personId === 'patient'
+    )
+      throw new HttpError(
+        409,
+        'IDENTITY_NAME_CHOICE',
+        'The selected future name owner changed. Refresh the identity review.',
+      );
+    futureTarget = { noteId: note.id, personId: note.personId };
+  }
+  const challengedNotes = assessment.challengedName
+    ? challengedNameNoteIds(db, confirmedPrintedName)
+    : [];
+  if (
+    ['prior_confirmation', 'evidenced_match'].includes(assessment.status) &&
+    input.selfUpdate === undefined &&
+    input.outcome === 'this_is_me' &&
+    (getNote(db, 'person-note:self').person.fullName === confirmedPrintedName ||
+      getNote(db, 'person-note:self').person.sourceKnownNames?.some(
+        (entry) => entry.name === confirmedPrintedName,
+      )) &&
+    receipts.some(
+      (receipt) =>
+        receipt.outcome === 'this_is_me' &&
+        identityReceiptAppliesToCurrentBoundary(receipt, {
+          ...current,
+          evidenceOriginalFingerprint: current.evidenceOriginalFingerprint || null,
+        }) &&
+        (current.assignmentTargets || current.targets).every((target) =>
+          (receipt.scope.assignmentTargets || receipt.scope.targets).some(
+            (prior) =>
+              prior.candidateId === target.candidateId &&
+              prior.candidateVersionId === target.candidateVersionId &&
+              prior.proposalId === target.proposalId &&
+              prior.recordId === target.recordId,
+          ),
+        ),
+    )
+  )
+    throw new HttpError(
+      409,
+      'IDENTITY_ALREADY_RESOLVED',
+      'This report identity is already resolved; no additional confirmation is needed',
+    );
+  let assignedPerson: IntakeIdentityPerson | undefined;
+  if (input.outcome === 'this_is_person') {
+    if (input.selfUpdate !== undefined)
+      throw new HttpError(
+        400,
+        'IDENTITY_SELECTION',
+        'Self fields cannot be changed when assigning another person',
+      );
+    const selection = input.personSelection;
+    if (!selection || typeof selection !== 'object')
+      throw new HttpError(
+        400,
+        'IDENTITY_SELECTION',
+        'Choose an existing person or create a family person',
+      );
+    let note;
+    if ('noteId' in selection && !('newPerson' in selection)) {
+      if (typeof selection.noteId !== 'string' || !Number.isSafeInteger(selection.expectedVersion))
+        throw new HttpError(400, 'IDENTITY_SELECTION', 'Choose the displayed person version');
+      note = getNote(db, selection.noteId);
+      if (note.kind !== 'person' || !note.personId || note.personId === 'patient' || note.archived)
+        throw new HttpError(
+          400,
+          'IDENTITY_SELECTION',
+          'Choose an available person other than Self',
+        );
+      if (note.version !== selection.expectedVersion)
+        throw new HttpError(
+          409,
+          'PERSON_VERSION_CONFLICT',
+          'This person changed; review the current person before confirming',
+        );
+      const printedBirthDate = reviewedBirthDate;
+      const savedBirthDate =
+        typeof note.person.birthDate === 'string' ? note.person.birthDate : null;
+      if (
+        printedBirthDate &&
+        savedBirthDate &&
+        !compatibleIdentityBirthDates(printedBirthDate, savedBirthDate)
+      )
+        throw new HttpError(
+          409,
+          'IDENTITY_CONFLICT',
+          'The report birth date differs from this person. Choose another person or add a new person.',
+        );
+    } else if ('newPerson' in selection && !('noteId' in selection)) {
+      const person = selection.newPerson;
+      if (
+        !person ||
+        typeof person.fullName !== 'string' ||
+        !person.fullName.trim() ||
+        person.fullName.trim().length > 200 ||
+        /[\x00-\x1f]/.test(person.fullName) ||
+        (person.relationship !== undefined &&
+          (typeof person.relationship !== 'string' || person.relationship.length > 200))
+      )
+        throw new HttpError(
+          400,
+          'IDENTITY_SELECTION',
+          'Enter a name and an optional relationship for this family person',
+        );
+      const self = getNote(db, 'patient');
+      if (
+        matchesSelfIdentityName(person.fullName, [
+          String(self.person.fullName || ''),
+          ...effectiveKnownNames(db, self.id, self.person),
+        ])
+      )
+        throw new HttpError(
+          409,
+          'INTAKE_PERSON_SELF',
+          'This name belongs to Self. Choose Me (Self) rather than creating another Person.',
+        );
+      note = createIntakeFamilyPersonInTransaction(
+        db,
+        person.fullName.trim(),
+        person.relationship?.trim(),
+        preparedPerson,
+      );
+    } else throw new HttpError(400, 'IDENTITY_SELECTION', 'Choose exactly one person destination');
+    assignedPerson = {
+      noteId: note.id,
+      personId: note.personId!,
+      version: note.version,
+      fullName:
+        typeof note.person.fullName === 'string' && note.person.fullName.trim()
+          ? note.person.fullName.trim()
+          : note.title,
+    };
+  } else if (input.personSelection !== undefined)
+    throw new HttpError(
+      400,
+      'IDENTITY_SELECTION',
+      'A separate person cannot be selected when confirming Self',
+    );
+  let selfUpdate:
+    | {
+        noteId: 'person-note:self';
+        versionBefore: number;
+        versionAfter: number;
+        fields: NonNullable<IntakeIdentityConfirmation['selfUpdate']>['fields'];
+      }
+    | undefined;
+  if (input.selfUpdate !== undefined) {
+    const selected = input.selfUpdate;
+    if (
+      !selected ||
+      typeof selected !== 'object' ||
+      Array.isArray(selected) ||
+      !Number.isSafeInteger(selected.expectedVersion) ||
+      selected.expectedVersion < 1 ||
+      !selected.fields ||
+      typeof selected.fields !== 'object' ||
+      Array.isArray(selected.fields)
+    )
+      throw new HttpError(
+        400,
+        'SELF_IDENTITY_UPDATE',
+        'Select one or both displayed blank Self identity fields',
+      );
+    if (selected.expectedVersion !== currentSelf.version)
+      throw new HttpError(
+        409,
+        'SELF_VERSION_CONFLICT',
+        'Self changed while identity was being reviewed; refresh before confirming',
+      );
+    if (
+      !Object.keys(selected.fields).length ||
+      Object.keys(selected.fields).some((key) => !['fullName', 'birthDate'].includes(key)) ||
+      (Object.keys(selected.fields) as ('fullName' | 'birthDate')[]).some(
+        (key) => selected.fields[key] !== assessment.offeredSelfFields[key],
+      )
+    )
+      throw new HttpError(
+        409,
+        'SELF_IDENTITY_UPDATE',
+        'Select only the unchanged blank Self values displayed with this identity scope',
+      );
+    const updated = updateBlankSelfIdentityFieldsInTransaction(
+      db,
+      selected.expectedVersion,
+      selected.fields,
+    );
+    selfUpdate = {
+      noteId: 'person-note:self',
+      ...updated,
+      fields: structuredClone(selected.fields),
+    };
+  }
+  const selectedNote = getNote(db, assignedPerson?.noteId || 'person-note:self');
+  const knownNameAdded =
+    safeSourceIdentityName(confirmedPrintedName) &&
+    confirmedPrintedName !== selectedNote.person.fullName
+      ? rememberSourceNameInTransaction(db, assignedPerson?.noteId || 'person-note:self', {
+          name: confirmedPrintedName,
+          operationId: input.operationId,
+          intakeId: id,
+          sourceHash: current.sourceHash,
+          groupId: current.groupId,
+          subjectText: current.subject.text,
+        })
+      : undefined;
+  if (assessment.challengedName && safeSourceIdentityName(confirmedPrintedName))
+    rememberFutureNameOwner(
+      db,
+      confirmedPrintedName,
+      futureTarget,
+      input.operationId,
+      challengedNotes,
+    );
+  if (assignedPerson) assignedPerson.version = getNote(db, assignedPerson.noteId).version;
+  if (selfUpdate) selfUpdate.versionAfter = getNote(db, 'person-note:self').version;
+  return {
+    answers,
+    confirmationTargets,
+    assignedPerson,
+    knownNameAdded,
+    confirmedPrintedName,
+    selfUpdate,
+    createdPerson:
+      input.personSelection && 'newPerson' in input.personSelection
+        ? getNote(db, assignedPerson!.noteId)
+        : undefined,
+  };
+}
+import { intakeFirstLocatorMatchesCooperatively } from './intake-state-access.ts';
+import { COMPACT_SCALAR_FORMAT } from './intake-compact-scalar.ts';
+import { intakeLocatorKey } from './intake-locator-key.ts';

@@ -1,0 +1,322 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { StatementSync } from 'node:sqlite';
+import type { SourceTextEvidence } from '../../shared/intake-source-text.ts';
+
+// Install before production imports so captured native reads remain observable.
+const originalNativeGet = StatementSync.prototype.get;
+let observeNativeGet: typeof StatementSync.prototype.get | undefined;
+const observableNativeGet = function (
+  this: StatementSync,
+  ...args: Parameters<StatementSync['get']>
+) {
+  return Reflect.apply(observeNativeGet ?? originalNativeGet, this, args);
+} as typeof StatementSync.prototype.get;
+StatementSync.prototype.get = observableNativeGet;
+test.after(() => {
+  observeNativeGet = undefined;
+  StatementSync.prototype.get = originalNativeGet;
+});
+
+const { openDatabase, transaction } = await import('../database.ts');
+const { ensureProfileDirectories } = await import('../profile-storage.ts');
+const { registerIntakeFile } = await import('../intake-state-access.ts');
+const { memoryRecordAuthority } = await import('./helpers/intake-authority-fixture.ts');
+const { prepareIntakeSourceDependencyHeaders } =
+  await import('../intake-source-text-dependencies.ts');
+const { readIntakeSourcePin } = await import('../intake-source-pin.ts');
+const { runIntakeSourceExtractionOperation } =
+  await import('../intake-source-extraction-operation.ts');
+const { getIntakeSourceText, publishIntakeSourceText } = await import('../intake-source-text.ts');
+const { intakeWorkCounters } = await import('../intake-work-accounting.ts');
+const { packetSourceAncestry, packetSourceAncestryWork } =
+  await import('../packet-source-ancestry.ts');
+const { iterateIntakeSourceAncestry } = await import('../intake-source-ancestry.ts');
+const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+const {
+  openIntakeCollectionEnvelope,
+  prepareIntakeEnvelopeFieldMutation,
+  stageIntakeEnvelopeFieldMutation,
+} = await import('../intake-collection-envelope.ts');
+
+const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
+function fixture(t: test.TestContext, parents: (string | null | number)[]) {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-source-ancestry-')),
+    profileId = 'cookie-dough',
+    paths = ensureProfileDirectories(root, profileId),
+    db = openDatabase(paths.database, profileId),
+    authority = memoryRecordAuthority(db),
+    bytes = Buffer.from('Exact fictional deep child source text.');
+  transaction(db, () => {
+    db.prepare('INSERT INTO providers(id,name) VALUES(?,?)').run(
+      'fictional-clinic',
+      'Fictional clinic',
+    );
+    for (let i = 0; i < parents.length; i++) {
+      const filename = `fictional-${i}.txt`;
+      writeFileSync(join(paths.sources, filename), bytes);
+      registerIntakeFile(db, {
+        id: `fictional-${i}`,
+        providerId: 'fictional-clinic',
+        path: `${paths.relativeRoot}/sources/${filename}`,
+        sha256: digest(bytes),
+        size: bytes.length,
+        mimeType: 'text/plain',
+        kind: 'intake_original',
+        coverage: 'unknown',
+        details: {
+          intake: {
+            version: 1,
+            originalName: filename,
+            proposals: [],
+            parentSourceFileId: parents[i],
+          },
+        },
+      });
+    }
+  });
+  t.after(() => {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  return {
+    db,
+    root,
+    profileId,
+    authority,
+    sourceHash: digest(bytes),
+    id: `fictional-${parents.length - 1}`,
+  };
+}
+const evidence: SourceTextEvidence = {
+  adapter: { name: 'fictional-source', version: '1' },
+  pages: [{ page: 1, disposition: 'extracted', inspected: false }],
+  spans: [
+    {
+      id: 'fictional-span',
+      text: 'Exact fictional correction.',
+      region: { page: 1 },
+      provenance: 'native',
+    },
+  ],
+  relations: [],
+  issues: [],
+};
+
+test('legacy ancestry selects each checked edge once without repeating accepted authority reads', (t) => {
+  const f = fixture(t, [null, 'fictional-0', 'fictional-1']);
+  const originalGet = originalNativeGet,
+    originalRead = f.authority.storage.read;
+  let selections = 0,
+    checks = 0,
+    heads = 0;
+  t.after(() => {
+    observeNativeGet = undefined;
+  });
+  observeNativeGet = function (this: StatementSync, ...args: unknown[]) {
+    if (typeof args[0] === 'string' && args[0].startsWith('fictional-')) {
+      if (this.sourceSQL === 'SELECT id,kind,sha256,details_json FROM main.source_files WHERE id=?')
+        selections++;
+      if (
+        this.sourceSQL ===
+        "SELECT id,kind,sha256 FROM main.source_files WHERE id=? AND kind='intake_original'"
+      )
+        checks++;
+    }
+    return Reflect.apply(originalGet, this, args);
+  } as typeof StatementSync.prototype.get;
+  t.mock.method(f.authority.storage, 'read', function (name: string) {
+    if (name === 'head') heads++;
+    return Reflect.apply(originalRead, f.authority.storage, [name]);
+  });
+  const before = { ...intakeWorkCounters(f.db).warm };
+  assert.deepEqual(
+    [...iterateIntakeSourceAncestry(f.db, f.profileId, f.id)],
+    [
+      { id: 'fictional-2', parentId: 'fictional-1' },
+      { id: 'fictional-1', parentId: 'fictional-0' },
+      { id: 'fictional-0', parentId: undefined },
+    ],
+  );
+  assert.equal(checks, 6, 'each legacy edge is checked and rechecked');
+  assert.equal(selections, 6, 'each check selects the legacy source projection once');
+  assert.equal(heads, 6, 'each check reads the genuine accepted HEAD once');
+  assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+  observeNativeGet = undefined;
+  t.mock.restoreAll();
+});
+
+test('native ancestry selects each checked edge once and keeps its post-yield recheck', async (t) => {
+  const f = fixture(t, [null]);
+  await buildIntakeCollectionEnvelope(f.db, { id: f.id });
+  const original = originalNativeGet;
+  let selections = 0;
+  t.after(() => {
+    observeNativeGet = undefined;
+  });
+  observeNativeGet = function (this: StatementSync, ...args: unknown[]) {
+    if (
+      this.sourceSQL === 'SELECT id,kind,sha256,details_json FROM main.source_files WHERE id=?' &&
+      args[0] === f.id
+    )
+      selections++;
+    return Reflect.apply(original, this, args);
+  } as typeof StatementSync.prototype.get;
+  assert.deepEqual(
+    [...iterateIntakeSourceAncestry(f.db, f.profileId, f.id)],
+    [{ id: f.id, parentId: undefined }],
+  );
+  assert.equal(selections, 2, 'the check and recheck each select source metadata once');
+  observeNativeGet = undefined;
+  t.mock.restoreAll();
+
+  const walk = iterateIntakeSourceAncestry(f.db, f.profileId, f.id);
+  assert.deepEqual(walk.next(), { done: false, value: { id: f.id, parentId: undefined } });
+  const reader = openIntakeCollectionEnvelope(f.db, { id: f.id });
+  const change = prepareIntakeEnvelopeFieldMutation(
+    f.db,
+    { id: f.id },
+    {
+      reader,
+      record: reader.child(reader.root(), 'intake')!,
+      field: 'parentSourceFileId',
+      jsonText: JSON.stringify('fictional-missing-parent'),
+      operationId: randomUUID(),
+      requestDigest: digest('fictional-parent-change'),
+      domainVersion: reader.logical.domainVersion + 1,
+    },
+  );
+  transaction(f.db, () => stageIntakeEnvelopeFieldMutation(f.db, { id: f.id }, change));
+  assert.throws(() => walk.next(), { code: 'SOURCE_ANCESTRY' });
+});
+
+test('packet ancestry work bounds duplicate seeds and ancestor advances without changing output', (t) => {
+  const f = fixture(
+    t,
+    Array.from({ length: 130 }, (_, i) => (i ? `fictional-${i - 1}` : null)),
+  );
+  const expected = [...packetSourceAncestry(f.db, [f.id])];
+  const iterator = packetSourceAncestryWork(
+    f.db,
+    Array.from({ length: 130 }, () => f.id),
+  );
+  let advances = 0;
+  for (;;) {
+    const next = iterator.next();
+    advances++;
+    if (!next.value && !next.done) break;
+    assert.equal(next.done, false);
+  }
+  assert.equal(advances, 1, 'the first64 duplicate seeds produce a work checkpoint before records');
+  iterator.return();
+  const actual = [...packetSourceAncestryWork(f.db, [f.id])];
+  assert.ok(actual.filter((value) => value === undefined).length >= 2);
+  assert.deepEqual(
+    actual.filter((value) => value !== undefined),
+    expected,
+  );
+  assert.equal(expected.length, 130);
+});
+
+test('deep native capture propagates exact pins through every ancestor, replays without writes and cancels warm preparation', async (t) => {
+  const f = fixture(
+    t,
+    Array.from({ length: 66 }, (_, i) => (i ? `fictional-${i - 1}` : null)),
+  );
+  await prepareIntakeSourceDependencyHeaders(f.db, f.id);
+  let yielded = false;
+  setImmediate(() => {
+    yielded = true;
+  });
+  const objectsBefore = f.authority.objects.size;
+  await prepareIntakeSourceDependencyHeaders(f.db, f.id);
+  assert.equal(yielded, true);
+  assert.equal(f.authority.objects.size, objectsBefore);
+  const before = intakeWorkCounters(f.db).warm;
+  const operation = {
+    ...f,
+    operationId: 'fictional-deep-source-capture',
+    expectedRevisionId: null,
+  };
+  const captured = await runIntakeSourceExtractionOperation(operation);
+  assert.equal(captured.operation.status, 'completed', JSON.stringify(captured.operation));
+  assert.match(
+    captured.sourceText.revision!.spans.map((span) => span.text).join(''),
+    /Exact fictional deep child source text/,
+  );
+  const child = readIntakeSourcePin(f.db, f.id)!;
+  assert.ok(child.version >= 1);
+  const allPins = () =>
+    Array.from({ length: 66 }, (_, i) => readIntakeSourcePin(f.db, `fictional-${i}`));
+  for (const [i, pin] of allPins().entries()) {
+    assert.ok(pin);
+    assert.equal(pin.version, child.version);
+    assert.equal(pin.dependencyToken, child.dependencyToken);
+    assert.equal(pin.revisionId, i === 65 ? captured.sourceText.revision!.id : null);
+  }
+  const retained = allPins(),
+    capturedObjects = f.authority.objects.size;
+  const replay = await runIntakeSourceExtractionOperation(operation);
+  assert.equal(replay.sourceText.revision!.id, captured.sourceText.revision!.id);
+  assert.deepEqual(allPins(), retained);
+  assert.equal(f.authority.objects.size, capturedObjects);
+  const request = {
+    operationId: randomUUID(),
+    expectedRevisionId: captured.sourceText.revision!.id,
+    sourceHash: f.sourceHash,
+    evidence,
+  };
+  const next = publishIntakeSourceText(f.db, f.root, f.profileId, f.id, request);
+  const expectedToken = digest(JSON.stringify([child.dependencyToken, f.id, next.revision!.id]));
+  for (const [i, pin] of allPins().entries()) {
+    assert.equal(pin!.version, child.version + 1);
+    assert.equal(pin!.dependencyToken, expectedToken);
+    assert.equal(pin!.revisionId, i === 65 ? next.revision!.id : null);
+  }
+  const nextObjects = f.authority.objects.size;
+  assert.equal(
+    publishIntakeSourceText(f.db, f.root, f.profileId, f.id, request).revision!.id,
+    next.revision!.id,
+  );
+  assert.equal(f.authority.objects.size, nextObjects);
+  const after = intakeWorkCounters(f.db).warm;
+  for (const key of ['materializationReads', 'envelopeHydrations', 'sourceDTOHydrations'] as const)
+    assert.equal(after[key], before[key], key);
+  let cancelled = false;
+  setImmediate(() => {
+    cancelled = true;
+  });
+  await assert.rejects(
+    prepareIntakeSourceDependencyHeaders(f.db, f.id, {
+      assertRunning() {
+        if (cancelled) throw Error('fictional cancellation');
+      },
+    }),
+    /fictional cancellation/,
+  );
+  assert.equal(f.authority.objects.size, nextObjects);
+});
+
+for (const parents of [['fictional-1', 'fictional-0'], ['missing'], [17]] as const)
+  test(`invalid source ancestry ${JSON.stringify(parents)} rolls back source revision and all ancestor pins`, async (t) => {
+    const f = fixture(t, [...parents]);
+    await assert.rejects(prepareIntakeSourceDependencyHeaders(f.db, f.id));
+    const before = f.db.prepare('SELECT key,value FROM app_meta ORDER BY key').all(),
+      objects = f.authority.objects.size;
+    assert.throws(() =>
+      publishIntakeSourceText(f.db, f.root, f.profileId, f.id, {
+        operationId: randomUUID(),
+        expectedRevisionId: null,
+        sourceHash: f.sourceHash,
+        evidence,
+      }),
+    );
+    assert.deepEqual(f.db.prepare('SELECT key,value FROM app_meta ORDER BY key').all(), before);
+    assert.equal(f.authority.objects.size, objects);
+    assert.equal(getIntakeSourceText(f.db, f.root, f.profileId, f.id).status, 'unavailable');
+  });

@@ -12,6 +12,14 @@ function object(value: unknown): Record<string, unknown> {
     : {};
 }
 
+/** Inline arrays remain legacy evidence; this marker requires accepted-contribution paging. */
+export function hasReferencedImportCorrections(extra: unknown): boolean {
+  return (
+    object(object(object(extra).import).correctionHistorySource).format ===
+    'health-accepted-contribution-corrections-v1'
+  );
+}
+
 export function recordCorrections(extra: unknown): RecordCorrectionEntry[] {
   const metadata = object(extra);
   const imported = object(metadata.import);
@@ -57,6 +65,7 @@ export function recordCorrectionStages(extra: unknown) {
     );
   return {
     imported:
+      hasReferencedImportCorrections(extra) ||
       imported.manuallyEdited === true ||
       entries.some((entry) => entry.stage === 'import') ||
       legacyImport,

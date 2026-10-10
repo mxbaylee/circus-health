@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { fstatSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { recordIntakeFileWork, recordIntakePackageWorkerWork } from './intake-file-work.ts';
 
 export interface InspectedPackageMember {
   ordinal: number;
@@ -36,18 +37,21 @@ export class PackageInspectionError extends Error {
   readonly filename?: string;
   readonly ordinal?: number;
   readonly work?: PackageInspectionWork;
+  readonly traversalWork?: import('./intake-package-protocol.ts').PackageTraversalWork;
   constructor(
     message: string,
     reasonCode = 'PACKAGE_INSPECTION',
     filename?: string,
     ordinal?: number,
     work?: PackageInspectionWork,
+    traversalWork?: import('./intake-package-protocol.ts').PackageTraversalWork,
   ) {
     super(message);
     this.reasonCode = reasonCode;
     this.filename = filename;
     this.ordinal = ordinal;
     this.work = work;
+    this.traversalWork = traversalWork;
   }
 }
 const script = fileURLToPath(new URL('./intake-package-inspector.ts', import.meta.url));
@@ -288,4 +292,221 @@ export async function inspectPackageFile({
       }
     });
   });
+}
+
+/** Explicit new metadata traversal transport. No result-array compatibility
+ * adapter is installed here: callers supply an awaited bounded disk/page sink. */
+export async function runBoundedPackageWorker({
+  lease,
+  outputFd,
+  selected,
+  onRecord,
+}: {
+  lease: Pick<
+    import('./intake-package-source-lease.ts').PackageSourceLease,
+    'sourceFd' | 'binding' | 'assertCurrent'
+  >;
+  outputFd?: number;
+  selected?: {
+    descriptor: import('./intake-package-protocol.ts').PackageCentralDescriptor;
+    sourceHash: string;
+  };
+  onRecord: (
+    record: Record<string, unknown>,
+    controls: { assertRunning: () => void },
+  ) => Promise<Record<string, unknown> | void>;
+}): Promise<{
+  work: import('./intake-package-protocol.ts').PackageTraversalWork;
+  summary?: import('./intake-package-protocol.ts').PackageTraversalSummary;
+}> {
+  const { readPackageRecords, writePackageRecord, emptyPackageTraversalWork, safePackageFilename } =
+    await import('./intake-package-protocol.ts');
+  lease.assertCurrent();
+  if ((selected === undefined) !== (outputFd === undefined))
+    throw new PackageInspectionError(
+      'Selected extraction requires a private output descriptor',
+      'PACKAGE_SELECTION',
+    );
+  if (outputFd !== undefined) {
+    const output = fstatSync(outputFd),
+      source = fstatSync(lease.sourceFd);
+    if (
+      !output.isFile() ||
+      output.size !== 0 ||
+      (output.ino === source.ino && output.dev === source.dev)
+    )
+      throw new PackageInspectionError(
+        'Output must be an empty private regular file',
+        'PACKAGE_SELECTION',
+      );
+  }
+  recordIntakeFileWork('packageWorkerAttempts');
+  const child = spawn(
+    process.execPath,
+    ['--max-old-space-size=128', script, selected ? '--checked-member' : '--bounded-inventory'],
+    {
+      stdio: [
+        'pipe',
+        'pipe',
+        'ignore',
+        lease.sourceFd,
+        ...(outputFd === undefined ? [] : [outputFd]),
+      ],
+      env: { PATH: process.env.PATH || '/usr/bin:/bin', LANG: 'C' },
+    },
+  );
+  let failure: Error | undefined,
+    complete = false,
+    accepted = false,
+    waitingHost = false,
+    lastProgress = Date.now();
+  let work = emptyPackageTraversalWork();
+  let summary: import('./intake-package-protocol.ts').PackageTraversalSummary | undefined;
+  let rejectFailure!: (error: Error) => void;
+  const failureSignal = new Promise<never>((_resolve, reject) => {
+    rejectFailure = reject;
+  });
+  void failureSignal.catch(() => {});
+  const assertRunning = () => {
+    if (failure) throw failure;
+    lease.assertCurrent();
+  };
+  const fail = (error: unknown) => {
+    failure ||= error instanceof Error ? error : Error('Package operation failed');
+    rejectFailure(failure);
+    child.kill('SIGKILL');
+  };
+  child.on('error', () =>
+    fail(new PackageInspectionError('ZIP worker is unavailable', 'PACKAGE_WORKER')),
+  );
+  child.stdin!.on('error', () =>
+    fail(new PackageInspectionError('ZIP worker command transport failed', 'PACKAGE_PROTOCOL')),
+  );
+  const closed = new Promise<number | null>((resolve) =>
+    child.once('close', (code) => resolve(code)),
+  );
+  const poll = setInterval(() => {
+    try {
+      lease.assertCurrent();
+    } catch (error) {
+      fail(error);
+    }
+    if (!waitingHost && Date.now() - lastProgress > 30_000)
+      fail(new PackageInspectionError('ZIP worker stopped making progress', 'PACKAGE_STALLED'));
+  }, 100);
+  try {
+    await writePackageRecord(child.stdin!, {
+      type: 'begin',
+      mode: selected ? 'selected' : 'inventory',
+      bytes: lease.binding.bytes,
+    });
+    if (selected) await writePackageRecord(child.stdin!, { type: 'selected', ...selected });
+    for await (const record of readPackageRecords(child.stdout!)) {
+      if (failure) throw failure;
+      lease.assertCurrent();
+      if (complete)
+        throw new PackageInspectionError(
+          'ZIP worker sent facts after completion',
+          'PACKAGE_PROTOCOL',
+        );
+      let advanced = false;
+      if (record.work !== undefined) {
+        if (
+          !record.work ||
+          typeof record.work !== 'object' ||
+          Object.keys(record.work).length !== Object.keys(work).length ||
+          Object.keys(work).some((key) => {
+            const value = (record.work as Record<string, unknown>)[key];
+            return (
+              !Number.isSafeInteger(value) || (value as number) < work[key as keyof typeof work]
+            );
+          })
+        )
+          throw new PackageInspectionError(
+            'ZIP worker work counts are invalid',
+            'PACKAGE_PROTOCOL',
+          );
+        advanced = Object.keys(work).some(
+          (key) => (record.work as Record<string, number>)[key] > work[key as keyof typeof work],
+        );
+        work = { ...record.work } as typeof work;
+      }
+      if (record.type === 'error') {
+        if (
+          typeof record.reasonCode !== 'string' ||
+          !/^PACKAGE_[A-Z_]+$/.test(record.reasonCode) ||
+          typeof record.message !== 'string' ||
+          record.message.length > 500
+        )
+          throw new PackageInspectionError(
+            'ZIP worker failure frame is invalid',
+            'PACKAGE_PROTOCOL',
+          );
+        throw new PackageInspectionError(
+          record.message,
+          record.reasonCode,
+          safePackageFilename(record.filename) ? record.filename : undefined,
+          Number.isSafeInteger(record.ordinal) && (record.ordinal as number) >= 0
+            ? (record.ordinal as number)
+            : undefined,
+          undefined,
+          { ...work },
+        );
+      }
+      if (
+        ![
+          'declaration',
+          'central_complete',
+          'need_descriptor',
+          'member_verified',
+          'member_reused',
+          'selected_verified',
+          'progress',
+          'complete',
+        ].includes(String(record.type))
+      )
+        throw new PackageInspectionError('ZIP worker frame is invalid', 'PACKAGE_PROTOCOL');
+      if (record.type === 'progress') {
+        if (record.work === undefined)
+          throw new PackageInspectionError('ZIP progress has no work counts', 'PACKAGE_PROTOCOL');
+        if (advanced) lastProgress = Date.now();
+        continue;
+      }
+      waitingHost = true;
+      let reply: Record<string, unknown> | void;
+      try {
+        reply = await Promise.race([onRecord(record, { assertRunning }), failureSignal]);
+      } finally {
+        waitingHost = false;
+        lastProgress = Date.now();
+      }
+      lease.assertCurrent();
+      if (reply) await writePackageRecord(child.stdin!, reply);
+      if (record.type === 'complete') {
+        complete = true;
+        if (record.summary !== undefined) summary = record.summary as typeof summary;
+        child.stdin!.end();
+      }
+    }
+    child.stdin!.end();
+    const code = await closed;
+    if (failure) throw failure;
+    lease.assertCurrent();
+    if (code !== 0 || !complete)
+      throw new PackageInspectionError('ZIP operation did not complete', 'PACKAGE_INCOMPLETE');
+    accepted = true;
+    return { work, summary };
+  } catch (error) {
+    fail(
+      error instanceof Error &&
+        (error.message === 'PACKAGE_PROTOCOL' || error instanceof SyntaxError)
+        ? new PackageInspectionError('ZIP transport metadata is invalid', 'PACKAGE_PROTOCOL')
+        : error,
+    );
+    await closed;
+    throw failure;
+  } finally {
+    clearInterval(poll);
+    recordIntakePackageWorkerWork(work, accepted);
+  }
 }

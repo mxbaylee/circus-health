@@ -1,11 +1,34 @@
+import { clearNativeIdentityPreviews } from './intake-identity-preview-cache.ts';
+import { setImmediate } from 'node:timers/promises';
+import { DatabaseSync } from 'node:sqlite';
+import { terminalStatement } from './database-terminal-statements.ts';
+import { clearPreparedClinicalReviewRead } from './intake-clinical-review-read-cache.ts';
+import { clearCollectionQueueReviews } from './intake-report-group-collection.ts';
+import { clearReviewIssueScratch } from './intake-review-issue-scratch.ts';
 import {
   currentTransactionToken,
-  observeTransactionOutcome,
   rejectCurrentTransaction,
   transaction,
   type Database,
 } from './database.ts';
-import { recordDurabilityStatus } from './record-versions.ts';
+import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
+const outcomes = createTransactionOutcomeIssuer();
+const nativeReadPrepare = DatabaseSync.prototype.prepare;
+export const intakeStateTerminalOutcome = outcomes.recognizes;
+import { recordDurabilityStatus, recordTerminalSelectionAttempted } from './record-versions.ts';
+import { clearIntakeCollectionCache, createIntakeCollections } from './intake-state-collections.ts';
+import { clearIntakeMaintenancePublications } from './intake-state-maintenance.ts';
+import { clearIntakeLegacyBridgeProofs } from './intake-state-migration.ts';
+export type {
+  IntakeCollectionView,
+  PreparedIntakeCollectionMutation,
+  IntakeCollectionArea,
+  IntakeCollectionChange,
+  IntakeCollectionMutation,
+  IntakeCollectionDescriptor,
+  IntakeByteValue,
+  IntakeCollectionValue,
+} from './intake-state-collections.ts';
 import {
   createIntakePrimitiveCounters,
   recordIntakeWork,
@@ -15,6 +38,7 @@ import {
   applyIntakeChangesIsolated,
   cloneValidatedIntakeJson,
   freezeValidatedIntakeJson,
+  freezeValidatedIntakeJsonSteps,
   intakeChanges,
   normalizeIntakeJson,
   serializeIntakeJson,
@@ -35,12 +59,14 @@ import {
   intakeNamespace,
   parseIntakeHead,
   reconstructIntakeEvidence,
+  reconstructIntakeEvidenceSteps,
   checkIntakeResult,
   frameIntakeChanges,
   type Basis,
   type Limits,
   type IntakeStateIdentity,
   type IntakeStateResult,
+  type Head,
 } from './intake-state-evidence.ts';
 export type { IntakeStateIdentity, IntakeStateResult } from './intake-state-evidence.ts';
 export interface IntakePreparedMaterialization {
@@ -71,32 +97,133 @@ const preparations = new WeakMap<PreparedIntakeState, Preparation>();
 interface Cache {
   committed: Map<string, CachedBasis>;
   candidates: Map<string, CachedBasis>;
+  prepared: Map<PreparedIntakeState, Preparation>;
   token?: object;
   dispose: () => void;
 }
 const caches = new WeakMap<Database, Cache>();
+const terminalCleanups = new WeakMap<Database, { pending: boolean; selected: boolean }>();
+/** Refusal cleanup can invoke mutable session methods, so it runs only after
+ * the terminal owner has closed its native rollback and callback barrier. */
+export function withIntakeStateTerminalCleanup<T>(db: Database, run: () => T): T {
+  if (terminalCleanups.has(db)) throw Error('Nested terminal intake cleanup');
+  const cleanup = { pending: false, selected: false };
+  terminalCleanups.set(db, cleanup);
+  try {
+    return run();
+  } finally {
+    terminalCleanups.delete(db);
+    if (cleanup.pending && !cleanup.selected) {
+      if (db.isTransaction) throw Error('Terminal intake cleanup requires completed rollback');
+      try {
+        clearIntakeCaches(db, false);
+      } catch {
+        // Disposable outcome cleanup cannot change the original refusal.
+      }
+    }
+  }
+}
+/** Legacy materializations share the connection lifecycle with v4 pages. Large
+ * v3 values remain readable, but are not retained as an unbounded warm cache. */
+function remember(cache: Cache, target: Map<string, CachedBasis>, key: string, value: CachedBasis) {
+  target.delete(key);
+  if (value.semanticBytes > 16 * 1024 * 1024) return;
+  target.set(key, value);
+  const retainedBytes = () =>
+    [...cache.committed.values(), ...cache.candidates.values()].reduce(
+      (sum, entry) => sum + entry.semanticBytes,
+      0,
+    );
+  while (cache.committed.size + cache.candidates.size > 64 || retainedBytes() > 32 * 1024 * 1024) {
+    const oldest = cache.committed.size ? cache.committed : cache.candidates;
+    oldest.delete(oldest.keys().next().value!);
+  }
+}
 export function clearIntakeStateCache(db: Database): void {
+  clearIntakeCaches(db, true);
+}
+function clearIntakeCaches(
+  db: Database,
+  releaseReviewScratch: boolean,
+  preparedToken?: object,
+): void {
+  const terminal = terminalCleanups.get(db);
+  if (terminal) {
+    terminal.pending = true;
+    const token = currentTransactionToken(db);
+    terminal.selected ||= !!token && recordTerminalSelectionAttempted(token);
+    const cache = caches.get(db);
+    cache?.committed.clear();
+    cache?.candidates.clear();
+    if (cache) {
+      for (const prepared of cache.prepared.keys()) preparations.delete(prepared);
+      cache.prepared.clear();
+      cache.token = undefined;
+    }
+    return;
+  }
+  clearNativeIdentityPreviews(db);
+  clearPreparedClinicalReviewRead(db);
+  clearCollectionQueueReviews(db);
+  if (releaseReviewScratch) clearReviewIssueScratch(db);
+  clearIntakeCollectionCache(db);
+  clearIntakeMaintenancePublications(db, preparedToken);
+  clearIntakeLegacyBridgeProofs(db);
   const cache = caches.get(db);
   if (!cache) return;
   cache.committed.clear();
   cache.candidates.clear();
+  for (const prepared of cache.prepared.keys()) preparations.delete(prepared);
+  cache.prepared.clear();
   cache.dispose();
   caches.delete(db);
 }
 function cacheFor(db: Database): Cache {
   let cache = caches.get(db);
   if (!cache) {
-    cache = { committed: new Map(), candidates: new Map(), dispose: () => {} };
+    cache = { committed: new Map(), candidates: new Map(), prepared: new Map(), dispose: () => {} };
     const owned = cache;
-    owned.dispose = observeTransactionOutcome(db, (outcome) => {
+    owned.dispose = outcomes.observe(db, (outcome) => {
+      const terminal = terminalCleanups.get(db);
+      if (terminal) {
+        terminal.selected ||= outcome.committed || recordTerminalSelectionAttempted(outcome.token);
+        if (!outcome.succeeded) {
+          if (!outcome.committed && !recordTerminalSelectionAttempted(outcome.token))
+            terminal.pending = true;
+          // A post-selection failure is not permission to call mutable cleanup
+          // after the original roster. Invalidate only private prepared maps.
+          owned.committed.clear();
+          owned.candidates.clear();
+          for (const prepared of owned.prepared.keys()) preparations.delete(prepared);
+          owned.prepared.clear();
+          owned.token = undefined;
+          return;
+        }
+        if (outcome.token !== owned.token) return;
+        // No mutable session/scope disposal, including a catch path, is allowed
+        // after a successful terminal publication.
+        for (const [key, candidate] of owned.candidates)
+          remember(owned, owned.committed, key, candidate);
+        owned.candidates.clear();
+        owned.token = undefined;
+        return;
+      }
       try {
         if (!outcome.succeeded) {
-          clearIntakeStateCache(db);
+          // A rollback invalidates cached/prepared state, but does not own
+          // caller-held review sessions. Their original physical proofs must
+          // survive for a retry; their normal authority guards still run.
+          clearIntakeCaches(
+            db,
+            false,
+            outcome.prepared && !outcome.committed ? outcome.token : undefined,
+          );
           return;
         }
         if (outcome.token !== owned.token) return;
         if (outcome.succeeded) {
-          for (const [key, candidate] of owned.candidates) owned.committed.set(key, candidate);
+          for (const [key, candidate] of owned.candidates)
+            remember(owned, owned.committed, key, candidate);
           owned.candidates.clear();
           owned.token = undefined;
         } else clearIntakeStateCache(db);
@@ -124,9 +251,22 @@ export function createIntakeStateStorage(
   const headKey = `${prefix}head`;
   let closed = false;
   const { counters, count } = createIntakePrimitiveCounters(db);
-  const get = (key: string) => {
-    const value = db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
+  const readMeta = nativeReadPrepare.call(db, 'SELECT value FROM main.app_meta WHERE key=?'),
+    readBoundedMeta = nativeReadPrepare.call(
+      db,
+      'SELECT length(CAST(value AS BLOB)) AS bytes, CASE WHEN length(CAST(value AS BLOB))<=? THEN value END AS value FROM app_meta WHERE key=?',
+    ),
+    readSource = nativeReadPrepare.call(db, 'SELECT sha256,kind FROM main.source_files WHERE id=?'),
+    insertMeta = db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)');
+  const get = (key: string, maxBytes?: number) => {
+    const row =
+      maxBytes === undefined
+        ? terminalStatement(db, readMeta.sourceSQL, readMeta).get(key)
+        : terminalStatement(db, readBoundedMeta.sourceSQL, readBoundedMeta).get(maxBytes, key);
     count('metadataReads');
+    if (maxBytes !== undefined && row && (typeof row.bytes !== 'number' || row.bytes > maxBytes))
+      invalid('collection stored row bytes');
+    const value = row?.value;
     if (typeof value === 'string') count('metadataReadBytes', Buffer.byteLength(value));
     return value;
   };
@@ -136,9 +276,7 @@ export function createIntakeStateStorage(
       invalid('closed');
     }
     if (get('owner_profile_id') !== identity.profileId) invalid('database owner');
-    const source = db
-      .prepare('SELECT sha256,kind FROM source_files WHERE id=?')
-      .get(identity.intakeId);
+    const source = terminalStatement(db, readSource.sourceSQL, readSource).get(identity.intakeId);
     if (!source || source.sha256 !== identity.sourceHash || source.kind !== 'intake_original')
       invalid('original source');
     const durability = recordDurabilityStatus(db);
@@ -146,14 +284,18 @@ export function createIntakeStateStorage(
       clearIntakeStateCache(db);
       invalid('accepted authority requires configured current projection');
     }
+    // V4 also uses the existing outcome observer, including cache/preparation
+    // invalidation after rollback or uncertain durable publication.
+    cacheFor(db);
   }
-  function immutable(key: string, serialized: string) {
-    const old = get(key);
+  function immutable(key: string, serialized: string, maxBytes?: number): boolean {
+    const old = get(key, maxBytes);
     if (old !== undefined) {
       if (old !== serialized) invalid('immutable collision');
-      return;
+      return false;
     }
-    db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(key, serialized);
+    terminalStatement(db, insertMeta.sourceSQL, insertMeta, false, 'none').run(key, serialized);
+    return true;
   }
   function cachedBasis(basis: Basis, selectedHead: string): CachedBasis {
     freezeValidatedIntakeJson(basis.value);
@@ -168,6 +310,26 @@ export function createIntakeStateStorage(
         selectedHead,
       }),
     };
+  }
+  async function cachedBasisAsync(
+    basis: Basis,
+    selectedHead: string,
+    assertCurrent: () => void,
+  ): Promise<CachedBasis> {
+    const steps = freezeValidatedIntakeJsonSteps(basis.value);
+    try {
+      for (;;) {
+        assertCurrent();
+        const next = withIntakeWork(db, 'reconstruction', () => steps.next());
+        assertCurrent();
+        if (next.done) break;
+        await setImmediate();
+      }
+    } finally {
+      steps.return(undefined as never);
+    }
+    assertCurrent();
+    return withIntakeWork(db, 'reconstruction', () => cachedBasis(basis, selectedHead));
   }
   function load(): CachedBasis | undefined {
     ready();
@@ -204,8 +366,69 @@ export function createIntakeStateStorage(
     );
     if (token) {
       cache.token = token;
-      cache.candidates.set(prefix, result);
-    } else cache.committed.set(prefix, result);
+      remember(cache, cache.candidates, prefix, result);
+    } else remember(cache, cache.committed, prefix, result);
+    return result;
+  }
+  async function replayAsync(
+    head: Head,
+    assertCurrent: () => void,
+    onFrameRead?: () => void,
+  ): Promise<ReturnType<typeof reconstructIntakeEvidence>> {
+    const steps = reconstructIntakeEvidenceSteps(identity, caps, head, get, onFrameRead);
+    try {
+      for (;;) {
+        assertCurrent();
+        const next = withIntakeWork(db, 'reconstruction', () => steps.next());
+        assertCurrent();
+        if (next.done) return next.value;
+        await setImmediate();
+      }
+    } finally {
+      steps.return(undefined as never);
+    }
+  }
+  async function loadAsync(assertCurrent: () => void): Promise<CachedBasis | undefined> {
+    assertCurrent();
+    ready();
+    const selectedHead = get(headKey);
+    const head = parseIntakeHead(selectedHead, identity, caps);
+    const cache = cacheFor(db);
+    const token = currentTransactionToken(db);
+    const candidate = token === cache.token ? cache.candidates.get(prefix) : undefined;
+    const remembered = candidate ?? cache.committed.get(prefix);
+    if (!head) {
+      if (db.prepare('SELECT 1 FROM app_meta WHERE key GLOB ? LIMIT 1').get(`${prefix}*`))
+        invalid('missing head with retained evidence');
+      assertCurrent();
+      return undefined;
+    }
+    if (remembered && remembered.materialization.selectedHead === selectedHead) {
+      count('warmLoads');
+      assertCurrent();
+      return remembered;
+    }
+    count('coldReconstructions');
+    const reconstructed = await replayAsync(head, assertCurrent, () => count('ancestorReads'));
+    assertCurrent();
+    if (get(headKey) !== selectedHead) invalid('selected head changed during cold replay');
+    assertCurrent();
+    const result = await cachedBasisAsync(
+      {
+        head: reconstructed.head,
+        value: reconstructed.value,
+        semanticBytes: reconstructed.semanticBytes,
+        serialized: reconstructed.serialized,
+        fingerprint: reconstructed.fingerprint,
+      },
+      selectedHead as string,
+      assertCurrent,
+    );
+    assertCurrent();
+    if (token) {
+      cache.token = token;
+      remember(cache, cache.candidates, prefix, result);
+    } else remember(cache, cache.committed, prefix, result);
     return result;
   }
   function normalized(next: unknown): IntakePreparedMaterialization {
@@ -215,6 +438,41 @@ export function createIntakeStateStorage(
     count('normalizedStateBytes', semanticBytes);
     freezeValidatedIntakeJson(value);
     return Object.freeze({ value, serialized, fingerprint: digest(serialized), semanticBytes });
+  }
+  function legacyMaterialization(head: Head): IntakeStateMaterialization {
+    ready();
+    const raw = JSON.stringify(head),
+      cache = cacheFor(db),
+      key = prefix + 'legacy';
+    const prior = cache.committed.get(key) ?? cache.committed.get(prefix);
+    if (prior?.materialization.selectedHead === raw) return prior.materialization;
+    const reconstructed = withIntakeWork(db, 'reconstruction', () =>
+      reconstructIntakeEvidence(identity, caps, head, get),
+    );
+    const result = cachedBasis(reconstructed, raw);
+    remember(cache, cache.committed, key, result);
+    return result.materialization;
+  }
+  async function legacyMaterializationAsync(
+    head: Head,
+    assertCurrent: () => void,
+  ): Promise<IntakeStateMaterialization> {
+    assertCurrent();
+    ready();
+    const raw = JSON.stringify(head),
+      cache = cacheFor(db),
+      key = prefix + 'legacy';
+    const prior = cache.committed.get(key) ?? cache.committed.get(prefix);
+    if (prior?.materialization.selectedHead === raw) {
+      assertCurrent();
+      return prior.materialization;
+    }
+    const reconstructed = await replayAsync(head, assertCurrent);
+    assertCurrent();
+    const result = await cachedBasisAsync(reconstructed, raw, assertCurrent);
+    assertCurrent();
+    remember(cache, cache.committed, key, result);
+    return result.materialization;
   }
   function inspected(prepared: PreparedIntakeState): IntakePreparedMaterialization {
     ready();
@@ -292,7 +550,9 @@ export function createIntakeStateStorage(
     ).run(headKey, serializedHead);
     const cache = cacheFor(db);
     cache.token = token;
-    cache.candidates.set(
+    remember(
+      cache,
+      cache.candidates,
       prefix,
       cachedBasis(
         {
@@ -308,6 +568,17 @@ export function createIntakeStateStorage(
     return result;
   }
   return {
+    collections: createIntakeCollections({
+      db,
+      identity,
+      prefix,
+      ready,
+      get,
+      immutable,
+      legacyMaterialization,
+      legacyMaterializationAsync,
+      invalidate: () => clearIntakeStateCache(db),
+    }),
     counters,
     prepare(next: unknown): PreparedIntakeState {
       return withIntakeWork(db, 'warm', () => {
@@ -322,6 +593,23 @@ export function createIntakeStateStorage(
             cache: cacheFor(db),
             materialization,
           });
+          const cache = cacheFor(db);
+          cache.prepared.set(prepared, preparations.get(prepared)!);
+          // An explicitly prepared legacy value can still use its existing
+          // per-value v3 budget; do not retain other preparations alongside it.
+          while (
+            cache.prepared.size > 1 &&
+            (cache.prepared.size > 8 ||
+              [...cache.prepared.values()].reduce(
+                (sum, entry) => sum + entry.materialization.semanticBytes,
+                0,
+              ) >
+                32 * 1024 * 1024)
+          ) {
+            const oldest = cache.prepared.keys().next().value!;
+            cache.prepared.delete(oldest);
+            preparations.delete(oldest);
+          }
           return prepared;
         } catch (error) {
           if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
@@ -340,6 +628,15 @@ export function createIntakeStateStorage(
         recordIntakeWork('materializationReads');
         return basis.materialization;
       });
+    },
+    async readMaterializationAsync(
+      assertCurrent: () => void,
+    ): Promise<IntakeStateMaterialization | undefined> {
+      const basis = await loadAsync(assertCurrent);
+      if (!basis) return undefined;
+      recordIntakeWork('materializationReads');
+      assertCurrent();
+      return basis.materialization;
     },
     stagePrepared(prepared: PreparedIntakeState, operationId: string): IntakeStateResult {
       return withIntakeWork(db, 'warm', () => {

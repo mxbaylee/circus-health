@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { createHash } from 'node:crypto';
 import { HttpError, transaction, type Database } from './database.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
@@ -206,6 +207,8 @@ function finish(
 export function runIntakeSourceExtractionOperation(
   context: Context,
 ): Promise<SourceExtractionOperationResult> {
+  if (currentClinicalOperation(context.db))
+    throw new Error('Source extraction cannot start or join inside a clinical operation');
   const { db, root, profileId, id, operationId, expectedRevisionId } = context;
   if (
     !operationPattern.test(operationId) ||
@@ -243,6 +246,125 @@ export function runIntakeSourceExtractionOperation(
     return running.promise;
   }
   const prior = readReceipt(db, operationId);
+  if (
+    prior &&
+    (prior.fingerprint !== fingerprint ||
+      prior.profileId !== profileId ||
+      prior.intakeId !== id ||
+      prior.sourceHash !== sourceHash)
+  )
+    conflict('Operation ID was already used with different extraction arguments');
+  if (!prior && [...active.values()].some((entry) => entry.intakeId === id))
+    throw new HttpError(
+      409,
+      'SOURCE_TEXT_EXTRACTION_ACTIVE',
+      'Source extraction is already running; retry the same operation or wait',
+    );
+  if (!prior && (current.revision?.id ?? null) !== expectedRevisionId)
+    throw new HttpError(
+      409,
+      'SOURCE_TEXT_CHANGED',
+      'Reload source text before continuing extraction',
+    );
+  // Reserve the exact operation before yielding. Admission returns inert state;
+  // I/O is started by this original caller only after the short owner is released.
+  let promise: Promise<SourceExtractionOperationResult>;
+  promise = Promise.resolve()
+    .then(async () => {
+      const admitted = await extractionPhase(context, () =>
+        admitExtractionOperation(context, sourceHash, fingerprint, active),
+      );
+      if ('result' in admitted) return admitted.result;
+      const receipt = admitted.receipt;
+      const assertCurrent = () => {
+        context.assertRunning?.();
+        requireDurability(db, profileId);
+        if (
+          db
+            .prepare("SELECT sha256 FROM source_files WHERE id=? AND kind='intake_original'")
+            .get(id)?.sha256 !== sourceHash
+        )
+          conflict('The extraction original changed');
+        const live = readReceipt(db, operationId);
+        if (!live || live.fingerprint !== fingerprint || live.status !== 'started')
+          conflict('Extraction operation changed while its worker was active');
+      };
+      try {
+        assertCurrent();
+        const result = await (context.extract ?? extractIntakeSourceText)({
+          db,
+          root,
+          profileId,
+          id,
+          maxPages: 2,
+          expectedInitialRevisionId: receipt.expectedRevisionId,
+          assertRunning: assertCurrent,
+        });
+        return await extractionPhase(context, () => {
+          assertCurrent();
+          if (
+            currentIntakeSourceTextRevisionId(db, profileId, id) !==
+            (result.sourceText.revision?.id ?? null)
+          )
+            throw new HttpError(
+              409,
+              'SOURCE_TEXT_CHANGED',
+              'Source text changed before its extraction terminal receipt',
+            );
+          return response(
+            context,
+            finish(context, receipt, 'completed', result.sourceText.revision?.id ?? null, null),
+          );
+        });
+      } catch (error) {
+        return await extractionPhase(context, () => {
+          assertCurrent();
+          const retained = getIntakeSourceText(db, root, profileId, id);
+          const reasonCode =
+            error instanceof HttpError && /^[A-Z0-9_]{1,80}$/.test(error.code)
+              ? error.code
+              : 'SOURCE_EXTRACTION_INTERRUPTED';
+          return response(
+            context,
+            finish(context, receipt, 'interrupted', retained.revision?.id ?? null, reasonCode),
+          );
+        });
+      }
+    })
+    .finally(() => {
+      if (active.get(operationId)?.promise === promise) active.delete(operationId);
+    });
+  active.set(operationId, { fingerprint, intakeId: id, promise });
+  return promise;
+}
+function extractionPhase<T>(context: Context, work: () => T): Promise<T> {
+  return runExclusiveClinicalOperation(
+    context.db,
+    async () => {
+      context.assertRunning?.();
+      requireDurability(context.db, context.profileId);
+      return work();
+    },
+    { assertRunning: context.assertRunning },
+  );
+}
+function admitExtractionOperation(
+  context: Context,
+  expectedSourceHash: string,
+  fingerprint: string,
+  active: Map<string, Active>,
+): { result: SourceExtractionOperationResult } | { receipt: Receipt } {
+  const { db, root, profileId, id, operationId, expectedRevisionId } = context;
+  context.assertRunning?.();
+  requireDurability(db, profileId);
+  const current = getIntakeSourceText(db, root, profileId, id);
+  const sourceHash = String(
+    db.prepare("SELECT sha256 FROM source_files WHERE id=? AND kind='intake_original'").get(id)
+      ?.sha256,
+  );
+  if (sourceHash !== expectedSourceHash || active.get(operationId)?.fingerprint !== fingerprint)
+    conflict('The extraction original or reserved operation changed before admission');
+  const prior = readReceipt(db, operationId);
   if (prior) {
     if (
       prior.fingerprint !== fingerprint ||
@@ -261,11 +383,11 @@ export function runIntakeSourceExtractionOperation(
         current.revision?.id ?? null,
         'SOURCE_EXTRACTION_RECOVERED_PARTIAL',
       );
-      return Promise.resolve(response(context, terminal));
+      return { result: response(context, terminal) };
     }
-    return Promise.resolve(response(context, prior));
+    return { result: response(context, prior) };
   }
-  if ([...active.values()].some((entry) => entry.intakeId === id))
+  if ([...active.entries()].some(([key, entry]) => key !== operationId && entry.intakeId === id))
     throw new HttpError(
       409,
       'SOURCE_TEXT_EXTRACTION_ACTIVE',
@@ -331,7 +453,7 @@ export function runIntakeSourceExtractionOperation(
         references: { intakeId: id, operationId, sourceHash },
       },
     );
-    return Promise.resolve(response(context, interrupted));
+    return { result: response(context, interrupted) };
   }
   transaction(
     db,
@@ -347,50 +469,6 @@ export function runIntakeSourceExtractionOperation(
       references: { intakeId: id, operationId, sourceHash },
     },
   );
-  // Defer invocation until the in-memory lease is installed: even synchronously invoked
-  // adapter hooks cannot launch a second worker before the first lease exists.
-  const promise = Promise.resolve().then(async () => {
-    try {
-      context.assertRunning?.();
-      const result = await (context.extract ?? extractIntakeSourceText)({
-        db,
-        root,
-        profileId,
-        id,
-        maxPages: 2,
-        assertRunning: context.assertRunning,
-      });
-      context.assertRunning?.();
-      const terminal = finish(
-        context,
-        receipt,
-        'completed',
-        result.sourceText.revision?.id ?? null,
-        null,
-      );
-      return response(context, terminal);
-    } catch (error) {
-      // Lock or unavailable durable storage cannot acknowledge a terminal state. The
-      // admission remains recoverable after authorized unlock, never automatically rerun.
-      context.assertRunning?.();
-      requireDurability(db, profileId);
-      const retained = getIntakeSourceText(db, root, profileId, id);
-      const reasonCode =
-        error instanceof HttpError && /^[A-Z0-9_]{1,80}$/.test(error.code)
-          ? error.code
-          : 'SOURCE_EXTRACTION_INTERRUPTED';
-      const terminal = finish(
-        context,
-        receipt,
-        'interrupted',
-        retained.revision?.id ?? null,
-        reasonCode,
-      );
-      return response(context, terminal);
-    } finally {
-      if (active.get(operationId)?.promise === promise) active.delete(operationId);
-    }
-  });
-  active.set(operationId, { fingerprint, intakeId: id, promise });
-  return promise;
+
+  return { receipt };
 }

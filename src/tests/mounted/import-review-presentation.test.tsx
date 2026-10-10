@@ -354,6 +354,45 @@ it('highlights file drags and sends dropped files to the upload action', () => {
   expect(onFiles).toHaveBeenCalledWith([file]);
 });
 
+it('admits file selection and drops only after upload prerequisites and the current action settle', () => {
+  const onFiles = vi.fn();
+  const { container, rerender } = render(
+    <ImportReviewPresentation
+      model={model()}
+      actions={{ onFiles, uploadUnavailable: 'Getting ready to upload…' }}
+    />,
+  );
+  const input = container.querySelector('input[type=file]')!;
+  const dropzone = screen.getByText('Drop reports here').closest('.import-upload-card')!;
+  const file = new File(['fictional report'], 'fictional-report.pdf', { type: 'application/pdf' });
+  const dataTransfer = { files: [file], types: ['Files'], dropEffect: 'copy' };
+  expect(input).toBeDisabled();
+  expect(screen.getByText('Getting ready to upload…')).toBeVisible();
+  fireEvent.dragOver(dropzone, { dataTransfer });
+  expect(dataTransfer.dropEffect).toBe('none');
+  fireEvent.drop(dropzone, { dataTransfer });
+  fireEvent.change(input, { target: { files: [file] } });
+  expect(onFiles).not.toHaveBeenCalled();
+
+  rerender(<ImportReviewPresentation model={model()} actions={{ onFiles, busy: true }} />);
+  expect(input).toBeDisabled();
+  fireEvent.drop(dropzone, { dataTransfer });
+  expect(onFiles).not.toHaveBeenCalled();
+
+  rerender(
+    <ImportReviewPresentation
+      model={model()}
+      actions={{ onFiles, busy: true, uploadBusy: false }}
+    />,
+  );
+  expect(input).toBeEnabled();
+  fireEvent.change(input, { target: { files: [file] } });
+  expect(onFiles).toHaveBeenCalledExactlyOnceWith([file]);
+  fireEvent.drop(dropzone, { dataTransfer });
+  expect(onFiles).toHaveBeenCalledTimes(2);
+  expect(onFiles).toHaveBeenLastCalledWith([file]);
+});
+
 it('shows possible same-file overlap before saving without merging or blocking the result', () => {
   const onSave = vi.fn();
   const displayed: ImportReviewModel = {
@@ -886,7 +925,7 @@ it('keeps an evidenced match saveable while offering a separate optional Self fi
           },
         ],
       }}
-      actions={{ onConfirmIdentity }}
+      actions={{ onConfirmIdentity, peopleBusy: true }}
     />,
   );
   expect(screen.getByRole('button', { name: 'Confirm & save' })).not.toBeDisabled();
@@ -2041,6 +2080,104 @@ for (const succeeds of [true, false])
       rendered.rerender(<ImportReviewPresentation {...props} model={{ ...value }} />);
       expect(screen.queryByText('Fictional eyewear prescription')).toBeNull();
     } else await waitFor(() => expect(screen.getByLabelText('Open correction')).toBeVisible());
+  });
+
+for (const newerDraft of [false, true])
+  it(`closes acknowledged review after its save settles without losing a newer draft: ${newerDraft}`, async () => {
+    const value = sourceModel();
+    value.records[0]!.eligible = true;
+    const save = controlledPromise<boolean>();
+    const onSave = vi.fn(() => save.promise);
+    let busy = false;
+    let dirty = false;
+    const guard = vi.fn(async () => !busy && !dirty);
+    const props = () => ({
+      model: value,
+      actions: { onSave, busy },
+      // The parent supplies the current editor guard on each render.
+      beforeReviewChange: () => guard(),
+      renderRecordReview: () => <input aria-label="Open correction" defaultValue="4.1" />,
+    });
+    const rendered = render(<ImportReviewPresentation {...props()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    await screen.findByLabelText('Open correction');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm & save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    busy = true;
+    dirty = newerDraft;
+    if (newerDraft)
+      fireEvent.change(screen.getByLabelText('Open correction'), { target: { value: '4.2' } });
+    rendered.rerender(<ImportReviewPresentation {...props()} />);
+    save.resolve(true);
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Confirm & save' })).toBeDisabled(),
+    );
+    expect(screen.getByLabelText('Open correction')).toBeVisible();
+    busy = false;
+    rendered.rerender(<ImportReviewPresentation {...props()} />);
+    if (newerDraft) {
+      await waitFor(() => expect(guard).toHaveBeenCalledTimes(3));
+      expect(screen.getByLabelText('Open correction')).toHaveValue('4.2');
+      dirty = false;
+      rendered.rerender(<ImportReviewPresentation {...props()} />);
+    }
+    await waitFor(() => expect(screen.queryByLabelText('Open correction')).toBeNull());
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText('Fictional eyewear prescription')).toBeNull();
+  });
+
+for (const replaceContext of [false, true])
+  it(`does not close a replacement editor with an earlier save guard (new context: ${replaceContext})`, async () => {
+    const value = sourceModel();
+    value.records[0]!.eligible = true;
+    const save = controlledPromise<boolean>();
+    const closeCheck = controlledPromise<boolean>();
+    let deferClose = false;
+    const guard = vi.fn(() => (deferClose ? closeCheck.promise : Promise.resolve(true)));
+    const onSave = vi.fn(() => save.promise);
+    const props = {
+      model: value,
+      actions: { onSave },
+      beforeReviewChange: guard,
+      renderRecordReview: () => <input aria-label="Open correction" />,
+    };
+    const rendered = render(<ImportReviewPresentation {...props} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    await screen.findByLabelText('Open correction');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm & save' }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    deferClose = true;
+    save.resolve(true);
+    await waitFor(() => expect(guard).toHaveBeenCalledTimes(3));
+    if (replaceContext)
+      rendered.rerender(
+        <ImportReviewPresentation
+          {...props}
+          model={sourceModel('another-fictional-profile:active')}
+          beforeReviewChange={async () => true}
+        />,
+      );
+    else {
+      deferClose = false;
+      fireEvent.click(screen.getByRole('button', { name: 'Close review' }));
+    }
+    await waitFor(() => expect(screen.queryByLabelText('Open correction')).toBeNull());
+    if (!replaceContext)
+      rendered.rerender(
+        <ImportReviewPresentation
+          {...props}
+          model={{
+            ...value,
+            records: value.records.map((record) => ({ ...record, status: 'saved' })),
+            filters: { ...value.filters!, view: 'saved' },
+          }}
+        />,
+      );
+    fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    await screen.findByLabelText('Open correction');
+    closeCheck.resolve(true);
+    await closeCheck.promise;
+    await waitFor(() => expect(screen.getByLabelText('Open correction')).toBeVisible());
   });
 
 function AttentionMock({

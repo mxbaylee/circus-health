@@ -1,5 +1,6 @@
 import { sourceFileDetails, sourceDetailsSearch } from './intake-state-access.ts';
 import { recordSourceDetailsSearchDTORead } from './source-details-search.ts';
+import { intakeEnvelopeAuthorityBinding } from './intake-authority.ts';
 import { sourceAssertionBoundary } from './source-assertion-ownership.ts';
 import { clinicalRedirect, resolveClinicalReference } from './clinical-references.ts';
 import { clinicalRelationshipProjections } from './clinical-relationships.ts';
@@ -28,6 +29,7 @@ import type {
   Provider,
   SourceFile,
   SourceFileReference,
+  SourceFileListItem,
   SourceRecordClinicalEvidence,
   SourceRecord,
   SourceRecordFileView,
@@ -124,6 +126,7 @@ interface SourceFileReferenceRow extends SqliteRow {
   reviewed_source_provider_id: string | number | null;
   reviewed_source: string | number | null;
   parent_source_file_id: string | number | null;
+  details_json: string | null;
 }
 interface SourceRecordRow extends SqliteRow {
   id: string;
@@ -740,13 +743,15 @@ function getSourceFileReference(db: Database, id: string): SourceFileReferenceNo
                 f.mime_type,f.kind,f.coverage_status,
                 json_extract(f.details_json,'$.intake.metadata.sourceProviderId') AS reviewed_source_provider_id,
                 json_extract(f.details_json,'$.intake.metadata.source') AS reviewed_source,
-                json_extract(f.details_json,'$.intake.parentSourceFileId') AS parent_source_file_id
+                json_extract(f.details_json,'$.intake.parentSourceFileId') AS parent_source_file_id,
+                CASE WHEN f.kind='intake_original' THEN f.details_json END details_json
          FROM source_files f
          LEFT JOIN providers p ON p.id=f.provider_id
          WHERE f.id=?`,
       )
       .get(id) as SourceFileReferenceRow | undefined,
   );
+  const binding = row.kind === 'intake_original' ? intakeEnvelopeAuthorityBinding(db, row) : null;
   return {
     file: {
       archived: visibilityState(db, 'source_file', row.id).archived,
@@ -765,14 +770,42 @@ function getSourceFileReference(db: Database, id: string): SourceFileReferenceNo
       kind: row.kind,
       coverageStatus: row.coverage_status,
       contentUrl: '/api/sources/' + encodeURIComponent(row.id) + '/content',
-      detailsUrl: '/api/sources/' + encodeURIComponent(row.id),
+      detailsUrl:
+        '/api/sources/' +
+        encodeURIComponent(row.id) +
+        (binding?.logicalHead !== undefined ? '/operational-envelope' : ''),
       detailsIncluded: false,
     },
     parentSourceFileId:
       typeof row.parent_source_file_id === 'string' ? row.parent_source_file_id : null,
   };
 }
-export function sourceFiles(db: Database, params: URLSearchParams): Page<SourceFileDTO> {
+/** Checked source header, without loading operational collection scope. */
+export function sourceFileReference(db: Database, id: string): SourceFileReference {
+  return getSourceFileReference(db, id).file;
+}
+/** Original download depends on the retained file binding, not on whether its
+ * operational intake envelope can currently be opened. Authorization and archive
+ * containment remain the serving route's responsibility. */
+export function sourceFileContentHeader(
+  db: Database,
+  id: string,
+): Pick<SourceFile, 'id' | 'path' | 'sha256' | 'bytes' | 'mimeType' | 'kind'> {
+  const row = required(
+    db
+      .prepare('SELECT id,path,sha256,bytes,mime_type,kind FROM source_files WHERE id=?')
+      .get(id) as SourceFileRow | undefined,
+  );
+  return {
+    id: row.id,
+    path: row.path,
+    sha256: row.sha256,
+    bytes: row.bytes,
+    mimeType: row.mime_type,
+    kind: row.kind,
+  };
+}
+export function sourceFiles(db: Database, params: URLSearchParams): Page<SourceFileListItem> {
   const pg = pagination(params),
     args: string[] = [],
     where = [visibilityCondition(params, visibilitySQL("'source_file'", 'f.id'))];
@@ -811,6 +844,11 @@ export function sourceFiles(db: Database, params: URLSearchParams): Page<SourceF
       .map((valueRow) => {
         const row = valueRow as SourceFileRow;
         recordSourceDetailsSearchDTORead(db, row.details_json);
+        if (
+          row.kind === 'intake_original' &&
+          intakeEnvelopeAuthorityBinding(db, row).logicalHead !== undefined
+        )
+          return sourceFileReference(db, row.id);
         return {
           ...sourceFile(db, row),
           archived: visibilityState(db, 'source_file', row.id).archived,

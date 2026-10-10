@@ -4,7 +4,8 @@ import { createImportDiagnostics } from '../import-diagnostics.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import type { IncomingMessage } from 'node:http';
+import { IncomingMessage } from 'node:http';
+import { Socket } from 'node:net';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import fs from 'node:fs';
 import childProcess from 'node:child_process';
@@ -58,6 +59,7 @@ test('package routes paginate inventory and scope selected member reads without 
     resource: 'intakes',
     method: 'GET',
     action: 'package',
+    req: new IncomingMessage(new Socket()),
     params: new URLSearchParams('offset=50&limit=10'),
     respond: (value: unknown) => {
       response = value as NonNullable<typeof response>;
@@ -83,7 +85,9 @@ test('package routes paginate inventory and scope selected member reads without 
       ...context,
       method: 'POST',
       action: 'package-member',
-      req: { headers: { 'content-type': 'application/json' } } as unknown as IncomingMessage,
+      req: Object.assign(new IncomingMessage(new Socket()), {
+        headers: { 'content-type': 'application/json' },
+      }),
       body: async () =>
         Buffer.from(
           JSON.stringify({
@@ -114,7 +118,9 @@ test('package routes paginate inventory and scope selected member reads without 
         ...context,
         method: 'POST',
         action: 'package-member',
-        req: { headers: { 'content-type': 'application/json' } } as unknown as IncomingMessage,
+        req: Object.assign(new IncomingMessage(new Socket()), {
+          headers: { 'content-type': 'application/json' },
+        }),
         body: async () => Buffer.from(JSON.stringify({ memberId: 'fictional-missing' })),
       }),
     ),

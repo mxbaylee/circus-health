@@ -608,8 +608,9 @@ function associationsAt(
   profileId: string,
   current: NoteRecord,
   sequence: number,
-  entity: string,
+  entity: 'note_links' | 'attachments',
 ): AssociationRow[] {
+  const selectedEntity = entity === 'note_links' ? "'note_links'" : "'attachments'";
   const condition =
     entity === 'note_links'
       ? "json_extract(v.contents_json,'$.note_id')=?"
@@ -617,9 +618,9 @@ function associationsAt(
   const owners = entity === 'note_links' ? [current.id] : [current.id, current.personId || ''];
   return db
     .prepare(
-      `SELECT v.contents_json FROM __record_versions v WHERE v.profile_id=? AND v.entity=? AND v.sequence<=? AND ${condition} AND v.deleted=0 AND NOT EXISTS(SELECT 1 FROM __record_versions newer WHERE newer.profile_id=v.profile_id AND newer.entity=v.entity AND newer.record_id=v.record_id AND newer.sequence>v.sequence AND newer.sequence<=?) ORDER BY v.record_id`,
+      `SELECT v.contents_json FROM __record_versions v WHERE v.profile_id=? AND v.entity=${selectedEntity} AND v.sequence<=? AND ${condition} AND v.deleted=0 AND NOT EXISTS(SELECT 1 FROM __record_versions newer WHERE newer.profile_id=v.profile_id AND newer.entity=v.entity AND newer.record_id=v.record_id AND newer.sequence>v.sequence AND newer.sequence<=?) ORDER BY v.record_id`,
     )
-    .all(profileId, entity, sequence, ...owners, sequence)
+    .all(profileId, sequence, ...owners, sequence)
     .map((row) => JSON.parse(row.contents_json as string) as AssociationRow);
 }
 function historicalNote(

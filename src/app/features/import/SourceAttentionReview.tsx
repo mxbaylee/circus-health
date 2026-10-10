@@ -1,7 +1,8 @@
+import { intakeFilenameDisplay } from '../../../shared/intake-summary';
 import { useSourceAttentionRevision } from './useSourceAttentionRevision';
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ImportSourceSelection } from './import-source-selection';
-import type { Intake } from '../../../shared/intake';
+import type { IntakeHeader } from '../../../shared/intake-summary';
 import type {
   IntakeSourceText,
   SourceTextRevision,
@@ -25,6 +26,7 @@ const pageText = (revision: SourceTextRevision, page: number) =>
 /** Approval is transcription trust only. It never saves or regenerates clinical records. */
 export function SourceAttentionReview({
   intake,
+  guardNavigation = true,
   onChanged,
   onPendingChange,
   onManualCreated,
@@ -34,7 +36,8 @@ export function SourceAttentionReview({
 }: {
   onRead?: () => Promise<void>;
   readingBlocked?: string;
-  intake: Intake;
+  intake: IntakeHeader;
+  guardNavigation?: boolean;
   onRemainingChange?: (count: number) => void;
   onChanged: () => void;
   onPendingChange?: (pending: boolean) => void;
@@ -285,8 +288,17 @@ export function SourceAttentionReview({
     }
   }
   return (
-    <section className="source-attention" aria-label={`Text review for ${intake.filename}`}>
-      <ReviewNavigationGuard anyLocationChange pending={() => pending} flush={async () => false} />
+    <section
+      className="source-attention"
+      aria-label={`Text review for ${intakeFilenameDisplay(intake)}`}
+    >
+      {guardNavigation && (
+        <ReviewNavigationGuard
+          anyLocationChange
+          pending={() => pending}
+          flush={async () => false}
+        />
+      )}
       {resource.loading && !data && <p role="status">Loading source sections…</p>}
       {resource.error && <p role="alert">{resource.error.message}</p>}
       {error && (
@@ -472,6 +484,7 @@ export function SourceAttentionReview({
                             <summary>Add a missing clinical record</summary>
                             <fieldset disabled={dirty || busy || advanced}>
                               <ImportManualSourceRecord
+                                guardNavigation={guardNavigation}
                                 intakeId={intake.id}
                                 page={page}
                                 onPendingChange={setManualPending}
@@ -512,6 +525,7 @@ export function SourceAttentionReview({
                             {readingBlocked && <p className="helper-text">{readingBlocked}</p>}
                             {advanced && !dirty && !busy && (
                               <SourceTextReview
+                                guardNavigation={guardNavigation}
                                 intakeId={intake.id}
                                 embedded
                                 initialPage={page}
@@ -540,6 +554,7 @@ export function SourceAttentionReview({
       )}
       {data?.status === 'unavailable' && (
         <SourceTextReview
+          guardNavigation={guardNavigation}
           intakeId={intake.id}
           onPendingChange={onPendingChange}
           onChanged={() => {
@@ -557,7 +572,7 @@ function AttentionOriginal({
   page,
   revisionId,
 }: {
-  intake: Intake;
+  intake: IntakeHeader;
   page: number;
   revisionId: string;
 }) {

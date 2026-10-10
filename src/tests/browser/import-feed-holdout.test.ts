@@ -1,27 +1,42 @@
-import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { launchBrowser, newTestPage } from './harness.ts';
+import { sameDisplayedIdentityReview } from '../../app/data/identity-confirmation-freshness.ts';
+import { startProcessRuntime } from './process-runtime.ts';
+import { fetchFixtureApi, fixtureApiHeaders } from './fixture-api-request.ts';
+import { diagnosticRoute } from './runtime-connection-diagnostics.ts';
+import { observeFixtureClientConnections } from './runtime-client-connection-diagnostics.ts';
+import {
+  fixtureBrowserResponse,
+  fixtureNativeFeedReady,
+  fixtureNativeReportReady,
+} from './native-intake-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import type { AddressInfo } from 'node:net';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { type Browser, type Request } from 'playwright';
+import { type Browser, type Page, type Request } from 'playwright';
 import type { Medication, Note, Observation, Procedure } from '../../shared/api.ts';
 import type {
   HealthRecordEnvelope,
-  Intake,
-  IntakeImportFeed,
+  IntakeReviewRecord,
   IntakeReportAcceptanceRequest,
   IntakeReportAcceptanceResult,
-  IntakeReview,
 } from '../../shared/intake.ts';
-import type { IntakePeopleQueue, IntakePersonApplyRequest } from '../../shared/intake-people.ts';
+import type { IntakePersonApplyRequest } from '../../shared/intake-people.ts';
+import type { IntakeSummaryV2 } from '../../shared/intake-summary.ts';
+import type {
+  CollectionImportFeed,
+  CollectionPeoplePage,
+  CollectionReportDetail,
+} from '../../shared/intake-clinical-pages.ts';
+import type { IntakeClinicalReviewPage } from '../../shared/intake-clinical-review.ts';
 import type { SourceAttentionQueue } from '../../shared/intake-source-text.ts';
 import type {
   IntakeIdentityConfirmation,
   IntakeIdentityReview,
   IntakeIdentityScope,
+  IntakeIdentityScopePage,
 } from '../../shared/intake-identity.ts';
 import type { VisionPrescriptionRecord } from '../../shared/vision.ts';
 
@@ -165,23 +180,428 @@ async function until<T>(
   throw new Error('Timed out waiting for ' + description);
 }
 
+function runtimeFailureSummary(capture: {
+  status: string;
+  diagnostics: string;
+  truncated: boolean;
+}) {
+  const status = [
+    'captured',
+    'child-exited',
+    'aborted',
+    'deadline-exceeded',
+    'ipc-unavailable',
+  ].includes(capture.status)
+    ? capture.status
+    : 'unknown';
+  const base = { status, truncated: capture.truncated };
+  const marker = 'Fictional runtime connections: ';
+  const start = capture.diagnostics.lastIndexOf(marker);
+  if (start < 0) return { ...base, connections: 'unavailable' };
+  const line = capture.diagnostics.slice(start + marker.length).split('\n', 1)[0];
+  try {
+    const value = JSON.parse(line) as Record<string, unknown>;
+    const rows = (input: unknown, limit: number) =>
+      Array.isArray(input)
+        ? input.slice(-limit).filter((row) => row && typeof row === 'object')
+        : [];
+    const number = (input: unknown) =>
+      typeof input === 'number' && Number.isFinite(input)
+        ? Math.max(0, Math.min(Math.round(input), 1_000_000_000))
+        : undefined;
+    const port = (input: unknown) =>
+      typeof input === 'number' && Number.isInteger(input) && input > 0 && input <= 65535
+        ? input
+        : undefined;
+    const diagnosticRequest = (input: unknown) =>
+      typeof input === 'number' && Number.isInteger(input) && input > 0 && input <= 1_000_000_000
+        ? input
+        : undefined;
+    const method = (input: unknown) =>
+      typeof input === 'string' &&
+      ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(input)
+        ? input
+        : 'OTHER';
+    const event = (input: unknown) =>
+      typeof input === 'string' &&
+      [
+        'socket-open',
+        'socket-close',
+        'socket-timeout',
+        'request-start',
+        'response-finish',
+        'response-close',
+      ].includes(input)
+        ? input
+        : 'other';
+    return {
+      ...base,
+      connections: {
+        keepAliveTimeoutMs: number(value.keepAliveTimeoutMs),
+        headersTimeoutMs: number(value.headersTimeoutMs),
+        requestTimeoutMs: number(value.requestTimeoutMs),
+        totalSockets: number(value.totalSockets),
+        totalRequests: number(value.totalRequests),
+        openSocketCount: number(value.openSocketCount),
+        openSocketOverflow: number(value.openSocketOverflow),
+        activeRequestCount: number(value.activeRequestCount),
+        activeRequestOverflow: number(value.activeRequestOverflow),
+        observationFailures: number(value.observationFailures),
+        openSockets: rows(value.openSockets, 12).map((row: Record<string, unknown>) => ({
+          socketId: number(row.id),
+          socketRequests: number(row.requests),
+          remotePort: port(row.remotePort),
+        })),
+        activeRequests: rows(value.activeRequests, 12).map((row: Record<string, unknown>) => ({
+          requestId: number(row.requestId),
+          socketId: number(row.socketId),
+          socketRequests: number(row.socketRequests),
+          remotePort: port(row.remotePort),
+          diagnosticRequest: diagnosticRequest(row.diagnosticRequest),
+          method: method(row.method),
+          path: diagnosticRoute(String(row.path)),
+          durationMs: number(row.durationMs),
+        })),
+        recent: rows(value.recent, 32).map((row: Record<string, unknown>) => ({
+          event: event(row.event),
+          ageMs: number(row.ageMs),
+          socketId: number(row.socketId),
+          socketRequests: number(row.socketRequests),
+          requestId: number(row.requestId),
+          remotePort: port(row.remotePort),
+          diagnosticRequest: diagnosticRequest(row.diagnosticRequest),
+          method: method(row.method),
+          path: diagnosticRoute(String(row.path)),
+          status: number(row.status),
+          durationMs: number(row.durationMs),
+          hadError: row.hadError === true,
+        })),
+      },
+    };
+  } catch {
+    return { ...base, connections: 'unavailable' };
+  }
+}
+
+const runtimeFailureReport = (
+  route: string,
+  diagnostic: ReturnType<typeof runtimeFailureSummary>,
+  client?: ReturnType<ReturnType<typeof observeFixtureClientConnections>['snapshot']>,
+) => JSON.stringify({ route: diagnosticRoute(route), diagnostic, client });
+
+type PeopleRequestKind = 'preflight' | 'apply';
+type PeopleRequestEvent = 'started' | 'completed' | 'failed';
+const addPeopleButtonPattern = '^Add (?:1 person|2 people)$';
+function peopleRequestKind(prefix: string, method: string, path: string): PeopleRequestKind | null {
+  if (method === 'GET' && path.startsWith(prefix + '/intakes/people/')) return 'preflight';
+  if (method === 'POST' && path === prefix + '/intakes/people-apply') return 'apply';
+  return null;
+}
+function peopleRequestDiagnostics() {
+  const counts = {
+    preflight: { started: 0, completed: 0, failed: 0 },
+    apply: { started: 0, completed: 0, failed: 0 },
+  };
+  const recent: Array<{ kind: PeopleRequestKind; event: PeopleRequestEvent; status?: number }> = [];
+  let armed = false;
+  return {
+    arm() {
+      armed = true;
+      for (const kind of ['preflight', 'apply'] as const)
+        for (const event of ['started', 'completed', 'failed'] as const) counts[kind][event] = 0;
+      recent.length = 0;
+    },
+    record(kind: PeopleRequestKind | null, event: PeopleRequestEvent, status?: number) {
+      if (!armed || !kind) return;
+      counts[kind][event] = Math.min(1_000_000_000, counts[kind][event] + 1);
+      recent.push({
+        kind,
+        event,
+        ...(event === 'completed' && Number.isInteger(status) && status! >= 100 && status! <= 599
+          ? { status }
+          : {}),
+      });
+      if (recent.length > 4) recent.shift();
+    },
+    snapshot() {
+      return {
+        counts: {
+          preflight: { ...counts.preflight },
+          apply: { ...counts.apply },
+        },
+        recent: [...recent],
+      };
+    },
+  };
+}
+
+test('People request diagnostics retain only bounded fixed labels and counts', () => {
+  const prefix = '/api/profiles/private-profile';
+  const button = new RegExp(addPeopleButtonPattern);
+  assert.equal(button.test('Add 1 person'), true);
+  assert.equal(button.test('Add 2 people'), true);
+  assert.equal(button.test('Add private person'), false);
+  assert.equal(
+    peopleRequestKind(prefix, 'GET', prefix + '/intakes/people/private-id'),
+    'preflight',
+  );
+  assert.equal(peopleRequestKind(prefix, 'POST', prefix + '/intakes/people-apply'), 'apply');
+  assert.equal(peopleRequestKind(prefix, 'GET', prefix + '/intakes/import-feed'), null);
+  const trace = peopleRequestDiagnostics();
+  trace.record('apply', 'started');
+  assert.equal(trace.snapshot().counts.apply.started, 0);
+  trace.arm();
+  for (let index = 0; index < 8; index++) {
+    trace.record('preflight', 'started');
+    trace.record('preflight', 'completed', 200);
+  }
+  trace.record('apply', 'started');
+  trace.record('apply', 'failed');
+  trace.record('apply', 'completed', 999);
+  const snapshot = trace.snapshot();
+  assert.deepEqual(snapshot.counts, {
+    preflight: { started: 8, completed: 8, failed: 0 },
+    apply: { started: 1, completed: 1, failed: 1 },
+  });
+  assert.equal(snapshot.recent.length, 4);
+  assert.deepEqual(snapshot.recent.at(-1), { kind: 'apply', event: 'completed' });
+  assert.doesNotMatch(JSON.stringify(snapshot), /private-profile|private-id|people-apply/);
+});
+
+test('holdout transport diagnostics retain fixed socket state without private routes', () => {
+  const privateRoute = '/api/profiles/private-profile/intakes/import-feed?private-token=secret';
+  const capture = {
+    status: 'captured',
+    truncated: false,
+    diagnostics:
+      'private stderr must not be reported\nFictional runtime connections: ' +
+      JSON.stringify({
+        keepAliveTimeoutMs: 5000,
+        openSocketCount: 2,
+        activeRequestCount: 1,
+        openSockets: [{ id: 3, requests: 2, remotePort: 49321 }],
+        activeRequests: [
+          {
+            requestId: 8,
+            socketId: 3,
+            remotePort: 49321,
+            diagnosticRequest: 17,
+            method: 'GET',
+            path: privateRoute,
+          },
+        ],
+        recent: [
+          {
+            event: 'socket-timeout',
+            socketId: 3,
+            remotePort: 49321,
+            path: privateRoute,
+            hadError: true,
+            ageMs: 4,
+          },
+        ],
+      }) +
+      '\n',
+  };
+  const summary = runtimeFailureSummary(capture);
+  const client = {
+    matched: true,
+    activeCount: 0,
+    overCapacity: 0,
+    observationFailures: 0,
+    recent: [
+      {
+        event: 'socket-assigned' as const,
+        diagnosticRequest: 17,
+        localPort: 49321,
+        reusedSocket: true,
+        ageMs: 3,
+      },
+      {
+        event: 'request-error' as const,
+        diagnosticRequest: 17,
+        localPort: 49321,
+        reusedSocket: true,
+        error: 'ECONNRESET' as const,
+        ageMs: 1,
+      },
+    ],
+  };
+  const output = runtimeFailureReport(privateRoute, summary, client);
+  const reported = JSON.parse(output);
+  assert.equal(reported.route, '/api/profiles/:profile/intakes/import-feed');
+  assert.equal(reported.diagnostic.connections.activeRequests[0].method, 'GET');
+  assert.equal(reported.diagnostic.connections.activeRequests[0].diagnosticRequest, 17);
+  assert.equal(reported.diagnostic.connections.openSockets[0].remotePort, 49321);
+  assert.equal(reported.diagnostic.connections.recent[0].event, 'socket-timeout');
+  assert.equal(
+    reported.client.recent[0].diagnosticRequest,
+    reported.diagnostic.connections.activeRequests[0].diagnosticRequest,
+  );
+  assert.equal(
+    reported.client.recent[0].localPort,
+    reported.diagnostic.connections.openSockets[0].remotePort,
+  );
+  assert.equal(reported.client.recent[1].error, 'ECONNRESET');
+  assert.match(output, /api\/profiles\/:profile\/intakes\/import-feed/);
+  assert.match(output, /socket-timeout/);
+  assert.doesNotMatch(output, /private-profile|private-token|secret|private stderr/);
+  assert.deepEqual(runtimeFailureSummary({ ...capture, diagnostics: 'malformed' }), {
+    status: 'captured',
+    truncated: false,
+    connections: 'unavailable',
+  });
+  assert.equal(
+    runtimeFailureSummary({ ...capture, status: 'child-exited', diagnostics: '' }).status,
+    'child-exited',
+  );
+  const many = runtimeFailureSummary({
+    ...capture,
+    diagnostics:
+      'Fictional runtime connections: ' +
+      JSON.stringify({
+        activeRequests: Array.from({ length: 20 }, () => ({
+          method: ['GET'],
+          path: privateRoute,
+          durationMs: -2,
+          remotePort: 'secret-port',
+          diagnosticRequest: 'secret-request',
+        })),
+        recent: Array.from({ length: 40 }, () => ({
+          event: ['socket-close'],
+          path: privateRoute,
+          durationMs: 2_000_000_000,
+        })),
+      }) +
+      '\n',
+  });
+  assert.equal(typeof many.connections, 'object');
+  if (typeof many.connections !== 'object') throw Error('Expected bounded connection fields');
+  assert.equal(many.connections.activeRequests.length, 12);
+  assert.equal(many.connections.recent.length, 32);
+  assert.equal(many.connections.activeRequests[0]?.method, 'OTHER');
+  assert.equal(many.connections.activeRequests[0]?.remotePort, undefined);
+  assert.equal(many.connections.activeRequests[0]?.diagnosticRequest, undefined);
+  assert.equal(many.connections.activeRequests[0]?.durationMs, 0);
+  assert.equal(many.connections.recent[0]?.event, 'other');
+  assert.equal(many.connections.recent[0]?.durationMs, 1_000_000_000);
+});
+
 test(
   'encrypted Import holdout defers blocked work, saves exact destinations and recovers a lost acceptance acknowledgement',
-  { timeout: 60000 },
+  { timeout: 600000 },
   async (t) => {
     const root = mkdtempSync(resolve(tmpdir(), 'circus-import-feed-holdout-'));
     mkdirSync(resolve(root, 'data'));
     const runtimeDirectory = createTestRuntimeDirectory();
-    const runtime = await startBrowserRuntime(t, {
+    const runtime = await startProcessRuntime(t, {
       dataDirectory: resolve(root, 'data'),
       runtimeDirectory,
       codeRoot: process.env.CRS_TEST_CODE_ROOT,
       port: 0,
       host: '127.0.0.1',
-      assistantOptions: { availability: () => ({ available: false }) },
+      connectionDiagnostics: true,
     });
+    const captureRuntimeDiagnostics = runtime.captureDiagnostics();
+    let phase = 'browser setup';
+    let phaseStarted = Date.now();
+    let requestNumber = 0;
+    const inFlight = new Map<number, { method: string; path: string; started: number }>();
+    const browserInFlight = new Map<Request, { method: string; path: string; started: number }>();
+    const peopleRequests = peopleRequestDiagnostics();
+    const recentBrowserRequests: Array<{
+      method: string;
+      path: string;
+      status: number | 'failed';
+      durationMs: number;
+    }> = [];
+    let peopleApplyStep = 'not started';
+    let peopleApplyPosts = 0;
+    let postClickPeopleState:
+      | { state: 'not-captured' | 'capturing' | 'unavailable' }
+      | {
+          state: 'captured';
+          addButton: 'absent' | 'disabled' | 'enabled';
+          selectedCheckboxes: number;
+          alertPresent: boolean;
+          definiteFailureVisible: boolean;
+          uncertainFailureVisible: boolean;
+        } = { state: 'not-captured' };
+    let completed = false;
+    let failureDiagnosticsPrinted = false;
+    let pageForDiagnostics: Page | undefined;
+    const enterPhase = (name: string) => {
+      phase = name;
+      phaseStarted = Date.now();
+    };
+    const diagnosticPath = (path: string) =>
+      path
+        .split('?')[0]!
+        .split('/')
+        .map((part) => (/%3A|^[0-9a-f-]{20,}$/i.test(part) ? ':id' : part))
+        .join('/');
+    const requestDiagnostics = () => ({
+      phase,
+      phaseDurationMs: Date.now() - phaseStarted,
+      inFlight: [...inFlight.values()].map((request) => ({
+        method: request.method,
+        path: request.path,
+        durationMs: Date.now() - request.started,
+      })),
+      browserInFlight: [...browserInFlight.values()].map((request) => ({
+        method: request.method,
+        path: request.path,
+        durationMs: Date.now() - request.started,
+      })),
+      recentBrowserRequests,
+      peopleApplyStep,
+      peopleApplyPosts,
+      peopleRequests: peopleRequests.snapshot(),
+      postClickPeopleState,
+    });
+    t.signal.addEventListener(
+      'abort',
+      () => {
+        if (!completed && !failureDiagnosticsPrinted) {
+          failureDiagnosticsPrinted = true;
+          console.error('Fictional holdout interrupted', JSON.stringify(requestDiagnostics()));
+        }
+      },
+      { once: true },
+    );
     let browser: Browser | undefined;
     t.after(async () => {
+      if (!completed) {
+        if (!failureDiagnosticsPrinted) {
+          failureDiagnosticsPrinted = true;
+          console.error('Fictional holdout final step', JSON.stringify(requestDiagnostics()));
+        }
+        if (pageForDiagnostics && !pageForDiagnostics.isClosed()) {
+          try {
+            const ui = await pageForDiagnostics.evaluate(() => ({
+              definiteFailureVisible: globalThis.document.body.innerText.includes(
+                'The second fictional Person changed before saving.',
+              ),
+              uncertainFailureVisible: globalThis.document.body.innerText.includes(
+                'The outcome is unconfirmed.',
+              ),
+              selectedItemsUpdatedVisible:
+                globalThis.document.body.innerText.includes('selected item updated.'),
+              addPeopleButtonPresent: [...globalThis.document.querySelectorAll('button')].some(
+                (button) => /^Add [12] people?$/.test(button.textContent?.trim() || ''),
+              ),
+            }));
+            console.error('Fictional holdout final UI', ui);
+            const screenshot = resolve(tmpdir(), 'circus-import-feed-holdout-failure.png');
+            await pageForDiagnostics.screenshot({ path: screenshot, timeout: 5000 });
+            console.error('Fictional holdout screenshot', screenshot);
+          } catch (cause) {
+            console.error('Fictional holdout UI diagnostic unavailable', String(cause));
+          }
+        }
+      }
+      if (process.env.CRS_TEST_DIAGNOSTICS)
+        console.error('Fictional holdout runtime:', await captureRuntimeDiagnostics());
       await browser?.close();
       await runtime.close();
       rmSync(runtimeDirectory, { recursive: true, force: true });
@@ -189,6 +609,10 @@ test(
     });
     browser = await launchBrowser(t);
     const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
+    pageForDiagnostics = page;
+    page.on('pageerror', (error) =>
+      console.error('Fictional holdout browser error:', error.message),
+    );
     async function captureControls(stage: string) {
       if (!process.env.CRS_TEST_SCREENSHOTS) return;
       mkdirSync(process.env.CRS_TEST_SCREENSHOTS, { recursive: true });
@@ -221,7 +645,9 @@ test(
       }
       if (viewport) await page.setViewportSize(viewport);
     }
-    const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
+    const url = `http://127.0.0.1:${runtime.port}`;
+    const clientSockets = observeFixtureClientConnections(runtime.port);
+    t.after(() => clientSockets.close());
     await page.goto(url);
     const profileId = await page.evaluate(async () => {
       const post = async (path: string, body: unknown) => {
@@ -248,29 +674,270 @@ test(
       ).id as string;
     });
     const prefix = `/api/profiles/${profileId}`;
-    async function request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
-      const response = await page.request.fetch(url + prefix + path, {
-        method,
-        headers: method === 'GET' ? undefined : { Origin: url },
-        data: body,
+    page.on('request', (request) => {
+      const path = new URL(request.url()).pathname;
+      if (!path.startsWith(prefix + '/')) return;
+      peopleRequests.record(peopleRequestKind(prefix, request.method(), path), 'started');
+      browserInFlight.set(request, {
+        method: request.method(),
+        path: diagnosticPath(path.slice(prefix.length)),
+        started: Date.now(),
       });
-      const json = await response.json();
-      assert.ok(response.ok(), JSON.stringify(json));
-      return json.data as T;
+    });
+    page.on('requestfinished', async (request) => {
+      const started = browserInFlight.get(request);
+      if (!started) return;
+      browserInFlight.delete(request);
+      const response = await request.response().catch(() => null);
+      peopleRequests.record(
+        peopleRequestKind(prefix, request.method(), new URL(request.url()).pathname),
+        'completed',
+        response?.status(),
+      );
+      recentBrowserRequests.push({
+        method: started.method,
+        path: started.path,
+        status: response?.status() ?? 'failed',
+        durationMs: Date.now() - started.started,
+      });
+      if (recentBrowserRequests.length > 8) recentBrowserRequests.shift();
+    });
+    page.on('requestfailed', (request) => {
+      peopleRequests.record(
+        peopleRequestKind(prefix, request.method(), new URL(request.url()).pathname),
+        'failed',
+      );
+      const started = browserInFlight.get(request);
+      if (!started) return;
+      browserInFlight.delete(request);
+      recentBrowserRequests.push({
+        method: started.method,
+        path: started.path,
+        status: 'failed',
+        durationMs: Date.now() - started.started,
+      });
+      if (recentBrowserRequests.length > 8) recentBrowserRequests.shift();
+    });
+    enterPhase('upload and initial Import feed');
+    async function request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+      const started = Date.now();
+      const requestId = ++requestNumber;
+      inFlight.set(requestId, { method, path: diagnosticPath(path), started });
+      const captureRequestDiagnostics = runtime.captureDiagnostics();
+      try {
+        let response;
+        try {
+          response = await fetchFixtureApi(page.request, url + prefix + path, {
+            method,
+            headers: {
+              ...(method === 'GET' ? {} : { Origin: url }),
+              'X-CRS-Test-Request': String(requestId),
+            },
+            data: body,
+          });
+        } catch (error) {
+          let diagnostic: ReturnType<typeof runtimeFailureSummary>;
+          try {
+            diagnostic = runtimeFailureSummary(await captureRequestDiagnostics());
+          } catch {
+            diagnostic = { status: 'capture-failed', truncated: false, connections: 'unavailable' };
+          }
+          console.error(
+            'Fictional holdout failed request',
+            runtimeFailureReport(prefix + path, diagnostic, clientSockets.snapshot(requestId)),
+          );
+          throw error;
+        }
+        if (process.env.CRS_TEST_DIAGNOSTICS)
+          console.error(
+            'Fixture request',
+            diagnosticPath(path),
+            Date.now() - started,
+            response.status(),
+          );
+        const json = await response.json();
+        assert.ok(response.ok(), JSON.stringify(json));
+        return json.data as T;
+      } finally {
+        inFlight.delete(requestId);
+      }
     }
     async function upload(rows: HealthRecordEnvelope[], filename: string) {
       const bytes = Buffer.from(rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
-      const response = await page.request.post(url + prefix + '/intakes', {
+      const response = await fetchFixtureApi(page.request, url + prefix + '/intakes', {
+        method: 'POST',
         headers: { Origin: url, 'Content-Type': 'application/x-ndjson', 'X-Filename': filename },
         data: bytes,
       });
       assert.equal(response.status(), 201, await response.text());
-      return { intake: (await response.json()).data as Intake, bytes };
+      return { intake: (await response.json()).data as IntakeSummaryV2, bytes };
+    }
+    async function readIdentityTargets(scope: IntakeIdentityConfirmation['scope']) {
+      if (!('format' in scope)) return scope.targets;
+      const targets: IntakeIdentityScope['targets'] = [];
+      let cursor: string | null = null;
+      do {
+        const query = new URLSearchParams({
+          groupId: scope.groupId,
+          scopeToken: scope.scopeToken,
+          section: 'targets',
+          limit: '20',
+        });
+        if (cursor) query.set('cursor', cursor);
+        const page: IntakeIdentityScopePage = await request<IntakeIdentityScopePage>(
+          `/intakes/${encodeURIComponent(scope.intakeId)}/identity-scope-page?${query}`,
+        );
+        assert.equal(page.scopeToken, scope.scopeToken);
+        assert.equal(page.total, scope.collection.targets);
+        for (const item of page.items) {
+          assert.equal(item.kind, 'value', 'controlled fictional targets fit a bounded page');
+          if (item.kind === 'value')
+            targets.push(item.value as IntakeIdentityScope['targets'][number]);
+        }
+        assert.notEqual(page.nextCursor, cursor || undefined, 'identity target pages advance');
+        cursor = page.nextCursor;
+      } while (cursor);
+      assert.equal(targets.length, scope.collection.targets);
+      return targets;
     }
     const clinical = await upload(clinicalRows, 'fictional-linden-clinical.jsonl');
     const people = await upload([peopleOnly], 'fictional-linden-people.jsonl');
     const selfBefore = await request<Note>('/notes/person-note%3Aself');
-    const readFeed = () => request<IntakeImportFeed>('/intakes/import-feed?view=all');
+    const readFeed = () =>
+      request<CollectionImportFeed>('/intakes/import-feed?view=all&limit=40&bytes=65536');
+    const feedRecords = (feed: CollectionImportFeed) => {
+      assert.equal(
+        feed.nextCursor,
+        null,
+        'the controlled five-record fixture fits one bounded page',
+      );
+      return feed.records.map((row) => {
+        assert.equal(row.detail.kind, 'record');
+        if (row.detail.kind !== 'record') throw new Error('Unexpected fictional record reference');
+        return row.detail.record;
+      });
+    };
+    async function readReview(intakeId: string) {
+      const page = await request<IntakeClinicalReviewPage>(
+        `/intakes/${encodeURIComponent(intakeId)}/review?limit=40&bytes=65536`,
+      );
+      assert.equal(page.format, 'health-intake-clinical-review-page-v2');
+      assert.equal(
+        page.nextCursor,
+        null,
+        'controlled review fixture fits one complete bounded page',
+      );
+      const records = page.items.map((item) => {
+        assert.equal(item.kind, 'value');
+        if (item.kind !== 'value') throw new Error('Unexpected fictional record reference');
+        return item.value as IntakeReviewRecord;
+      });
+      assert.equal(records.length, page.total);
+      return { version: page.version, records };
+    }
+    async function groupFor(intakeId: string, title?: string) {
+      let cursor: string | null = null;
+      const visited = new Set<string>();
+      const groups = new Set<string>();
+      do {
+        const query = new URLSearchParams({ view: 'all', limit: '40', bytes: '65536' });
+        if (cursor) query.set('cursor', cursor);
+        const feed = await request<CollectionImportFeed>('/intakes/import-feed?' + query);
+        const matches = feed.groups.filter((group) => group.intakeId === intakeId);
+        for (const ref of matches) {
+          if (groups.has(ref.groupId)) continue;
+          groups.add(ref.groupId);
+          const detail = await request<CollectionReportDetail>(
+            `/intakes/report-queue/${encodeURIComponent(ref.groupId)}?intakeId=${encodeURIComponent(intakeId)}&view=all&limit=40&bytes=65536`,
+          );
+          if (!title || detail.group.title === title) return detail.group;
+        }
+        const nextCursor = feed.nextCursor;
+        if (nextCursor !== null && (nextCursor === cursor || visited.has(nextCursor)))
+          throw new Error('Exact fictional report lookup cursor did not advance');
+        if (nextCursor !== null) visited.add(nextCursor);
+        cursor = nextCursor;
+      } while (cursor !== null);
+      throw new Error('Missing exact fictional report ' + title);
+    }
+    const displayedIdentityReviews = new Map<string, IntakeIdentityReview>();
+    async function openReport(
+      intakeId: string,
+      title?: string,
+      identityExpectation: 'scoped' | 'missing_identity' = 'scoped',
+    ) {
+      const group = await groupFor(intakeId, title);
+      // Open one fresh document after fixture writes, without also preparing
+      // the same report in the document immediately discarded by a reload.
+      await page.goto('about:blank');
+      const identityReady = fixtureBrowserResponse(page, (response) => {
+        const selected = new URL(response.url());
+        return (
+          response.request().method() === 'GET' &&
+          selected.pathname ===
+            prefix + '/intakes/' + encodeURIComponent(intakeId) + '/identity-review' &&
+          selected.searchParams.get('groupId') === group.groupId
+        );
+      });
+      const detail = await fixtureNativeReportReady(
+        page,
+        prefix,
+        { intakeId, groupId: group.groupId },
+        () =>
+          page.goto(
+            url + '/#/import?' + new URLSearchParams({ intake: intakeId, group: group.groupId }),
+          ),
+      );
+      assert.equal(detail.format, 'health-intake-report-detail-v2');
+      assert.equal(detail.group.intakeId, intakeId);
+      assert.equal(detail.group.groupId, group.groupId);
+      assert.equal(detail.group.title, group.title);
+      // The first report page can precede the real retained-original identity
+      // check. Keep the UI deadline for rendering its completed response.
+      const identityResponse = await identityReady;
+      assert.equal(identityResponse.status(), 200, await identityResponse.text());
+      assert.equal(await identityResponse.finished(), null);
+      const identity = (await identityResponse.json()).data as IntakeIdentityReview;
+      displayedIdentityReviews.set(group.groupId, identity);
+      const identityScope = identity.scopeReference || identity.scope;
+      if (identityExpectation === 'missing_identity') {
+        // This explicitly anonymous fixture offers individual record review,
+        // not common confirmation of an invented printed report subject.
+        // The exact request URL/group and report detail remain checked above.
+        assert.equal(identity.scope, null);
+        assert.equal(identity.scopeReference, undefined);
+        assert.equal(identity.scopeFragmentReference, undefined);
+        assert.equal(identity.status, 'missing_warning');
+        assert.equal(identity.blocking, false);
+        assert.deepEqual(identity.evidencedIdentity, {});
+        assert.deepEqual(identity.offeredSelfFields, {});
+        assert.deepEqual(identity.conflicts, []);
+      } else {
+        assert.equal(identityScope?.intakeId, intakeId);
+        assert.equal(identityScope?.groupId, group.groupId);
+      }
+      try {
+        await page.getByRole('heading', { name: String(group.title), exact: true }).waitFor();
+      } catch (cause) {
+        throw new Error(`Exact report did not open: ${await page.locator('body').innerText()}`, {
+          cause,
+        });
+      }
+      return group;
+    }
+    async function readPeople() {
+      const result = await request<CollectionPeoplePage>(
+        `/intakes/people/${encodeURIComponent(initial.people.groups[0]!.groupId)}?intakeId=${encodeURIComponent(people.intake.id)}&view=all&limit=40&bytes=65536`,
+      );
+      assert.equal(result.nextCursor, null);
+      const values = result.people.map((item) => {
+        assert.equal(item.kind, 'person');
+        if (item.kind !== 'person') throw new Error('Unexpected fictional Person reference');
+        return item.person;
+      });
+      assert.equal(values.length, result.totalPeople);
+      return { people: values };
+    }
     const initial = await readFeed();
     assert.equal(initial.counts.pending, 5);
     assert.equal(initial.counts.blocked, 5, 'every printed-subject clinical row awaits review');
@@ -279,7 +946,7 @@ test(
       11,
       'five identity prompts, five saved-name conflicts, and one uncertain reading',
     );
-    const initialClinicalRecords = initial.blocks.flatMap((block) => block.records);
+    const initialClinicalRecords = feedRecords(initial);
     assert.equal(initialClinicalRecords.length, 5);
     assert.equal(
       initialClinicalRecords.filter((record) => record.selectable).length,
@@ -309,86 +976,70 @@ test(
     assert.equal(initial.groups.length, 2, 'two clinical reports share one retained original');
     assert.equal(initial.people.groups.length, 1, 'People-only report has independent discovery');
 
-    await page.goto(url + '/#/import');
-    await page.reload();
-    const laboratoryReport = page.getByRole('region', {
-      name: /Fictional Linden laboratory report/,
-    });
-    await laboratoryReport.getByRole('button', { name: /Review person for/ }).waitFor();
+    const laboratoryGroup = await openReport(
+      clinical.intake.id,
+      'Fictional Linden laboratory report',
+    );
+    const identityPanel = page.getByRole('region', { name: 'Report identity', exact: true });
+    await identityPanel.getByText(/This report identifies “Fictional Sol Linden”/).waitFor();
     await captureControls('import-person-pending');
-    await laboratoryReport.getByRole('button', { name: /Review person for/ }).click();
-    await page
-      .getByRole('dialog')
-      .getByText('The report identifies “Fictional Sol Linden”.', { exact: true })
-      .waitFor();
     await captureControls('import-person-sidebar');
-    if (process.env.CRS_TEST_SCREENSHOTS) {
-      await page.getByRole('dialog').getByRole('button', { name: 'Source', exact: true }).click();
-      await captureControls('import-source-sidebar');
-      await page.getByRole('dialog').getByRole('button', { name: 'Person', exact: true }).click();
-      await page
-        .getByRole('dialog')
-        .getByRole('link', { name: 'Review retained report evidence' })
-        .click();
-      await page
-        .getByRole('button', { name: 'Review person for this report', exact: true })
-        .click();
-      await page
-        .getByRole('dialog')
-        .getByRole('combobox', { name: 'Person for this report' })
-        .waitFor();
-      await captureControls('import-direct-person-sidebar');
-      await page.goto(url + '/#/import');
-      await page.reload();
-      await laboratoryReport.getByRole('button', { name: /Review person for/ }).click();
-    }
     const initialIdentityPosts: IntakeIdentityConfirmation[] = [];
     const captureInitialIdentity = (request: Request) => {
       if (request.method() === 'POST' && request.url().endsWith('/identity-scope'))
         initialIdentityPosts.push(request.postDataJSON() as IntakeIdentityConfirmation);
     };
     page.on('request', captureInitialIdentity);
-    const initialIdentityResponse = page.waitForResponse(
+    const initialLaboratoryScope = await request<IntakeIdentityConfirmation['scope']>(
+      `/intakes/${encodeURIComponent(clinical.intake.id)}/identity-scope?groupId=${encodeURIComponent(laboratoryGroup.groupId)}`,
+    );
+    const initialLaboratoryTargets = await readIdentityTargets(initialLaboratoryScope);
+    const initialIdentityResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
     await page
-      .getByRole('dialog')
+      .getByRole('region', { name: 'Report identity', exact: true })
       .getByLabel('Name printed on this report')
       .fill('Fictional Sol Linden');
-    await page.getByRole('dialog').getByRole('button', { name: 'This is me', exact: true }).click();
+    await identityPanel.getByRole('button', { name: 'This is me', exact: true }).click();
     const initialIdentity = await initialIdentityResponse;
     assert.equal(initialIdentity.status(), 200, await initialIdentity.text());
     const initialIdentityRequest = initialIdentity
       .request()
       .postDataJSON() as IntakeIdentityConfirmation;
     assert.equal(initialIdentityRequest.attestation, 'confirmed_displayed_identity_questions');
-    assert.equal(
-      initialIdentityRequest.scope.groupId,
-      initial.groups.find((group) => group.title === 'Fictional Linden laboratory report')!.groupId,
+    assert.equal(initialIdentityRequest.scope.groupId, laboratoryGroup.groupId);
+    assert.deepEqual(
+      initialIdentityRequest.scope,
+      initialLaboratoryScope,
+      'confirmation binds the exact displayed target scope',
     );
-    assert.deepEqual(initialIdentityRequest.scope.targets.map((target) => target.title).sort(), [
+    assert.deepEqual(initialLaboratoryTargets.map((target) => target.title).sort(), [
       'Fictional Linden copper',
       'Fictional Linden unclear result',
     ]);
     // JSONL repeats report headings in payload and metadata. It does not establish
     // one unambiguous original patient header, so each report needs its own choice.
     const laboratoryReady = await readFeed();
+    enterPhase('second report identity confirmation');
     assert.equal(laboratoryReady.counts.blocked, 4);
-    await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    const visitGroup = await openReport(clinical.intake.id, 'Fictional Linden visit report');
     await page
-      .getByRole('region', { name: /Fictional Linden visit report/ })
-      .getByRole('button', { name: /Review person for/ })
-      .click();
-    await page
-      .getByRole('dialog')
+      .getByRole('region', { name: 'Report identity', exact: true })
       .getByLabel('Name printed on this report')
       .fill('Fictional Sol Linden');
-    const visitIdentityResponse = page.waitForResponse(
+    const initialVisitScope = await request<IntakeIdentityConfirmation['scope']>(
+      `/intakes/${encodeURIComponent(clinical.intake.id)}/identity-scope?groupId=${encodeURIComponent(visitGroup.groupId)}`,
+    );
+    const initialVisitTargets = await readIdentityTargets(initialVisitScope);
+    const visitIdentityResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
-    await page.getByRole('dialog').getByRole('button', { name: 'This is me', exact: true }).click();
+    await identityPanel.getByRole('button', { name: 'This is me', exact: true }).click();
     const visitIdentity = await visitIdentityResponse;
     assert.equal(visitIdentity.status(), 200, await visitIdentity.text());
     const identityReady = await until(
@@ -396,6 +1047,7 @@ test(
       (value) => value.counts.blocked === 1,
       'two report confirmations to leave only the uncertain reading blocked',
     );
+    enterPhase('source inspection and Later selection');
     page.off('request', captureInitialIdentity);
     assert.equal(
       initialIdentityPosts.length,
@@ -403,11 +1055,9 @@ test(
       'each report confirmation records exactly one identity operation',
     );
     assert.deepEqual(initialIdentityPosts[0], initialIdentityRequest);
-    assert.equal(
-      initialIdentityPosts[1]!.scope.groupId,
-      initial.groups.find((group) => group.title === 'Fictional Linden visit report')!.groupId,
-    );
-    assert.equal(initialIdentityPosts[1]!.scope.targets.length, 3);
+    assert.equal(initialIdentityPosts[1]!.scope.groupId, visitGroup.groupId);
+    assert.deepEqual(initialIdentityPosts[1]!.scope, initialVisitScope);
+    assert.equal(initialVisitTargets.length, 3);
     assert.equal(identityReady.counts.pending, 5);
     assert.equal(identityReady.counts.accepted, 0, 'identity confirmation does not accept records');
     assert.equal(identityReady.counts.questions, 1);
@@ -416,7 +1066,7 @@ test(
     assert.equal(selfAfterIdentity.person.birthDate, selfBefore.person.birthDate);
     assert.deepEqual(selfAfterIdentity.person.knownNames, ['Fictional Sol Linden']);
     assert.equal(selfAfterIdentity.person.sourceKnownNames?.[0]?.name, 'Fictional Sol Linden');
-    const identityReadyRecords = identityReady.blocks.flatMap((block) => block.records);
+    const identityReadyRecords = feedRecords(identityReady);
     assert.equal(identityReadyRecords.filter((record) => record.selectable).length, 4);
     const stillBlocked = identityReadyRecords.filter((record) => !record.selectable);
     assert.equal(stillBlocked.length, 1);
@@ -437,7 +1087,8 @@ test(
       ),
       'both reports retain their explicit printed-person confirmations',
     );
-    await page.reload();
+    await page.goto('about:blank');
+    await fixtureNativeFeedReady(page, prefix, () => page.goto(url + '/#/import'));
     const sourceAttention = await request<SourceAttentionQueue>('/intakes/source-attention');
     assert.equal(
       sourceAttention.sections,
@@ -449,9 +1100,6 @@ test(
       [clinical.intake.id, people.intake.id].sort(),
     );
     // Source inspection remains separate from the five clinical and two People rows.
-    await page.getByRole('tab', { name: /^All\s*9$/ }).waitFor();
-    await page.getByRole('tab', { name: /^Needs attention\s*2$/ }).waitFor();
-    await page.getByRole('tab', { name: /^People\s*2$/ }).waitFor();
     await captureControls('import-person-confirmed');
     await until(
       () => page.locator('.import-record').count(),
@@ -460,20 +1108,25 @@ test(
     );
     await page.getByLabel('Select all shown', { exact: true }).check();
     await page.getByRole('button', { name: 'Later 7', exact: true }).click();
+    await page
+      .getByRole('status')
+      .filter({ hasText: /^7 selected items updated\.$/ })
+      .waitFor({ timeout: 0 });
     const deferred = await until(
       readFeed,
       (value) => value.counts.deferred === 5 && value.people.counts.later === 2,
       'all seven explicitly selected rows deferred',
     );
+    enterPhase('clinical acceptance and receipt recovery');
     assert.equal(deferred.counts.pending, 0);
     assert.equal(deferred.counts.blocked, 1);
     assert.equal(
-      (await request<IntakeImportFeed>('/intakes/import-feed?view=all&edited=true')).totalRecords,
+      (await request<CollectionImportFeed>('/intakes/import-feed?view=all&edited=true'))
+        .totalRecords,
       0,
       'Later snapshots are not manual clinical edits',
     );
     await page.getByRole('combobox', { name: 'Review status' }).selectOption('later');
-    await page.getByRole('tab', { name: /^All\s*7$/ }).waitFor();
     await until(
       () => page.locator('.import-record').count(),
       (count) => count === 7,
@@ -502,7 +1155,10 @@ test(
     await page.route('**/intakes/report-acceptance', async (route) => {
       if (route.request().method() !== 'POST') return route.continue();
       acceptanceRequests.push(route.request().postDataJSON() as IntakeReportAcceptanceRequest);
-      const response = await route.fetch();
+      const response = await route.fetch({
+        timeout: 180000,
+        headers: fixtureApiHeaders(route.request().headers()),
+      });
       if (!lostAcknowledgement && response.ok()) {
         lostAcknowledgement = true;
         await route.abort('failed');
@@ -510,18 +1166,19 @@ test(
     });
     await page.getByLabel('Select all shown', { exact: true }).check();
     await page.getByRole('button', { name: 'Save 4 records', exact: true }).click();
+    await page
+      .getByText('A save has not been confirmed yet. Check its status before retrying.', {
+        exact: true,
+      })
+      .waitFor({ timeout: 0 });
     const clinicalSaved = await until(
       readFeed,
       (value) => value.counts.accepted === 4,
       'four clinical records committed despite the lost acknowledgement',
     );
+    enterPhase('People apply and definite failure');
     assert.equal(clinicalSaved.people.counts.saved, 0, 'clinical save has its own honest count');
     assert.equal(clinicalSaved.people.counts.later, 2);
-    await page
-      .getByText('A save has not been confirmed yet. Check its status before retrying.', {
-        exact: true,
-      })
-      .waitFor();
     await page.getByRole('button', { name: 'Check save status', exact: true }).waitFor();
     assert.equal(
       await page.getByRole('button', { name: 'Add 2 people', exact: true }).isDisabled(),
@@ -535,7 +1192,9 @@ test(
     await page.route(peopleApplyPattern, async (route) => {
       if (route.request().method() !== 'POST') return route.continue();
       peopleApplyRequests.push(route.request().postDataJSON() as IntakePersonApplyRequest);
+      peopleApplyPosts = peopleApplyRequests.length;
       if (peopleApplyRequests.length === 2) {
+        peopleApplyStep = 'fulfilling second POST with definite 409';
         await route.fulfill({
           status: 409,
           contentType: 'application/json',
@@ -546,23 +1205,63 @@ test(
             },
           }),
         });
+        peopleApplyStep = 'second POST fulfilled with definite 409';
         return;
       }
+      peopleApplyStep = 'forwarding first POST';
       await route.continue();
+      peopleApplyStep = 'first POST forwarded';
     });
+    peopleRequests.arm();
+    peopleApplyStep = 'clicking Add 2 people';
     await page.getByRole('button', { name: 'Add 2 people', exact: true }).click();
+    enterPhase('second Person failure feedback');
+    postClickPeopleState = { state: 'capturing' };
+    void page
+      .evaluate((buttonPattern) => {
+        const buttonLabel = new RegExp(buttonPattern);
+        const button = [...globalThis.document.querySelectorAll('button')].find((candidate) =>
+          buttonLabel.test(candidate.textContent?.trim() || ''),
+        );
+        const alerts = [...globalThis.document.querySelectorAll('[role="alert"]')].map(
+          (element) => element.textContent || '',
+        );
+        return {
+          state: 'captured' as const,
+          addButton: !button
+            ? ('absent' as const)
+            : button.disabled
+              ? ('disabled' as const)
+              : ('enabled' as const),
+          selectedCheckboxes: globalThis.document.querySelectorAll(
+            '.import-record input[type="checkbox"]:checked',
+          ).length,
+          alertPresent: alerts.length > 0,
+          definiteFailureVisible: alerts.some((value) =>
+            value.includes('The second fictional Person changed before saving.'),
+          ),
+          uncertainFailureVisible: alerts.some((value) =>
+            value.includes('The outcome is unconfirmed.'),
+          ),
+        };
+      }, addPeopleButtonPattern)
+      .then((snapshot) => {
+        postClickPeopleState = snapshot;
+      })
+      .catch(() => {
+        postClickPeopleState = { state: 'unavailable' };
+      });
+    await page
+      .getByText('The second fictional Person changed before saving.', { exact: true })
+      .waitFor({ timeout: 0 });
+    enterPhase('first Person durable result');
     const partiallySaved = await until(
       readFeed,
       (value) => value.people.counts.saved === 1 && value.people.counts.later === 1,
       'first Person saved before the second definite failure',
     );
     assert.equal(partiallySaved.counts.accepted, 4);
-    await page
-      .getByText('The second fictional Person changed before saving.', { exact: true })
-      .waitFor();
-    const savedAfterFailure = await request<IntakePeopleQueue>(
-      `/intakes/people/${encodeURIComponent(initial.people.groups[0]!.groupId)}`,
-    );
+    const savedAfterFailure = await readPeople();
     const firstSavedPerson = savedAfterFailure.people.find((person) => person.state === 'saved')!;
     assert.ok(firstSavedPerson.saved, 'the first successful Apply has a durable destination');
     const justSavedPeople = page.getByRole('region', { name: 'Just saved People' });
@@ -571,21 +1270,25 @@ test(
     });
     await firstDestination.waitFor();
     assert.equal(await firstDestination.getAttribute('href'), firstSavedPerson.saved.resultUrl);
+    enterPhase('retry second Person');
     await page.getByRole('button', { name: 'Add 1 person', exact: true }).click();
+    await page
+      .getByRole('status')
+      .filter({ hasText: /^1 selected item updated\.$/ })
+      .waitFor({ timeout: 0 });
     const saved = await until(
       readFeed,
       (value) => value.counts.accepted === 4 && value.people.counts.saved === 2,
       'four clinical records and two separate People saved',
     );
+    enterPhase('saved destination verification');
     assert.equal(await justSavedPeople.getByRole('link').count(), 2);
     assert.equal(
       await firstDestination.getAttribute('href'),
       firstSavedPerson.saved.resultUrl,
       'the first confirmed destination remains available after retrying the second Person',
     );
-    const savedPeople = await request<IntakePeopleQueue>(
-      `/intakes/people/${encodeURIComponent(initial.people.groups[0]!.groupId)}`,
-    );
+    const savedPeople = await readPeople();
     assert.equal(peopleApplyRequests.length, 3, 'only the failed Person is retried');
     for (const person of savedPeople.people)
       assert.equal(
@@ -597,9 +1300,8 @@ test(
       );
     await page.unroute(peopleApplyPattern);
     await page.getByRole('combobox', { name: 'Review status' }).selectOption('saved');
-    await page.getByRole('tab', { name: /^People\s*2$/ }).click();
     await until(
-      () => page.locator('.import-record-destination').count(),
+      () => page.locator('.import-record-destination [data-saved-person-id]').count(),
       (count) => count === 2,
       'both durable saved Person row destinations',
     );
@@ -681,9 +1383,7 @@ test(
     assert.equal(vision[0]!.opticalPrescription.eyes[0]!.sph?.valueText, '-00.75');
     assert.equal(vision[0]!.opticalPrescription.eyes[0]!.baseCurve?.valueText, '08.60');
     assert.equal(vision[0]!.opticalPrescription.expiresDateText, '6 November 2027');
-    const peopleQueue = await request<IntakePeopleQueue>(
-      `/intakes/people/${encodeURIComponent(initial.people.groups[0]!.groupId)}`,
-    );
+    const peopleQueue = await readPeople();
     assert.equal(peopleQueue.people.length, 2);
     for (const person of peopleQueue.people) {
       assert.ok(person.saved);
@@ -703,7 +1403,7 @@ test(
       'relative history and clinician contact never modify Self',
     );
     for (const original of [clinical, people]) {
-      const response = await page.request.get(url + original.intake.contentUrl);
+      const response = await fetchFixtureApi(page.request, url + original.intake.contentUrl);
       assert.equal(response.status(), 200, await response.text());
       assert.deepEqual(
         await response.body(),
@@ -711,6 +1411,7 @@ test(
         'original JSONL remains byte exact after review and acceptance',
       );
     }
+    enterPhase('identity freshness retry');
 
     // The original click sends its displayed scope. Unrelated version-only
     // progress permits one exact-boundary retry of that same explicit action.
@@ -722,18 +1423,14 @@ test(
       unit: 'arb',
     });
     const matchedOriginal = await upload([identityRow], 'fictional-linden-alias-match.jsonl');
-    const matchedGroup = matchedOriginal.intake.workflow!.reportGroups![0]!;
+    const matchedGroup = await groupFor(matchedOriginal.intake.id);
     const matchedIdentity = await request<IntakeIdentityReview>(
-      `/intakes/${encodeURIComponent(matchedOriginal.intake.id)}/identity-review?groupId=${encodeURIComponent(matchedGroup.id)}`,
+      `/intakes/${encodeURIComponent(matchedOriginal.intake.id)}/identity-review?groupId=${encodeURIComponent(matchedGroup.groupId)}`,
     );
     assert.equal(matchedIdentity.status, 'confirmation_required');
     assert.equal(matchedIdentity.blocking, true);
     assert.equal(matchedIdentity.evidencedIdentity.fullName, undefined);
-    assert.equal(
-      (await request<Intake>(`/intakes/${encodeURIComponent(matchedOriginal.intake.id)}`)).workflow
-        ?.identityConfirmations?.length || 0,
-      0,
-    );
+    assert.equal(matchedIdentity.confirmationCount, 0);
     // Neither a remembered spelling nor a new alias can replace original
     // patient grounding; this report also requires an explicit choice.
     identityRow.report!.subject!.text = 'Fictional Sol Birch';
@@ -742,30 +1439,15 @@ test(
       'Fictional Sol Birch',
     );
     const identity = await upload([identityRow], 'fictional-linden-identity.jsonl');
-    await page.goto(url + '/#/import');
-    await page.reload();
-    const staleIdentityReport = page
-      .getByRole('region', {
-        name: /Fictional Linden identity holdout/,
-      })
-      .filter({ hasText: 'New Import Source: fictional-linden-identity.jsonl' });
-    await staleIdentityReport.getByRole('button', { name: /Review person for/ }).click();
-    await page
-      .getByRole('dialog')
-      .getByText('The report identifies “Fictional Sol Birch”.', { exact: true })
-      .waitFor();
-    await page
-      .getByRole('dialog')
-      .getByLabel('Name printed on this report')
-      .fill('Fictional Sol Birch');
-    const identityFeed = await request<IntakeImportFeed>('/intakes/import-feed');
-    const group = identityFeed.groups.find((item) => item.intakeId === identity.intake.id)!;
-    const displayedScope = await request<IntakeIdentityScope>(
+    await openReport(identity.intake.id);
+    await identityPanel.getByText(/This report identifies “Fictional Sol Birch”/).waitFor();
+    await identityPanel.getByLabel('Name printed on this report').fill('Fictional Sol Birch');
+    const group = await groupFor(identity.intake.id);
+    const displayedIdentityReview = displayedIdentityReviews.get(group.groupId)!;
+    const displayedScope = await request<IntakeIdentityConfirmation['scope']>(
       `/intakes/${encodeURIComponent(identity.intake.id)}/identity-scope?groupId=${encodeURIComponent(group.groupId)}`,
     );
-    const review = await request<IntakeReview>(
-      `/intakes/${encodeURIComponent(identity.intake.id)}/review`,
-    );
+    const review = await readReview(identity.intake.id);
     await request(`/intakes/${encodeURIComponent(identity.intake.id)}/review-draft`, 'POST', {
       version: review.version,
       operationId: 'fictional-stale-displayed-scope',
@@ -773,6 +1455,38 @@ test(
       recordId: review.records[0]!.id,
       candidateVersionId: review.records[0]!.candidateVersionId,
       disposition: 'pending',
+    });
+    let identityEventSequence = 0;
+    let firstConflictResponseSequence: number | undefined;
+    const identityRequestSequences = new WeakMap<Request, number>();
+    const recordIdentityRequest = (request: Request) => {
+      const path = new URL(request.url()).pathname;
+      const base = `${prefix}/intakes/${encodeURIComponent(identity.intake.id)}`;
+      if (path === base + '/identity-scope' || path === base + '/identity-review')
+        identityRequestSequences.set(request, ++identityEventSequence);
+    };
+    const recordIdentityResponse = (response: import('playwright').Response) => {
+      if (
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          `${prefix}/intakes/${encodeURIComponent(identity.intake.id)}/identity-scope` &&
+        response.status() === 409 &&
+        firstConflictResponseSequence === undefined
+      )
+        firstConflictResponseSequence = ++identityEventSequence;
+    };
+    page.on('request', recordIdentityRequest);
+    page.on('response', recordIdentityResponse);
+    const freshIdentityReviewResponse = fixtureBrowserResponse(page, (response) => {
+      const target = new URL(response.url());
+      return (
+        response.request().method() === 'GET' &&
+        target.pathname ===
+          `${prefix}/intakes/${encodeURIComponent(identity.intake.id)}/identity-review` &&
+        target.searchParams.get('groupId') === group.groupId &&
+        firstConflictResponseSequence !== undefined &&
+        (identityRequestSequences.get(response.request()) || 0) > firstConflictResponseSequence
+      );
     });
     const identityPosts: IntakeIdentityConfirmation[] = [];
     const captureIdentity = (request: Request) => {
@@ -782,29 +1496,46 @@ test(
       )
         identityPosts.push(request.postDataJSON() as IntakeIdentityConfirmation);
     };
-    const firstIdentityResponse = page.waitForResponse(
+    const firstIdentityResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
-    const confirmedIdentityResponse = page.waitForResponse(
+    const confirmedIdentityResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'POST' &&
         response.url().endsWith('/identity-scope') &&
         response.status() === 200,
     );
     page.on('request', captureIdentity);
-    await page.getByRole('dialog').getByRole('button', { name: 'This is me', exact: true }).click();
+    await identityPanel.getByRole('button', { name: 'This is me', exact: true }).click();
     const firstIdentity = await firstIdentityResponse;
     assert.equal(firstIdentity.status(), 409, await firstIdentity.text());
     assert.equal((await firstIdentity.json()).error.code, 'VERSION_CONFLICT');
+    const freshIdentityReviewResponseValue = await freshIdentityReviewResponse;
+    assert.equal(freshIdentityReviewResponseValue.status(), 200);
+    assert.ok(
+      firstConflictResponseSequence !== undefined,
+      'the real first409 response precedes freshness reload',
+    );
+    assert.ok(
+      (identityRequestSequences.get(freshIdentityReviewResponseValue.request()) || 0) >
+        firstConflictResponseSequence,
+      'fresh review request starts after the actual409 response',
+    );
+    const freshIdentityReview = (await freshIdentityReviewResponseValue.json())
+      .data as IntakeIdentityReview;
     const confirmedIdentity = await confirmedIdentityResponse;
     assert.equal(confirmedIdentity.status(), 200, await confirmedIdentity.text());
     await until(
-      () => request<IntakeReview>(`/intakes/${encodeURIComponent(identity.intake.id)}/review`),
+      () => readReview(identity.intake.id),
       (value) => value.records[0]!.mapping.subject === 'self',
       'one explicit action confirmed after exact freshness validation',
     );
     page.off('request', captureIdentity);
+    page.off('request', recordIdentityRequest);
+    page.off('response', recordIdentityResponse);
     assert.equal(identityPosts.length, 2, 'one click produces only the original and bounded retry');
     assert.deepEqual(
       identityPosts[0]!.scope,
@@ -813,16 +1544,63 @@ test(
     );
     assert.equal(identityPosts[0]!.attestation, 'confirmed_displayed_identity_questions');
     assert.equal(identityPosts[1]!.operationId, identityPosts[0]!.operationId);
+    const retryScope = identityPosts[1]!.scope;
+    assert.ok(
+      'collection' in displayedScope,
+      'this fixture selects a native complete displayed scope',
+    );
+    assert.ok('collection' in retryScope, 'retry retains the native complete scope protocol');
+    assert.deepEqual(
+      displayedIdentityReview.scopeReference || displayedIdentityReview.scope,
+      displayedScope,
+      'commitment belongs to the real displayed scope',
+    );
+    assert.deepEqual(
+      freshIdentityReview.scopeReference || freshIdentityReview.scope,
+      retryScope,
+      'retry sends the real freshly reviewed scope',
+    );
+    assert.equal(
+      displayedIdentityReview.evidenceCommitment?.format,
+      'health-intake-identity-evidence-v1',
+    );
+    assert.match(displayedIdentityReview.evidenceCommitment!.sha256, /^[a-f0-9]{64}$/);
+    assert.equal(
+      freshIdentityReview.evidenceCommitment?.format,
+      'health-intake-identity-evidence-v1',
+    );
+    assert.match(freshIdentityReview.evidenceCommitment!.sha256, /^[a-f0-9]{64}$/);
+    assert.deepEqual(
+      freshIdentityReview.evidenceCommitment,
+      displayedIdentityReview.evidenceCommitment,
+      'complete native evidence and ordered warnings are unchanged',
+    );
+    assert.equal(
+      sameDisplayedIdentityReview(displayedIdentityReview, freshIdentityReview),
+      true,
+      'real complete server reviews qualify the native client freshness policy',
+    );
+    assert.equal(displayedScope.collection.snapshotId, 'identity:' + displayedScope.scopeToken);
+    assert.equal(retryScope.collection.snapshotId, 'identity:' + retryScope.scopeToken);
+    assert.notEqual(
+      retryScope.collection.snapshotId,
+      displayedScope.collection.snapshotId,
+      'native storage snapshots remain version-bound',
+    );
     const {
       intakeVersion: _oldVersion,
       scopeToken: _oldToken,
-      ...originalBoundary
+      collection: { snapshotId: _oldSnapshotId, ...originalCollection },
+      ...originalFields
     } = displayedScope;
     const {
       intakeVersion: freshVersion,
       scopeToken: freshToken,
-      ...freshBoundary
-    } = identityPosts[1]!.scope;
+      collection: { snapshotId: _freshSnapshotId, ...freshCollection },
+      ...freshFields
+    } = retryScope;
+    const originalBoundary = { ...originalFields, collection: originalCollection };
+    const freshBoundary = { ...freshFields, collection: freshCollection };
     assert.deepEqual(freshBoundary, originalBoundary, 'no unseen identity evidence is confirmed');
     assert.equal(freshVersion, displayedScope.intakeVersion + 1);
     assert.notEqual(freshToken, displayedScope.scopeToken);
@@ -831,15 +1609,16 @@ test(
       version: freshVersion,
       scope: identityPosts[1]!.scope,
     });
-    const confirmedIntake = await request<Intake>(
-      `/intakes/${encodeURIComponent(identity.intake.id)}`,
+    const confirmedReview = await request<IntakeIdentityReview>(
+      `/intakes/${encodeURIComponent(identity.intake.id)}/identity-review?groupId=${encodeURIComponent(group.groupId)}`,
     );
-    assert.equal(confirmedIntake.workflow?.identityConfirmations?.length, 1);
+    assert.equal(confirmedReview.confirmationCount, 1);
     assert.equal(
       (await readFeed()).counts.accepted,
       4,
       'identity confirmation never implicitly accepts clinical results',
     );
+    enterPhase('shared report identity question');
 
     const questionPrompt = 'Does the printed patient Fictional Sol Linden identify you?';
     const questionAnchor = 'Patient: Fictional Sol Linden';
@@ -856,11 +1635,15 @@ test(
       ],
     }));
     const questionsOriginal = await upload(questionRows, 'fictional-explicit-subject.jsonl');
-    await page.reload();
-    await page
-      .getByRole('region', { name: /Fictional explicit subject report/ })
-      .getByRole('button', { name: /Review person for/ })
-      .click();
+    const questionsGroup = await openReport(questionsOriginal.intake.id);
+    const questionScope = await request<IntakeIdentityConfirmation['scope']>(
+      `/intakes/${encodeURIComponent(questionsOriginal.intake.id)}/identity-scope?groupId=${encodeURIComponent(questionsGroup.groupId)}`,
+    );
+    const questionTargets = await readIdentityTargets(questionScope);
+    const questionEvidence = await request<IntakeIdentityScopePage>(
+      `/intakes/${encodeURIComponent(questionsOriginal.intake.id)}/identity-scope-page?${new URLSearchParams({ groupId: questionsGroup.groupId, scopeToken: questionScope.scopeToken, section: 'questions', limit: '20' })}`,
+    );
+    assert.equal(questionEvidence.nextCursor, null);
     await page.getByText(questionPrompt, { exact: true }).waitFor();
     assert.equal(
       await page.getByText(questionPrompt, { exact: true }).count(),
@@ -869,29 +1652,32 @@ test(
     );
     await page.getByText(questionAnchor, { exact: true }).waitFor();
     await page
-      .getByRole('dialog')
+      .getByRole('region', { name: 'Report identity', exact: true })
       .getByLabel('Name printed on this report')
       .fill('Fictional Sol Linden');
-    const questionResponse = page.waitForResponse(
+    const questionResponse = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'POST' && response.url().endsWith('/identity-scope'),
     );
     await page.getByRole('button', { name: 'This is me', exact: true }).click();
     const confirmedQuestions = await questionResponse;
     assert.equal(confirmedQuestions.status(), 200, await confirmedQuestions.text());
-    const questionRequest = confirmedQuestions.request().postDataJSON() as {
-      scope: IntakeIdentityScope;
-      attestation: string;
-    };
+    const questionRequest = confirmedQuestions
+      .request()
+      .postDataJSON() as IntakeIdentityConfirmation;
     assert.equal(questionRequest.attestation, 'confirmed_displayed_identity_questions');
-    assert.deepEqual(questionRequest.scope.questions, [
-      { prompt: questionPrompt, textAnchor: questionAnchor },
-    ]);
-    assert.equal(questionRequest.scope.targets.length, 2);
-    assert.ok(questionRequest.scope.targets.every((target) => target.issueIds?.length === 2));
-    const questionsReview = await request<IntakeReview>(
-      `/intakes/${encodeURIComponent(questionsOriginal.intake.id)}/review`,
+    assert.deepEqual(questionRequest.scope, questionScope);
+    assert.deepEqual(
+      questionEvidence.items.map((item) => {
+        assert.equal(item.kind, 'value');
+        return item.kind === 'value' ? item.value : null;
+      }),
+      [{ prompt: questionPrompt, textAnchor: questionAnchor }],
     );
+    assert.equal(questionTargets.length, 2);
+    assert.ok(questionTargets.every((target) => target.issueIds?.length === 2));
+    const questionsReview = await readReview(questionsOriginal.intake.id);
     assert.ok(questionsReview.records.every((record) => record.mapping.subject === 'self'));
     assert.ok(
       questionsReview.records.every((record) =>
@@ -918,25 +1704,11 @@ test(
     anonymous.payload =
       'Fictional anonymous report. A measurement of 17.20 arb. No printed patient.';
     const anonymousOriginal = await upload([anonymous], 'fictional-anonymous.jsonl');
-    await page.reload();
-    const anonymousCard = page.getByRole('region', { name: /Fictional anonymous report/ });
-    await anonymousCard.getByRole('button', { name: /Review person for/ }).click();
-    await page
-      .getByRole('dialog')
-      .getByText('Identity is not printed clearly in this report.', { exact: true })
-      .waitFor();
-    await page
-      .getByRole('dialog')
-      .getByRole('link', { name: 'Review retained report evidence' })
-      .click();
-    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
+    await openReport(anonymousOriginal.intake.id, undefined, 'missing_identity');
     await page
       .getByText('Identity is not printed clearly in this report.', { exact: true })
       .waitFor();
-    await page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true }).click();
-    const anonymousReview = await request<IntakeReview>(
-      `/intakes/${encodeURIComponent(anonymousOriginal.intake.id)}/review`,
-    );
+    const anonymousReview = await readReview(anonymousOriginal.intake.id);
     const anonymousRecordLink = page.locator('.import-detail-record-link').filter({
       hasText: 'Fictional anonymous measurement',
     });
@@ -951,16 +1723,27 @@ test(
       anonymousReview.records[0]!.id,
       'the warning report exposes an exact record link without selecting a replacement',
     );
+    const anonymousDecisionResponse = fixtureBrowserResponse(
+      page,
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          `${prefix}/intakes/${encodeURIComponent(anonymousOriginal.intake.id)}/review-draft`,
+    );
     await page.getByRole('button', { name: 'This is me', exact: true }).click();
+    await anonymousDecisionResponse;
+    enterPhase('individual identity return to Import');
     await until(
-      () =>
-        request<IntakeReview>(`/intakes/${encodeURIComponent(anonymousOriginal.intake.id)}/review`),
+      () => readReview(anonymousOriginal.intake.id),
       (value) => value.records[0]!.mapping.subject === 'self',
       'individual identity decision is retained',
     );
-    await page.getByRole('button', { name: 'Back to Import', exact: true }).click();
+    await fixtureNativeFeedReady(page, prefix, () =>
+      page.getByRole('button', { name: 'Back to Import', exact: true }).click(),
+    );
     await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
     assert.ok(page.url().endsWith('/import'), 'secondary review returns to the new inbox');
     assert.equal((await readFeed()).counts.accepted, 4, 'returning does not accept the result');
+    completed = true;
   },
 );

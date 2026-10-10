@@ -11,6 +11,7 @@ import {
   rmSync,
   mkdirSync,
 } from 'node:fs';
+import { beginManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
 import { dirname } from 'node:path';
 import { entropyToMnemonic, mnemonicToEntropy } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
@@ -152,6 +153,14 @@ function readExact(fd: number, length: number, allowEnd = false): Buffer | null 
   return out;
 }
 function atomicOutput(path: string, fn: (fd: number) => void): void {
+  const finishMutation = beginManagedPhysicalMutation();
+  try {
+    atomicOutputOwned(path, fn);
+  } finally {
+    finishMutation();
+  }
+}
+function atomicOutputOwned(path: string, fn: (fd: number) => void): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const pending = `${path}.pending-${randomBytes(12).toString('hex')}`;
   let fd: number | undefined;
@@ -182,42 +191,51 @@ export function encryptObject(
   profileId: string,
   purpose: string,
 ): void {
+  atomicOutput(path, (fd) => encryptObjectToFileDescriptor(fd, input, key, profileId, purpose));
+}
+
+/** The caller owns the already-open descriptor, publication and mutation tracking. */
+export function encryptObjectToFileDescriptor(
+  fd: number,
+  input: Uint8Array | string,
+  key: Uint8Array,
+  profileId: string,
+  purpose: string,
+): void {
   const isBytes = input instanceof Uint8Array;
   let source: number | undefined;
   if (!isBytes) source = openSync(input, 'r');
   const { state, header } = sodium.crypto_secretstream_xchacha20poly1305_init_push(key);
   const aad = context(profileId, purpose);
   try {
-    atomicOutput(path, (fd) => {
-      writeAll(fd, MAGIC);
-      writeAll(fd, header);
-      let pos = 0;
-      for (;;) {
-        let plain: Uint8Array;
-        if (isBytes) {
-          plain = input.subarray(pos, pos + CHUNK);
-          pos += plain.length;
-        } else {
-          const chunk = Buffer.alloc(CHUNK);
-          const n = (readSync as unknown as CurrentPositionRead)(source!, chunk, 0, CHUNK);
-          plain = chunk.subarray(0, n);
-        }
-        const last = plain.length === 0;
-        const cipher = sodium.crypto_secretstream_xchacha20poly1305_push(
-          state,
-          plain,
-          aad,
-          last
-            ? sodium.crypto_secretstream_xchacha20poly1305_TAG_FINAL
-            : sodium.crypto_secretstream_xchacha20poly1305_TAG_MESSAGE,
-        );
-        const length = Buffer.alloc(4);
-        length.writeUInt32BE(cipher.length);
-        writeAll(fd, length);
-        writeAll(fd, cipher);
-        if (last) break;
+    writeAll(fd, MAGIC);
+    writeAll(fd, header);
+    let pos = 0;
+    for (;;) {
+      let plain: Uint8Array;
+      if (isBytes) {
+        plain = input.subarray(pos, pos + CHUNK);
+        pos += plain.length;
+      } else {
+        const chunk = Buffer.alloc(CHUNK);
+        const n = (readSync as unknown as CurrentPositionRead)(source!, chunk, 0, CHUNK);
+        plain = chunk.subarray(0, n);
       }
-    });
+      const last = plain.length === 0;
+      const cipher = sodium.crypto_secretstream_xchacha20poly1305_push(
+        state,
+        plain,
+        aad,
+        last
+          ? sodium.crypto_secretstream_xchacha20poly1305_TAG_FINAL
+          : sodium.crypto_secretstream_xchacha20poly1305_TAG_MESSAGE,
+      );
+      const length = Buffer.alloc(4);
+      length.writeUInt32BE(cipher.length);
+      writeAll(fd, length);
+      writeAll(fd, cipher);
+      if (last) break;
+    }
   } finally {
     if (source !== undefined) closeSync(source);
   }

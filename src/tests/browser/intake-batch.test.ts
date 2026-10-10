@@ -1,8 +1,19 @@
+import {
+  fixtureReview,
+  fixtureReport,
+  fixtureDestinations,
+  fixtureAssertNoAccepted,
+  fixtureSourcePath,
+  fixtureBrowserResponse,
+  fixtureNativeRecordReady,
+} from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { fetchFixtureApi } from './fixture-api-request.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AppOptions } from '../../server/index.ts';
 import type { Browser } from 'playwright';
 import type { AddressInfo } from 'node:net';
+import type { IncomingMessage } from 'node:http';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
@@ -57,7 +68,9 @@ function proposal(intakeId: string, label: string) {
 
 test(
   'encrypted browser reads two uploads sequentially and restores Stop, reload, Resume review',
-  { timeout: 60000 },
+  // Two real reading cycles, Stop/reload/Resume, and two encrypted acceptances
+  // include a lost acknowledgement and exact receipt recovery. UI waits stay 5s.
+  { timeout: 180000 },
   async (t) => {
     fictionalModel(t);
     const root = mkdtempSync(resolve(tmpdir(), 'circus-browser-intake-batch-'));
@@ -97,7 +110,7 @@ test(
             async turn() {
               active.add(index);
               maxActive = Math.max(maxActive, active.size);
-              callbacks.onEvent!('turn/started', { turn: { id: `turn-${index}` } });
+              await callbacks.onEvent!('turn/started', { turn: { id: `turn-${index}` } });
             },
             async cancel() {},
             close() {
@@ -146,8 +159,13 @@ test(
       return { profileId: profile.id };
     });
     const prefix = `/api/profiles/${setup.profileId}`;
+    let probeFirstFixtureGet = true;
     const get = async (path: string) => {
-      const response = await page.request.get(url + path);
+      const options = probeFirstFixtureGet
+        ? { headers: { 'X-Fixture-Api-Probe': 'batch-get' } }
+        : undefined;
+      probeFirstFixtureGet = false;
+      const response = await fetchFixtureApi(page.request, url + path, options);
       const json = await response.json();
       assert(response.ok(), JSON.stringify(json));
       return json.data;
@@ -189,9 +207,32 @@ test(
     async function openFullReview(label: string) {
       const record = page.locator('.import-record').filter({ hasText: label }).first();
       await record.waitFor();
-      await record.getByRole('button', { name: `More actions for ${label}`, exact: true }).click();
-      await record.getByRole('link', { name: 'Open full review' }).click();
+      await record.getByRole('button', { name: 'Review', exact: true }).click();
+      const exact = record.getByRole('link', { name: 'Open full review', exact: true });
+      assert.match((await exact.getAttribute('href')) || '', /[?&]record=/);
+      await exact.click();
       await page.getByRole('region', { name: 'Review actions' }).waitFor();
+    }
+    async function confirmRecordIdentity() {
+      const params = new URLSearchParams(new URL(page.url()).hash.split('?')[1]);
+      const intakeId = params.get('intake');
+      const recordId = params.get('record');
+      assert.ok(intakeId && recordId);
+      const saved = fixtureBrowserResponse(
+        page,
+        (response) =>
+          response.request().method() === 'POST' &&
+          new URL(response.url()).pathname ===
+            prefix + '/intakes/' + encodeURIComponent(intakeId) + '/review-draft' &&
+          response.request().postDataJSON().recordId === recordId &&
+          response.request().postDataJSON().mapping?.subject === 'self',
+      );
+      await fixtureNativeRecordReady(page, prefix, { intakeId, recordId }, async () => {
+        await page.getByRole('button', { name: 'This is me', exact: true }).click();
+        const response = await saved;
+        assert.equal(response.status(), 200, await response.text());
+        assert.equal(await response.finished(), null);
+      });
     }
 
     const conversionRequests = [];
@@ -208,7 +249,8 @@ test(
       const input = document.querySelector('.import-dropzone input[type="file"]');
       return input instanceof HTMLInputElement && !input.disabled;
     });
-    const created = page.waitForResponse(
+    const created = fixtureBrowserResponse(
+      page,
       async (response) =>
         response.request().method() === 'GET' &&
         response.url().endsWith('/intake-batches') &&
@@ -237,20 +279,46 @@ test(
     assert.equal(importRequests.length, 0, 'background reading never accepts a record');
 
     await waitFor(() => bridges.length === 1, 'first model pass');
-    const first = await get(
-      `${prefix}/intakes/${encodeURIComponent(initialBatch.items[0].intakeId)}`,
+    const firstPath = `${prefix}/intakes/${encodeURIComponent(initialBatch.items[0].intakeId)}`;
+    let fixtureConnection: string | undefined;
+    const observeFixtureGet = (incoming: IncomingMessage) => {
+      if (
+        incoming.method === 'GET' &&
+        incoming.url === firstPath &&
+        incoming.headers['x-fixture-api-probe'] === 'batch-get'
+      )
+        fixtureConnection = incoming.headers.connection;
+    };
+    runtime.server.on('request', observeFixtureGet);
+    const first = await get(firstPath).finally(() =>
+      runtime.server.off('request', observeFixtureGet),
     );
+    assert.equal(fixtureConnection, 'close', 'fixture API GET must not pool an idle socket');
     const firstText = (await bridges[0].callbacks.onTool!({
       tool: 'health_intake_source_text',
       arguments: { id: first.id },
       callId: 'fictional-first-source-text',
     })) as { revisionId: string };
-    const firstPlan = first.workflow.plans.find(
-      (plan: { status: string }) => plan.status === 'active',
-    );
+    assert.equal(first.format, 'health-intake-summary-v2');
+    const firstPlan = first.activePlan.plan;
+    assert.equal(firstPlan.status, 'active');
+    const firstUnits = (await bridges[0].callbacks.onTool!({
+      tool: 'health_intake_plan',
+      arguments: { id: first.id, action: 'read', section: 'units', freshStart: true },
+      callId: 'fictional-first-units',
+    })) as {
+      format: string;
+      items: { value: { id: string } }[];
+      logicalTotal: number;
+      complete: boolean;
+    };
+    assert.equal(firstUnits.format, 'health-intake-model-context-v2');
+    assert.equal(firstUnits.logicalTotal, 1);
+    assert.equal(firstUnits.complete, true);
+    const firstUnitId = firstUnits.items[0]!.value.id;
     await bridges[0].callbacks.onTool!({
       tool: 'health_intake_plan',
-      arguments: { id: first.id, action: 'read_unit', unitId: firstPlan.units[0].id },
+      arguments: { id: first.id, action: 'read_unit', unitId: firstUnitId },
       callId: 'fictional-first-read',
     });
     await bridges[0].callbacks.onTool!({
@@ -262,7 +330,7 @@ test(
         operationId: 'fictional-first-batch',
         coverage: [
           {
-            unitId: firstPlan.units[0].id,
+            unitId: firstUnitId,
             kind: 'extracted',
             notes: 'The supplied fictional section was fully read.',
           },
@@ -274,18 +342,21 @@ test(
       callId: 'fictional-first-proposal',
       ...{ threadId: 'fictional-thread-1', turnId: 'turn-1' },
     });
-    bridges[0].callbacks.onEvent!('turn/completed', { turn: { status: 'completed' } });
+    await bridges[0].callbacks.onEvent!('turn/completed', { turn: { status: 'completed' } });
 
     await waitFor(() => bridges.length === 2, 'second sequential model pass');
     assert.equal(active.size, 1);
     assert.equal(maxActive, 1, 'the profile never runs parallel model jobs');
     await page.locator('.import-reading').getByText('Moxie is reading 1 file').waitFor();
     const firstFeed = await get(`${prefix}/intakes/import-feed?view=all`);
-    const firstGroup = firstFeed.groups.find(
-      (group: { title: string }) => group.title === 'Fictional first report',
+    const firstPointer = firstFeed.groups.find(
+      (group: { intakeId: string }) => group.intakeId === first.id,
     );
+    assert(firstPointer);
+    const firstGroup = (await fixtureReport(get, prefix, firstPointer.groupId, first.id)).group;
+    assert.equal(firstGroup.title, 'Fictional first report');
     assert(firstGroup, 'the first retained report is represented in the Import feed');
-    const firstBlock = firstFeed.blocks.find(
+    const firstBlock = firstFeed.records.find(
       (block: { groupId: string; intakeId: string }) =>
         block.groupId === firstGroup.groupId && block.intakeId === first.id,
     );
@@ -295,11 +366,12 @@ test(
     );
     assert.equal(firstIdentity.status, 'missing_warning');
     assert.equal(firstIdentity.blocking, false);
-    const firstReview = await get(
+    const firstReview = await fixtureReview(
+      get,
       `${prefix}/intakes/${encodeURIComponent(first.id)}/review?proposalId=${encodeURIComponent(firstBlock.proposalId)}`,
     );
     assert(
-      firstReview.records[0].issues.some(
+      firstReview.records[0].issues!.some(
         (issue: { kind: string; status: string }) =>
           issue.kind === 'identity' && issue.status === 'unresolved',
       ),
@@ -313,48 +385,51 @@ test(
     });
     assert.equal(await firstSaveAction.count(), 1);
     assert.equal(await firstSaveAction.isDisabled(), false);
-    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
     await page
       .getByText('Identity is not printed clearly in this report.', { exact: true })
       .waitFor();
     assert.equal(
-      await page
-        .locator('.import-identity-question.is-warning')
-        .getByRole('button', { name: 'This is me', exact: true })
-        .count(),
+      await page.getByRole('region', { name: 'Report identity', exact: true }).count(),
       0,
-      'the warning does not claim that report identity was confirmed',
+      'missing printed identity does not invent a report-level confirmation',
     );
-    await page
-      .getByRole('dialog', { name: 'Who is this report for?' })
-      .getByRole('button', { name: 'Close', exact: true })
-      .click();
     assert.equal(await page.getByRole('button', { name: 'This is me', exact: true }).count(), 1);
     assert.equal(importRequests.length, 0, 'the first partial proposal remains review-only');
     await capture('batch-reading-partial-review');
 
     await page.getByRole('button', { name: 'Back to Import', exact: true }).click();
     await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
-    const stoppedResponse = page.waitForResponse(
+    const stoppedResponse = fixtureBrowserResponse(
+      page,
       (response) => response.url().endsWith('/stop') && response.ok(),
     );
     await page.getByRole('button', { name: 'Stop imports', exact: true }).click();
     const stopped = (await (await stoppedResponse).json()).data;
     assert.equal(stopped.status, 'stopped');
     assert.equal(stopped.items[0].status, 'review_ready');
-    assert.equal(stopped.items[0].proposalIds.length, 1);
+    assert.equal(stopped.items[0].proposalState.format, 'health-intake-proposal-summary-v2');
+    assert.equal(stopped.items[0].proposalState.total, 1);
+    const stoppedFirstReview = await fixtureReview(
+      get,
+      `${prefix}/intakes/${encodeURIComponent(first.id)}/review?proposalId=${encodeURIComponent(firstBlock.proposalId)}`,
+    );
+    assert.equal(stoppedFirstReview.proposalId, firstBlock.proposalId);
+    assert.equal(stoppedFirstReview.records.length, 1, 'Stop retains the exact first proposal');
     assert.equal(stopped.items[1].status, 'paused');
-    assert.equal((await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).imported, null);
+    await fixtureAssertNoAccepted(get, prefix, first.id);
     const second = await get(
       `${prefix}/intakes/${encodeURIComponent(initialBatch.items[1].intakeId)}`,
     );
     assert.equal(
       second.state,
-      'needs_review',
-      'source capture remains available before clinical proposals',
+      'pending_conversion',
+      'the captured original awaits clinical conversion while its reading is stopped',
     );
-    assert.equal(second.proposals.length, 0);
-    const secondOriginal = await page.request.get(url + second.contentUrl);
+    assert.equal(second.collections.proposals.total, 0);
+    const secondOriginal = await fetchFixtureApi(
+      page.request,
+      url + fixtureSourcePath(prefix, second.contentUrl),
+    );
     assert.equal(
       await secondOriginal.text(),
       'Fictional second result 18 ng/mL; unread appendix retained.',
@@ -363,7 +438,8 @@ test(
     await page.reload();
     await page.getByRole('button', { name: 'Resume imports', exact: true }).waitFor();
     assert.equal(importRequests.length, 0, 'reload does not accept retained proposals');
-    const resumedResponse = page.waitForResponse(
+    const resumedResponse = fixtureBrowserResponse(
+      page,
       (response) => response.url().endsWith('/resume') && response.ok(),
     );
     await page.getByRole('button', { name: 'Resume imports', exact: true }).click();
@@ -377,12 +453,26 @@ test(
       arguments: { id: resumedSecond.id },
       callId: 'fictional-second-source-text',
     })) as { revisionId: string };
-    const secondPlan = resumedSecond.workflow.plans.find(
-      (plan: { status: string }) => plan.status === 'active',
-    );
+    assert.equal(resumedSecond.format, 'health-intake-summary-v2');
+    const secondPlan = resumedSecond.activePlan.plan;
+    assert.equal(secondPlan.status, 'active');
+    const secondUnits = (await bridges[2].callbacks.onTool!({
+      tool: 'health_intake_plan',
+      arguments: { id: resumedSecond.id, action: 'read', section: 'units', freshStart: true },
+      callId: 'fictional-second-units',
+    })) as {
+      format: string;
+      items: { value: { id: string } }[];
+      logicalTotal: number;
+      complete: boolean;
+    };
+    assert.equal(secondUnits.format, 'health-intake-model-context-v2');
+    assert.equal(secondUnits.logicalTotal, 1);
+    assert.equal(secondUnits.complete, true);
+    const secondUnitId = secondUnits.items[0]!.value.id;
     await bridges[2].callbacks.onTool!({
       tool: 'health_intake_plan',
-      arguments: { id: resumedSecond.id, action: 'read_unit', unitId: secondPlan.units[0].id },
+      arguments: { id: resumedSecond.id, action: 'read_unit', unitId: secondUnitId },
       callId: 'fictional-second-read',
     });
     await bridges[2].callbacks.onTool!({
@@ -394,7 +484,7 @@ test(
         operationId: 'fictional-second-batch',
         coverage: [
           {
-            unitId: secondPlan.units[0].id,
+            unitId: secondUnitId,
             kind: 'extracted',
             notes: 'The supplied fictional section was fully read.',
           },
@@ -406,10 +496,10 @@ test(
       callId: 'fictional-second-proposal',
       ...{ threadId: 'fictional-thread-2', turnId: 'turn-3' },
     });
-    bridges[2].callbacks.onEvent!('turn/completed', { turn: { status: 'completed' } });
+    await bridges[2].callbacks.onEvent!('turn/completed', { turn: { status: 'completed' } });
     const currentSecond = await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`);
     assert.equal(
-      currentSecond.proposals.length,
+      currentSecond.collections.proposals.total,
       1,
       JSON.stringify({
         currentSecond,
@@ -417,11 +507,11 @@ test(
       }),
     );
     const firstReport = page
-      .locator('.import-report')
-      .filter({ hasText: 'Fictional first report' });
+      .locator('.import-record')
+      .filter({ hasText: 'Fictional first result' });
     const secondReport = page
-      .locator('.import-report')
-      .filter({ hasText: 'Fictional second report' });
+      .locator('.import-record')
+      .filter({ hasText: 'Fictional second result' });
     await firstReport.waitFor();
     await secondReport.waitFor();
     await capture('batch-review-queue');
@@ -430,21 +520,21 @@ test(
     assert.equal(maxActive, 1);
     assert.equal(conversionRequests.length, 0);
     assert.equal(importRequests.length, 0);
-    assert.equal((await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).imported, null);
-    assert.equal(
-      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).imported,
-      null,
-    );
+    await fixtureAssertNoAccepted(get, prefix, first.id);
+    await fixtureAssertNoAccepted(get, prefix, resumedSecond.id);
 
-    const firstImport = page.waitForResponse(
+    const firstImport = fixtureBrowserResponse(
+      page,
       (response) =>
         (response.url().endsWith('/report-acceptance') || response.url().endsWith('/import')) &&
         response.ok(),
     );
-    await page.getByRole('button', { name: 'This is me', exact: true }).click();
+    await confirmRecordIdentity();
     await firstSaveAction.waitFor({ state: 'visible' });
     await firstSaveAction.click();
     const firstAcceptedResponse = await firstImport;
+    const firstAccepted = (await firstAcceptedResponse.json()).data;
+    assert.equal(firstAccepted.receipt.acceptedCount, 1);
     assert(
       firstAcceptedResponse.url().endsWith('/report-acceptance'),
       'Report save must use counted atomic acceptance: ' + firstAcceptedResponse.url(),
@@ -456,7 +546,32 @@ test(
       0,
       'a saved exact record has no repeat save action',
     );
-    await page.getByRole('button', { name: 'Back to Import', exact: true }).click();
+    let navigationRequest: import('playwright').Request | undefined;
+    const observeNavigationRequest = (request: import('playwright').Request) => {
+      const selected = new URL(request.url());
+      if (
+        !navigationRequest &&
+        request.method() === 'GET' &&
+        selected.pathname === prefix + '/intakes/import-feed' &&
+        selected.searchParams.get('view') === 'active' &&
+        selected.searchParams.get('state') === 'pending' &&
+        !['groupId', 'intakeId', 'recordId'].some((key) => selected.searchParams.has(key))
+      )
+        navigationRequest = request;
+    };
+    page.on('request', observeNavigationRequest);
+    const navigatedFeed = fixtureBrowserResponse(
+      page,
+      (response) => response.request() === navigationRequest,
+    );
+    try {
+      await page.getByRole('button', { name: 'Back to Import', exact: true }).click();
+      const response = await navigatedFeed;
+      assert.equal(response.status(), 200, await response.text());
+      assert.equal(await response.finished(), null);
+    } finally {
+      page.off('request', observeNavigationRequest);
+    }
     await page.getByRole('heading', { name: 'Review reports', exact: true }).waitFor();
     await openFullReview('Fictional second result');
     await page.getByRole('heading', { name: 'Fictional second result', exact: true }).waitFor();
@@ -466,24 +581,24 @@ test(
     });
     await secondSaveAction.waitFor();
     assert.equal(await secondSaveAction.isDisabled(), false);
-    await page.getByRole('button', { name: 'Review person for this report', exact: true }).click();
     await page
       .getByText('Identity is not printed clearly in this report.', { exact: true })
       .waitFor();
-    await page
-      .getByRole('dialog', { name: 'Who is this report for?' })
-      .getByRole('button', { name: 'Close', exact: true })
-      .click();
-    await page.getByRole('button', { name: 'This is me', exact: true }).click();
-    assert.notEqual(
-      (await get(`${prefix}/intakes/${encodeURIComponent(first.id)}`)).imported,
-      null,
-    );
     assert.equal(
-      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).imported,
-      null,
-      'moving to the next review does not accept it',
+      await page.getByRole('region', { name: 'Report identity', exact: true }).count(),
+      0,
+      'missing printed identity does not invent a report-level confirmation',
     );
+    await confirmRecordIdentity();
+    // The current native acceptance is retained separately from archived importHistory.
+    // Check its exact receipt and destination, not whether an older receipt exists.
+    assert.deepEqual(
+      (await get(`${prefix}/intakes/report-acceptance/${firstAccepted.receipt.operationId}`))
+        .receipt,
+      firstAccepted.receipt,
+    );
+    assert.equal((await fixtureDestinations(get, prefix, first.id)).length, 1);
+    await fixtureAssertNoAccepted(get, prefix, resumedSecond.id);
     let lostOperationId = '';
     await page.route('**/intakes/report-acceptance', async (route) => {
       lostOperationId = route.request().postDataJSON().operationId;
@@ -492,7 +607,8 @@ test(
       // The real server committed; the browser receives no acknowledgement.
       await route.abort('failed');
     });
-    const recoveredReceipt = page.waitForResponse(
+    const recoveredReceipt = fixtureBrowserResponse(
+      page,
       (response) =>
         response.request().method() === 'GET' &&
         response.url().includes('/intakes/report-acceptance/') &&
@@ -505,17 +621,15 @@ test(
     await page.getByText('This exact record was saved to your profile.', { exact: true }).waitFor();
     await page.unroute('**/intakes/report-acceptance');
     assert.equal(importRequests.length, 2);
-    assert.notEqual(
-      (await get(`${prefix}/intakes/${encodeURIComponent(resumedSecond.id)}`)).imported,
-      null,
-    );
+    assert.equal((await fixtureDestinations(get, prefix, resumedSecond.id)).length, 1);
     for (const [intakeId, label] of [
       [first.id, 'first'],
       [resumedSecond.id, 'second'],
     ]) {
       const accepted = await get(`${prefix}/intakes/${encodeURIComponent(intakeId)}`);
-      assert.equal(accepted.imported.clinical.records.length, 1);
-      const target = accepted.imported.clinical.records[0];
+      const destinations = await fixtureDestinations(get, prefix, intakeId);
+      assert.equal(destinations.length, 1);
+      const target = destinations[0]!;
       assert.equal(target.kind, 'observation');
       const result = await get(`${prefix}/tests/${encodeURIComponent(target.entityId)}`);
       assert.equal(result.label, `Fictional ${label} result`);
@@ -523,7 +637,10 @@ test(
       assert.equal(result.unit, 'ng/mL');
       assert.equal(result.date, '2026-09-01');
       assert(result.evidence.length > 0);
-      const original = await page.request.get(url + accepted.contentUrl);
+      const original = await fetchFixtureApi(
+        page.request,
+        url + fixtureSourcePath(prefix, accepted.contentUrl),
+      );
       assert.equal(
         await original.text(),
         `Fictional ${label} result 18 ng/mL; unread appendix retained.`,

@@ -10,6 +10,21 @@ The supported runtime is npm → Docker Compose → LiteLLM. The [batch coordina
 
 Local extraction uses bounded workers and local English Tesseract for supported raster evidence. Original/member reads may capture up to two pages before returning evidence. Native text, OCR alternatives and located exceptions are retained separately from clinical proposals. Unsupported formats and unreadable material remain visible.
 
+Upload publication, native conversion and extraction's short database phases
+share the existing per-database operation queue. Receiving the upload and running
+local extraction workers remain outside that queue. Extraction rechecks its
+original source and revision before each publication; queued work cannot adopt a
+newer human correction as its starting evidence. Exact operation retries share
+the worker or replay its retained result. An interrupted admitted operation
+remains recoverable without silently launching the unknown work again.
+
+Waiting for a database operation slot does not consume the extraction worker's
+stall allowance. The watchdog resumes its remaining allowance when work resumes;
+queue admission does not reset it as progress. Reported elapsed extraction time
+still includes the wait. Stop and authorization checks run again after queued
+publications before the batch advances or saves another checkpoint. These rules
+do not establish a model-speed target or serialize every possible database writer.
+
 Automatic processing continues while unique progress is made, with bounded operations and located stall recovery instead of document-wide allowances. See [automatic recovery](automatic-recovery.md) for durable intent, enqueue, provider deadlines, unknown-usage accounting and the owner rationale.
 
 Server reading continues after tab closure while authorized. Lock/logout/profile switch end the ordinary runtime; authorized unlock restores automatic intent, while explicit Stop remains stopped. Restricted post-logout authority remains CRS-081; this coordinator alone does not complete that experience.
@@ -104,4 +119,4 @@ Default Self collection navigation does not briefly render an ownership-check ba
 
 ## Attention queue counts and completion
 
-Import displays unresolved source sections in both All and Needs attention. The attention badge counts distinct page sections across visible retained originals and package members; All includes these sections in addition to clinical records. Section counts come from durable source indexes, including compatible read-only fallback for older revisions, rather than counting only the current file page. Uncaptured originals have no identified source sections yet and remain available in Sources. Completed originals are excluded before pagination. One shared Select all shown control covers loaded clinical rows and approvable source sections in the active tab, across the displayed files; hidden tabs and unloaded pages are excluded. The selected count and indeterminate state include both kinds of item, with separate actions for clinical saves and transcription approvals. A file disappears when its final section is resolved. The attention tab disappears at zero, and an emptied attention or clinical-kind tab returns to All in the same review-status view after pending edits/saves are resolved. This redirect requires settled results for the requested filters: a loading feed is not treated as empty.
+Import displays unresolved source sections in both All and Needs attention. The attention badge counts distinct page sections across visible retained originals and package members; All includes these sections in addition to clinical records. Section counts come from durable source indexes, including compatible read-only fallback for older revisions, rather than counting only the current file page. Uncaptured originals have no identified source sections yet and remain available in Sources. Completed originals are excluded before pagination. A disposable per-source count index keeps warm page reads bounded; source changes refresh their own counts, and cold reconstruction yields between bounded source batches. Exact totals and visibility filtering stay in SQLite. The cache is not recovery authority. One shared Select all shown control covers loaded clinical rows and approvable source sections in the active tab, across the displayed files; hidden tabs and unloaded pages are excluded. The selected count and indeterminate state include both kinds of item, with separate actions for clinical saves and transcription approvals. A file disappears when its final section is resolved. The attention tab disappears at zero, and an emptied attention or clinical-kind tab returns to All in the same review-status view after pending edits/saves are resolved. This redirect requires settled results for the requested filters: a loading feed is not treated as empty.

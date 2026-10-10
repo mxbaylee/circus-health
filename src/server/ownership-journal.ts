@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { json, now, revision, type Database } from './database.ts';
 import { canonicalLiteral } from './intake-format.ts';
+import { recordMutationStatement } from './record-mutation-recipe.ts';
 
 export const ownershipHash = (value: unknown) =>
   createHash('sha256').update(canonicalLiteral(value)).digest('hex');
@@ -14,7 +15,8 @@ export function appendOwnershipDecision(
   reason = DEFAULT_OWNERSHIP_REASON,
 ) {
   const at = now();
-  db.prepare(
+  recordMutationStatement(
+    db,
     "INSERT INTO manual_batches(id,title,status,created_at,verified_at,notes,coverage_json) VALUES(?,?,'verified',?,?,?,?)",
   ).run(id, title, at, at, reason, JSON.stringify({ ...value, revision: revision(db) + 1, at }));
 }

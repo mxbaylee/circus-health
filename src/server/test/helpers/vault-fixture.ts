@@ -3,13 +3,14 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { createEncryptedProfiles } from '../../encrypted-profiles.ts';
+import type { ImportDiagnostics } from '../../import-diagnostics.ts';
 
-export function vaultFixture(t: TestContext) {
+export function vaultFixture(t: TestContext, options: { diagnostics?: ImportDiagnostics } = {}) {
   const base = mkdtempSync(resolve(tmpdir(), 'circus-vault-fault-'));
   const dataDirectory = resolve(base, 'data');
   const runtimeDirectory = resolve(base, 'runtime');
   mkdirSync(dataDirectory);
-  const manager = createEncryptedProfiles({ dataDirectory, runtimeDirectory });
+  const manager = createEncryptedProfiles({ dataDirectory, runtimeDirectory, ...options });
   t.after(() => {
     try {
       manager.close();

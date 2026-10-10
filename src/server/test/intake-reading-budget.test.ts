@@ -22,11 +22,6 @@ import { profilePaths } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { uploadIntake } from '../intake.ts';
 import { ProxyModelBridge } from '../proxy-model-bridge.ts';
-const waitFor = async (check: () => boolean) => {
-  const until = Date.now() + 3000;
-  while (!check() && Date.now() < until) await new Promise((r) => setTimeout(r, 5));
-  assert.ok(check());
-};
 const state = (overrides: Partial<IntakeBatchReadingState> = {}): IntakeBatchReadingState => ({
   status: 'paused',
   reason: 'time_limit',
@@ -207,6 +202,7 @@ test('explicit Stop still aborts an admitted provider request immediately', asyn
   attachPersonalDurability(db, { root, profileId });
   const databases = new Map([[profileId, db]]);
   let admittedSignal: AbortSignal | undefined;
+  const admitted = Promise.withResolvers<void>();
   let batchNow = Date.parse('2026-01-01T00:00:00.000Z');
   const assistant = createAssistant({
     root,
@@ -233,6 +229,7 @@ test('explicit Stop still aborts an admitted provider request immediately', asyn
           const signal = init?.signal;
           assert.ok(signal);
           admittedSignal = signal;
+          admitted.resolve();
           return new Promise<Response>((_resolve, reject) => {
             signal.addEventListener('abort', () => reject(signal.reason), { once: true });
           });
@@ -268,7 +265,9 @@ test('explicit Stop still aborts an admitted provider request immediately', asyn
     operationId: 'fictional-stop-boundary-start',
     intakeIds: [source.id],
   });
-  await waitFor(() => !!admittedSignal);
+  // Wait for actual provider admission; native host preparation is outside the
+  // immediate Stop invariant and the test runner still bounds a hung fixture.
+  await admitted.promise;
   batchNow += 20;
   await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal(admittedSignal!.aborted, false, 'passive limits do not abort admitted work');
