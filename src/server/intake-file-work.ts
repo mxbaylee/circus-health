@@ -9,6 +9,7 @@ import {
   type PathOrFileDescriptor,
 } from 'node:fs';
 import { beginManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
+import type { PackageTraversalWork } from './intake-package-protocol.ts';
 
 /** Filesystem API payload work for the calling intake APIs, not physical disk
  * traffic. Fixed numeric totals only; no paths, identities or file contents.
@@ -16,8 +17,10 @@ import { beginManagedPhysicalMutation } from './clinical-review-physical-epoch.t
  * version hashes have separate counters for actual serialized semantic input.
  * A failed writeFileSync may have partially written bytes: attempts and failures expose
  * that uncertainty; successful payload bytes are not a total for failed writes.
- * Metadata syscalls, allocator/string copies, encrypted-vault/worker/HTTP upload
- * receiver I/O and unrelated consumers are outside these hooks. */
+ * Bounded package-worker totals use separately named fields and count validated
+ * worker reports, not parent I/O. Interrupted workers may have unreported work.
+ * Metadata syscalls, allocator/string copies, encrypted-vault/HTTP upload receiver
+ * I/O and unrelated consumers are outside these hooks. */
 export function createIntakeFileWorkCounters() {
   return {
     readAttempts: 0,
@@ -48,6 +51,18 @@ export function createIntakeFileWorkCounters() {
     copyAttempts: 0,
     copies: 0,
     copyRequestedBytes: 0,
+    packageWorkerAttempts: 0,
+    packageWorkerIncomplete: 0,
+    packageWorkerCentralDeclarations: 0,
+    packageWorkerDescriptorReads: 0,
+    packageWorkerMemberReadBytes: 0,
+    packageWorkerHashBytes: 0,
+    packageWorkerCrcBytes: 0,
+    packageWorkerWrittenBytes: 0,
+    packageWorkerPeakChunkBytes: 0,
+    packageWorkerMembersVerified: 0,
+    packageWorkerMembersReused: 0,
+    packageWorkerReusedPayloadBytes: 0,
   };
 }
 type FileWork = ReturnType<typeof createIntakeFileWorkCounters>;
@@ -58,6 +73,25 @@ export function withIntakeFileWork<T>(counters: FileWork, run: () => T): T {
 export function recordIntakeFileWork(metric: keyof FileWork, amount = 1): void {
   const counters = scope.getStore();
   if (counters) counters[metric] += amount;
+}
+/** Aggregate once per worker, including its last validated report on failure. */
+export function recordIntakePackageWorkerWork(work: PackageTraversalWork, completed: boolean) {
+  const counters = scope.getStore();
+  if (!counters) return;
+  if (!completed) counters.packageWorkerIncomplete++;
+  counters.packageWorkerCentralDeclarations += work.centralDeclarations;
+  counters.packageWorkerDescriptorReads += work.descriptorReads;
+  counters.packageWorkerMemberReadBytes += work.memberReadBytes;
+  counters.packageWorkerHashBytes += work.hashBytes;
+  counters.packageWorkerCrcBytes += work.crcBytes;
+  counters.packageWorkerWrittenBytes += work.writtenBytes;
+  counters.packageWorkerPeakChunkBytes = Math.max(
+    counters.packageWorkerPeakChunkBytes,
+    work.peakChunkBytes,
+  );
+  counters.packageWorkerMembersVerified += work.membersVerified;
+  counters.packageWorkerMembersReused += work.membersReused;
+  counters.packageWorkerReusedPayloadBytes += work.reusedPayloadBytes;
 }
 export function recordIntakeFileHash(value: string | Uint8Array): void {
   const counters = scope.getStore();

@@ -150,6 +150,15 @@ test(
       const result = await withIntakeFileWork(counters, () =>
         readIntakePackageMember({ ...context, memberId: member.memberId, page: 2, pdf: true }),
       );
+      assert.equal(counters.packageWorkerAttempts, 1);
+      assert.equal(counters.packageWorkerIncomplete, 0);
+      assert.equal(counters.packageWorkerCentralDeclarations, 0);
+      assert.equal(counters.packageWorkerDescriptorReads, 1);
+      assert.equal(counters.packageWorkerMemberReadBytes, member.bytes);
+      assert.equal(counters.packageWorkerHashBytes, member.bytes);
+      assert.equal(counters.packageWorkerCrcBytes, member.bytes);
+      assert.equal(counters.packageWorkerWrittenBytes, member.bytes);
+      assert.ok(counters.packageWorkerPeakChunkBytes <= 256 * 1024);
       assert.ok('pdfContent' in result && result.pdfContent);
       assert.ok('metadata' in result && result.metadata.sourceFileId);
       const childId = result.metadata.sourceFileId;

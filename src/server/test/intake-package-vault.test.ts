@@ -53,7 +53,14 @@ test('streamed large ZIP children and located failures recover from encrypted au
     createReadStream(zipPath, { highWaterMark: 64 * 1024 }) as unknown as IncomingMessage,
   );
   const context = () => ({ db: state.db, root: state.root, profileId, id: intake.id });
-  const inventory = await inventoryIntakePackagePaged({ ...context(), offset: 0, limit: 3 });
+  const inventoryWork = createIntakeFileWorkCounters();
+  const inventory = await withIntakeFileWork(inventoryWork, () =>
+    inventoryIntakePackagePaged({ ...context(), offset: 0, limit: 3 }),
+  );
+  assert.equal(inventoryWork.packageWorkerAttempts, 1);
+  assert.equal(inventoryWork.packageWorkerCentralDeclarations, 3);
+  assert.equal(inventoryWork.packageWorkerDescriptorReads, 3);
+  assert.equal(inventoryWork.packageWorkerMemberReadBytes, 3 * pdf.bytes);
   assert.equal(inventory.nextOffset, null, 'the three retained occurrences fit one native page');
   const index = {
     ...inventory,
@@ -71,12 +78,15 @@ test('streamed large ZIP children and located failures recover from encrypted au
     version: inventory.version,
   });
   const childIds: string[] = [];
+  const publications = createIntakeFileWorkCounters();
   for (const member of index.members.slice(0, 2)) {
-    const result = await readIntakePackageMember({
-      ...context(),
-      memberId: member.memberId,
-      page: 2,
-    });
+    const result = await withIntakeFileWork(publications, () =>
+      readIntakePackageMember({
+        ...context(),
+        memberId: member.memberId,
+        page: 2,
+      }),
+    );
     assert.ok('metadata' in result && result.metadata?.sourceFileId);
     childIds.push(result.metadata.sourceFileId);
     const original = verifyIntakeOriginal(
@@ -88,6 +98,12 @@ test('streamed large ZIP children and located failures recover from encrypted au
     assert.equal(original.sourceHash, pdf.sourceHash);
     assert.equal(original.size, pdf.bytes);
   }
+  assert.equal(publications.packageWorkerAttempts, 2);
+  assert.equal(publications.packageWorkerIncomplete, 0);
+  assert.equal(publications.packageWorkerCentralDeclarations, 0);
+  assert.equal(publications.packageWorkerDescriptorReads, 2);
+  assert.equal(publications.packageWorkerMemberReadBytes, 2 * pdf.bytes);
+  assert.equal(publications.packageWorkerWrittenBytes, 2 * pdf.bytes);
   assert.equal(new Set(childIds).size, 2, 'identical bytes retain distinct delivery occurrences');
   const waiting = index.members[2]!;
   const open = fs.openSync;
@@ -103,15 +119,22 @@ test('streamed large ZIP children and located failures recover from encrypted au
     return fd;
   });
   syncBuiltinESMExports();
+  const failedWork = createIntakeFileWorkCounters();
   try {
     await assert.rejects(
-      readIntakePackageMember({ ...context(), memberId: waiting.memberId, page: 2 }),
+      withIntakeFileWork(failedWork, () =>
+        readIntakePackageMember({ ...context(), memberId: waiting.memberId, page: 2 }),
+      ),
       { status: 503, code: 'PACKAGE_STORAGE' },
     );
   } finally {
     injected.mock.restore();
     syncBuiltinESMExports();
   }
+  assert.equal(failedWork.packageWorkerAttempts, 1);
+  assert.equal(failedWork.packageWorkerIncomplete, 1);
+  assert.equal(failedWork.packageWorkerCentralDeclarations, 0);
+  assert.equal(failedWork.packageWorkerDescriptorReads, 1);
   assert.deepEqual(
     fs.readdirSync(join(state.root, '.intake-child-staging')),
     [],
@@ -218,17 +241,31 @@ test('streamed large ZIP children and located failures recover from encrypted au
     'an existing occurrence is verified and reused without staging publication',
   );
   assert.equal(counters.renames, 0);
+  assert.equal(
+    counters.packageWorkerAttempts,
+    0,
+    'accepted inventory and child survive cache loss',
+  );
   assert.equal(state.db.prepare('SELECT count(*) n FROM source_files').get()!.n, 3);
   assert.deepEqual(
     snapshot(intake.id).packageFailures,
     parentBefore.packageFailures,
     'successful unrelated occurrence does not clear the pending failure',
   );
-  const resumed = await readIntakePackageMember({
-    ...context(),
-    memberId: waiting.memberId,
-    page: 2,
-  });
+  const resumedWork = createIntakeFileWorkCounters();
+  const resumed = await withIntakeFileWork(resumedWork, () =>
+    readIntakePackageMember({
+      ...context(),
+      memberId: waiting.memberId,
+      page: 2,
+    }),
+  );
+  assert.equal(resumedWork.packageWorkerAttempts, 1);
+  assert.equal(resumedWork.packageWorkerIncomplete, 0);
+  assert.equal(resumedWork.packageWorkerCentralDeclarations, 0);
+  assert.equal(resumedWork.packageWorkerDescriptorReads, 1);
+  assert.equal(resumedWork.packageWorkerMemberReadBytes, pdf.bytes);
+  assert.equal(resumedWork.packageWorkerWrittenBytes, pdf.bytes);
   assert.ok('metadata' in resumed && resumed.metadata?.sourceFileId);
   assert.ok(!childIds.includes(resumed.metadata.sourceFileId));
   assert.equal(

@@ -25,6 +25,7 @@ import { clearPackageSourceSession, packageSourceSessionWork } from '../intake-p
 import { zipFixture, type ZipFixtureEntry } from '../../tests/fixtures/zip.ts';
 import { fictionalModel } from './fictional-model.ts';
 import { DatabaseSync } from 'node:sqlite';
+import { createIntakeFileWorkCounters, withIntakeFileWork } from '../intake-file-work.ts';
 function fixture(t: test.TestContext, entries: ZipFixtureEntry[]) {
   fictionalModel(t);
   const root = mkdtempSync(join(tmpdir(), 'fictional-native-package-'));
@@ -43,6 +44,71 @@ function fixture(t: test.TestContext, entries: ZipFixtureEntry[]) {
   });
   return { db, root, profileId, id: intake.id };
 }
+
+for (const count of [4, 32])
+  test(`public member publications do not rescan a ${count}-member inventory`, async (t) => {
+    const entries = Array.from({ length: count }, (_, ordinal) => ({
+      name: `fictional-${ordinal}.txt`,
+      data: `Fictional retained member ${ordinal}`,
+    }));
+    const f = fixture(t, entries);
+    const inventoryWork = createIntakeFileWorkCounters();
+    const page = await withIntakeFileWork(inventoryWork, () =>
+      inventoryIntakePackagePaged({ ...f, limit: count }),
+    );
+    assert.equal(page.totalMembers, count);
+    assert.equal(inventoryWork.packageWorkerAttempts, 1);
+    assert.equal(inventoryWork.packageWorkerIncomplete, 0);
+    assert.equal(inventoryWork.packageWorkerCentralDeclarations, count);
+    assert.equal(inventoryWork.packageWorkerDescriptorReads, count);
+    assert.equal(inventoryWork.packageWorkerMembersVerified, count);
+    assert.equal(
+      inventoryWork.packageWorkerMemberReadBytes,
+      entries.reduce((bytes, entry) => bytes + Buffer.byteLength(entry.data), 0),
+    );
+    const publicationWork = createIntakeFileWorkCounters();
+    const selected = [0, count - 1];
+    const children: string[] = [];
+    await withIntakeFileWork(publicationWork, async () => {
+      for (const ordinal of selected) {
+        const result = await readIntakePackageMemberPaged({
+          ...f,
+          memberId: page.members[ordinal]!.memberId,
+        });
+        assert.ok('sourceFileId' in result && typeof result.sourceFileId === 'string');
+        children.push(result.sourceFileId);
+      }
+    });
+    assert.notEqual(children[0], children[1]);
+    assert.equal(publicationWork.packageWorkerAttempts, selected.length);
+    assert.equal(publicationWork.packageWorkerIncomplete, 0);
+    assert.equal(publicationWork.packageWorkerCentralDeclarations, 0);
+    assert.equal(publicationWork.packageWorkerDescriptorReads, selected.length);
+    assert.equal(publicationWork.packageWorkerMembersVerified, selected.length);
+    const selectedBytes = selected.reduce(
+      (bytes, ordinal) => bytes + Buffer.byteLength(entries[ordinal]!.data),
+      0,
+    );
+    assert.equal(publicationWork.packageWorkerMemberReadBytes, selectedBytes);
+    assert.equal(publicationWork.packageWorkerHashBytes, selectedBytes);
+    assert.equal(publicationWork.packageWorkerCrcBytes, selectedBytes);
+    assert.equal(publicationWork.packageWorkerWrittenBytes, selectedBytes);
+    assert.ok(publicationWork.packageWorkerPeakChunkBytes <= 256 * 1024);
+    const retryWork = createIntakeFileWorkCounters();
+    await withIntakeFileWork(retryWork, async () => {
+      for (const [index, ordinal] of selected.entries()) {
+        const result = await readIntakePackageMemberPaged({
+          ...f,
+          memberId: page.members[ordinal]!.memberId,
+        });
+        assert.ok('sourceFileId' in result);
+        assert.equal(result.sourceFileId, children[index]);
+      }
+    });
+    assert.equal(retryWork.packageWorkerAttempts, 0);
+    assert.equal(retryWork.packageWorkerCentralDeclarations, 0);
+    assert.equal(retryWork.packageWorkerDescriptorReads, 0);
+  });
 
 test('safe disposable spool refusal leaves a located inventory failure and only successful retry resolves it', async (t) => {
   const f = fixture(t, [{ name: 'fictional.txt', data: 'fictional' }]);

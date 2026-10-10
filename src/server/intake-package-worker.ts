@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { fstatSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { recordIntakeFileWork, recordIntakePackageWorkerWork } from './intake-file-work.ts';
 
 export interface InspectedPackageMember {
   ordinal: number;
@@ -339,6 +340,7 @@ export async function runBoundedPackageWorker({
         'PACKAGE_SELECTION',
       );
   }
+  recordIntakeFileWork('packageWorkerAttempts');
   const child = spawn(
     process.execPath,
     ['--max-old-space-size=128', script, selected ? '--checked-member' : '--bounded-inventory'],
@@ -355,6 +357,7 @@ export async function runBoundedPackageWorker({
   );
   let failure: Error | undefined,
     complete = false,
+    accepted = false,
     waitingHost = false,
     lastProgress = Date.now();
   let work = emptyPackageTraversalWork();
@@ -491,6 +494,7 @@ export async function runBoundedPackageWorker({
     lease.assertCurrent();
     if (code !== 0 || !complete)
       throw new PackageInspectionError('ZIP operation did not complete', 'PACKAGE_INCOMPLETE');
+    accepted = true;
     return { work, summary };
   } catch (error) {
     fail(
@@ -503,5 +507,6 @@ export async function runBoundedPackageWorker({
     throw failure;
   } finally {
     clearInterval(poll);
+    recordIntakePackageWorkerWork(work, accepted);
   }
 }
