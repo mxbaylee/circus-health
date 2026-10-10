@@ -85,11 +85,17 @@ function dependencyHeader(db: DatabaseSync, id: string) {
 
 /** Explicit cold compatibility preparation before a native source capture.
  * V3 requires its one retained decode; subsequent invalidation reads fields.
+ * Clinical consumers may build only selected workflows while checking the
+ * complete ancestry through its existing legacy/native authority readers.
  * This must run outside the source revision's final transaction. */
 export async function prepareIntakeSourceDependencyHeaders(
   db: DatabaseSync,
   id: string,
-  options: { assertRunning?: () => void; assertPublicationCurrent?: () => void } = {},
+  options: {
+    assertRunning?: () => void;
+    assertPublicationCurrent?: () => void;
+    nativeSchema?: 'ancestry' | 'selected';
+  } = {},
 ): Promise<void> {
   const profileId = db
     .prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'")
@@ -98,6 +104,12 @@ export async function prepareIntakeSourceDependencyHeaders(
     throw new HttpError(409, 'SOURCE_CHANGED', 'Retained source owner is missing');
   let count = 0;
   for (const { id: current } of iterateIntakeSourceAncestry(db, profileId, id, options)) {
+    // Clinical reviews consume the selected original's workflow, while parent
+    // authorization needs the same checked edges, not each parent's full schema.
+    if (options.nativeSchema === 'selected' && current !== id) {
+      if (++count % 64 === 0) await setImmediate();
+      continue;
+    }
     const source = db
       .prepare(
         "SELECT id,kind,sha256,details_json FROM source_files WHERE id=? AND kind='intake_original'",

@@ -220,6 +220,17 @@ counts one sweep and both physical identities, with single-use, late caller
 refusal, accepted-state drift and scratch-disposal controls. This removes
 duplicate verification, not required members or subsequent authority checks.
 
+Clinical dependency preparation builds a native workflow for the selected source
+and each actually referenced clinical source. Ancestors needed only to establish
+parentage keep their checked legacy or native representation. The complete walk
+still authenticates and rechecks every parent edge, accepted authority and owner,
+and yields for cancellation. Source-text preparation keeps its full-ancestry
+schema conversion behavior. A fictional three-versus-130-ancestor comparison
+counts identical selected-schema operations and durable writes, complete parent
+checks, no warm writes and refusal after accepted authority changes. This avoids
+unused schema migrations; it does not eliminate ancestry reads, legacy decoding
+or the final cumulative physical proof.
+
 Literal progress totals (retained candidate versions and submitted batches) bind
 to the complete logical workflow index. Source-text or mapping changes leave
 those historical totals intact while classified review and remaining-work

@@ -170,7 +170,10 @@ export async function prepareCollectionClinicalReviewDependencies(
     db,
     async () => {
       assertIntakeOwner(db, profileId);
-      await prepareIntakeSourceDependencyHeaders(db, intakeId, options);
+      await prepareIntakeSourceDependencyHeaders(db, intakeId, {
+        ...options,
+        nativeSchema: 'selected',
+      });
       const original = requiredFile(db, intakeId, true),
         version = intakeSourceVersion(db, intakeId),
         revision = clinicalReviewRevision(db),
@@ -270,7 +273,10 @@ export async function prepareCollectionClinicalReviewDependencies(
         if (id === undefined) continue;
         assertCurrent();
         if (prepared.has(id)) continue;
-        await prepareIntakeSourceDependencyHeaders(db, id, { assertRunning: assertCurrent });
+        await prepareIntakeSourceDependencyHeaders(db, id, {
+          assertRunning: assertCurrent,
+          nativeSchema: 'selected',
+        });
         const source = requiredFile(db, id, true),
           selected = openIntakeCollectionEnvelope(db, source),
           details = selected.child(selected.root(), 'intake')!,
