@@ -1067,8 +1067,11 @@ Guarded feed construction retains a separate private completion proof tied to
 the exact original queue guard, ready session and generation. Certified disposable
 maintenance can preserve that original normalized guard without producing a raw
 public review certificate. Repeated rows under the same guard share one completed
-policy; a different guard cannot inherit that proof. Internal identity preparation
-may borrow the completed policy after checking its original pins and complete
+policy. An unchanged request can select that original completed guard only after
+fresh request admission and checks of its original session, generation, source,
+revision, queue binding and normalized authority. A different guard cannot inherit
+that proof, and a new request cannot refresh an expired original baseline. Internal
+identity preparation may borrow the completed policy after checking its original pins and complete
 physical evidence. A proof already stale at admission is a cache miss, not a new
 baseline; changes after selection refuse. Public raw-certificate admission remains
 separate. Closing a borrow invalidates its checked records and paused artifact

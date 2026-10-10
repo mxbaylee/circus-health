@@ -391,6 +391,18 @@ test('prepared queue policy reuses its original guard without minting a raw cert
   });
   const reopened = await openCollectionReportQueue(f.db, f.root, f.profileId);
   t.after(() => reopened.close({ discard: true }));
+  const continuedGuard = reopened.capturePreparedGuard();
+  assert.equal(
+    continuedGuard,
+    replacementGuard,
+    'a new lease selects the still-current original proof',
+  );
+  await reopened.reviewMember(f.source.id, f.members[0]!, undefined, undefined, continuedGuard);
+  assert.equal(
+    intakeWorkCounters(f.db).warm.collectionQueueClinicalReviews - before,
+    2,
+    'an unchanged request does not rebuild the completed policy',
+  );
   f.db.exec('CREATE TEMP TABLE fictional_unowned_policy_change(n INTEGER)');
   await assert.rejects(
     reopened.reviewMember(f.source.id, f.members[0]!, undefined, undefined, replacementGuard),

@@ -1519,6 +1519,21 @@ async function buildCollectionReportQueue(db: DatabaseSync, root: string, profil
   const preparedGuardOwner = {};
   const capturePreparedGuard = (): PreparedCollectionQueueGuard => {
     assertCurrent();
+    const completed = preparedReview;
+    if (
+      completed &&
+      completed.selected === reviewCache &&
+      completed.generation === reviewGeneration &&
+      completed.key === reviewKey &&
+      completed.queueBinding === binding &&
+      completed.requestRevision === revision(db) &&
+      completed.sourcePin === canonicalLiteral(intakeSourceVersion(db, completed.intakeId)) &&
+      preparedQueueGuards.get(completed.guard)?.current()
+    ) {
+      // A fresh request can select a still-current original proof, but cannot
+      // replace its baseline with a newly captured guard.
+      return completed.guard;
+    }
     const original = bindingWitness,
       originalBinding = binding,
       originalRevision = clinicalRevision,

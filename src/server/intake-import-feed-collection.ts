@@ -286,22 +286,23 @@ async function feedWindow(
           member: cached.member,
           certificate: fresh.certificate,
         } satisfies CachedFeedMember);
-      feed.scratch.db
-        .prepare('UPDATE records SET value=?,member=?,signature=? WHERE ordering=?')
-        .run(
-          updated,
-          member,
-          feedRowSignature(
-            db,
-            feed.signingKey,
-            String(row.ordering),
+      if (updated !== value || member !== String(row.member))
+        feed.scratch.db
+          .prepare('UPDATE records SET value=?,member=?,signature=? WHERE ordering=?')
+          .run(
             updated,
-            String(row.groupValue),
-            String(row.intake),
             member,
-          ),
-          row.ordering,
-        );
+            feedRowSignature(
+              db,
+              feed.signingKey,
+              String(row.ordering),
+              updated,
+              String(row.groupValue),
+              String(row.intake),
+              member,
+            ),
+            row.ordering,
+          );
     }
     if (records.length && used + size > input.budget) {
       more = true;
