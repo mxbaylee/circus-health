@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
 import {
-  prepareIntakeJsonCanonical,
+  prepareIntakeJsonCanonicalSteps,
   type IntakeJsonCanonicalWork,
 } from './intake-json-canonical.ts';
 import { prepareIntakeJsonLexical, type IntakeJsonLexicalSpan } from './intake-json-lexical.ts';
@@ -13,6 +13,7 @@ import {
   type IntakeCompactScalarField,
 } from './intake-compact-scalar.ts';
 import type { DatabaseSync } from 'node:sqlite';
+import { intakeCopyNativeSelect } from './intake-copy-work.ts';
 import {
   currentTransactionToken,
   json,
@@ -251,7 +252,28 @@ export async function prepareIntakeEnvelopeProjection(
     onWork?: (work: Readonly<IntakeJsonCanonicalWork>) => void;
   } = {},
 ): Promise<{ mode: Mode; format: IntakeEnvelopeProjectionFormat }> {
-  const tree = await prepareIntakeJsonCanonical(typeof raw === 'string' ? [raw] : raw, options);
+  const steps = prepareIntakeEnvelopeProjectionSteps(raw, options);
+  try {
+    for (;;) {
+      const next = steps.next();
+      if (next.done) return next.value;
+      await setImmediate();
+    }
+  } finally {
+    steps.return(undefined as never);
+  }
+}
+export function* prepareIntakeEnvelopeProjectionSteps(
+  raw: string | Iterable<string>,
+  options: {
+    assertRunning?: () => void;
+    onWork?: (work: Readonly<IntakeJsonCanonicalWork>) => void;
+  } = {},
+): Generator<void, { mode: Mode; format: IntakeEnvelopeProjectionFormat }> {
+  const tree = yield* prepareIntakeJsonCanonicalSteps(
+    typeof raw === 'string' ? [raw] : raw,
+    options,
+  );
   try {
     const allowed = (value: typeof tree.root, names: readonly string[]) => {
       if (tree.kind(value) !== 'object') return false;
@@ -603,8 +625,10 @@ export function readNonIntakeEnvelope(raw: unknown): unknown {
 }
 function identity(db: DatabaseSync, source: IntakeEnvelopeSource): IntakeStateIdentity {
   return validateIntakeIdentity({
-    profileId: db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()
-      ?.value as string,
+    profileId: intakeCopyNativeSelect(
+      db,
+      "SELECT value FROM main.app_meta WHERE key='owner_profile_id'",
+    ).get()?.value as string,
     intakeId: source.id,
     sourceHash: source.sha256 as string,
   });
@@ -796,7 +820,9 @@ function intakeEnvelopeAuthorityBindingChecked(
   if (!status?.configured || status.dirty || status.conflicted)
     fail('requires configured current accepted authority');
   const key = intakeNamespace(selected) + 'head';
-  const head = db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value;
+  const head = intakeCopyNativeSelect(db, 'SELECT value FROM main.app_meta WHERE key=?').get(
+    key,
+  )?.value;
   if (
     typeof head === 'string' &&
     Buffer.byteLength(head) <= 4096 &&

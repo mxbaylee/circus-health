@@ -43,19 +43,40 @@ import {
 } from 'node:fs';
 import { withManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
 
+function portableMutationPaths(
+  operands: readonly unknown[],
+  removal = false,
+): readonly string[] | undefined {
+  if (!operands.every((operand): operand is string => typeof operand === 'string'))
+    return undefined;
+  for (const operand of operands) {
+    try {
+      const stat = statSync(operand);
+      if ((stat.isFile() && stat.nlink !== 1) || (removal && stat.isDirectory())) return undefined;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return undefined;
+    }
+  }
+  return operands;
+}
+
 const chmodSync: typeof rawChmodSync = (...args) =>
-  withManagedPhysicalMutation(() => rawChmodSync(...args));
+  withManagedPhysicalMutation(() => rawChmodSync(...args), portableMutationPaths([args[0]]));
 const mkdirSync: typeof rawMkdirSync = (...args) =>
-  withManagedPhysicalMutation(() => rawMkdirSync(...args));
+  withManagedPhysicalMutation(() => rawMkdirSync(...args), portableMutationPaths([args[0]]));
 const renameSync: typeof rawRenameSync = (...args) =>
-  withManagedPhysicalMutation(() => rawRenameSync(...args));
+  withManagedPhysicalMutation(
+    () => rawRenameSync(...args),
+    portableMutationPaths([args[0], args[1]]),
+  );
 const copyFileSync: typeof rawCopyFileSync = (...args) =>
-  withManagedPhysicalMutation(() => rawCopyFileSync(...args));
-const rmSync: typeof rawRmSync = (...args) => withManagedPhysicalMutation(() => rawRmSync(...args));
+  withManagedPhysicalMutation(() => rawCopyFileSync(...args), portableMutationPaths([args[1]]));
+const rmSync: typeof rawRmSync = (...args) =>
+  withManagedPhysicalMutation(() => rawRmSync(...args), portableMutationPaths([args[0]], true));
 const rmdirSync: typeof rawRmdirSync = (...args) =>
-  withManagedPhysicalMutation(() => rawRmdirSync(...args));
+  withManagedPhysicalMutation(() => rawRmdirSync(...args), portableMutationPaths([args[0]], true));
 const unlinkSync: typeof rawUnlinkSync = (...args) =>
-  withManagedPhysicalMutation(() => rawUnlinkSync(...args));
+  withManagedPhysicalMutation(() => rawUnlinkSync(...args), portableMutationPaths([args[0]]));
 import { resolve, dirname, relative, isAbsolute } from 'node:path';
 import {
   openDatabase,

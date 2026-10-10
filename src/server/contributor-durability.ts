@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { resolve, dirname, relative } from 'node:path';
 import { tmpdir } from 'node:os';
+import { Worker } from 'node:worker_threads';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { portableWork } from './portable-work.ts';
 import { openDatabase, type Database } from './database.ts';
@@ -20,8 +21,25 @@ import {
   rebuildRecordDatabase,
   flushRecordDurability,
   recordDurabilityStatus,
+  captureRecordReadOwner,
+  assertRecordReadOwnerInterval,
+  assertRecordReadOwnerBeforeVerification,
+  closeRecordReadOwner,
+  type RecordReadOwner,
 } from './record-versions.ts';
 import { validateProductionIntakeAuthority } from './intake-state-bootstrap.ts';
+import { intakeCopyRowKeySteps } from './intake-copy-json.ts';
+import {
+  finishIntakeCopyStepsAsync,
+  captureIntakeCopyReadInterval,
+  intakeCopyNativeSelect,
+} from './intake-copy-work.ts';
+import {
+  captureManagedPhysicalScope,
+  managedPhysicalScopeCurrent,
+  retainManagedPhysicalScope,
+} from './clinical-review-physical-epoch.ts';
+import type { UnlockPhysicalWitness } from './encrypted-unlock-physical.ts';
 import { ensureProfileDirectories } from './profile-storage.ts';
 import {
   contributorAuthorityPath,
@@ -255,6 +273,466 @@ export function assertContributorCopyCoherence(
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+}
+
+declare const contributorCopyBrand: unique symbol;
+export interface ContributorCopyCertification {
+  readonly [contributorCopyBrand]: true;
+}
+interface ContributorCopyData {
+  source: Database;
+  root: string;
+  profileId: string;
+  head: string;
+  directory: string;
+  selected: Database;
+  storage: ContributorRecordStorage;
+  owner: RecordReadOwner;
+  physicalScope: object;
+  releasePhysicalScope: () => void;
+  sourceCurrent: () => void;
+  selectedCurrent: () => void;
+  physical: Array<{ root: string; path: string; witness: UnlockPhysicalWitness }>;
+}
+const contributorCopies = new WeakMap<ContributorCopyCertification, ContributorCopyData>();
+
+function assertCopyCurrent(
+  data: Omit<ContributorCopyData, 'selected' | 'physical' | 'selectedCurrent'>,
+): void {
+  data.sourceCurrent();
+  if ('selectedCurrent' in data) (data.selectedCurrent as () => void)();
+  const status = recordDurabilityStatus(data.source);
+  if (
+    !data.source.isOpen ||
+    data.source.isTransaction ||
+    !status ||
+    status.dirty ||
+    status.conflicted
+  )
+    throw Error('Contributor copy original durability changed');
+  if (
+    data.source.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value !==
+    data.profileId
+  )
+    throw Error('Contributor copy original owner changed');
+  if (!managedPhysicalScopeCurrent(data.physicalScope))
+    throw Error('Contributor copy original physical scope changed');
+  if (selectedContributorHead(data.root, data.profileId) !== data.head)
+    throw Error('Contributor copy original selected head changed');
+  assertRecordReadOwnerBeforeVerification(data.source, data.owner);
+  data.sourceCurrent();
+  if ('selectedCurrent' in data) (data.selectedCurrent as () => void)();
+}
+
+async function runContributorCopyWorker(
+  data: unknown,
+  signal: AbortSignal | undefined,
+  checkpoint: () => void,
+): Promise<Pick<ContributorCopyData, 'physical'>> {
+  signal?.throwIfAborted();
+  const worker = new Worker(new URL('./contributor-copy-worker.ts', import.meta.url), {
+    workerData: data,
+  });
+  let ready = false,
+    started = false,
+    exited = false,
+    received = false,
+    failure: unknown;
+  let bootResolve!: () => void, exitResolve!: () => void;
+  const boot = new Promise<void>((resolve) => {
+      bootResolve = resolve;
+    }),
+    exit = new Promise<void>((resolve) => {
+      exitResolve = resolve;
+    });
+  let resultResolve!: (result: Pick<ContributorCopyData, 'physical'>) => void,
+    resultReject!: (error: unknown) => void;
+  const result = new Promise<Pick<ContributorCopyData, 'physical'>>((resolve, reject) => {
+    resultResolve = resolve;
+    resultReject = reject;
+  });
+  const fail = (error: unknown) => {
+    failure ??= error;
+    resultReject(error);
+    if (!exited && ready) {
+      if (started) void worker.terminate();
+      else worker.postMessage({ cancel: true });
+    }
+  };
+  const abort = () => fail(signal!.reason);
+  signal?.addEventListener('abort', abort, { once: true });
+  worker.on('error', (error) => {
+    bootResolve();
+    fail(error);
+  });
+  worker.on('exit', (code) => {
+    exited = true;
+    bootResolve();
+    exitResolve();
+    if (code !== 0 || !received)
+      fail(Error('Contributor copy worker exited without certification'));
+  });
+  worker.on(
+    'message',
+    (message: {
+      ready?: true;
+      progress?: true;
+      failure?: string;
+      prepared?: Pick<ContributorCopyData, 'physical'>;
+    }) => {
+      try {
+        if (message.ready) {
+          if (ready) throw Error('Contributor copy worker protocol');
+          ready = true;
+          bootResolve();
+          if (failure || signal?.aborted) {
+            worker.postMessage({ cancel: true });
+            return;
+          }
+          checkpoint();
+          started = true;
+          worker.postMessage({ start: true });
+          return;
+        }
+        signal?.throwIfAborted();
+        checkpoint();
+        if (!ready || !started) throw Error('Contributor copy worker protocol');
+        if (message.progress) return;
+        if (message.failure) throw Error(message.failure);
+        if (!message.prepared || received) throw Error('Contributor copy worker protocol');
+        received = true;
+        resultResolve(message.prepared);
+      } catch (error) {
+        fail(error);
+      }
+    },
+  );
+  try {
+    const prepared = await result;
+    await exit;
+    if (failure) throw failure;
+    signal?.throwIfAborted();
+    checkpoint();
+    return prepared;
+  } finally {
+    await boot;
+    if (!exited && started) await worker.terminate();
+    else if (!exited && ready) worker.postMessage({ cancel: true });
+    await exit;
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
+function* equalCopyRowsSteps(
+  left: Database,
+  right: Database,
+  checkpoint: () => void,
+): Generator<void, boolean> {
+  const names = (db: Database) =>
+    intakeCopyNativeSelect(
+      db,
+      "SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '__record_*' ORDER BY name",
+      checkpoint,
+    )
+      .all()
+      .map((row) => String(row.name));
+  const tables = names(left);
+  if (JSON.stringify(tables) !== JSON.stringify(names(right))) return false;
+  const scratch = disposableSqlite('contributor-copy-comparison-');
+  try {
+    scratch.db.exec('CREATE TABLE comparison(key TEXT PRIMARY KEY,count INTEGER NOT NULL)');
+    for (const table of tables) {
+      scratch.db.exec('DELETE FROM comparison');
+      for (const row of intakeCopyNativeSelect(
+        left,
+        `SELECT * FROM main.${quote(table)}`,
+        checkpoint,
+      ).iterate()) {
+        checkpoint();
+        yield;
+        if (table === 'app_meta' && bookkeeping(row.key)) continue;
+        const key = yield* intakeCopyRowKeySteps(row);
+        scratch.db
+          .prepare(
+            'INSERT INTO comparison VALUES(?,1) ON CONFLICT(key) DO UPDATE SET count=count+1',
+          )
+          .run(key);
+      }
+      for (const row of intakeCopyNativeSelect(
+        right,
+        `SELECT * FROM main.${quote(table)}`,
+        checkpoint,
+      ).iterate()) {
+        checkpoint();
+        yield;
+        if (table === 'app_meta' && bookkeeping(row.key)) continue;
+        const key = yield* intakeCopyRowKeySteps(row);
+        if (
+          !scratch.db
+            .prepare('UPDATE comparison SET count=count-1 WHERE key=? AND count>0')
+            .run(key).changes
+        )
+          return false;
+      }
+      if (scratch.db.prepare('SELECT 1 FROM comparison WHERE count<>0 LIMIT 1').get()) return false;
+    }
+    return true;
+  } finally {
+    scratch.close();
+  }
+}
+
+export async function prepareContributorCopyCertification(
+  db: Database,
+  root: string,
+  profileId: string,
+  backup?: Database,
+  signal?: AbortSignal,
+): Promise<ContributorCopyCertification> {
+  const sourceCurrent = captureIntakeCopyReadInterval(db, profileId);
+  const storage = attached.get(db);
+  if (!storage) throw Error('Contributor copy requires genuine attached writer');
+  const owner = captureRecordReadOwner(db, profileId),
+    physicalScope = captureManagedPhysicalScope(resolve(root, 'data/profiles', profileId));
+  if (!owner || !physicalScope) {
+    closeRecordReadOwner(owner);
+    throw Error('Contributor copy physical source unavailable');
+  }
+  let directory: string | undefined,
+    selected: Database | undefined,
+    releasePhysicalScope: (() => void) | undefined,
+    complete = false;
+  try {
+    releasePhysicalScope = retainManagedPhysicalScope(physicalScope);
+    directory = mkdtempSync(resolve(tmpdir(), 'health-contributor-copy-'));
+    const initial = {
+      source: db,
+      root,
+      profileId,
+      head: selectedContributorHead(root, profileId),
+      directory,
+      storage,
+      owner,
+      physicalScope,
+      releasePhysicalScope,
+      sourceCurrent,
+    };
+    const checkpoint = () => {
+      signal?.throwIfAborted();
+      assertCopyCurrent(initial);
+    };
+    checkpoint();
+    const path = resolve(directory, 'selected.sqlite'),
+      prepared = await runContributorCopyWorker(
+        { root, profileId, directory, path },
+        signal,
+        checkpoint,
+      );
+    selected = openDatabase(path, profileId);
+    const selectedCurrent = captureIntakeCopyReadInterval(selected, profileId);
+    if (
+      !(await finishIntakeCopyStepsAsync(equalCopyRowsSteps(db, selected, checkpoint), signal)) ||
+      (backup &&
+        !(await finishIntakeCopyStepsAsync(
+          equalCopyRowsSteps(backup, selected, checkpoint),
+          signal,
+        )))
+    )
+      throw Error('Contributor copy cache conflicts with selected record authority');
+    checkpoint();
+    selectedCurrent();
+    await runContributorCopyWorker(
+      { root, profileId, directory, path, physical: prepared.physical },
+      signal,
+      checkpoint,
+    );
+    checkpoint();
+    selectedCurrent();
+    const certification = Object.freeze({}) as ContributorCopyCertification;
+    contributorCopies.set(certification, {
+      ...initial,
+      selected,
+      selectedCurrent,
+      physical: prepared.physical,
+    });
+    complete = true;
+    return certification;
+  } finally {
+    if (!complete) {
+      try {
+        selected?.close();
+      } finally {
+        try {
+          if (directory) rmSync(directory, { recursive: true, force: true });
+        } finally {
+          try {
+            closeRecordReadOwner(owner);
+          } finally {
+            releasePhysicalScope?.();
+          }
+        }
+      }
+    }
+  }
+}
+
+export async function contributorCopySourceTextInventory(
+  certification: ContributorCopyCertification,
+  source: Database,
+  root: string,
+  profileId: string,
+  signal?: AbortSignal,
+): Promise<{ has(key: string): boolean; assertCurrent(): void }> {
+  const data = contributorCopies.get(certification);
+  if (!data || data.source !== source || data.root !== root || data.profileId !== profileId)
+    throw Error('Contributor copy certification scope');
+  const checkpoint = () => {
+    signal?.throwIfAborted();
+    assertCopyCurrent(data);
+  };
+  if (
+    !(await finishIntakeCopyStepsAsync(
+      equalCopyRowsSteps(source, data.selected, checkpoint),
+      signal,
+    ))
+  )
+    throw Error('Contributor copy certified cache changed');
+  await runContributorCopyWorker(
+    {
+      root,
+      profileId,
+      directory: data.directory,
+      path: resolve(data.directory, 'selected.sqlite'),
+      physical: data.physical,
+    },
+    signal,
+    checkpoint,
+  );
+  checkpoint();
+  return {
+    assertCurrent: checkpoint,
+    has(key) {
+      checkpoint();
+      const found = !!data.selected.prepare('SELECT 1 FROM app_meta WHERE key=?').get(key);
+      checkpoint();
+      return found;
+    },
+  };
+}
+
+export function disposeContributorCopyCertification(
+  certification: ContributorCopyCertification,
+): void {
+  const data = contributorCopies.get(certification);
+  if (!data) return;
+  contributorCopies.delete(certification);
+  try {
+    data.selected.close();
+  } finally {
+    try {
+      rmSync(data.directory, { recursive: true, force: true });
+    } finally {
+      try {
+        closeRecordReadOwner(data.owner);
+      } finally {
+        data.releasePhysicalScope();
+      }
+    }
+  }
+}
+
+export function assertContributorCopyCertificationCurrent(
+  certification: ContributorCopyCertification,
+): void {
+  const data = contributorCopies.get(certification);
+  if (!data) throw Error('Contributor copy certification disposed');
+  assertCopyCurrent(data);
+}
+
+declare const contributorPublicationBrand: unique symbol;
+export interface ContributorCopyPublicationSeal {
+  readonly [contributorPublicationBrand]: true;
+}
+const copyPublicationSeals = new WeakMap<
+  ContributorCopyPublicationSeal,
+  { certification: ContributorCopyCertification; data: ContributorCopyData }
+>();
+
+function assertCopyPublicationCurrent(data: ContributorCopyData): void {
+  data.sourceCurrent();
+  data.selectedCurrent();
+  assertRecordReadOwnerInterval(data.source, data.owner);
+  if (!managedPhysicalScopeCurrent(data.physicalScope))
+    throw Error('Contributor copy original physical source changed');
+  data.sourceCurrent();
+  data.selectedCurrent();
+  assertRecordReadOwnerInterval(data.source, data.owner);
+}
+
+/** Reverify the original complete roster after all callback-capable work. All
+ * worker/handoff guards from this point use native reads and factory identities. */
+export async function verifyContributorCopyCertificationForPublication(
+  certification: ContributorCopyCertification,
+  signal?: AbortSignal,
+): Promise<ContributorCopyPublicationSeal> {
+  const data = contributorCopies.get(certification);
+  if (!data) throw Error('Contributor copy certification disposed');
+  assertCopyCurrent(data);
+  const checkpoint = () => {
+    signal?.throwIfAborted();
+    if (contributorCopies.get(certification) !== data)
+      throw Error('Contributor copy certification disposed');
+    assertCopyPublicationCurrent(data);
+  };
+  checkpoint();
+  await runContributorCopyWorker(
+    {
+      root: data.root,
+      profileId: data.profileId,
+      directory: data.directory,
+      path: resolve(data.directory, 'selected.sqlite'),
+      physical: data.physical,
+    },
+    signal,
+    checkpoint,
+  );
+  checkpoint();
+  const seal = Object.freeze({}) as ContributorCopyPublicationSeal;
+  copyPublicationSeals.set(seal, { certification, data });
+  return seal;
+}
+
+/** One-use callback-free continuation immediately before owner-controlled rename. */
+export function consumeContributorCopyPublicationSeal(
+  seal: ContributorCopyPublicationSeal,
+  certification: ContributorCopyCertification,
+): void {
+  const value = copyPublicationSeals.get(seal);
+  copyPublicationSeals.delete(seal);
+  if (
+    !value ||
+    value.certification !== certification ||
+    contributorCopies.get(certification) !== value.data
+  )
+    throw Error('Contributor copy publication seal unavailable');
+  assertCopyPublicationCurrent(value.data);
+}
+
+export async function assertContributorCopyCoherenceAsync(
+  db: Database,
+  root: string,
+  profileId: string,
+  backup?: Database,
+  signal?: AbortSignal,
+): Promise<void> {
+  const certification = await prepareContributorCopyCertification(
+    db,
+    root,
+    profileId,
+    backup,
+    signal,
+  );
+  disposeContributorCopyCertification(certification);
 }
 /** Same-profile archive recovery retains journal identity, unlike private copy. */
 export function copyContributorAuthority(

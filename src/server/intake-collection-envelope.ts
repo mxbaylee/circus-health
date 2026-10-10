@@ -1,4 +1,5 @@
 import { types as utilTypes } from 'node:util';
+import { intakeCopyNativeSelect } from './intake-copy-work.ts';
 import {
   resolveSchemaMetadata,
   resolveSchemaFieldTarget,
@@ -55,6 +56,10 @@ import {
 } from './intake-envelope-schema.ts';
 import { iterateIntakeJsonVerification } from './intake-json-verify.ts';
 import { prepareIntakeJsonCanonicalSteps } from './intake-json-canonical.ts';
+import {
+  intakeCopyTrimmedPieceSteps,
+  prepareIntakeCopyPieceSpoolSteps,
+} from './intake-copy-json.ts';
 import { hashIntakeJsonScalar, hashIntakeJsonScalarSteps } from './intake-json-scalar.ts';
 import { validateIntakeSchemaReachabilitySteps } from './intake-envelope-schema-validation.ts';
 import {
@@ -989,13 +994,16 @@ const selectedStorageHandles = new WeakMap<
   }
 >();
 export function selectedEnvelopeStore(db: Database, input: IntakeEnvelopeSource) {
-  const source = db
-    .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
-    .get(input.id) as unknown as IntakeEnvelopeSource | undefined;
+  const source = intakeCopyNativeSelect(
+    db,
+    'SELECT id,kind,sha256,details_json FROM main.source_files WHERE id=?',
+  ).get(input.id) as unknown as IntakeEnvelopeSource | undefined;
   if (!source || source.kind !== 'intake_original') return fail('missing original source');
   const identity = validateIntakeIdentity({
-    profileId: db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()
-      ?.value as string,
+    profileId: intakeCopyNativeSelect(
+      db,
+      "SELECT value FROM main.app_meta WHERE key='owner_profile_id'",
+    ).get()?.value as string,
     intakeId: source.id,
     sourceHash: source.sha256 as string,
   });
@@ -1407,19 +1415,163 @@ export function* validateIntakeCollectionEnvelopeRepresentationSteps(
   const { store, control, reader } = createIntakeEnvelopeGraphReader(head.identity, head, readNode);
   yield* validateIntakeSchemaReachabilitySteps(store, control);
   yield* iterateIntakeJsonVerification(iterateSchemaEnvelopeText(store, control));
-  const expected = yield* projectSchemaCompactMetadataSteps(
-    store,
-    control,
-    Buffer.byteLength(detailsJson) + 4096,
-    projectionFormat ?? intakeEnvelopeProjection(detailsJson).format,
-  );
-  if (expected !== detailsJson) fail('compact metadata conflicts with selected schema');
+  if (projectionFormat !== undefined)
+    yield* validateSchemaCompactMetadataPiecesSteps(store, control, detailsJson, projectionFormat);
+  else {
+    const expected = yield* projectSchemaCompactMetadataSteps(
+      store,
+      control,
+      Buffer.byteLength(detailsJson) + 4096,
+      intakeEnvelopeProjection(detailsJson).format,
+    );
+    if (expected !== detailsJson) fail('compact metadata conflicts with selected schema');
+  }
   const intake = reader.child(reader.root(), 'intake');
   if (!intake) fail('missing intake');
   const version = reader.field(intake!, 'version');
   if (version.kind !== 'value' || version.value !== head.logical.domainVersion)
     fail('selected domain version disagreement');
   return { mode: control.mode, domainVersion: head.logical.domainVersion };
+}
+
+function* validateSchemaCompactMetadataPiecesSteps(
+  store: EnvelopeCellReader,
+  control: SchemaControl,
+  detailsJson: string,
+  format: IntakeEnvelopeProjectionFormat,
+): Generator<void> {
+  const metadata = new Map(
+    [
+      'originalName',
+      'acquisition',
+      'metadata',
+      'receivedMimeType',
+      'createdAt',
+      'parentSourceFileId',
+      'locator',
+      'derivative',
+    ].map((name) => [schemaKey(name), name]),
+  );
+  const nameHash = function* (entry: SchemaOrder): Generator<void, string | undefined> {
+    return entry.name === undefined
+      ? undefined
+      : (yield* hashIntakeJsonScalarSteps(cellChunks(store, 'n:' + entry.name))).hash;
+  };
+  const key = (entry: SchemaOrder) => {
+    let result = '',
+      started = false,
+      escaped = false;
+    for (const piece of cellChunks(store, 'c:' + entry.prefix))
+      for (const char of piece) {
+        if (!started) {
+          if (/[\s{,]/.test(char)) continue;
+          if (char !== '"') fail('property prefix');
+          started = true;
+        }
+        result += char;
+        if (result.length > 4096) fail('known metadata key spelling');
+        if (result.length === 1) continue;
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') return result;
+      }
+    return fail('metadata property key');
+  };
+  function* selectedValue(item: SchemaTarget): Generator<string> {
+    if (item.type === 'cell') yield* cellChunks(store, 'c:' + item.id);
+    else yield* iterateSchemaRecordValue(store, item.id);
+  }
+  function* intakePieces(id: string): Generator<string | void> {
+    yield '{';
+    let first = true;
+    for (const entry of orderEntries(store, id)) {
+      const field = metadata.get((yield* nameHash(entry)) ?? '');
+      if (!field) continue;
+      if (!first) yield ',';
+      first = false;
+      yield (control.mode === 'raw' ? key(entry) : JSON.stringify(field)) + ':';
+      const cell = entry.target.type === 'cell' ? store.get('c:' + entry.target.id) : undefined;
+      let stringCell = false;
+      if (cell && typeof cell !== 'string') {
+        const pieces = cellChunks(store, 'c:' + entry.target.id);
+        try {
+          stringCell = pieces.next().value?.trimStart().startsWith('"') ?? false;
+        } finally {
+          pieces.return(undefined);
+        }
+      }
+      if (
+        format !== INTAKE_ENVELOPE_FORMAT &&
+        ['originalName', 'locator'].includes(field) &&
+        cell &&
+        typeof cell !== 'string' &&
+        cell.bytes > COMPACT_SCALAR_BYTES &&
+        stringCell
+      ) {
+        if (!store.byteBinding) return fail('compact scalar requires checked evidence');
+        const raw = store.get('q:' + entry.target.id);
+        if (typeof raw !== 'string') return fail('prepare compact scalar facts before projection');
+        const facts = parseIntakeFilenameFacts(raw);
+        if (
+          facts.binding !== store.byteBinding(cell as IntakeByteValue) ||
+          facts.bytes !== cell.bytes
+        )
+          fail('compact scalar facts binding');
+        yield JSON.stringify(compactIntakeScalar(field as IntakeCompactScalarField, facts));
+      } else yield* intakeCopyTrimmedPieceSteps(selectedValue(entry.target));
+    }
+    yield '}';
+  }
+  let offset = 0,
+    turns = 0;
+  const compare = (piece: string) => {
+    if (detailsJson.slice(offset, offset + piece.length) !== piece)
+      fail('compact metadata conflicts with selected schema');
+    offset += piece.length;
+  };
+  compare('{"intakeAuthority":' + JSON.stringify({ format, mode: control.mode }) + ',');
+  let last: string | undefined,
+    firstIntake = true;
+  for (const entry of orderEntries(store, control.root)) {
+    if (++turns % 64 === 0) yield;
+    if ((yield* nameHash(entry)) !== schemaKey('intake')) continue;
+    const retainedObject =
+      entry.target.type === 'record' && header(store, entry.target.id).shape === 'object';
+    if (!retainedObject && control.mode !== 'raw') fail('selected intake record');
+    last = retainedObject ? entry.target.id : undefined;
+    if (control.mode !== 'raw') continue;
+    if (!firstIntake) compare(',');
+    firstIntake = false;
+    compare(key(entry) + ':');
+    if (retainedObject)
+      for (const piece of intakePieces(entry.target.id)) {
+        if (typeof piece === 'string') compare(piece);
+        if (++turns % 16 === 0) yield;
+      }
+    else compare('null');
+  }
+  if (!last) return fail('missing intake record');
+  if (control.mode !== 'raw') {
+    compare('"intake":');
+    const spool = yield* prepareIntakeCopyPieceSpoolSteps(intakePieces(last));
+    try {
+      const normalized = yield* prepareIntakeJsonCanonicalSteps(spool.pieces(), {
+        mode: 'stringify',
+      });
+      try {
+        for (const piece of normalized.chunks()) {
+          compare(piece);
+          if (++turns % 16 === 0) yield;
+        }
+      } finally {
+        normalized.close();
+      }
+    } finally {
+      spool.close();
+    }
+  }
+  compare('}');
+  if (offset !== detailsJson.length) fail('compact metadata conflicts with selected schema');
 }
 
 function projectSchemaCompactMetadata(

@@ -1,16 +1,12 @@
-import { randomUUID } from 'node:crypto';
 import { IntakeStateManifest } from './intake-state-manifest.ts';
-import { inspectIntakeCollectionGraph } from './intake-state-graph.ts';
+import { inspectIntakeCollectionGraphSteps } from './intake-state-graph.ts';
 import { createIntakeTree } from './intake-state-tree.ts';
 import {
   parseIntakeCollectionDescriptor,
   parseIntakeStoredValue,
 } from './intake-state-collections.ts';
-import {
-  INTAKE_LEGACY_BRIDGE_CONTROL,
-  validateLegacyIntakeEnvelope,
-} from './intake-state-migration.ts';
-import { validateIntakeCollectionEnvelopeRepresentation } from './intake-collection-envelope.ts';
+import { INTAKE_LEGACY_BRIDGE_CONTROL } from './intake-state-migration.ts';
+import { validateIntakeCollectionEnvelopeRepresentationSteps } from './intake-collection-envelope.ts';
 import { rebindCopiedPackageInventory } from './intake-package-state.ts';
 import {
   currentTransactionToken,
@@ -22,24 +18,35 @@ import { flushRecordDurability, recordDurabilityStatus } from './record-versions
 import { safeRelative } from './profile-storage.ts';
 import { validProfileId } from './profiles.ts';
 import { intakeSourcePinKey, parseIntakeSourcePin } from './intake-source-pin.ts';
-import { intakeEnvelopeMode, validateIntakeEnvelopeRepresentation } from './intake-authority.ts';
+import {
+  prepareIntakeEnvelopeProjectionSteps,
+  type IntakeEnvelopeProjectionFormat,
+} from './intake-authority.ts';
+import { iterateIntakeJsonVerification } from './intake-json-verify.ts';
+import {
+  intakeCopyEncodedBytes,
+  intakeCopyEncodedBytesSteps,
+  intakeCopyTextPieces,
+} from './intake-copy-json.ts';
+import {
+  finishIntakeCopySteps,
+  finishIntakeCopyStepsAsync,
+  intakeCopyNativeSelect,
+} from './intake-copy-work.ts';
+import { toUSVString } from 'node:util';
 import { withIntakeWork } from './intake-work-accounting.ts';
-import { applyIntakeChanges, serializeIntakeJson } from './intake-state-codec.ts';
+import { prepareIntakeLegacyReplaySteps } from './intake-state-legacy-replay.ts';
 import {
   COLLECTION_FORMAT,
   DEFAULT_LIMITS,
   HEAD_BYTES,
-  budget,
   decode,
-  digest,
   exact,
-  frameIntakeChanges,
   intakeNamespace,
   integer,
   invalid,
   limits,
   parseIntakeHead,
-  reconstructIntakeEvidence,
   validateIntakeIdentity,
 } from './intake-state-evidence.ts';
 
@@ -167,7 +174,7 @@ function ownedPath(path: unknown, profileId: string): asserts path is string {
     invalid('copy original path');
 }
 function sourceSize(original: IntakeCopyOriginal): number {
-  return Buffer.byteLength(JSON.stringify(original));
+  return intakeCopyEncodedBytes(original);
 }
 function rowSize(row: { key: string; value: string }): number {
   return Buffer.byteLength(row.key) + Buffer.byteLength(row.value);
@@ -177,7 +184,10 @@ function assertTotals(rows: number, bytes: number, caps: IntakePreparationLimits
   integer(bytes);
   if (rows > caps.rows || bytes > caps.bytes) invalid('aggregate preparation rows/bytes');
 }
-function validateOriginal(raw: IntakeCopyOriginal, profileId: string): IntakeCopyOriginal {
+function* validateOriginalSteps(
+  raw: IntakeCopyOriginal,
+  profileId: string,
+): Generator<void, IntakeCopyOriginal> {
   exact(raw, ['id', 'kind', 'sha256', 'path', 'detailsJson', 'sourcePin', 'preserved']);
   validateIntakeIdentity({
     profileId,
@@ -187,9 +197,24 @@ function validateOriginal(raw: IntakeCopyOriginal, profileId: string): IntakeCop
   if (raw.kind !== 'intake_original') invalid('copy original kind');
   ownedPath(raw.path, profileId);
   if (typeof raw.detailsJson !== 'string') invalid('copy original envelope');
-  const envelope = decode(raw.detailsJson, PREPARATION_LIMITS.bytes);
-  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope))
-    invalid('copy original envelope');
+  let bytes = 0;
+  for (const piece of intakeCopyTextPieces(raw.detailsJson)) {
+    bytes += Buffer.byteLength(piece);
+    if (bytes > PREPARATION_LIMITS.bytes) invalid('encoded bytes');
+    if (toUSVString(piece) !== piece) invalid('UTF-8');
+    yield;
+  }
+  yield* iterateIntakeJsonVerification(intakeCopyTextPieces(raw.detailsJson));
+  let object = false;
+  for (const piece of intakeCopyTextPieces(raw.detailsJson)) {
+    const first = piece.replace(/^[\x20\t\r\n]*/, '');
+    if (first) {
+      object = first.startsWith('{');
+      break;
+    }
+    yield;
+  }
+  if (!object) invalid('copy original envelope');
   if (raw.sourcePin !== null && typeof raw.sourcePin !== 'string') invalid('copy source pin');
   parseIntakeSourcePin(raw.sourcePin);
   exact(raw.preserved, ['provider_id', 'bytes', 'mime_type', 'coverage_status', 'batch_id']);
@@ -209,6 +234,24 @@ function validateOriginal(raw: IntakeCopyOriginal, profileId: string): IntakeCop
     detailsJson: raw.detailsJson,
     sourcePin: raw.sourcePin,
     preserved: { ...raw.preserved },
+  };
+}
+
+function savedOriginal(row: Record<string, unknown>): IntakeCopyOriginal {
+  return {
+    id: row.id as string,
+    kind: row.kind as string,
+    sha256: row.sha256 as string,
+    path: row.path as string,
+    detailsJson: row.value as string,
+    sourcePin: row.source_pin as string | null,
+    preserved: {
+      provider_id: row.provider_id as string | null,
+      bytes: row.bytes as number,
+      mime_type: row.mime_type as string,
+      coverage_status: row.coverage_status as string,
+      batch_id: row.batch_id as string | null,
+    },
   };
 }
 
@@ -242,11 +285,43 @@ export function prepareProductionIntakeStateCopyRows(
   return inspectSnapshot(capture(db, sourceProfileId), targetProfileId, { production: true })!;
 }
 
+export function* prepareProductionIntakeStateCopyRowsSteps(
+  db: Database,
+  sourceProfileId: string,
+  targetProfileId: string,
+  options: IntakeRecoveryTraversalOptions = {},
+): Generator<void, IntakeStateCopyPlan> {
+  return (yield* inspectSnapshotSteps(capture(db, sourceProfileId), targetProfileId, {
+    ...options,
+    production: true,
+  }))!;
+}
+
+export function prepareProductionIntakeStateCopyRowsAsync(
+  db: Database,
+  sourceProfileId: string,
+  targetProfileId: string,
+  options: IntakeRecoveryTraversalOptions = {},
+): Promise<IntakeStateCopyPlan> {
+  return finishIntakeCopyStepsAsync(
+    prepareProductionIntakeStateCopyRowsSteps(db, sourceProfileId, targetProfileId, options),
+    options.signal,
+  );
+}
+
 function inspectSnapshot(
   snapshot: IntakeStateCopyRows,
   targetProfileId: string | undefined,
   options: Options,
 ): IntakeStateCopyPlan | undefined {
+  return finishIntakeCopySteps(inspectSnapshotSteps(snapshot, targetProfileId, options));
+}
+
+function* inspectSnapshotSteps(
+  snapshot: IntakeStateCopyRows,
+  targetProfileId: string | undefined,
+  options: Options,
+): Generator<void, IntakeStateCopyPlan | undefined> {
   exact(snapshot, ['sourceProfileId', 'originals', 'rows']);
   if (targetProfileId !== undefined) profiles(snapshot.sourceProfileId, targetProfileId);
   else if (!validProfileId(snapshot.sourceProfileId)) invalid('copy profile identity');
@@ -265,6 +340,18 @@ function inspectSnapshot(
   };
   try {
     checkpoint();
+    manifest.db.exec(`
+      ALTER TABLE originals ADD COLUMN kind TEXT;
+      ALTER TABLE originals ADD COLUMN sha256 TEXT;
+      ALTER TABLE originals ADD COLUMN path TEXT;
+      ALTER TABLE originals ADD COLUMN source_pin TEXT;
+      ALTER TABLE originals ADD COLUMN provider_id TEXT;
+      ALTER TABLE originals ADD COLUMN bytes INTEGER;
+      ALTER TABLE originals ADD COLUMN mime_type TEXT;
+      ALTER TABLE originals ADD COLUMN coverage_status TEXT;
+      ALTER TABLE originals ADD COLUMN batch_id TEXT;
+      ALTER TABLE originals ADD COLUMN projection_format TEXT;
+    `);
     const counters: IntakeCopyCounters = {
       namespaces: 0,
       sourceRows: 0,
@@ -283,25 +370,51 @@ function inspectSnapshot(
     };
     for (const original of snapshot.originals) {
       checkpoint();
+      yield;
       // Charge encoded raw input before parsing or retaining an additional copy.
       counters.sourceRows++;
-      counters.sourceBytes += sourceSize(original);
+      counters.sourceBytes += yield* intakeCopyEncodedBytesSteps(original);
       assertTotals(counters.sourceRows, counters.sourceBytes, caps);
-      const validated = validateOriginal(original, sourceProfileId);
-      if (options.production) intakeEnvelopeMode(validated.detailsJson);
+      const validated = yield* validateOriginalSteps(original, sourceProfileId);
+      let projectionFormat: IntakeEnvelopeProjectionFormat | null = null;
+      if (options.production) {
+        const projection = yield* prepareIntakeEnvelopeProjectionSteps(
+          intakeCopyTextPieces(validated.detailsJson),
+          { assertRunning: checkpoint },
+        );
+        projectionFormat = projection.format;
+      }
       if (manifest.db.prepare('SELECT 1 FROM originals WHERE id=?').get(validated.id))
         invalid('duplicate copy original');
       manifest.db
-        .prepare('INSERT INTO originals VALUES(?,?)')
-        .run(validated.id, JSON.stringify(validated));
+        .prepare('INSERT INTO originals VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(
+          validated.id,
+          validated.detailsJson,
+          validated.kind,
+          validated.sha256,
+          validated.path,
+          validated.sourcePin,
+          validated.preserved.provider_id,
+          validated.preserved.bytes,
+          validated.preserved.mime_type,
+          validated.preserved.coverage_status,
+          validated.preserved.batch_id,
+          projectionFormat,
+        );
     }
     for (const raw of snapshot.rows) {
       checkpoint();
+      yield;
       exact(raw, ['key', 'value']);
       if (typeof raw.key !== 'string' || typeof raw.value !== 'string')
         invalid('copy inventory row');
       counters.sourceRows++;
-      counters.sourceBytes += rowSize(raw);
+      for (const value of [raw.key, raw.value])
+        for (const piece of intakeCopyTextPieces(value)) {
+          counters.sourceBytes += Buffer.byteLength(piece);
+          yield;
+        }
       assertTotals(counters.sourceRows, counters.sourceBytes, caps);
       const match =
         /^intake_state_v1:([0-9a-f]{64}):(head|node:[0-9a-f]{64}|(?:frame|operation):[0-9a-f-]{36})$/.exec(
@@ -330,6 +443,7 @@ function inspectSnapshot(
       const entry = nextNamespace.get(afterNamespace);
       if (!entry) break;
       checkpoint();
+      yield;
       const prefix = String(entry.prefix);
       afterNamespace = prefix;
       const get = (key: string) => readSource.get(key)?.value as string | undefined;
@@ -350,22 +464,20 @@ function inspectSnapshot(
       if (identity.profileId !== sourceProfileId || intakeNamespace(identity) !== prefix)
         invalid('copy namespace identity');
       const originalRow = manifest.db
-        .prepare('SELECT value FROM originals WHERE id=?')
+        .prepare('SELECT * FROM originals WHERE id=?')
         .get(identity.intakeId);
-      const original = originalRow
-        ? (JSON.parse(String(originalRow.value)) as IntakeCopyOriginal)
-        : undefined;
+      const original = originalRow ? savedOriginal(originalRow) : undefined;
       if (!original || original.sha256 !== identity.sourceHash)
         invalid('copy original identity/hash');
       if (v4) {
-        inspectIntakeCollectionGraph(
+        yield* inspectIntakeCollectionGraphSteps(
           manifest,
           identity,
           rawHead,
           targetProfileId,
           checkpoint,
           options.production
-            ? (head, legacyValue) => {
+            ? function* (head, legacyValue) {
                 const readNode = (hash: string) => {
                   checkpoint();
                   return get(prefix + 'node:' + hash);
@@ -383,21 +495,24 @@ function inspectSnapshot(
                   invalid('fragmented production envelope representation');
                 if (marker.text === INTAKE_LEGACY_BRIDGE_CONTROL) {
                   if (legacyValue === undefined) invalid('missing production legacy envelope');
-                  const checked = validateLegacyIntakeEnvelope(original.detailsJson, legacyValue);
+                  const checked = yield* legacyValue.validateEnvelopeSteps(original.detailsJson);
                   if (checked.domainVersion !== head.logical.domainVersion)
                     invalid('legacy selected domain version disagreement');
-                } else
-                  validateIntakeCollectionEnvelopeRepresentation(
+                } else {
+                  yield* validateIntakeCollectionEnvelopeRepresentationSteps(
                     original.detailsJson,
                     head,
                     readNode,
+                    originalRow!.projection_format as IntakeEnvelopeProjectionFormat,
                   );
+                }
                 const inventories = parseIntakeCollectionDescriptor(
                   tree.get(head.builds, 'package.inventories'),
                 );
                 if (inventories) {
                   if (inventories.kind !== 'map') invalid('inventory registry collection kind');
                   for (const row of tree.entries(inventories.root)) {
+                    yield;
                     const stored = parseIntakeStoredValue(row.value);
                     if (stored.kind !== 'inline') invalid('inventory registry value');
                     rebindCopiedPackageInventory({
@@ -451,75 +566,57 @@ function inspectSnapshot(
         invalid('aggregate preparation decoded work');
       // Constrain the actual decoder too: a forged smaller usage claim must not
       // buy a default-sized decode before final usage agreement rejects it.
-      const basis = reconstructIntakeEvidence(identity, remainingCaps, head, (key) => get(key));
-      for (const row of manifest.db
-        .prepare('SELECT key FROM source WHERE prefix=?')
-        .iterate(prefix))
-        if (!basis.consumed.has(String(row.key))) invalid('unselected copy contribution');
-      counters.decodedNodes += head.usage.nodes;
-      counters.decodedOperations += head.usage.operations;
-      counters.decodedStringWork += head.usage.stringWork;
-      if (
-        (options.limits?.nodes !== undefined && counters.decodedNodes > caps.nodes) ||
-        (options.limits?.operations !== undefined &&
-          counters.decodedOperations > caps.operations) ||
-        (options.limits?.stringWork !== undefined && counters.decodedStringWork > caps.stringWork)
-      )
-        invalid('aggregate preparation decoded work');
-      const serialized = serializeIntakeJson(basis.value);
-      if (options.production)
-        validateIntakeEnvelopeRepresentation(original.detailsJson, basis.value);
-      counters.reconstructedStateBytes += Buffer.byteLength(serialized);
-      if (counters.reconstructedStateBytes > caps.bytes) invalid('aggregate reconstructed bytes');
-      if (targetProfileId === undefined) continue;
-      const targetIdentity = { ...identity, profileId: targetProfileId };
-      const changes = [{ op: 'set', path: [], value: basis.value }];
-      const remaining = budget(chainCaps, {
-        bytes: 0,
-        frames: 0,
-        nodes: 0,
-        operations: 0,
-        stringWork: 0,
+      const basis = yield* prepareIntakeLegacyReplaySteps(identity, remainingCaps, head, get, {
+        checkpoint,
       });
-      const applied = applyIntakeChanges(undefined, changes, remaining);
-      counters.bootstrapCopyBytes += Buffer.byteLength(serialized);
-      if (serializeIntakeJson(applied) !== serialized) invalid('copy serialization');
-      const evidence = frameIntakeChanges(
-        targetIdentity,
-        changes,
-        digest(serialized),
-        randomUUID(),
-        chainCaps,
-        undefined,
-        remaining,
-      );
-      const targetPrefix = intakeNamespace(targetIdentity);
-      const receiptKey = `${targetPrefix}operation:${evidence.result.operationId}`;
-      const rows = [
-        ...evidence.frames.map((frame) => ({ key: frame.key, value: frame.serialized })),
-        { key: receiptKey, value: evidence.receipt },
-        { key: `${targetPrefix}head`, value: evidence.serializedHead },
-      ];
-      for (const row of rows) {
-        counters.preparedRows++;
-        counters.preparedBytes += rowSize(row);
-        assertTotals(
-          counters.sourceRows + counters.preparedRows,
-          counters.sourceBytes + counters.preparedBytes,
-          caps,
-        );
-        manifest.put('prepared', row.key, row.value);
+      try {
+        for (const key of basis.consumed()) {
+          manifest.db.prepare('INSERT OR IGNORE INTO visited VALUES(?)').run(key);
+          yield;
+        }
+        for (const row of manifest.db
+          .prepare(
+            'SELECT source.key FROM source LEFT JOIN visited ON source.key=visited.key WHERE source.prefix=? AND visited.key IS NULL',
+          )
+          .iterate(prefix))
+          invalid('unselected copy contribution: ' + row.key);
+        counters.decodedNodes += head.usage.nodes;
+        counters.decodedOperations += head.usage.operations;
+        counters.decodedStringWork += head.usage.stringWork;
+        if (
+          (options.limits?.nodes !== undefined && counters.decodedNodes > caps.nodes) ||
+          (options.limits?.operations !== undefined &&
+            counters.decodedOperations > caps.operations) ||
+          (options.limits?.stringWork !== undefined && counters.decodedStringWork > caps.stringWork)
+        )
+          invalid('aggregate preparation decoded work');
+        if (options.production) yield* basis.validateEnvelopeSteps(original.detailsJson);
+        counters.reconstructedStateBytes += basis.semanticBytes;
+        if (counters.reconstructedStateBytes > caps.bytes) invalid('aggregate reconstructed bytes');
+        if (targetProfileId === undefined) continue;
+        const targetIdentity = { ...identity, profileId: targetProfileId };
+        counters.bootstrapCopyBytes += basis.semanticBytes;
+        const targetPrefix = intakeNamespace(targetIdentity);
+        const put = (key: string, value: string) => {
+          counters.preparedRows++;
+          counters.preparedBytes += rowSize({ key, value });
+          assertTotals(
+            counters.sourceRows + counters.preparedRows,
+            counters.sourceBytes + counters.preparedBytes,
+            caps,
+          );
+          manifest.put('prepared', key, value);
+        };
+        const rebound = yield* basis.rebindSteps(targetIdentity, put);
+        put(targetPrefix + 'head', JSON.stringify(rebound));
+      } finally {
+        basis.close();
       }
-      counters.preparedFrameBytes += evidence.frames.reduce(
-        (sum, row) => sum + Buffer.byteLength(row.serialized),
-        0,
-      );
-      counters.preparedHeadBytes += Buffer.byteLength(evidence.serializedHead);
-      counters.preparedReceiptBytes += Buffer.byteLength(evidence.receipt);
     }
     if (options.production)
-      for (const row of manifest.db.prepare('SELECT value FROM originals').iterate()) {
-        const original = JSON.parse(String(row.value)) as IntakeCopyOriginal;
+      for (const row of manifest.db.prepare('SELECT * FROM originals').iterate()) {
+        yield;
+        const original = savedOriginal(row);
         if (
           !manifest.db.prepare('SELECT 1 FROM namespaces WHERE prefix=?').get(
             intakeNamespace({
@@ -539,6 +636,7 @@ function inspectSnapshot(
     counters.preparedReceiptBytes = 0;
     counters.preparedNodeBytes = 0;
     for (const row of manifest.rows('prepared')) {
+      yield;
       counters.preparedRows++;
       counters.preparedBytes += rowSize(row);
       const bytes = Buffer.byteLength(row.value);
@@ -558,7 +656,12 @@ function inspectSnapshot(
       targetProfileId,
       counters: Object.freeze(counters),
     });
-    plans.set(plan, { sourceProfileId, manifest, caps, fingerprint: manifest.fingerprint() });
+    plans.set(plan, {
+      sourceProfileId,
+      manifest,
+      caps,
+      fingerprint: yield* manifest.fingerprintSteps(),
+    });
     planCleanup.register(plan, manifest, plan);
     retained = true;
     return plan;
@@ -569,12 +672,14 @@ function inspectSnapshot(
 
 function capture(db: Database, sourceProfileId: string): IntakeStateCopyRows {
   function* originals(): Generator<IntakeCopyOriginal> {
-    for (const row of db
-      .prepare("SELECT * FROM source_files WHERE kind='intake_original' ORDER BY id")
-      .iterate()) {
-      const sourcePin = db
-        .prepare('SELECT value FROM app_meta WHERE key=?')
-        .get(intakeSourcePinKey(String(row.id)))?.value;
+    for (const row of intakeCopyNativeSelect(
+      db,
+      "SELECT * FROM main.source_files WHERE kind='intake_original' ORDER BY id",
+    ).iterate()) {
+      const sourcePin = intakeCopyNativeSelect(
+        db,
+        'SELECT value FROM main.app_meta WHERE key=?',
+      ).get(intakeSourcePinKey(String(row.id)))?.value;
       const original: IntakeCopyOriginal = {
         id: row.id as string,
         kind: row.kind as string,
@@ -594,9 +699,10 @@ function capture(db: Database, sourceProfileId: string): IntakeStateCopyRows {
     }
   }
   function* rows(): Generator<{ key: string; value: string }> {
-    for (const row of db
-      .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_state_*' ORDER BY key")
-      .iterate()) {
+    for (const row of intakeCopyNativeSelect(
+      db,
+      "SELECT key,value FROM main.app_meta WHERE key GLOB 'intake_state_*' ORDER BY key",
+    ).iterate()) {
       if (typeof row.key !== 'string' || typeof row.value !== 'string')
         invalid('copy inventory row');
       const contribution = { key: row.key, value: row.value };
@@ -678,8 +784,8 @@ export function prepareIntakeStateCopy(
   if (!db.isOpen || db.isTransaction || currentTransactionToken(db))
     invalid('copy source transaction/closed');
   if (
-    db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value !==
-    sourceProfileId
+    intakeCopyNativeSelect(db, "SELECT value FROM main.app_meta WHERE key='owner_profile_id'").get()
+      ?.value !== sourceProfileId
   )
     invalid('copy source owner');
   flushRecordDurability(db);
@@ -719,7 +825,12 @@ function assertUnpublished(
     invalid('copy target owner');
   if (hasTransactionDurability(db) || recordDurabilityStatus(db))
     invalid('copy target durability attached');
-  if (db.prepare("SELECT 1 FROM sqlite_schema WHERE name GLOB '__record_*' LIMIT 1").get())
+  if (
+    intakeCopyNativeSelect(
+      db,
+      "SELECT 1 FROM main.sqlite_schema WHERE name GLOB '__record_*' LIMIT 1",
+    ).get()
+  )
     invalid('copy target retained accepted history');
   if (
     !publication ||
@@ -735,9 +846,10 @@ function assertInventory(
   table: 'source' | 'prepared',
 ): void {
   const expected = manifest.rows(table);
-  for (const row of db
-    .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_state_*' ORDER BY key")
-    .iterate()) {
+  for (const row of intakeCopyNativeSelect(
+    db,
+    "SELECT key,value FROM main.app_meta WHERE key GLOB 'intake_state_*' ORDER BY key",
+  ).iterate()) {
     const next = expected.next();
     if (next.done || next.value.key !== row.key || next.value.value !== row.value)
       invalid('copy target inventory conflict');
@@ -746,18 +858,19 @@ function assertInventory(
 }
 function assertOriginals(db: Database, data: PlanData, targetProfileId: string): void {
   const expected = data.manifest.db.prepare('SELECT id,value FROM originals ORDER BY id').iterate();
-  for (const row of db
-    .prepare("SELECT id FROM source_files WHERE kind='intake_original' ORDER BY id")
-    .iterate()) {
+  for (const row of intakeCopyNativeSelect(
+    db,
+    "SELECT id FROM main.source_files WHERE kind='intake_original' ORDER BY id",
+  ).iterate()) {
     const next = expected.next();
     if (next.done || next.value.id !== row.id) invalid('copy target original inventory');
   }
   if (!expected.next().done) invalid('copy target missing original');
-  for (const saved of data.manifest.db
-    .prepare('SELECT value FROM originals ORDER BY id')
-    .iterate()) {
-    const original = JSON.parse(String(saved.value)) as IntakeCopyOriginal;
-    const row = db.prepare('SELECT * FROM source_files WHERE id=?').get(original.id);
+  for (const saved of data.manifest.db.prepare('SELECT * FROM originals ORDER BY id').iterate()) {
+    const original = savedOriginal(saved);
+    const row = intakeCopyNativeSelect(db, 'SELECT * FROM main.source_files WHERE id=?').get(
+      original.id,
+    );
     const path =
       `data/profiles/${targetProfileId}/` +
       original.path.slice(`data/profiles/${data.sourceProfileId}/`.length);

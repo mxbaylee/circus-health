@@ -1,5 +1,6 @@
 import { clearNativeIdentityPreviews } from './intake-identity-preview-cache.ts';
 import { setImmediate } from 'node:timers/promises';
+import { DatabaseSync } from 'node:sqlite';
 import { terminalStatement } from './database-terminal-statements.ts';
 import { clearPreparedClinicalReviewRead } from './intake-clinical-review-read-cache.ts';
 import { clearCollectionQueueReviews } from './intake-report-group-collection.ts';
@@ -12,6 +13,7 @@ import {
 } from './database.ts';
 import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
 const outcomes = createTransactionOutcomeIssuer();
+const nativeReadPrepare = DatabaseSync.prototype.prepare;
 export const intakeStateTerminalOutcome = outcomes.recognizes;
 import { recordDurabilityStatus, recordTerminalSelectionAttempted } from './record-versions.ts';
 import { clearIntakeCollectionCache, createIntakeCollections } from './intake-state-collections.ts';
@@ -249,11 +251,12 @@ export function createIntakeStateStorage(
   const headKey = `${prefix}head`;
   let closed = false;
   const { counters, count } = createIntakePrimitiveCounters(db);
-  const readMeta = db.prepare('SELECT value FROM app_meta WHERE key=?'),
-    readBoundedMeta = db.prepare(
+  const readMeta = nativeReadPrepare.call(db, 'SELECT value FROM main.app_meta WHERE key=?'),
+    readBoundedMeta = nativeReadPrepare.call(
+      db,
       'SELECT length(CAST(value AS BLOB)) AS bytes, CASE WHEN length(CAST(value AS BLOB))<=? THEN value END AS value FROM app_meta WHERE key=?',
     ),
-    readSource = db.prepare('SELECT sha256,kind FROM source_files WHERE id=?'),
+    readSource = nativeReadPrepare.call(db, 'SELECT sha256,kind FROM main.source_files WHERE id=?'),
     insertMeta = db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)');
   const get = (key: string, maxBytes?: number) => {
     const row =

@@ -4,7 +4,16 @@ import { basename, dirname, resolve, sep } from 'node:path';
 let epoch: object = {};
 let activeWriters = 0;
 let mutationSequence = 0n;
-const scopedWitnesses = new WeakMap<object, { root: string; sequence: bigint }>();
+interface ScopedWitness {
+  root: string;
+  sequence: bigint;
+  invalid?: boolean;
+  accountedThrough?: bigint;
+  retainers?: number;
+}
+const scopedWitnesses = new WeakMap<object, ScopedWitness>();
+const retainedScopes = new Set<ScopedWitness>();
+const MAX_RETAINED_SCOPES = 64;
 const MAX_SCOPED_EVENTS = 2048;
 const MAX_MUTATION_PATHS = 4;
 const MAX_MUTATION_PATH_LENGTH = 4096;
@@ -40,11 +49,19 @@ function recordMutation(paths?: readonly string[]): void {
     paths?.length && paths.length <= MAX_MUTATION_PATHS
       ? paths.map(physicalMutationPath)
       : undefined;
+  const checkedPaths = physical?.every((path): path is string => path !== undefined)
+    ? physical
+    : undefined;
+  for (const witness of retainedScopes) {
+    if (!checkedPaths || checkedPaths.some((path) => intersects(witness.root, path)))
+      witness.invalid = true;
+    witness.accountedThrough = mutationSequence;
+  }
   if (eventCount === MAX_SCOPED_EVENTS) discardedThrough = scopedEvents[nextEvent]!.sequence;
   else eventCount++;
   scopedEvents[nextEvent] = {
     sequence: mutationSequence,
-    paths: physical?.every((path): path is string => path !== undefined) ? physical : undefined,
+    paths: checkedPaths,
   };
   nextEvent = (nextEvent + 1) % MAX_SCOPED_EVENTS;
 }
@@ -98,12 +115,16 @@ export function captureManagedPhysicalScope(root: string): object | undefined {
 
 export function managedPhysicalScopeCurrent(expected: object): boolean {
   const witness = scopedWitnesses.get(expected);
-  if (!witness || activeWriters || witness.sequence < discardedThrough) return false;
+  if (!witness || witness.invalid || activeWriters) return false;
+  if (witness.retainers) {
+    if (witness.accountedThrough !== mutationSequence) return false;
+  } else if (witness.sequence < discardedThrough) return false;
   try {
     if (realpathSync.native(witness.root) !== witness.root) return false;
   } catch {
     return false;
   }
+  if (witness.retainers) return true;
   for (let offset = 0; offset < eventCount; offset++) {
     const event =
       scopedEvents[(nextEvent - eventCount + offset + MAX_SCOPED_EVENTS) % MAX_SCOPED_EVENTS]!;
@@ -111,6 +132,27 @@ export function managedPhysicalScopeCurrent(expected: object): boolean {
     if (!event.paths || event.paths.some((path) => intersects(witness.root, path))) return false;
   }
   return true;
+}
+
+/** Retain the original scope, not a newer authority baseline. Each event is
+ * accounted for before ring eviction; unknown or intersecting writes stay invalid. */
+export function retainManagedPhysicalScope(expected: object): () => void {
+  const witness = scopedWitnesses.get(expected);
+  if (!witness || !managedPhysicalScopeCurrent(expected))
+    throw Error('Original managed physical scope changed');
+  if (!witness.retainers && retainedScopes.size >= MAX_RETAINED_SCOPES)
+    throw Error('Retained managed physical scope capacity exhausted');
+  if (!witness.retainers) {
+    witness.accountedThrough = mutationSequence;
+    retainedScopes.add(witness);
+  }
+  witness.retainers = (witness.retainers ?? 0) + 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (--witness.retainers! === 0) retainedScopes.delete(witness);
+  };
 }
 
 export function withManagedPhysicalMutation<T>(work: () => T, paths?: readonly string[]): T {

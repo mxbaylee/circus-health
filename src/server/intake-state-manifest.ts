@@ -2,6 +2,8 @@
 import { createHash } from 'node:crypto';
 import { disposableSqlite } from './disposable-sqlite.ts';
 import { invalid } from './intake-state-evidence.ts';
+import { intakeCopyTextPieces } from './intake-copy-json.ts';
+import { finishIntakeCopySteps } from './intake-copy-work.ts';
 
 export class IntakeStateManifest {
   private readonly scratch = disposableSqlite('intake-state-copy-');
@@ -43,15 +45,27 @@ export class IntakeStateManifest {
       yield { key: String(row.key), value: String(row.value) };
   }
   fingerprint(): string {
+    return finishIntakeCopySteps(this.fingerprintSteps());
+  }
+  *fingerprintSteps(): Generator<void, string> {
     const hash = createHash('sha256');
     for (const table of ['originals', 'source', 'prepared'] as const) {
       hash.update(table);
-      const columns = table === 'originals' ? 'id,value' : 'key,value';
+      const columns = table === 'originals' ? '*' : 'key,value';
       for (const row of this.db.prepare(`SELECT ${columns} FROM ${table} ORDER BY 1`).iterate()) {
         for (const value of Object.values(row)) {
           const text = String(value);
-          hash.update(String(Buffer.byteLength(text)) + ':');
-          hash.update(text);
+          if (table === 'originals') hash.update(value === null ? 'null:' : typeof value + ':');
+          let bytes = 0;
+          for (const piece of intakeCopyTextPieces(text)) {
+            bytes += Buffer.byteLength(piece);
+            yield;
+          }
+          hash.update(String(bytes) + ':');
+          for (const piece of intakeCopyTextPieces(text)) {
+            hash.update(piece);
+            yield;
+          }
         }
       }
     }

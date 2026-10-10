@@ -2,7 +2,7 @@ import { personDisplayKey } from '../shared/person-display.ts';
 import { onboardingIdentity } from './profile-onboarding.ts';
 import { profileDefinition } from './profiles.ts';
 import { seedSyntheticPlacebo, SYNTHETIC_PLACEBO_SEED } from './synthetic-placebo.ts';
-import { backup, DatabaseSync } from 'node:sqlite';
+import { backup } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import {
   cpSync,
@@ -20,15 +20,20 @@ import {
 import { resolve, dirname } from 'node:path';
 import { openDatabase, HttpError, transaction, type Database } from './database.ts';
 import { rebindCopiedIntakeSourceText } from './intake-source-text.ts';
-import { stageIntakeStateCopy, disposeIntakeStateCopyPlan } from './intake-state-bootstrap.ts';
+import { stageIntakeStateCopy } from './intake-state-bootstrap.ts';
 import {
-  prepareManualSourceCopy,
+  prepareManualSourceCopyAsync,
   stageManualSourceCopy,
   disposeManualSourceCopyPlan,
 } from './intake-manual-copy.ts';
 import {
-  preparePortableIntakeCopy,
+  preparePortableIntakeCopyAsync,
+  disposePortableIntakeCopyPlan,
+  beginPortableIntakeCopyStaging,
   assertPortableCopyCoherence,
+  assertPortableIntakeCopySourceCurrent,
+  verifyPortableIntakeCopySourceForPublication,
+  consumePortableIntakeCopyPublicationSeal,
 } from './intake-state-portable-copy.ts';
 import {
   copyOperationId,
@@ -43,7 +48,7 @@ import { ensureProfileDirectories, profilePaths } from './profile-storage.ts';
 import { contributorAuthorityPath, hasContributorAuthority } from './contributor-record-storage.ts';
 import {
   rebuildContributorDatabase,
-  assertContributorCopyCoherence,
+  assertContributorCopyCoherenceAsync,
   selectedContributorHead,
 } from './contributor-durability.ts';
 import {
@@ -183,6 +188,7 @@ export function createProfileLifecycle({
   const locks = new Set<string>();
   const copyLocks = new Set<string>();
   let closed = false;
+  const preparationAbort = new AbortController();
   const assertOpen = (): void => {
     if (closed)
       throw new HttpError(
@@ -234,6 +240,7 @@ export function createProfileLifecycle({
         targetProfileId: operation.targetProfileId,
         stageRoot,
       });
+    assertOpen();
   }
   function rebindCopyReceipts(
     copy: Database,
@@ -431,6 +438,15 @@ export function createProfileLifecycle({
     const stage = resolve(root, 'data/operations/profile-staging', id);
     let db: Database | null | undefined,
       registered = false;
+    let copyPlan: Awaited<ReturnType<typeof preparePortableIntakeCopyAsync>> | undefined,
+      manualPlan: Awaited<ReturnType<typeof prepareManualSourceCopyAsync>> | undefined;
+    const copySource = sourceId ? databases.get(sourceId)! : undefined;
+    const assertCopySourceCurrent = () => {
+      if (!copyPlan) return;
+      if (databases.get(sourceId!) !== copySource)
+        throw Error('Copy original source database changed');
+      assertPortableIntakeCopySourceCurrent(copyPlan, copySource!);
+    };
     let finalDb: string | undefined;
     try {
       if (operation) writeCopyOperation(root, operation);
@@ -445,70 +461,75 @@ export function createProfileLifecycle({
         }
         await backup(databases.get(sourceId)!, paths.database);
         assertOpen();
-        const copy = new DatabaseSync(paths.database);
+        const copy = openDatabase(paths.database, sourceId);
         try {
-          const plan = preparePortableIntakeCopy(
+          const plan = (copyPlan = await preparePortableIntakeCopyAsync(
             databases.get(sourceId)!,
             copy,
             root,
             sourceId,
             id,
+            { signal: preparationAbort.signal },
+          ));
+          assertOpen();
+          manualPlan = await prepareManualSourceCopyAsync(
+            databases.get(sourceId)!,
+            root,
+            sourceId,
+            id,
+            { intakePlan: plan, signal: preparationAbort.signal },
           );
-          let manualPlan: ReturnType<typeof prepareManualSourceCopy> | undefined;
-          try {
-            manualPlan = prepareManualSourceCopy(databases.get(sourceId)!, root, sourceId, id);
-            checkpoint(operation, stage, 'validated');
-            transaction(copy, () => {
-              copy.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
-              const before = `data/profiles/${sourceId}/`,
-                after = `data/profiles/${id}/`;
-              for (const [table, column] of [
-                ['source_files', 'path'],
-                ['assets', 'stored_path'],
-              ])
-                copy
-                  .prepare(
-                    `UPDATE ${table} SET ${column}=? || substr(${column},?) WHERE substr(${column},1,?)=?`,
-                  )
-                  .run(after, before.length + 1, before.length, before);
-              rebindCopiedIntakeSourceText(copy, sourceId, id);
-              for (const row of copy
-                .prepare(
-                  "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'",
-                )
-                .all())
-                copy.exec(`DROP TABLE IF EXISTS "${String(row.name).replaceAll('"', '""')}"`);
-              const publication = {
-                profileId: id,
-                readSelectedHead: () => {
-                  for (const base of [stage, root]) {
-                    if (hasContributorAuthority(base, id))
-                      throw Error(
-                        'Copy target already has selected record authority: ' +
-                          contributorAuthorityPath(base, id),
-                      );
-                    for (const kind of ['personal', 'curation'] as const) {
-                      const head = resolve(profilePaths(base, id)[kind], 'current.json');
-                      if (existsSync(head)) return readFileSync(head);
-                    }
-                  }
-                  return null;
-                },
-              };
-              stageIntakeStateCopy(copy, plan, publication);
-              stageManualSourceCopy(copy, manualPlan!, publication);
-              rebindCopyReceipts(copy, sourceId, id);
+          assertOpen();
+          checkpoint(operation, stage, 'validated');
+          transaction(copy, () => {
+            beginPortableIntakeCopyStaging(plan, databases.get(sourceId)!, copy);
+            copy.prepare("UPDATE app_meta SET value=? WHERE key='owner_profile_id'").run(id);
+            const before = `data/profiles/${sourceId}/`,
+              after = `data/profiles/${id}/`;
+            for (const [table, column] of [
+              ['source_files', 'path'],
+              ['assets', 'stored_path'],
+            ])
               copy
                 .prepare(
-                  "DELETE FROM app_meta WHERE key IN ('personal_dirty','personal_persisted_revision','personal_last_error','personal_conflict','curation_revision')",
+                  `UPDATE ${table} SET ${column}=? || substr(${column},?) WHERE substr(${column},1,?)=?`,
                 )
-                .run();
-            });
-            checkpoint(operation, stage, 'staged');
-          } finally {
-            if (manualPlan) disposeManualSourceCopyPlan(manualPlan);
-            disposeIntakeStateCopyPlan(plan);
-          }
+                .run(after, before.length + 1, before.length, before);
+            rebindCopiedIntakeSourceText(copy, sourceId, id);
+            for (const row of copy
+              .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB '__record_*'",
+              )
+              .all())
+              copy.exec(`DROP TABLE IF EXISTS "${String(row.name).replaceAll('"', '""')}"`);
+            const publication = {
+              profileId: id,
+              readSelectedHead: () => {
+                for (const base of [stage, root]) {
+                  if (hasContributorAuthority(base, id))
+                    throw Error(
+                      'Copy target already has selected record authority: ' +
+                        contributorAuthorityPath(base, id),
+                    );
+                  for (const kind of ['personal', 'curation'] as const) {
+                    const head = resolve(profilePaths(base, id)[kind], 'current.json');
+                    if (existsSync(head)) return readFileSync(head);
+                  }
+                }
+                return null;
+              },
+            };
+            stageIntakeStateCopy(copy, plan, publication);
+            stageManualSourceCopy(copy, manualPlan!, publication);
+            rebindCopyReceipts(copy, sourceId, id);
+            copy
+              .prepare(
+                "DELETE FROM app_meta WHERE key IN ('personal_dirty','personal_persisted_revision','personal_last_error','personal_conflict','curation_revision')",
+              )
+              .run();
+          });
+          checkpoint(operation, stage, 'staged');
+          assertCopySourceCurrent();
         } finally {
           copy.close();
         }
@@ -525,6 +546,7 @@ export function createProfileLifecycle({
         },
         version: self.version,
       });
+      assertCopySourceCurrent();
       if (placebo)
         seedSyntheticPlacebo(db, {
           root: stage,
@@ -533,10 +555,13 @@ export function createProfileLifecycle({
           seed: SYNTHETIC_PLACEBO_SEED,
         });
       checkpoint(operation, stage, 'before-export');
+      assertCopySourceCurrent();
       attachPersonalDurability(db, { root: stage, profileId: id, initialize: true });
+      assertCopySourceCurrent();
       // One-time portable copy/export artifact. Subsequent runtime writes select
       // only the record journal and never refresh these complete snapshots.
       writePortableSources(db, stage, id, stage, { onFile: () => {} });
+      assertCopySourceCurrent();
       if (operation) {
         mkdirSync(resolve(paths.root, 'mappings'), { recursive: true });
         durableWrite(
@@ -559,7 +584,10 @@ export function createProfileLifecycle({
         );
       }
       checkpoint(operation, stage, 'exported');
-      assertContributorCopyCoherence(db, stage, id);
+      assertCopySourceCurrent();
+      await assertContributorCopyCoherenceAsync(db, stage, id, undefined, preparationAbort.signal);
+      assertOpen();
+      assertCopySourceCurrent();
       const acceptedHead = selectedContributorHead(stage, id);
       const portable = openPortableRows(stage, id);
       try {
@@ -605,6 +633,7 @@ export function createProfileLifecycle({
       assertOpen();
       requireDistinctProfile(createdIdentity.name, createdIdentity.icon);
       checkpoint(operation, stage, 'before-publication');
+      assertCopySourceCurrent();
       if (selectedContributorHead(stage, id) !== acceptedHead)
         throw Error('Prepared contributor authority changed before target publication');
       if (existsSync(final.root))
@@ -616,6 +645,17 @@ export function createProfileLifecycle({
       if (operation) {
         operation = { ...operation, publicationAttempted: true };
         writeCopyOperation(root, operation);
+      }
+      if (copyPlan) {
+        const seal = await verifyPortableIntakeCopySourceForPublication(
+          copyPlan,
+          copySource!,
+          preparationAbort.signal,
+        );
+        assertOpen();
+        if (databases.get(sourceId!) !== copySource)
+          throw Error('Copy original source database changed');
+        consumePortableIntakeCopyPublicationSeal(copyPlan, copySource!, seal);
       }
       renameSync(paths.root, final.root);
       checkpoint(operation, stage, 'renamed');
@@ -650,12 +690,25 @@ export function createProfileLifecycle({
           writeCopyOperation(root, unpublished);
         }
       } finally {
-        if (sourceId) locks.delete(sourceId);
-        if (operationId) copyLocks.delete(operationId);
-        db?.close();
-        rmSync(stage, { recursive: true, force: true });
-        if (!registered && finalDb && databaseDirectory && !existsSync(profilePaths(root, id).root))
-          rmSync(finalDb, { force: true });
+        try {
+          try {
+            if (manualPlan) disposeManualSourceCopyPlan(manualPlan);
+          } finally {
+            if (copyPlan) disposePortableIntakeCopyPlan(copyPlan);
+          }
+        } finally {
+          if (sourceId) locks.delete(sourceId);
+          if (operationId) copyLocks.delete(operationId);
+          db?.close();
+          rmSync(stage, { recursive: true, force: true });
+          if (
+            !registered &&
+            finalDb &&
+            databaseDirectory &&
+            !existsSync(profilePaths(root, id).root)
+          )
+            rmSync(finalDb, { force: true });
+        }
       }
     }
   }
@@ -716,6 +769,7 @@ export function createProfileLifecycle({
     isLocked: (id: string) => locks.has(id),
     close() {
       closed = true;
+      preparationAbort.abort(Error('Profile lifecycle closed during copy preparation'));
       lifetime.closed = true;
     },
   };
