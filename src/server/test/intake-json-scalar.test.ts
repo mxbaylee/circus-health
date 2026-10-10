@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { hashIntakeJsonScalar } from '../intake-json-scalar.ts';
+import { hashIntakeJsonScalar, hashIntakeJsonScalarSteps } from '../intake-json-scalar.ts';
 const digest = (value: unknown, leading: string[] = []) =>
   createHash('sha256')
     .update(JSON.stringify([...leading, value]))
@@ -81,4 +81,60 @@ test('scalar hash work counts exact canonical bytes including nullable identity 
       result = hashIntakeJsonScalar(pieces(token, 1), leading);
     assert.equal(result.bytes, Buffer.byteLength(JSON.stringify([...leading, JSON.parse(token)])));
   }
+});
+
+test('large scalar hashing batches native updates in fixed-size pieces without changing work boundaries', (t) => {
+  const value = 'fictional-\ud83d\ude80-\ud800-\\"\n'.repeat(20000),
+    raw = JSON.stringify(value),
+    expected = digest(value),
+    prototype = Object.getPrototypeOf(createHash('sha256')),
+    update = prototype.update;
+  let calls = 0,
+    largest = 0,
+    observed = 0,
+    yields = 0;
+  t.mock.method(prototype, 'update', function (this: unknown, piece: string, ...args: unknown[]) {
+    calls++;
+    largest = Math.max(largest, Buffer.byteLength(piece));
+    return Reflect.apply(update, this, [piece, ...args]);
+  });
+  const work = hashIntakeJsonScalarSteps(pieces(raw, 4096), [], () => observed++);
+  for (;;) {
+    const next = work.next();
+    if (next.done) {
+      assert.equal(next.value.hash, expected);
+      assert.equal(next.value.bytes, Buffer.byteLength(JSON.stringify([value])));
+      assert.ok(calls <= Math.ceil(next.value.bytes / 4000) + 2);
+      break;
+    }
+    yields++;
+  }
+  assert.equal(observed, value.length);
+  assert.ok(yields >= Math.floor(raw.length / 8192));
+  assert.ok(calls > 1);
+  assert.ok(largest <= 4096);
+});
+
+test('abandoning buffered scalar work closes its source without consuming the suffix', () => {
+  let closed = false,
+    reads = 0;
+  function* source() {
+    try {
+      yield '"';
+      for (let n = 0; n < 100; n++) {
+        reads++;
+        yield 'x'.repeat(4096);
+      }
+      yield '"';
+    } finally {
+      closed = true;
+    }
+  }
+  const work = hashIntakeJsonScalarSteps(source());
+  assert.equal(work.next().done, false);
+  const before = reads;
+  work.return(undefined as never);
+  assert.equal(closed, true);
+  assert.equal(reads, before);
+  assert.ok(reads < 100);
 });

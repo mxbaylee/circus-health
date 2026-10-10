@@ -57,9 +57,23 @@ export function* hashIntakeJsonScalarSteps(
   const hash = createHash('sha256'),
     prefix = JSON.stringify(leading);
   let bytes = 0;
+  const pending: string[] = [];
+  let pendingBytes = 0;
+  const flush = () => {
+    if (pendingBytes) hash.update(pending.join(''));
+    pending.length = 0;
+    pendingBytes = 0;
+  };
   const update = (piece: string) => {
-    bytes += Buffer.byteLength(piece);
-    hash.update(piece);
+    const size = Buffer.byteLength(piece);
+    bytes += size;
+    // Decoded string units are tiny; batch native hash calls without growing a scalar buffer.
+    if (pendingBytes + size > 4096) flush();
+    if (size >= 4096) hash.update(piece);
+    else if (size) {
+      pending.push(piece);
+      pendingBytes += size;
+    }
   };
   update(prefix.slice(0, -1) + (leading.length ? ',' : ''));
   let kind: 'string' | 'number' | 'boolean' | 'null';
@@ -200,6 +214,7 @@ export function* hashIntakeJsonScalarSteps(
     yield* ws();
     if (peek()) fail();
     update(']');
+    flush();
     return { hash: hash.digest('hex'), kind, bytes };
   } finally {
     iterator.return?.();
