@@ -225,8 +225,7 @@ test(
           .get()!.coverage_json,
       ),
     );
-    assert.equal(assignment.identityIssues.format, 'health-ownership-identity-issues-v1');
-    assert.equal(assignment.identityIssues.snapshot.count, 0);
+    assert.deepEqual(assignment.identityIssues, []);
     assert.equal(
       db.prepare('SELECT person_id FROM observations WHERE id=?').get(record.id)!.person_id,
       destination.personId,
