@@ -25,7 +25,14 @@ import {
   closeSelectedIntakeBuildView,
   type PreparedSelectedIntakeBuildView,
 } from '../intake-authority.ts';
-import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
+import {
+  buildIntakeCollectionEnvelope,
+  createEnvelopeBuildWriter,
+} from '../intake-envelope-build.ts';
+import {
+  prepareEnvelopeBuildResume,
+  selectedEnvelopeBuildCollections,
+} from '../intake-envelope-build-resume.ts';
 import { ensureIntakeFrontierObserver } from '../intake-lookup-frontier-observer.ts';
 import {
   captureIntakeLegacyBridgeReadWitness,
@@ -242,6 +249,71 @@ test('the checked selected build view is original-bound, one-use and disposable'
     );
   } finally {
     disposeIntakeLegacyBridgeReadWitness(original);
+  }
+});
+
+test('a resume reuses only its own selected collection handle', async (t) => {
+  const { db, source, text } = fixture(t, 1, 0);
+  await pauseAfter(db, source, 1);
+  let fullSourceReads = 0;
+  const stop = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, detail, database) => {
+      if (
+        action === constants.SQLITE_READ &&
+        database === 'main' &&
+        name === 'source_files' &&
+        detail === 'details_json'
+      )
+        fullSourceReads++;
+    },
+    () => {},
+  );
+  ensureIntakeFrontierObserver(db);
+  try {
+    const beforeResume = fullSourceReads;
+    const resume = prepareEnvelopeBuildResume(
+      db,
+      source,
+      {
+        mode: 'raw',
+        version: 7,
+        hash: sha(text),
+        bytes: Buffer.byteLength(text),
+      },
+      {},
+    );
+    try {
+      const collections = selectedEnvelopeBuildCollections(db, source, resume);
+      assert.equal(selectedEnvelopeBuildCollections(db, source, resume), collections);
+      const beforeWriter = fullSourceReads;
+      assert.ok(beforeWriter > beforeResume, 'the resume selected the full source');
+      createEnvelopeBuildWriter(db, source, resume.build, 7, {}, resume);
+      assert.equal(fullSourceReads, beforeWriter, 'the writer did not reselect full source text');
+      assert.throws(
+        () => selectedEnvelopeBuildCollections(db, { id: 'fictional-other' }, resume),
+        /selected resume owner changed/,
+      );
+      assert.throws(
+        () => selectedEnvelopeBuildCollections(db, source, {} as typeof resume),
+        /selected resume owner changed/,
+      );
+      const assertCurrent = resume.assertCurrent;
+      resume.assertCurrent = () => {};
+      assert.throws(
+        () => selectedEnvelopeBuildCollections(db, source, resume),
+        /selected resume owner changed/,
+      );
+      resume.assertCurrent = assertCurrent;
+    } finally {
+      resume.close();
+    }
+    assert.throws(
+      () => selectedEnvelopeBuildCollections(db, source, resume),
+      /selected resume owner changed/,
+    );
+  } finally {
+    stop?.();
   }
 });
 

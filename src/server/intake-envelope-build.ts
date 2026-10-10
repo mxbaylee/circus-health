@@ -38,6 +38,7 @@ import {
 import type { IntakeCollectionChange } from './intake-state-storage.ts';
 import {
   prepareEnvelopeBuildResume,
+  selectedEnvelopeBuildCollections,
   type EnvelopeBuildResume,
 } from './intake-envelope-build-resume.ts';
 import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
@@ -292,7 +293,9 @@ export function createEnvelopeBuildWriter(
   selected?: ReturnType<typeof sealSelectedIntakeBuildView>,
   originalRead?: IntakeLegacyBridgeReadWitness,
 ) {
-  const collections = selected?.collections ?? selectedEnvelopeStore(db, source).collections;
+  const collections = resume
+    ? selectedEnvelopeBuildCollections(db, source, resume)
+    : (selected?.collections ?? selectedEnvelopeStore(db, source).collections);
   const changes: IntakeCollectionChange[] = [];
   const flush = async () => {
     if (!changes.length) return;

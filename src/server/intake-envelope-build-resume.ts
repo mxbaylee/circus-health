@@ -34,6 +34,16 @@ const FORMAT = 'health-intake-envelope-build-resume-v1';
 const COLLECTION = 'schema.resume';
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const emptyHash = hash('');
+const selectedResumeCollections = new WeakMap<
+  object,
+  {
+    db: Database;
+    sourceId: string;
+    sourceHash: string;
+    collections: ReturnType<typeof selectedEnvelopeStore>['collections'];
+    assertCurrent: () => void;
+  }
+>();
 function fail(reason: string): never {
   throw Error(`Intake envelope build resume: ${reason}`);
 }
@@ -218,7 +228,7 @@ export function prepareEnvelopeBuildResume(
       assertWitness();
     };
     const releaseReadOnlySearch = holdReadOnlySourceTextProjection(db, assertCurrent);
-    return {
+    const result = {
       build,
       work,
       countWork,
@@ -378,13 +388,40 @@ export function prepareEnvelopeBuildResume(
         try {
           scratch.close();
         } finally {
+          selectedResumeCollections.delete(result);
           releaseReadOnlySearch();
         }
       },
     };
+    selectedResumeCollections.set(result, {
+      db,
+      sourceId: selected.identity.intakeId,
+      sourceHash: selected.identity.sourceHash,
+      collections,
+      assertCurrent,
+    });
+    return result;
   } catch (error) {
     scratch.close();
     throw error;
   }
 }
 export type EnvelopeBuildResume = ReturnType<typeof prepareEnvelopeBuildResume>;
+
+export function selectedEnvelopeBuildCollections(
+  db: Database,
+  source: IntakeEnvelopeSource,
+  resume: EnvelopeBuildResume,
+) {
+  const selected = selectedResumeCollections.get(resume);
+  if (
+    !selected ||
+    selected.db !== db ||
+    selected.sourceId !== source.id ||
+    (source.sha256 !== undefined && selected.sourceHash !== source.sha256) ||
+    Object.getOwnPropertyDescriptor(resume, 'assertCurrent')?.value !== selected.assertCurrent
+  )
+    fail('selected resume owner changed');
+  selected.assertCurrent();
+  return selected.collections;
+}
