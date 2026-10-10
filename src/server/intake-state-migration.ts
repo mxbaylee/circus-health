@@ -103,9 +103,10 @@ export function intakeCompactMetadataStampCurrent(
   db: Database,
   stamp: IntakeCompactMetadataStamp,
   beforeWrites: boolean,
+  expectedSequence?: number,
 ): boolean {
   return (
-    recordAuthorityWitnessCurrent(db, stamp.authority) &&
+    recordAuthorityWitnessCurrent(db, stamp.authority, expectedSequence) &&
     managedDatabaseMethodEpoch(db) === stamp.methods &&
     !protectedIntakeLookupTempShadow(db) &&
     terminalStatement(db, 'PRAGMA main.schema_version').get()!.schema_version ===
@@ -456,13 +457,8 @@ export async function prepareIntakeCompactMetadataProofAsync(
     withIntakeWork(db, 'reconstruction', () =>
       recordIntakeWork('compactMetadataSourceGuardChecks'),
     );
-    const current = recordDurabilityStatus(db);
     if (
-      !current?.configured ||
-      current.dirty ||
-      current.conflicted ||
-      current.sequence !== status!.sequence ||
-      !intakeCompactMetadataStampCurrent(db, stamp, true) ||
+      !intakeCompactMetadataStampCurrent(db, stamp, true, status!.sequence) ||
       db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)?.value !==
         candidate.beforeHead ||
       db.prepare("SELECT value FROM app_meta WHERE key='owner_profile_id'").get()?.value !==

@@ -4727,6 +4727,7 @@ const authorityWitnesses = new WeakMap<
     config: RecordConfig;
     read: RecordStorage['read'];
     row: string;
+    sequence: number;
     head: RecordObjectReference | null;
     epoch: object;
     staging?: VaultRecordStagingWitness;
@@ -4747,6 +4748,7 @@ export function captureRecordAuthorityWitness(db: Database): RecordAuthorityWitn
     config: config!,
     read: config!.storage.read,
     row: stringifyRecordJson(row),
+    sequence: row.sequence,
     head,
     epoch: epoch!,
   });
@@ -4756,10 +4758,12 @@ export function captureRecordAuthorityWitness(db: Database): RecordAuthorityWitn
 export function recordAuthorityWitnessCurrent(
   db: Database,
   witness: RecordAuthorityWitness,
+  expectedSequence?: number,
 ): boolean {
   const proof = authorityWitnesses.get(witness);
   if (!recordAuthorityWitnessIntervalCurrent(db, witness)) return false;
   return (
+    (expectedSequence === undefined || proof!.sequence === expectedSequence) &&
     stringifyRecordJson(readStatusRow(db)) === proof!.row &&
     eq(readConfiguredHead(db, proof!.config), proof!.head) &&
     recordAuthorityWitnessIntervalCurrent(db, witness)
