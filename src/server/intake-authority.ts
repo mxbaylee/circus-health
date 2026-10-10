@@ -1,4 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
+import {
+  prepareIntakeJsonCanonical,
+  type IntakeJsonCanonicalWork,
+} from './intake-json-canonical.ts';
+import { prepareIntakeJsonLexical, type IntakeJsonLexicalSpan } from './intake-json-lexical.ts';
+import { hashIntakeJsonScalarSteps } from './intake-json-scalar.ts';
 import {
   COMPACT_SCALAR_BYTES,
   compactIntakeScalarSteps,
@@ -6,7 +13,12 @@ import {
   type IntakeCompactScalarField,
 } from './intake-compact-scalar.ts';
 import type { DatabaseSync } from 'node:sqlite';
-import { currentTransactionToken, json, rejectCurrentTransaction } from './database.ts';
+import {
+  currentTransactionToken,
+  json,
+  rejectCurrentTransaction,
+  type Database,
+} from './database.ts';
 import {
   cloneValidatedIntakeJson,
   normalizeIntakeJson,
@@ -14,13 +26,18 @@ import {
 } from './intake-state-codec.ts';
 import { createIntakeStateStorage } from './intake-state-storage.ts';
 import { parseSchemaControl } from './intake-envelope-schema.ts';
-import { INTAKE_LEGACY_BRIDGE_CONTROL } from './intake-state-migration.ts';
+import {
+  INTAKE_LEGACY_BRIDGE_CONTROL,
+  assertIntakeLegacyBridgeReadWitness,
+  type IntakeLegacyBridgeReadWitness,
+} from './intake-state-migration.ts';
 import {
   intakeNamespace,
   limits,
   parseIntakeHead,
   parseIntakeCollectionHead,
   COLLECTION_FORMAT,
+  integer,
   validateIntakeIdentity,
   type IntakeStateIdentity,
 } from './intake-state-evidence.ts';
@@ -226,6 +243,259 @@ export function intakeEnvelopeProjection(raw: unknown): {
     format: value.intakeAuthority.format as IntakeEnvelopeProjectionFormat,
   };
 }
+/** Classify a complete selected representation without decoding large metadata scalars. */
+export async function prepareIntakeEnvelopeProjection(
+  raw: string | Iterable<string>,
+  options: {
+    assertRunning?: () => void;
+    onWork?: (work: Readonly<IntakeJsonCanonicalWork>) => void;
+  } = {},
+): Promise<{ mode: Mode; format: IntakeEnvelopeProjectionFormat }> {
+  const tree = await prepareIntakeJsonCanonical(typeof raw === 'string' ? [raw] : raw, options);
+  try {
+    const allowed = (value: typeof tree.root, names: readonly string[]) => {
+      if (tree.kind(value) !== 'object') return false;
+      let count = 0;
+      for (const field of tree.objectFields(value)) {
+        options.assertRunning?.();
+        if (!names.some((name) => field.matches(name))) return false;
+        count++;
+      }
+      return count === names.length;
+    };
+    const smallString = (value: typeof tree.root | undefined): string | undefined => {
+      if (!value || tree.kind(value) !== 'string') return undefined;
+      let text = '';
+      for (const piece of tree.pieces(value)) {
+        options.assertRunning?.();
+        text += piece;
+        if (text.length > 128) return undefined;
+      }
+      return JSON.parse(text) as string;
+    };
+    const authority = tree.field(tree.root, 'intakeAuthority'),
+      intake = tree.field(tree.root, 'intake');
+    if (
+      !allowed(tree.root, ['intake', 'intakeAuthority']) ||
+      !authority ||
+      !allowed(authority, ['format', 'mode']) ||
+      !intake ||
+      tree.kind(intake) !== 'object'
+    )
+      return fail('unsupported or duplicated original authority');
+    for (const field of tree.objectFields(intake)) {
+      options.assertRunning?.();
+      if (![...metadataFields].some((name) => field.matches(name)))
+        return fail('unsupported or duplicated original authority');
+    }
+    const format = smallString(tree.field(authority, 'format')),
+      mode = smallString(tree.field(authority, 'mode'));
+    if (
+      (format !== INTAKE_ENVELOPE_FORMAT && format !== INTAKE_COMPACT_ENVELOPE_FORMAT) ||
+      (mode !== 'normalized' && mode !== 'raw')
+    )
+      return fail('unsupported or duplicated original authority');
+    options.assertRunning?.();
+    return { format, mode };
+  } finally {
+    tree.close();
+  }
+}
+/** Compare selected metadata exactly, including raw duplicate members and escape spelling. */
+async function prepareIntakeEnvelopeRepresentation(
+  detailsJson: string | (() => Iterable<string>),
+  raw: string,
+  expectedMode: Mode | undefined,
+  options: { assertRunning?: () => void } = {},
+  checkedProjection?: { mode: Mode; format: IntakeEnvelopeProjectionFormat },
+): Promise<{ version: number; text: string }> {
+  const details = typeof detailsJson === 'string' ? () => [detailsJson] : detailsJson;
+  const projection =
+    checkedProjection ?? (await prepareIntakeEnvelopeProjection(details(), options));
+  if (expectedMode !== undefined && projection.mode !== expectedMode)
+    return fail('selected metadata mode changed');
+  const lexical = await prepareIntakeJsonLexical([raw], options);
+  const selected = details()[Symbol.iterator]();
+  let expected = '',
+    expectedAt = 0,
+    pieces = 0;
+  const current = async () => {
+    options.assertRunning?.();
+    if (++pieces % 64 === 0) {
+      await setImmediate();
+      options.assertRunning?.();
+    }
+  };
+  const compare = async (piece: string) => {
+    await current();
+    let at = 0;
+    while (at < piece.length) {
+      if (expectedAt === expected.length) {
+        options.assertRunning?.();
+        const next = selected.next();
+        if (next.done) fail('compact metadata conflicts with selected state');
+        expected = next.value;
+        expectedAt = 0;
+        if (!expected) continue;
+      }
+      const size = Math.min(piece.length - at, expected.length - expectedAt);
+      if (piece.slice(at, at + size) !== expected.slice(expectedAt, expectedAt + size))
+        fail('compact metadata conflicts with selected state');
+      at += size;
+      expectedAt += size;
+    }
+  };
+  const compareSpan = async (start: number, end: number) => {
+    for (const piece of lexical.pieces(start, end)) await compare(piece);
+  };
+  const scalarPieces = function* (start: number, end: number) {
+    let high = '';
+    for (const piece of lexical.pieces(start, end)) {
+      const joined = high + piece;
+      high = /[\uD800-\uDBFF]$/.test(joined) ? joined.slice(-1) : '';
+      const whole = high ? joined.slice(0, -1) : joined;
+      if (whole) yield whole;
+    }
+    if (high) yield high;
+  };
+  const scalar = async (span: IntakeJsonLexicalSpan, max: number): Promise<unknown> => {
+    let value = '',
+      long = false,
+      number: number | undefined;
+    const steps = hashIntakeJsonScalarSteps(
+      scalarPieces(span.start, span.end),
+      [],
+      (unit) => {
+        if (value.length < max) value += unit;
+        else long = true;
+      },
+      (parsed) => {
+        number = parsed;
+      },
+    );
+    for (;;) {
+      options.assertRunning?.();
+      const next = steps.next();
+      if (next.done) {
+        if (next.value.kind === 'string') return long ? undefined : value;
+        if (next.value.kind === 'number') return number;
+        return next.value.kind === 'null' ? null : undefined;
+      }
+      await setImmediate();
+    }
+  };
+  const name = (span: IntakeJsonLexicalSpan) =>
+    scalar({ ...span, start: span.nameStart!, end: span.nameEnd! }, 64);
+  const isLongString = async (span: IntakeJsonLexicalSpan) => {
+    if (lexical.pieces(span.start, span.start + 1).next().value !== '"') return false;
+    let bytes = 0,
+      high = '';
+    for (const piece of lexical.pieces(span.start, span.end)) {
+      options.assertRunning?.();
+      const combined = high + piece;
+      high = /[\uD800-\uDBFF]$/.test(combined) ? combined.slice(-1) : '';
+      bytes += Buffer.byteLength(high ? combined.slice(0, -1) : combined);
+      if (bytes > COMPACT_SCALAR_BYTES) return true;
+      await current();
+    }
+    return bytes + Buffer.byteLength(high) > COMPACT_SCALAR_BYTES;
+  };
+  try {
+    if (lexical.root.shape !== 'object') return fail('missing original intake envelope');
+    await compare(
+      '{"intakeAuthority":' +
+        JSON.stringify({ format: projection.format, mode: projection.mode }) +
+        ',',
+    );
+    let occurrences = 0,
+      lastIntake: IntakeJsonLexicalSpan | undefined;
+    for (const entry of lexical.children(lexical.root)) {
+      if ((await name(entry)) !== 'intake') continue;
+      lastIntake = entry;
+      if (occurrences++) await compare(',');
+      await compareSpan(entry.nameStart!, entry.nameEnd!);
+      await compare(':');
+      if (entry.shape !== 'object') {
+        await compare('null');
+        continue;
+      }
+      await compare('{');
+      let retained = 0;
+      for (const field of lexical.children(entry)) {
+        const fieldName = await name(field);
+        if (typeof fieldName !== 'string' || !metadataFields.has(fieldName)) continue;
+        if (retained++) await compare(',');
+        await compareSpan(field.nameStart!, field.nameEnd!);
+        await compare(':');
+        if (
+          projection.format === INTAKE_COMPACT_ENVELOPE_FORMAT &&
+          (fieldName === 'originalName' || fieldName === 'locator') &&
+          (await isLongString(field))
+        ) {
+          const steps = compactIntakeScalarSteps(fieldName, scalarPieces(field.start, field.end));
+          for (;;) {
+            options.assertRunning?.();
+            const next = steps.next();
+            if (next.done) {
+              if (isIntakeCompactScalar(next.value)) await compare(JSON.stringify(next.value));
+              else await compareSpan(field.start, field.end);
+              break;
+            }
+            await setImmediate();
+          }
+        } else await compareSpan(field.start, field.end);
+      }
+      await compare('}');
+    }
+    await compare('}');
+    if (projection.mode === 'normalized' && occurrences !== 1)
+      return fail('missing original intake envelope');
+    if (expectedAt < expected.length || !selected.next().done)
+      fail('compact metadata conflicts with selected state');
+    if (!lastIntake || lastIntake.shape !== 'object')
+      return fail('missing original intake envelope');
+    let workflow: IntakeJsonLexicalSpan | undefined, version: IntakeJsonLexicalSpan | undefined;
+    for (const field of lexical.children(lastIntake)) {
+      const fieldName = await name(field);
+      if (fieldName === 'workflow') workflow = field;
+      if (fieldName === 'version') version = field;
+    }
+    if (workflow) {
+      if (workflow.shape !== 'object') return fail('unsupported or incomplete workflow');
+      let format: unknown,
+        formatSeen = false;
+      for (const field of lexical.children(workflow)) {
+        if ((await name(field)) === 'format') {
+          formatSeen = true;
+          format = await scalar(field, 64);
+        }
+      }
+      if (formatSeen && format !== 'health-intake-workflow-v1')
+        return fail('unsupported or incomplete workflow');
+    }
+    if (!version) return fail('missing legacy intake version');
+    const selectedVersion = await scalar(version, 0);
+    integer(selectedVersion);
+    options.assertRunning?.();
+    return { version: selectedVersion, text: raw };
+  } finally {
+    lexical.close();
+  }
+}
+export function prepareRawIntakeEnvelopeRepresentation(
+  detailsJson: string | (() => Iterable<string>),
+  raw: string,
+  options: { assertRunning?: () => void } = {},
+): Promise<{ version: number; text: string }> {
+  return prepareIntakeEnvelopeRepresentation(detailsJson, raw, 'raw', options);
+}
+export function prepareNormalizedIntakeEnvelopeRepresentation(
+  detailsJson: string | (() => Iterable<string>),
+  serialized: string,
+  options: { assertRunning?: () => void } = {},
+): Promise<{ version: number; text: string }> {
+  return prepareIntakeEnvelopeRepresentation(detailsJson, serialized, 'normalized', options);
+}
 export function intakeEnvelopeMode(raw: unknown): Mode {
   return intakeEnvelopeProjection(raw).mode;
 }
@@ -272,6 +542,59 @@ function selectedSource(db: DatabaseSync, source: IntakeEnvelopeSource): IntakeE
   if (!row) return fail('missing source');
   return row as unknown as IntakeEnvelopeSource;
 }
+export interface PagedIntakeEnvelopeSource extends IntakeEnvelopeSource {
+  metadataBytes: number;
+}
+export function selectedSourceHeader(
+  db: Database,
+  source: IntakeEnvelopeSource,
+): PagedIntakeEnvelopeSource {
+  const row = db
+    .prepare(
+      'SELECT id,kind,sha256,typeof(details_json) AS metadataType,length(CAST(details_json AS BLOB)) AS metadataBytes FROM main.source_files WHERE id=?',
+    )
+    .get(source.id);
+  if (
+    !row ||
+    row.metadataType !== 'text' ||
+    !Number.isSafeInteger(row.metadataBytes) ||
+    Number(row.metadataBytes) < 0
+  )
+    return fail('missing source');
+  return { ...row, metadataBytes: Number(row.metadataBytes) } as PagedIntakeEnvelopeSource;
+}
+export function selectedDetailsPages(
+  db: Database,
+  source: PagedIntakeEnvelopeSource,
+  assertCurrent: () => void,
+): Iterable<string> {
+  const pageBytes = 64 * 1024;
+  return {
+    *[Symbol.iterator]() {
+      const read = db.prepare(
+        'SELECT substr(CAST(details_json AS BLOB),?,?) AS data FROM main.source_files WHERE id=?',
+      );
+      const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+      for (let at = 0; at < source.metadataBytes; at += pageBytes) {
+        assertCurrent();
+        const size = Math.min(pageBytes, source.metadataBytes - at);
+        const data = read.get(at + 1, size, source.id)?.data;
+        assertCurrent();
+        if (!(data instanceof Uint8Array) || data.length !== size)
+          return fail('selected metadata page changed');
+        recordIntakePrimitiveWork(db, 'metadataReads');
+        recordIntakePrimitiveWork(db, 'metadataReadBytes', data.length);
+        recordIntakePrimitiveWork(db, 'selectedMetadataSqlPages');
+        recordIntakePrimitiveWork(db, 'selectedMetadataSqlReadBytes', data.length);
+        const text = decoder.decode(data, { stream: true });
+        if (text) yield text;
+      }
+      const tail = decoder.decode();
+      if (tail) yield tail;
+      assertCurrent();
+    },
+  };
+}
 export function readNonIntakeEnvelope(raw: unknown): unknown {
   const value = json(raw);
   if (object(value) && Object.hasOwn(value, 'intakeAuthority'))
@@ -292,11 +615,65 @@ export interface IntakeEnvelopeBinding {
   /** Present only for V4. Receipt/build churn preserves this logical binding. */
   logicalHead?: string;
 }
+const checkedProjectionHints = new WeakMap<
+  DatabaseSync,
+  { details: string; projection: { mode: Mode; format: IntakeEnvelopeProjectionFormat } }
+>();
+declare const selectedBridgeBrand: unique symbol;
+export interface PreparedSelectedIntakeEnvelope {
+  readonly [selectedBridgeBrand]: true;
+}
+const selectedBridgeProofs = new WeakMap<
+  PreparedSelectedIntakeEnvelope,
+  {
+    db: Database;
+    originalRead: IntakeLegacyBridgeReadWitness;
+    id: string;
+    sourceHash: string;
+    beforeHead: string;
+    metadataBytes: number;
+    detailsDigest: string;
+    textDigest: string;
+    mode: Mode;
+    version: number;
+  }
+>();
+/** A one-use result of the actual complete selected read, never a caller digest. */
+export function consumeSelectedIntakeEnvelopeForBridge(
+  db: Database,
+  proof: PreparedSelectedIntakeEnvelope,
+  originalRead: IntakeLegacyBridgeReadWitness,
+  id: string,
+  beforeHead: string,
+) {
+  const item = selectedBridgeProofs.get(proof);
+  selectedBridgeProofs.delete(proof);
+  if (
+    !item ||
+    item.db !== db ||
+    item.originalRead !== originalRead ||
+    item.id !== id ||
+    item.beforeHead !== beforeHead
+  )
+    return fail('foreign or expired selected intake proof');
+  assertIntakeLegacyBridgeReadWitness(db, originalRead);
+  return Object.freeze({ ...item });
+}
 /** Small selected-head validation lets warm derived readers avoid loading intake views. */
 export function intakeEnvelopeAuthorityBinding(
   db: DatabaseSync,
   source: IntakeEnvelopeSource,
 ): IntakeEnvelopeBinding {
+  return intakeEnvelopeAuthorityBindingChecked(db, source);
+}
+function intakeEnvelopeAuthorityBindingChecked(
+  db: DatabaseSync,
+  source: IntakeEnvelopeSource & { metadataBytes?: number },
+  projection?: { mode: Mode; format: IntakeEnvelopeProjectionFormat },
+): IntakeEnvelopeBinding {
+  const known = checkedProjectionHints.get(db);
+  const selectedProjection =
+    projection ?? (known?.details === source.details_json ? known?.projection : undefined);
   if (source.kind !== 'intake_original') {
     readNonIntakeEnvelope(source.details_json);
     return { key: null, head: null };
@@ -316,8 +693,9 @@ export function intakeEnvelopeAuthorityBinding(
     // Classification is not metadata admission. Cold giant native metadata is
     // checked cooperatively against the exact graph before presentation.
     if (
-      typeof source.details_json === 'string' &&
-      source.details_json.length > COMPACT_SCALAR_BYTES
+      (source.metadataBytes ??
+        (typeof source.details_json === 'string' ? source.details_json.length : 0)) >
+      COMPACT_SCALAR_BYTES
     ) {
       const collections = createIntakeStateStorage(db, selected).collections;
       const view = collections.openView();
@@ -329,10 +707,10 @@ export function intakeEnvelopeAuthorityBinding(
         return { key, head, logicalHead: JSON.stringify(checked.logical) };
       }
     }
-    intakeEnvelopeMode(source.details_json);
+    if (!selectedProjection) intakeEnvelopeMode(source.details_json);
     return { key, head, logicalHead: JSON.stringify(checked.logical) };
   }
-  intakeEnvelopeMode(source.details_json);
+  if (!selectedProjection) intakeEnvelopeMode(source.details_json);
   if (!parseIntakeHead(head, selected, limits())) return fail('missing selected intake head');
   return { key, head: head as string };
 }
@@ -411,6 +789,115 @@ export function readIntakeEnvelopeMaterialized(
     if (source.kind !== 'intake_original') return fail('materialization requires an original');
     return selectedEnvelope(db, source).envelope;
   });
+}
+
+/** Build-only selected reader. The caller's original authority witness must
+ * remain live across every cooperative cold-replay and metadata step. */
+export async function readIntakeEnvelopeMaterializedForBuild(
+  db: Database,
+  input: IntakeEnvelopeSource,
+  originalRead: IntakeLegacyBridgeReadWitness,
+): Promise<{
+  mode: Mode;
+  version: number;
+  text: string;
+  fingerprint: string | null;
+  selectedProof: PreparedSelectedIntakeEnvelope;
+}> {
+  const assertCurrent = () => assertIntakeLegacyBridgeReadWitness(db, originalRead);
+  assertCurrent();
+  const source = selectedSourceHeader(db, input);
+  if (source.kind !== 'intake_original') return fail('materialization requires an original');
+  let detailsDigest: string | undefined;
+  const detailsPieces = () => ({
+    *[Symbol.iterator]() {
+      const digest = createHash('sha256');
+      for (const piece of selectedDetailsPages(db, source, assertCurrent)) {
+        digest.update(piece, 'utf8');
+        yield piece;
+      }
+      const observed = digest.digest('hex');
+      if (detailsDigest !== undefined && detailsDigest !== observed)
+        return fail('selected metadata changed between validation passes');
+      detailsDigest = observed;
+    },
+  });
+  const details = source.metadataBytes <= 64 * 1024 ? [...detailsPieces()].join('') : undefined;
+  const projection =
+    details !== undefined
+      ? intakeEnvelopeProjection(details)
+      : await prepareIntakeEnvelopeProjection(detailsPieces(), { assertRunning: assertCurrent });
+  assertCurrent();
+  // Deterministic classification only. Selected SQL/head and original read
+  // authority are still checked on every subsequent binding.
+  if (details !== undefined) checkedProjectionHints.set(db, { details, projection });
+  const binding = intakeEnvelopeAuthorityBindingChecked(db, source, projection);
+  const storage = createIntakeStateStorage(db, identity(db, source));
+  const state = binding.logicalHead
+    ? await storage.collections.readLegacyMaterializationAsync(assertCurrent)
+    : await storage.readMaterializationAsync(assertCurrent);
+  if (!state) return fail('missing selected envelope');
+  assertCurrent();
+  let text: string;
+  if (projection.mode === 'raw') {
+    if (Object.keys(state.value).join(',') !== 'raw' || typeof state.value.raw !== 'string')
+      return fail('raw mode requires its sole exact text');
+    text = state.value.raw;
+  } else text = state.serialized;
+  const version =
+    details !== undefined && Buffer.byteLength(text) <= 64 * 1024
+      ? (() => {
+          const validated = validateRepresentation(details, state.value, state.serialized);
+          const intake = validated.value.intake;
+          if (!object(intake)) return fail('missing original intake envelope');
+          integer(intake.version);
+          return intake.version as number;
+        })()
+      : (
+          await prepareIntakeEnvelopeRepresentation(
+            details ?? detailsPieces,
+            text,
+            projection.mode,
+            { assertRunning: assertCurrent },
+            projection,
+          )
+        ).version;
+  assertCurrent();
+  const current = selectedSourceHeader(db, input);
+  if (
+    current.metadataBytes !== source.metadataBytes ||
+    current.sha256 !== source.sha256 ||
+    current.kind !== source.kind
+  )
+    return fail('selected original changed');
+  const currentBinding = intakeEnvelopeAuthorityBindingChecked(db, current, projection);
+  if (currentBinding.head !== binding.head || currentBinding.logicalHead !== binding.logicalHead)
+    return fail('selected head changed');
+  assertCurrent();
+  if (!detailsDigest || !binding.head || !source.sha256)
+    return fail('incomplete selected intake proof');
+  const textDigest = createHash('sha256').update(text).digest('hex');
+  assertCurrent();
+  const selectedProof = Object.freeze({}) as PreparedSelectedIntakeEnvelope;
+  selectedBridgeProofs.set(selectedProof, {
+    db,
+    originalRead,
+    id: source.id,
+    sourceHash: source.sha256,
+    beforeHead: binding.head,
+    metadataBytes: source.metadataBytes,
+    detailsDigest,
+    textDigest,
+    mode: projection.mode,
+    version,
+  });
+  return {
+    mode: projection.mode,
+    version,
+    text,
+    fingerprint: projection.mode === 'normalized' ? state.fingerprint : null,
+    selectedProof,
+  };
 }
 export function readIntakeEnvelope(
   db: DatabaseSync,

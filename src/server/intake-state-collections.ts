@@ -27,6 +27,7 @@ import {
 import { assertRecordCompactReadmission } from './record-versions.ts';
 import {
   prepareIntakeLegacyBridgeProof,
+  prepareIntakeLegacyBridgeProofAsync,
   type IntakeLegacyBridgeReadWitness,
   prepareIntakeSchemaAdoptionProof,
   prepareIntakeSchemaAdoptionProofAsync,
@@ -37,6 +38,7 @@ import {
   prepareIntakeCompactMetadataProofAsync,
 } from './intake-state-migration.ts';
 import type { IntakeStateMaterialization } from './intake-state-storage.ts';
+import type { PreparedSelectedIntakeEnvelope } from './intake-authority.ts';
 import {
   COLLECTION_FORMAT,
   HEAD_BYTES,
@@ -408,6 +410,10 @@ export function createIntakeCollections(owner: {
   immutable: (key: string, value: string, maxBytes?: number) => boolean;
   invalidate: () => void;
   legacyMaterialization: (head: Head) => IntakeStateMaterialization;
+  legacyMaterializationAsync: (
+    head: Head,
+    assertCurrent: () => void,
+  ) => Promise<IntakeStateMaterialization>;
 }) {
   const { db, identity, prefix, ready, immutable } = owner;
   const headKey = prefix + 'head';
@@ -420,6 +426,7 @@ export function createIntakeCollections(owner: {
   let validatedSelection:
     { raw: unknown; generation: string; registry: Registry; value: ViewData } | undefined;
   let bridgeTransaction: object | undefined;
+  let deferredLegacyInput: IntakeCollectionMutation | undefined;
   let readEpoch: object = {};
   const readWitness = () => {
     recordIntakeWork('collectionReadWitnessQueries', 2);
@@ -1005,8 +1012,68 @@ export function createIntakeCollections(owner: {
         }
       });
     },
+    async prepareLegacyBridgeAsync(
+      input: {
+        operationId: string;
+        requestDigest: string;
+        domainVersion: number;
+      },
+      originalRead: IntakeLegacyBridgeReadWitness,
+      assertCurrent: () => void,
+      selectedProof?: PreparedSelectedIntakeEnvelope,
+    ): Promise<PreparedIntakeCollectionMutation> {
+      assertCurrent();
+      const raw = get(headKey);
+      const legacy = parseIntakeHead(raw, identity, limits());
+      if (!legacy) invalid('legacy bridge requires v3 authority');
+      const view = Object.freeze({}) as IntakeCollectionView;
+      const registry = registryFor(db);
+      registry.views.set(view, { prefix, raw: raw as string, head: undefined, legacy });
+      const mutation: IntakeCollectionMutation = {
+        ...input,
+        changes: [
+          {
+            area: 'logical',
+            collection: 'envelope.control',
+            op: 'put',
+            key: 'representation',
+            value: INTAKE_LEGACY_BRIDGE_CONTROL,
+          },
+        ],
+      };
+      let prepared: PreparedIntakeCollectionMutation;
+      try {
+        if (deferredLegacyInput) invalid('nested legacy bridge preparation');
+        deferredLegacyInput = mutation;
+        prepared = api.prepare(view, mutation, originalRead);
+      } finally {
+        deferredLegacyInput = undefined;
+        registry.views.delete(view);
+      }
+      try {
+        assertCurrent();
+        const data = inspect(prepared);
+        if (!data.before || data.legacyBridge) invalid('legacy bridge deferred preparation');
+        data.legacyBridge = await prepareIntakeLegacyBridgeProofAsync(
+          db,
+          {
+            identity,
+            beforeHead: data.before,
+            afterHead: data.after,
+            writes: data.writes,
+          },
+          originalRead,
+          selectedProof,
+        );
+        assertCurrent();
+        return prepared;
+      } catch (error) {
+        discard(prepared);
+        throw error;
+      }
+    },
     readLegacyMaterialization(): IntakeStateMaterialization {
-      return run(() => {
+      const head = run(() => {
         const current = selected();
         if (!current.head) invalid('missing legacy bridge');
         validateIntakeLegacyBridgeControl(identity, current.head, (hash) =>
@@ -1017,8 +1084,31 @@ export function createIntakeCollections(owner: {
         const event = parseIntakeCollectionHistory(raw, identity);
         if (!event.previous || event.previous.format !== 'health-intake-legacy-v3')
           invalid('missing retained v3 authority');
-        return owner.legacyMaterialization(event.previous.head);
+        return event.previous.head;
       });
+      return owner.legacyMaterialization(head);
+    },
+    async readLegacyMaterializationAsync(
+      assertCurrent: () => void,
+    ): Promise<IntakeStateMaterialization> {
+      assertCurrent();
+      const head = run(() => {
+        const current = selected();
+        if (!current.head) invalid('missing legacy bridge');
+        validateIntakeLegacyBridgeControl(identity, current.head, (hash) =>
+          get(prefix + 'node:' + hash),
+        );
+        const raw = tree().get(current.head.history, orderedKey(1));
+        if (raw === undefined) invalid('missing retained legacy edge');
+        const event = parseIntakeCollectionHistory(raw, identity);
+        if (!event.previous || event.previous.format !== 'health-intake-legacy-v3')
+          invalid('missing retained v3 authority');
+        return event.previous.head;
+      });
+      assertCurrent();
+      const result = await owner.legacyMaterializationAsync(head, assertCurrent);
+      assertCurrent();
+      return result;
     },
     openView(expectedLogical?: string): IntakeCollectionView {
       if (
@@ -1372,6 +1462,8 @@ export function createIntakeCollections(owner: {
       input: IntakeCollectionMutation,
       originalRead?: IntakeLegacyBridgeReadWitness,
     ): PreparedIntakeCollectionMutation {
+      const deferredLegacy = deferredLegacyInput === input;
+      if (deferredLegacy) deferredLegacyInput = undefined;
       // Do not inherit a caller's optimistic read, even if an input getter
       // starts this preparation from another read. Existing page-cache bounds
       // apply; SQL transactions retain the uncached, checked fallback.
@@ -1723,16 +1815,18 @@ export function createIntakeCollections(owner: {
           discard(registry.preparations.keys().next().value!);
         registry.preparedBytes += size;
         const legacyBridge = before.legacy
-          ? prepareIntakeLegacyBridgeProof(
-              db,
-              {
-                identity,
-                beforeHead: before.raw!,
-                afterHead: after,
-                writes,
-              },
-              originalRead,
-            )
+          ? deferredLegacy
+            ? undefined
+            : prepareIntakeLegacyBridgeProof(
+                db,
+                {
+                  identity,
+                  beforeHead: before.raw!,
+                  afterHead: after,
+                  writes,
+                },
+                originalRead,
+              )
           : undefined;
         registry.preparations.set(prepared, {
           prefix,

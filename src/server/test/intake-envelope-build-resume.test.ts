@@ -430,7 +430,7 @@ test('real contributor HEAD final physical checks refuse committed peer ABA and 
     try {
       await assert.rejects(
         () => ensureNativeIntakeSchema(f.db, f.identity.profileId, f.source.id),
-        /authority changed during preparation/,
+        /authority changed during preparation|legacy bridge original read authority changed/,
       );
     } finally {
       Error.stackTraceLimit = stackTraceLimit;

@@ -17,6 +17,7 @@ import {
   parseIntakeHead,
   parseIntakeCollectionHead,
   reconstructIntakeEvidence,
+  reconstructIntakeEvidenceSteps,
   integer,
   invalid,
   type IntakeStateIdentity,
@@ -33,6 +34,13 @@ import {
   validateIntakeEnvelopeRepresentation,
   readIntakeEnvelopeMaterialized,
   INTAKE_ENVELOPE_FORMAT,
+  prepareIntakeEnvelopeProjection,
+  prepareNormalizedIntakeEnvelopeRepresentation,
+  prepareRawIntakeEnvelopeRepresentation,
+  consumeSelectedIntakeEnvelopeForBridge,
+  selectedDetailsPages,
+  selectedSourceHeader,
+  type PreparedSelectedIntakeEnvelope,
 } from './intake-authority.ts';
 import {
   createIntakeEnvelopeGraphReader,
@@ -118,8 +126,9 @@ export interface IntakeLegacyBridgeBinding {
 interface ProofData {
   db: Database;
   binding: string;
-  detailsJson: string;
+  detailsJson?: string;
   stamp?: IntakeLegacyBridgeStamp;
+  originalRead?: IntakeLegacyBridgeReadWitness;
 }
 declare const legacyReadBrand: unique symbol;
 export interface IntakeLegacyBridgeReadWitness {
@@ -335,7 +344,9 @@ export function validateIntakeLegacyBridgeControl(
   if (value.kind !== 'inline' || value.text !== INTAKE_LEGACY_BRIDGE_CONTROL)
     invalid('legacy bridge control representation');
 }
-function certificate(binding: IntakeLegacyBridgeBinding): string {
+function certificate(
+  binding: Omit<IntakeLegacyBridgeBinding, 'detailsJson'> & { detailsJson?: string },
+): string {
   const digest = createHash('sha256');
   digest.update(
     JSON.stringify([
@@ -611,10 +622,162 @@ export function intakeCompactSourceRowsEqual(
     )
   );
 }
+declare const preparedLegacyReplayBrand: unique symbol;
+interface PreparedLegacyBridgeReplay {
+  readonly [preparedLegacyReplayBrand]: true;
+}
+const preparedLegacyBridgeReplays = new WeakMap<
+  PreparedLegacyBridgeReplay,
+  {
+    db: Database;
+    identity: IntakeStateIdentity;
+    beforeHead: string;
+    metadataBytes: number;
+    detailsDigest: string;
+    domainVersion: number;
+    originalRead: IntakeLegacyBridgeReadWitness;
+  }
+>();
+
+export async function prepareIntakeLegacyBridgeProofAsync(
+  db: Database,
+  candidate: Pick<IntakeLegacyBridgeBinding, 'identity' | 'beforeHead' | 'afterHead' | 'writes'>,
+  originalRead: IntakeLegacyBridgeReadWitness,
+  selectedProof?: PreparedSelectedIntakeEnvelope,
+): Promise<IntakeLegacyBridgeProof> {
+  const original = legacyReads.get(originalRead);
+  if (
+    !original ||
+    original.db !== db ||
+    original.sourceId !== candidate.identity.intakeId ||
+    !original.active
+  )
+    invalid('foreign legacy bridge original read witness');
+  const assertCurrent = () => assertIntakeLegacyBridgeReadWitness(db, originalRead);
+  assertCurrent();
+  const { identity, beforeHead } = candidate;
+  const prefix = intakeNamespace(identity);
+  const selected = selectedProof
+    ? consumeSelectedIntakeEnvelopeForBridge(
+        db,
+        selectedProof,
+        originalRead,
+        identity.intakeId,
+        beforeHead,
+      )
+    : undefined;
+  const source = selectedSourceHeader(db, { id: identity.intakeId });
+  if (source.kind !== 'intake_original' || source.sha256 !== identity.sourceHash)
+    invalid('legacy bridge source');
+  if (
+    selected &&
+    (selected.sourceHash !== identity.sourceHash || selected.metadataBytes !== source.metadataBytes)
+  )
+    invalid('legacy bridge selected source changed');
+  let detailsDigest: string | undefined = selected?.detailsDigest,
+    detailsPasses = 0;
+  const details = () => ({
+    *[Symbol.iterator]() {
+      const digest = createHash('sha256');
+      for (const piece of selectedDetailsPages(db, source, assertCurrent)) {
+        digest.update(piece, 'utf8');
+        yield piece;
+      }
+      const observed = digest.digest('hex');
+      if (detailsDigest !== undefined && detailsDigest !== observed)
+        invalid('legacy bridge selected metadata changed between passes');
+      detailsDigest = observed;
+      detailsPasses++;
+    },
+  });
+  const legacyHead = parseIntakeHead(beforeHead, identity, limits());
+  if (!legacyHead) invalid('legacy bridge missing v3 head');
+  const read = db.prepare('SELECT value FROM app_meta WHERE key=?');
+  const steps = reconstructIntakeEvidenceSteps(
+    identity,
+    limits(),
+    legacyHead,
+    (key) => read.get(key)?.value,
+  );
+  let legacy: ReturnType<typeof reconstructIntakeEvidence>;
+  try {
+    for (;;) {
+      assertCurrent();
+      const next = withIntakeWork(db, 'reconstruction', () => steps.next());
+      assertCurrent();
+      if (next.done) {
+        legacy = next.value;
+        break;
+      }
+      await setImmediate();
+    }
+  } finally {
+    steps.return(undefined as never);
+  }
+  let after = '';
+  const members = db.prepare(
+    'SELECT key FROM app_meta WHERE key GLOB ? AND key>? ORDER BY key LIMIT 64',
+  );
+  for (;;) {
+    assertCurrent();
+    const page = members.all(prefix + '*', after);
+    for (const row of page) {
+      if (typeof row.key !== 'string' || !legacy.consumed.has(row.key))
+        invalid('legacy bridge unselected v3 evidence');
+      after = row.key;
+    }
+    assertCurrent();
+    if (page.length < 64) break;
+    await setImmediate();
+  }
+  const projection = selected
+    ? { mode: selected.mode }
+    : await prepareIntakeEnvelopeProjection(details(), { assertRunning: assertCurrent });
+  assertCurrent();
+  let text: string;
+  if (projection.mode === 'raw') {
+    if (Object.keys(legacy.value).join(',') !== 'raw' || typeof legacy.value.raw !== 'string')
+      invalid('legacy bridge raw state');
+    text = legacy.value.raw;
+  } else text = legacy.serialized;
+  const prepared = selected
+    ? (() => {
+        if (createHash('sha256').update(text).digest('hex') !== selected.textDigest)
+          invalid('legacy bridge selected graph changed');
+        return { version: selected.version };
+      })()
+    : projection.mode === 'raw'
+      ? await prepareRawIntakeEnvelopeRepresentation(details, text, {
+          assertRunning: assertCurrent,
+        })
+      : await prepareNormalizedIntakeEnvelopeRepresentation(details, text, {
+          assertRunning: assertCurrent,
+        });
+  assertCurrent();
+  if ((!selected && detailsPasses !== 2) || detailsDigest === undefined)
+    invalid('legacy bridge incomplete selected metadata');
+  const replay = Object.freeze({}) as PreparedLegacyBridgeReplay;
+  preparedLegacyBridgeReplays.set(replay, {
+    db,
+    identity,
+    beforeHead,
+    metadataBytes: source.metadataBytes,
+    detailsDigest,
+    domainVersion: prepared.version,
+    originalRead,
+  });
+  try {
+    return prepareIntakeLegacyBridgeProof(db, candidate, originalRead, replay);
+  } finally {
+    preparedLegacyBridgeReplays.delete(replay);
+  }
+}
+
 export function prepareIntakeLegacyBridgeProof(
   db: Database,
   candidate: Pick<IntakeLegacyBridgeBinding, 'identity' | 'beforeHead' | 'afterHead' | 'writes'>,
   originalRead?: IntakeLegacyBridgeReadWitness,
+  preparedReplay?: PreparedLegacyBridgeReplay,
 ): IntakeLegacyBridgeProof {
   return withIntakeWork(db, 'reconstruction', () => {
     const original = originalRead && legacyReads.get(originalRead);
@@ -640,28 +803,56 @@ export function prepareIntakeLegacyBridgeProof(
       invalid('legacy bridge current owner/head');
     const durability = recordDurabilityStatus(db);
     if (!durability?.configured || durability.dirty) invalid('legacy bridge accepted authority');
-    const source = db
-      .prepare('SELECT kind,sha256,details_json FROM source_files WHERE id=?')
-      .get(identity.intakeId);
+    const replay = preparedReplay && preparedLegacyBridgeReplays.get(preparedReplay);
+    if (preparedReplay) preparedLegacyBridgeReplays.delete(preparedReplay);
+    if (preparedReplay && !replay) invalid('foreign legacy bridge replay');
+    const source = replay
+      ? selectedSourceHeader(db, { id: identity.intakeId })
+      : db
+          .prepare('SELECT kind,sha256,details_json FROM source_files WHERE id=?')
+          .get(identity.intakeId);
     if (
       !source ||
       source.kind !== 'intake_original' ||
       source.sha256 !== identity.sourceHash ||
-      typeof source.details_json !== 'string'
+      (replay
+        ? source.metadataBytes !== replay.metadataBytes
+        : typeof source.details_json !== 'string')
     )
       invalid('legacy bridge source');
     const legacyHead = parseIntakeHead(beforeHead, identity, limits());
     if (!legacyHead) invalid('legacy bridge missing v3 head');
-    const legacy = reconstructIntakeEvidence(identity, limits(), legacyHead, get);
-    for (const row of db.prepare('SELECT key FROM app_meta WHERE key GLOB ?').iterate(prefix + '*'))
-      if (typeof row.key !== 'string' || !legacy.consumed.has(row.key))
-        invalid('legacy bridge unselected v3 evidence');
-    const envelope = validateLegacyIntakeEnvelope(source.details_json, legacy.value);
+    if (
+      preparedReplay &&
+      (!replay ||
+        replay.db !== db ||
+        replay.originalRead !== originalRead ||
+        replay.beforeHead !== beforeHead ||
+        !/^[a-f0-9]{64}$/.test(replay.detailsDigest) ||
+        replay.identity.profileId !== identity.profileId ||
+        replay.identity.intakeId !== identity.intakeId ||
+        replay.identity.sourceHash !== identity.sourceHash)
+    )
+      invalid('foreign legacy bridge replay');
+    let domainVersion: number;
+    if (replay) domainVersion = replay.domainVersion;
+    else {
+      const legacy = reconstructIntakeEvidence(identity, limits(), legacyHead, get);
+      for (const row of db
+        .prepare('SELECT key FROM app_meta WHERE key GLOB ?')
+        .iterate(prefix + '*'))
+        if (typeof row.key !== 'string' || !legacy.consumed.has(row.key))
+          invalid('legacy bridge unselected v3 evidence');
+      domainVersion = validateLegacyIntakeEnvelope(
+        source.details_json as string,
+        legacy.value,
+      ).domainVersion;
+    }
     const head = parseIntakeCollectionHead(afterHead, identity);
     if (
       !head ||
       head.storageSequence !== 1 ||
-      head.logical.domainVersion !== envelope.domainVersion ||
+      head.logical.domainVersion !== domainVersion ||
       head.builds !== null
     )
       invalid('legacy bridge initial selection');
@@ -717,11 +908,7 @@ export function prepareIntakeLegacyBridgeProof(
       invalid('legacy bridge disconnected candidate evidence');
     const pin = get(intakeSourcePinKey(identity.intakeId));
     if (pin !== undefined && typeof pin !== 'string') invalid('legacy bridge source pin');
-    const binding = certificate({
-      ...candidate,
-      detailsJson: source.details_json,
-      sourcePin: pin as string | undefined,
-    });
+    const binding = certificate({ ...candidate, sourcePin: pin as string | undefined });
     const proof = Object.freeze({}) as IntakeLegacyBridgeProof;
     let entries = retained.get(db);
     if (!entries) {
@@ -736,16 +923,43 @@ export function prepareIntakeLegacyBridgeProof(
     entries.add(proof);
     if (!legacyBridgeStampCurrent(db, stamp, true))
       invalid('legacy bridge original authority changed during preparation');
-    proofs.set(proof, { db, binding, detailsJson: source.details_json as string, stamp });
+    proofs.set(proof, {
+      db,
+      binding,
+      detailsJson: replay ? undefined : (source.details_json as string),
+      stamp,
+      originalRead,
+    });
     return proof;
   });
+}
+function originalSourceWatchCurrent(item: ProofData, db: Database): boolean {
+  const original = item.originalRead && legacyReads.get(item.originalRead);
+  if (
+    !original ||
+    original.db !== db ||
+    !original.active ||
+    original.stamp !== item.stamp ||
+    !legacyAttemptWatches.has(original.stamp)
+  )
+    return false;
+  assertIntakeLegacyBridgeReadWitness(db, item.originalRead!);
+  return true;
+}
+/** Only a retained original-read proof can avoid rereading its already checked source. */
+export function intakeLegacyBridgeHasOriginalSourceWatch(
+  proof: IntakeLegacyBridgeProof,
+  db: Database,
+): boolean {
+  const item = proofs.get(proof);
+  return !!item && item.db === db && originalSourceWatchCurrent(item, db);
 }
 /** Consumed in the maintenance factory. The transaction separately rechecks all
  * current source/head bindings and exact captured writes before acknowledgement. */
 export function verifyIntakeLegacyBridgeProof(
   proof: IntakeLegacyBridgeProof,
   db: Database,
-  binding: IntakeLegacyBridgeBinding,
+  binding: Omit<IntakeLegacyBridgeBinding, 'detailsJson'> & { detailsJson?: string },
 ): IntakeLegacyBridgeStamp | undefined {
   const retainedProof = proofs.get(proof);
   proofs.delete(proof);
@@ -754,7 +968,9 @@ export function verifyIntakeLegacyBridgeProof(
     !retainedProof ||
     retainedProof.db !== db ||
     retainedProof.binding !== certificate(binding) ||
-    retainedProof.detailsJson !== binding.detailsJson ||
+    (binding.detailsJson === undefined
+      ? !originalSourceWatchCurrent(retainedProof, db)
+      : retainedProof.detailsJson !== binding.detailsJson) ||
     (retainedProof.stamp && !legacyBridgeStampCurrent(db, retainedProof.stamp, true))
   )
     invalid('foreign, expired or conflicting legacy bridge proof');

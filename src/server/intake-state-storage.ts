@@ -1,4 +1,5 @@
 import { clearNativeIdentityPreviews } from './intake-identity-preview-cache.ts';
+import { setImmediate } from 'node:timers/promises';
 import { terminalStatement } from './database-terminal-statements.ts';
 import { clearPreparedClinicalReviewRead } from './intake-clinical-review-read-cache.ts';
 import { clearCollectionQueueReviews } from './intake-report-group-collection.ts';
@@ -35,6 +36,7 @@ import {
   applyIntakeChangesIsolated,
   cloneValidatedIntakeJson,
   freezeValidatedIntakeJson,
+  freezeValidatedIntakeJsonSteps,
   intakeChanges,
   normalizeIntakeJson,
   serializeIntakeJson,
@@ -55,6 +57,7 @@ import {
   intakeNamespace,
   parseIntakeHead,
   reconstructIntakeEvidence,
+  reconstructIntakeEvidenceSteps,
   checkIntakeResult,
   frameIntakeChanges,
   type Basis,
@@ -297,6 +300,26 @@ export function createIntakeStateStorage(
       }),
     };
   }
+  async function cachedBasisAsync(
+    basis: Basis,
+    selectedHead: string,
+    assertCurrent: () => void,
+  ): Promise<CachedBasis> {
+    const steps = freezeValidatedIntakeJsonSteps(basis.value);
+    try {
+      for (;;) {
+        assertCurrent();
+        const next = withIntakeWork(db, 'reconstruction', () => steps.next());
+        assertCurrent();
+        if (next.done) break;
+        await setImmediate();
+      }
+    } finally {
+      steps.return(undefined as never);
+    }
+    assertCurrent();
+    return withIntakeWork(db, 'reconstruction', () => cachedBasis(basis, selectedHead));
+  }
   function load(): CachedBasis | undefined {
     ready();
     const selectedHead = get(headKey);
@@ -336,6 +359,67 @@ export function createIntakeStateStorage(
     } else remember(cache, cache.committed, prefix, result);
     return result;
   }
+  async function replayAsync(
+    head: Head,
+    assertCurrent: () => void,
+    onFrameRead?: () => void,
+  ): Promise<ReturnType<typeof reconstructIntakeEvidence>> {
+    const steps = reconstructIntakeEvidenceSteps(identity, caps, head, get, onFrameRead);
+    try {
+      for (;;) {
+        assertCurrent();
+        const next = withIntakeWork(db, 'reconstruction', () => steps.next());
+        assertCurrent();
+        if (next.done) return next.value;
+        await setImmediate();
+      }
+    } finally {
+      steps.return(undefined as never);
+    }
+  }
+  async function loadAsync(assertCurrent: () => void): Promise<CachedBasis | undefined> {
+    assertCurrent();
+    ready();
+    const selectedHead = get(headKey);
+    const head = parseIntakeHead(selectedHead, identity, caps);
+    const cache = cacheFor(db);
+    const token = currentTransactionToken(db);
+    const candidate = token === cache.token ? cache.candidates.get(prefix) : undefined;
+    const remembered = candidate ?? cache.committed.get(prefix);
+    if (!head) {
+      if (db.prepare('SELECT 1 FROM app_meta WHERE key GLOB ? LIMIT 1').get(`${prefix}*`))
+        invalid('missing head with retained evidence');
+      assertCurrent();
+      return undefined;
+    }
+    if (remembered && remembered.materialization.selectedHead === selectedHead) {
+      count('warmLoads');
+      assertCurrent();
+      return remembered;
+    }
+    count('coldReconstructions');
+    const reconstructed = await replayAsync(head, assertCurrent, () => count('ancestorReads'));
+    assertCurrent();
+    if (get(headKey) !== selectedHead) invalid('selected head changed during cold replay');
+    assertCurrent();
+    const result = await cachedBasisAsync(
+      {
+        head: reconstructed.head,
+        value: reconstructed.value,
+        semanticBytes: reconstructed.semanticBytes,
+        serialized: reconstructed.serialized,
+        fingerprint: reconstructed.fingerprint,
+      },
+      selectedHead as string,
+      assertCurrent,
+    );
+    assertCurrent();
+    if (token) {
+      cache.token = token;
+      remember(cache, cache.candidates, prefix, result);
+    } else remember(cache, cache.committed, prefix, result);
+    return result;
+  }
   function normalized(next: unknown): IntakePreparedMaterialization {
     const value = normalizeIntakeJson(next, undefined, true);
     const serialized = serializeIntakeJson(value);
@@ -355,6 +439,27 @@ export function createIntakeStateStorage(
       reconstructIntakeEvidence(identity, caps, head, get),
     );
     const result = cachedBasis(reconstructed, raw);
+    remember(cache, cache.committed, key, result);
+    return result.materialization;
+  }
+  async function legacyMaterializationAsync(
+    head: Head,
+    assertCurrent: () => void,
+  ): Promise<IntakeStateMaterialization> {
+    assertCurrent();
+    ready();
+    const raw = JSON.stringify(head),
+      cache = cacheFor(db),
+      key = prefix + 'legacy';
+    const prior = cache.committed.get(key) ?? cache.committed.get(prefix);
+    if (prior?.materialization.selectedHead === raw) {
+      assertCurrent();
+      return prior.materialization;
+    }
+    const reconstructed = await replayAsync(head, assertCurrent);
+    assertCurrent();
+    const result = await cachedBasisAsync(reconstructed, raw, assertCurrent);
+    assertCurrent();
     remember(cache, cache.committed, key, result);
     return result.materialization;
   }
@@ -460,6 +565,7 @@ export function createIntakeStateStorage(
       get,
       immutable,
       legacyMaterialization,
+      legacyMaterializationAsync,
       invalidate: () => clearIntakeStateCache(db),
     }),
     counters,
@@ -511,6 +617,15 @@ export function createIntakeStateStorage(
         recordIntakeWork('materializationReads');
         return basis.materialization;
       });
+    },
+    async readMaterializationAsync(
+      assertCurrent: () => void,
+    ): Promise<IntakeStateMaterialization | undefined> {
+      const basis = await loadAsync(assertCurrent);
+      if (!basis) return undefined;
+      recordIntakeWork('materializationReads');
+      assertCurrent();
+      return basis.materialization;
     },
     stagePrepared(prepared: PreparedIntakeState, operationId: string): IntakeStateResult {
       return withIntakeWork(db, 'warm', () => {

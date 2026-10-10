@@ -1,6 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { toUSVString } from 'node:util';
-import { applyIntakeChanges, serializeIntakeJson, type IntakeJson } from './intake-state-codec.ts';
+import {
+  applyIntakeChanges,
+  applyIntakeChangesSteps,
+  iterateSerializedIntakeJson,
+  serializeIntakeJson,
+  type IntakeJson,
+} from './intake-state-codec.ts';
+import { parseRecordJsonPiecesSteps } from './record-json-pieces.ts';
 import type { ChatDecodeBudget } from './chat-journal-codec.ts';
 import { recordIntakeSerialization, recordIntakeWork } from './intake-work-accounting.ts';
 import { intakeTreeRef, type IntakeTreeRoot } from './intake-state-tree.ts';
@@ -279,6 +286,22 @@ export function reconstructIntakeEvidence(
   get: (key: string) => unknown,
   onFrameRead?: () => void,
 ): Basis & { consumed: Set<string> } {
+  const steps = reconstructIntakeEvidenceSteps(identity, caps, head, get, onFrameRead, false);
+  for (;;) {
+    const next = steps.next();
+    if (next.done) return next.value;
+  }
+}
+
+/** A cold replay with bounded parser, hashing, and per-change work turns. */
+export function* reconstructIntakeEvidenceSteps(
+  identity: IntakeStateIdentity,
+  caps: Limits,
+  head: Head,
+  get: (key: string) => unknown,
+  onFrameRead?: () => void,
+  cooperative = true,
+): Generator<void, Basis & { consumed: Set<string> }> {
   const prefix = intakeNamespace(identity);
   const consumed = new Set([`${prefix}head`]);
   const frames: Frame[] = [];
@@ -341,6 +364,7 @@ export function reconstructIntakeEvidence(
       invalid('base64');
     frames.push(frame as unknown as Frame);
     ref = frame.previous as Reference | null;
+    if (cooperative) yield;
   }
   frames.reverse();
   let value: IntakeJson | undefined;
@@ -374,23 +398,74 @@ export function reconstructIntakeEvidence(
         invalid('chunk group');
       chunks.push(copied(Buffer.from(frame.data, 'base64')));
     }
-    const payload = copied(Buffer.concat(chunks));
-    if (
-      digest(payload) !== first.payloadHash ||
-      !copied(Buffer.from(payload.toString('utf8'))).equals(payload)
-    )
-      invalid('payload hash/UTF-8');
     const remaining = budget(caps, used);
-    const changes = decode(payload.toString('utf8'), caps.bytes);
+    let changes: unknown;
+    if (cooperative) {
+      const payloadHash = createHash('sha256');
+      let payloadBytes = 0;
+      for (const chunk of chunks) {
+        payloadHash.update(chunk);
+        payloadBytes += chunk.length;
+        if (payloadBytes > caps.bytes) invalid('operation bytes');
+        yield;
+      }
+      recordIntakeWork('hashCalls');
+      recordIntakeWork('hashedBytes', payloadBytes);
+      if (payloadHash.digest('hex') !== first.payloadHash) invalid('payload hash/UTF-8');
+      const text = function* (): Generator<string> {
+        const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+        for (const chunk of chunks) {
+          const piece = decoder.decode(chunk, { stream: true });
+          if (piece) yield piece;
+        }
+        const final = decoder.decode();
+        if (final) yield final;
+      };
+      changes = yield* parseRecordJsonPiecesSteps(text());
+    } else {
+      const payload = copied(Buffer.concat(chunks));
+      if (
+        digest(payload) !== first.payloadHash ||
+        !copied(Buffer.from(payload.toString('utf8'))).equals(payload)
+      )
+        invalid('payload hash/UTF-8');
+      changes = decode(payload.toString('utf8'), caps.bytes);
+    }
     recordIntakeWork('evidenceReplayVersions');
     if (Array.isArray(changes)) recordIntakeWork('evidenceReplayOperations', changes.length);
-    value = applyIntakeChanges(value, changes, remaining);
+    value = cooperative
+      ? yield* applyIntakeChangesSteps(value, changes, remaining)
+      : applyIntakeChanges(value, changes, remaining);
     used = addDecoded(used, caps, remaining);
-    const serializedValue = serializeIntakeJson(value);
-    serialized = serializedValue;
     fingerprint = first.fingerprint;
-    semanticBytes = Buffer.byteLength(serializedValue);
-    if (digest(serializedValue) !== first.fingerprint) invalid('result fingerprint');
+    if (cooperative) {
+      const serializedHash = createHash('sha256');
+      const pieces: string[] = [];
+      semanticBytes = 0;
+      let quantum = 0;
+      let visits = 0;
+      for (const piece of iterateSerializedIntakeJson(value)) {
+        serializedHash.update(piece);
+        semanticBytes += Buffer.byteLength(piece);
+        if (offset + first.chunks === frames.length) pieces.push(piece);
+        quantum += piece.length;
+        if (quantum >= 4096 || ++visits >= 64) {
+          quantum = 0;
+          visits = 0;
+          yield;
+        }
+      }
+      recordIntakeWork('hashCalls');
+      recordIntakeWork('hashedBytes', semanticBytes);
+      recordIntakeWork('serializedBytes', semanticBytes);
+      if (serializedHash.digest('hex') !== first.fingerprint) invalid('result fingerprint');
+      if (offset + first.chunks === frames.length) serialized = pieces.join('');
+    } else {
+      const serializedValue = serializeIntakeJson(value);
+      serialized = serializedValue;
+      semanticBytes = Buffer.byteLength(serializedValue);
+      if (digest(serializedValue) !== first.fingerprint) invalid('result fingerprint');
+    }
     const receiptRaw = get(`${prefix}operation:${first.operationId}`);
     recordIntakeWork('evidenceReceiptReads');
     if (typeof receiptRaw === 'string')

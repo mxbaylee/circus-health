@@ -87,6 +87,53 @@ test('snapshot catalog binding uses one bounded authenticated owner observation'
   assert.equal(after.collectionReadWitnessQueries - before.collectionReadWitnessQueries, 4);
 });
 
+test('large raw schema build preserves lexical cells and scalar indexes', async (t) => {
+  const selected = {
+    intake: {
+      version: 1,
+      workflow: {
+        format: 'health-intake-workflow-v1',
+        candidates: [{ id: 'fictional-candidate', attempts: ['one', ['nested'], 'two'] }],
+      },
+    },
+    large: 'fictional-escaped-\\"-value'.repeat(4000),
+  };
+  const text = ' { "duplicate":1,"duplicate":2,' + JSON.stringify(selected).slice(1) + ' \n';
+  assert.ok(text.length > 64 * 1024);
+  const { db, source } = fixture(t, text);
+  const selectedMetadataBytes = Number(
+    db
+      .prepare('SELECT length(CAST(details_json AS BLOB)) AS bytes FROM source_files WHERE id=?')
+      .get(source.id)?.bytes,
+  );
+  const beforeBuildWork = intakeWorkCounters(db).primitive;
+  await buildIntakeCollectionEnvelope(db, source);
+  const afterBuildWork = intakeWorkCounters(db).primitive;
+  assert.equal(
+    afterBuildWork.selectedMetadataSqlPages - beforeBuildWork.selectedMetadataSqlPages,
+    1,
+  );
+  assert.equal(
+    afterBuildWork.selectedMetadataSqlReadBytes - beforeBuildWork.selectedMetadataSqlReadBytes,
+    selectedMetadataBytes,
+  );
+  t.diagnostic(
+    JSON.stringify({
+      selectedMetadataBytes,
+      selectedMetadataSqlPages:
+        afterBuildWork.selectedMetadataSqlPages - beforeBuildWork.selectedMetadataSqlPages,
+      selectedMetadataSqlReadBytes:
+        afterBuildWork.selectedMetadataSqlReadBytes - beforeBuildWork.selectedMetadataSqlReadBytes,
+    }),
+  );
+  assert.equal([...iterateIntakeEnvelopeText(db, source)].join(''), text);
+  const reader = openIntakeCollectionEnvelope(db, source);
+  const intake = reader.child(reader.root(), 'intake')!;
+  const workflow = reader.child(intake, 'workflow')!;
+  const candidate = reader.find('candidate', workflow, 'fictional-candidate')!;
+  assert.equal(reader.contains(candidate, 'attempts', 'two'), true);
+});
+
 test('named lexical field access resolves once and preserves raw structured, duplicate and fragmented values', async (t) => {
   const giant = '🦊\\\"'.repeat(9000),
     raw =

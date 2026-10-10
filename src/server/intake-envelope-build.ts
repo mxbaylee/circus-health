@@ -7,8 +7,13 @@ import {
 import { reportSnapshotInlineTextFits } from './intake-report-snapshot-catalog.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
+import { prepareIntakeJsonLexical, type IntakeJsonLexicalSpan } from './intake-json-lexical.ts';
+import { hashIntakeJsonScalarSteps } from './intake-json-scalar.ts';
 import type { Database } from './database.ts';
-import { readIntakeEnvelopeMaterialized, type IntakeEnvelopeSource } from './intake-authority.ts';
+import {
+  readIntakeEnvelopeMaterializedForBuild,
+  type IntakeEnvelopeSource,
+} from './intake-authority.ts';
 import {
   collectionCellReader,
   hasIntakeCollectionEnvelope,
@@ -106,23 +111,25 @@ async function buildIntakeCollectionEnvelopeOwned(
   } = {},
   originalRead: IntakeLegacyBridgeReadWitness,
 ) {
-  const legacy = readIntakeEnvelopeMaterialized(db, source),
-    { collections, binding } = selectedEnvelopeStore(db, source);
+  const legacy = await readIntakeEnvelopeMaterializedForBuild(db, source, originalRead);
+  const { collections, binding } = selectedEnvelopeStore(db, source);
   assertIntakeLegacyBridgeReadWitness(db, originalRead);
-  const version = (legacy.value.intake as { version: number }).version;
+  const version = legacy.version;
   const sourceTextHash = digest(legacy.text);
   withIntakeWork(db, 'warm', () =>
     recordIntakeWork('schemaBuildSourceHashBytes', Buffer.byteLength(legacy.text)),
   );
   if (binding.logicalHead === undefined) {
     const id = randomUUID();
-    const prepared = collections.prepareLegacyBridge(
+    const prepared = await collections.prepareLegacyBridgeAsync(
       {
         operationId: id,
         requestDigest: digest(id),
         domainVersion: version,
       },
       originalRead,
+      () => assertIntakeLegacyBridgeReadWitness(db, originalRead),
+      legacy.selectedProof,
     );
     assertIntakeLegacyBridgeReadWitness(db, originalRead);
     collections.commitMaintenance(prepared);
@@ -140,7 +147,7 @@ async function buildIntakeCollectionEnvelopeOwned(
   );
   try {
     const build = resume.build;
-    const { put, cell, flush, record } = createEnvelopeBuildWriter(
+    const { put, cell, cellPieces, flush, record, recordLexical } = createEnvelopeBuildWriter(
       db,
       source,
       build,
@@ -150,13 +157,26 @@ async function buildIntakeCollectionEnvelopeOwned(
     );
     void put;
     const text = legacy.text;
-    let start = 0;
-    while (/\s/.test(text[start] ?? '') && start < text.length) start++;
-    const end = valueEnd(text, start),
-      root = schemaKey('envelope', build);
-    await cell('$before', text.slice(0, start));
-    await record(text, start, end, 'root', root);
-    await cell('$after', text.slice(end));
+    const root = schemaKey('envelope', build);
+    if (text.length > 64 * 1024) {
+      const lexical = await prepareIntakeJsonLexical([text], {
+        assertRunning: resume.assertCurrent,
+      });
+      try {
+        await cellPieces('$before', lexical.pieces(0, lexical.root.start));
+        await recordLexical(lexical, lexical.root, 'root', root);
+        await cellPieces('$after', lexical.pieces(lexical.root.end, lexical.work.inputUnits));
+      } finally {
+        lexical.close();
+      }
+    } else {
+      let start = 0;
+      while (/\s/.test(text[start] ?? '') && start < text.length) start++;
+      const end = valueEnd(text, start);
+      await cell('$before', text.slice(0, start));
+      await record(text, start, end, 'root', root);
+      await cell('$after', text.slice(end));
+    }
     await flush();
     resume.finish();
     const control: SchemaControl = {
@@ -532,5 +552,158 @@ export function createEnvelopeBuildWriter(
       await put('j:' + parent + ':' + schemaKey(kind, publicId), id);
     }
   }
-  return { put, cell, cellPieces, filenameFacts, flush, record, peek, remove };
+  type Lexical = Awaited<ReturnType<typeof prepareIntakeJsonLexical>>;
+  const scalarDigest = async (
+    lexical: Lexical,
+    span: IntakeJsonLexicalSpan,
+    leading: readonly (string | null)[] = [],
+    onStringUnit?: (unit: string) => void,
+  ) => {
+    const steps = hashIntakeJsonScalarSteps(
+      lexical.pieces(span.start, span.end),
+      leading,
+      onStringUnit,
+    );
+    try {
+      for (;;) {
+        options.assertRunning?.();
+        const next = steps.next();
+        options.assertRunning?.();
+        if (next.done) return next.value;
+        await setImmediate();
+      }
+    } finally {
+      steps.return(undefined as never);
+    }
+  };
+  const namePieces = function* (lexical: Lexical, span: IntakeJsonLexicalSpan) {
+    let pending = '';
+    const encoded: string[] = [];
+    const steps = hashIntakeJsonScalarSteps(
+      lexical.pieces(span.nameStart!, span.nameEnd!),
+      [],
+      (unit) => {
+        pending += unit;
+        if (pending.length >= 512 && !/[\uD800-\uDBFF]$/.test(pending)) {
+          encoded.push(JSON.stringify(pending).slice(1, -1));
+          pending = '';
+        }
+      },
+    );
+    yield '"';
+    try {
+      for (;;) {
+        options.assertRunning?.();
+        const next = steps.next();
+        while (encoded.length) yield encoded.shift()!;
+        if (next.done) {
+          if (next.value.kind !== 'string') throw Error('Invalid schema property name');
+          if (pending) yield JSON.stringify(pending).slice(1, -1);
+          yield '"';
+          return;
+        }
+      }
+    } finally {
+      steps.return(undefined as never);
+    }
+  };
+  async function recordLexical(
+    lexical: Lexical,
+    span: IntakeJsonLexicalSpan,
+    kind: string,
+    id: string,
+    parent?: string,
+  ): Promise<void> {
+    options.assertRunning?.();
+    const shape = span.shape;
+    let count = 0,
+      unique = 0,
+      publicIdHash: string | undefined;
+    if (shape === 'scalar') {
+      await cellPieces('c:' + id, lexical.pieces(span.start, span.end));
+      await put('r:' + id, JSON.stringify({ kind, shape, count: 0 }));
+      return;
+    }
+    let suffix = span.start;
+    for (const entry of lexical.children(span)) {
+      const occurrence = schemaKey(id, count),
+        prefix = schemaKey(occurrence, 'prefix');
+      let target: SchemaTarget;
+      const token = lexical.pieces(entry.start, entry.start + 1).next().value as string;
+      if (shape === 'array') {
+        await put('p:' + occurrence, JSON.stringify({ parent: id, ordinal: count, field: null }));
+        const itemKind = token === '{' ? kind : 'scalar';
+        await recordLexical(lexical, entry, itemKind, occurrence, parent);
+        target = { type: 'record', id: occurrence };
+        if (itemKind === 'scalar' && entry.shape === 'scalar') {
+          const scalar = await scalarDigest(lexical, entry);
+          await put('m:' + id + ':' + scalar.hash, occurrence);
+        }
+      } else {
+        const named: IntakeJsonLexicalSpan = {
+          ...entry,
+          start: entry.nameStart!,
+          end: entry.nameEnd!,
+        };
+        let name = '',
+          longName = false;
+        const field = await scalarDigest(lexical, named, [], (unit) => {
+          if (name.length + unit.length <= 128) name += unit;
+          else longName = true;
+        });
+        if (field.kind !== 'string') throw Error('Invalid schema property name');
+        const selectedName = longName ? undefined : name;
+        const nested = selectedName && structuredKind(kind, selectedName, token);
+        if (nested) {
+          await put(
+            'p:' + occurrence,
+            JSON.stringify({ parent: id, ordinal: count, field: field.hash }),
+          );
+          await recordLexical(lexical, entry, nested, occurrence, id);
+          target = { type: 'record', id: occurrence };
+        } else {
+          await cellPieces('c:' + occurrence, lexical.pieces(entry.start, entry.end));
+          if (kind === 'intake' && (selectedName === 'originalName' || selectedName === 'locator'))
+            await filenameFacts(occurrence);
+          target = { type: 'cell', id: occurrence };
+        }
+        if (peek('f:' + id + ':' + field.hash) === undefined) {
+          unique++;
+          await put('b:' + id + ':' + field.hash, String(count));
+        }
+        await put(
+          'd:' + id + ':' + schemaOrdinal(count),
+          peek('l:' + id + ':' + field.hash) ?? 'null',
+        );
+        await put('f:' + id + ':' + field.hash, JSON.stringify(target));
+        await put('l:' + id + ':' + field.hash, String(count));
+        await cellPieces('n:' + occurrence, namePieces(lexical, entry));
+        if (selectedName === 'id' && parent && token === '"') {
+          const scalar = await scalarDigest(lexical, entry, [kind]);
+          publicIdHash = scalar.kind === 'string' ? scalar.hash : undefined;
+        } else if (selectedName === 'id') publicIdHash = undefined;
+      }
+      await cellPieces('c:' + prefix, lexical.pieces(entry.prefix, entry.start));
+      await put(
+        'o:' + id + ':' + schemaOrdinal(count),
+        JSON.stringify({
+          target,
+          prefix,
+          ...(shape === 'array' ? {} : { name: occurrence }),
+        }),
+      );
+      suffix = entry.end;
+      count++;
+    }
+    await cellPieces('s:' + id, lexical.pieces(suffix, span.end));
+    await put('r:' + id, JSON.stringify({ kind, shape, count }));
+    await put('x:' + id, String(count));
+    if (shape === 'object') await put('u:' + id, String(unique));
+    if (publicIdHash !== undefined && parent) {
+      const key = 'i:' + parent + ':' + publicIdHash;
+      if (peek(key) === undefined) await put(key, id);
+      await put('j:' + parent + ':' + publicIdHash, id);
+    }
+  }
+  return { put, cell, cellPieces, filenameFacts, flush, record, recordLexical, peek, remove };
 }

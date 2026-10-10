@@ -19,6 +19,8 @@ const primitiveTemplate = {
   serializedReadBytes: 0,
   metadataReads: 0,
   metadataReadBytes: 0,
+  selectedMetadataSqlPages: 0,
+  selectedMetadataSqlReadBytes: 0,
 };
 const hostTemplate = {
   clinicalSourceScopePrefixVerifiedGroups: 0,

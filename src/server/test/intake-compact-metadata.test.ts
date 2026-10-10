@@ -214,7 +214,27 @@ test(
       );
     });
     const source = { id, sha256: sourceHash };
+    const beforeBuildWork = structuredClone(intakeWorkCounters(db).primitive);
     await buildIntakeCollectionEnvelope(db, source);
+    const afterBuildWork = intakeWorkCounters(db).primitive;
+    assert.equal(
+      afterBuildWork.selectedMetadataSqlPages - beforeBuildWork.selectedMetadataSqlPages,
+      2 * Math.ceil(Buffer.byteLength(initial.detailsJson) / (64 * 1024)),
+    );
+    assert.equal(
+      afterBuildWork.selectedMetadataSqlReadBytes - beforeBuildWork.selectedMetadataSqlReadBytes,
+      2 * Buffer.byteLength(initial.detailsJson),
+    );
+    t.diagnostic(
+      JSON.stringify({
+        selectedMetadataBytes: Buffer.byteLength(initial.detailsJson),
+        selectedMetadataSqlPages:
+          afterBuildWork.selectedMetadataSqlPages - beforeBuildWork.selectedMetadataSqlPages,
+        selectedMetadataSqlReadBytes:
+          afterBuildWork.selectedMetadataSqlReadBytes -
+          beforeBuildWork.selectedMetadataSqlReadBytes,
+      }),
+    );
     const exact = [...iterateIntakeEnvelopeText(db, source)].join('');
     const first = db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!
       .details_json as string;
@@ -322,6 +342,7 @@ test(
       },
     });
     assert.equal(result.changed, true);
+    t.diagnostic('giant phase: initial compact summary published');
     const preparedView = collections.openView();
     for (const cell of cells)
       assert.notEqual(
@@ -393,6 +414,7 @@ test(
       false,
       'cooperative lookup retains SQL first-occurrence semantics',
     );
+    t.diagnostic('giant phase: presentation and locator checks complete');
 
     const contracted = String(
       db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!.details_json,
@@ -473,6 +495,7 @@ test(
         undefined,
       );
     }
+    t.diagnostic('giant phase: source mutation refusal checks complete');
     restoreInitialDetails();
     const readObject = authority.storage.read,
       writeObject = authority.storage.writeImmutable,
@@ -513,6 +536,7 @@ test(
       authority.storage.writeImmutable = writeObject;
     }
     assert.equal(lateReadMutation, true, 'the final callback-capable HEAD read was exercised');
+    t.diagnostic('giant phase: late-read mutation refused');
     assert.equal(
       db.prepare('SELECT details_json FROM source_files WHERE id=?').get(id)!.details_json,
       initial.detailsJson,
@@ -1561,6 +1585,308 @@ test(
       } finally {
         again.close();
       }
+    } finally {
+      recovered.close();
+    }
+  },
+);
+
+test(
+  'actual encrypted authority replays an oversized accepted source predecessor and its field history',
+  { timeout: 180000 },
+  async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-encrypted-large-compact-'));
+    const profileId = 'fictional-encrypted-large-compact',
+      id = 'fictional-encrypted-large-intake';
+    const paths = ensureProfileDirectories(root, profileId);
+    const key = freshKey();
+    const vault = openVault({ directory: paths.root, profileId, key, initialize: true });
+    const db = openDatabase(paths.database, profileId);
+    t.after(() => {
+      db.close();
+      vault.close();
+      key.fill(0);
+      rmSync(root, { recursive: true, force: true });
+    });
+    const original = Buffer.from('Independently fictional encrypted large source evidence.');
+    const sourceHash = createHash('sha256').update(original).digest('hex');
+    const path = profilePaths(root, profileId).relativeRoot + '/sources/fictional.pdf';
+    writeFileSync(join(root, path), original);
+    vault.storeFile(path, original);
+    vault.publish();
+    const storage = vault.recordStorage();
+    const verifyReferences = (versions: DurableRecordVersion[]) => {
+      for (const version of versions)
+        if (version.entity === 'source_files' && !version.deleted)
+          assert.equal(
+            vault.verifyFile(
+              String(version.contents.path),
+              Number(version.contents.bytes),
+              String(version.contents.sha256),
+            ),
+            true,
+          );
+    };
+    attachRecordDurability(db, { profileId, storage, verifyReferences });
+    const initial = prepareInitialIntakeEnvelope({
+      intake: { version: 1, originalName: 'fictional.pdf', state: 'ready' },
+    });
+    transaction(db, () => {
+      db.prepare(
+        'INSERT INTO source_files(id,path,sha256,bytes,kind,mime_type,details_json) VALUES(?,?,?,?,?,?,?)',
+      ).run(
+        id,
+        path,
+        sourceHash,
+        original.length,
+        'intake_original',
+        'application/pdf',
+        initial.detailsJson,
+      );
+      createIntakeStateStorage(db, { profileId, intakeId: id, sourceHash }).stage(
+        initial.state,
+        randomUUID(),
+      );
+    });
+    const source = { id, sha256: sourceHash };
+    await buildIntakeCollectionEnvelope(db, source);
+    const view = openIntakeCollectionEnvelope(db, source);
+    const originalName = 'fictional-encrypted-' + 'x'.repeat(8 * 1024 * 1024 + 4096) + '.pdf';
+    const operationId = randomUUID();
+    const changed = await prepareIntakeEnvelopeMutation(db, source, {
+      reader: view,
+      operationId,
+      requestDigest: createHash('sha256').update(operationId).digest('hex'),
+      domainVersion: 2,
+      changes: [
+        {
+          op: 'set',
+          record: view.child(view.root(), 'intake')!,
+          field: 'originalName',
+          jsonText: JSON.stringify(originalName),
+        },
+      ],
+    });
+    assert.ok(changed.projectDetailsJson);
+    const oldMetadata = changed.projectDetailsJson({
+      bytes: Buffer.byteLength(originalName) + 16384,
+    });
+    assert.ok(Buffer.byteLength(oldMetadata) > 8 * 1024 * 1024);
+    transaction(db, () => {
+      selectedEnvelopeStore(db, source).collections.stage(changed.prepared!);
+      db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(oldMetadata, id);
+    });
+    const previous = String(
+      db
+        .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
+        .get('source_files', JSON.stringify([id]))!.version_id,
+    );
+    const beforeHead = Buffer.from(storage.read('head')!);
+    const parse = JSON.parse;
+    let giantParses = 0;
+    const publicationWork = createRecordVersionWorkCounters();
+    JSON.parse = ((
+      text: string,
+      ...args: Parameters<typeof JSON.parse> extends [string, ...infer Rest] ? Rest : never
+    ) => {
+      if (typeof text === 'string' && Buffer.byteLength(text) > 65536) giantParses++;
+      return parse(text, ...args);
+    }) as typeof JSON.parse;
+    try {
+      assert.equal(
+        (
+          await withRecordVersionWork(publicationWork, () =>
+            withPackageSessionSource({ db, root, profileId, id }, (lease) =>
+              prepareIntakeCompactMetadata(db, source, {
+                assertPublicationCurrent: lease.assertPublicationCurrent,
+              }),
+            ),
+          )
+        ).changed,
+        true,
+      );
+    } finally {
+      JSON.parse = parse;
+    }
+    assert.equal(giantParses, 0, 'the host does not JSON.parse a giant string during publication');
+    assert.ok(publicationWork.operation.vaultBackingChangedVersions > 0);
+    assert.ok(publicationWork.operation.vaultBackingCertificateWrites > 0);
+    t.diagnostic(
+      JSON.stringify({
+        publication: {
+          coldReplays: publicationWork.operation.vaultBackingColdReplays,
+          coldDecodedVersions: publicationWork.operation.vaultBackingColdDecodedVersions,
+          warmReuses: publicationWork.operation.vaultBackingReuses,
+          changedVersions: publicationWork.operation.vaultBackingChangedVersions,
+          coldBaselineCertificates: publicationWork.operation.vaultBackingCertificateWrites,
+          objectReadBytes: publicationWork.operation.objectReadBytes,
+          hashedBytes: publicationWork.operation.hashedBytes,
+        },
+      }),
+    );
+    assert.notDeepEqual(storage.read('head'), beforeHead);
+    const current = db
+      .prepare(
+        'SELECT v.previous_version FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?',
+      )
+      .get('source_files', JSON.stringify([id]))!;
+    assert.equal(current.previous_version, previous);
+    assert.equal(
+      db
+        .prepare(
+          "SELECT json_extract(contents_json,'$.details_json') AS details FROM __record_versions WHERE version_id=?",
+        )
+        .get(previous)!.details,
+      oldMetadata,
+      'the accepted source-column preimage remains exact',
+    );
+    assert.equal(
+      intakeMetadataScalarMatches(intakeSourceMetadata(db, id).originalName, originalName),
+      true,
+    );
+    assert.equal(vault.verifyFile(path, original.length, sourceHash), true);
+    const smallUpdateWork = createRecordVersionWorkCounters();
+    const beforeSmallIntake = intakeWorkCounters(db);
+    const smallOperationId = randomUUID();
+    const smallReader = openIntakeCollectionEnvelope(db, source);
+    const smallCollections = createIntakeStateStorage(db, {
+      profileId,
+      intakeId: id,
+      sourceHash,
+    }).collections;
+    const smallHead = smallCollections.binding(smallCollections.openView())!;
+    const changedPathBound =
+      4 *
+        ((smallHead.logical.root?.height ?? 0) +
+          (smallHead.receipts?.height ?? 0) +
+          (smallHead.history?.height ?? 0) +
+          (smallHead.builds?.height ?? 0) +
+          4) +
+      3;
+    const smallUpdate = await withRecordVersionWork(smallUpdateWork, () =>
+      prepareIntakeEnvelopeMutation(db, source, {
+        reader: smallReader,
+        operationId: smallOperationId,
+        requestDigest: createHash('sha256').update(smallOperationId).digest('hex'),
+        domainVersion: 3,
+        changes: [
+          {
+            op: 'set',
+            record: smallReader.child(smallReader.root(), 'intake')!,
+            field: 'metadata',
+            jsonText: JSON.stringify({ note: 'Independently fictional small correction.' }),
+          },
+        ],
+      }),
+    );
+    assert.ok(smallUpdate.projectDetailsJson);
+    const smallMetadata = smallUpdate.projectDetailsJson({ bytes: 65536 });
+    assert.ok(Buffer.byteLength(smallMetadata) < 65536);
+    const compactVersion = String(
+      db
+        .prepare('SELECT version_id FROM __record_current WHERE entity=? AND record_id=?')
+        .get('source_files', JSON.stringify([id]))!.version_id,
+    );
+    const smallStartSequence = Number(
+      db.prepare('SELECT sequence FROM __record_state WHERE singleton=1').get()!.sequence,
+    );
+    withRecordVersionWork(smallUpdateWork, () =>
+      transaction(db, () => {
+        selectedEnvelopeStore(db, source).collections.stage(smallUpdate.prepared!);
+        db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(smallMetadata, id);
+      }),
+    );
+    const smallCurrent = db
+      .prepare(
+        'SELECT v.previous_version FROM __record_current c JOIN __record_versions v ON v.version_id=c.version_id WHERE c.entity=? AND c.record_id=?',
+      )
+      .get('source_files', JSON.stringify([id]))!;
+    assert.equal(smallCurrent.previous_version, compactVersion);
+    const acceptedSmallVersions = Number(
+      db
+        .prepare('SELECT count(*) AS n FROM __record_versions WHERE sequence>?')
+        .get(smallStartSequence)!.n,
+    );
+    assert.ok(acceptedSmallVersions > 0);
+    assert.ok(acceptedSmallVersions <= changedPathBound);
+    assert.equal(
+      intakeMetadataScalarMatches(intakeSourceMetadata(db, id).originalName, originalName),
+      true,
+    );
+    const afterSmallIntake = intakeWorkCounters(db);
+    t.diagnostic(
+      JSON.stringify({
+        smallUpdate: {
+          coldReplays: smallUpdateWork.operation.vaultBackingColdReplays,
+          warmReuses: smallUpdateWork.operation.vaultBackingReuses,
+          changedVersions: smallUpdateWork.operation.vaultBackingChangedVersions,
+          acceptedVersions: acceptedSmallVersions,
+          changedPathBound,
+          certificateWrites: smallUpdateWork.operation.vaultBackingCertificateWrites,
+          objectReadBytes: smallUpdateWork.operation.objectReadBytes,
+          hashedBytes: smallUpdateWork.operation.hashedBytes,
+          serializedBytes: smallUpdateWork.operation.serializedBytes,
+          encodedBytes: smallUpdateWork.operation.encodedBytes,
+          versionValidations: smallUpdateWork.operation.versionValidations,
+          hostJsonParseBytes:
+            afterSmallIntake.warm.jsonParseBytes -
+            beforeSmallIntake.warm.jsonParseBytes +
+            afterSmallIntake.reconstruction.jsonParseBytes -
+            beforeSmallIntake.reconstruction.jsonParseBytes,
+        },
+      }),
+    );
+    const recoveredPath = join(paths.root, 'fictional-recovered.sqlite');
+    const replayWork = createRecordVersionWorkCounters();
+    giantParses = 0;
+    JSON.parse = ((
+      text: string,
+      ...args: Parameters<typeof JSON.parse> extends [string, ...infer Rest] ? Rest : never
+    ) => {
+      if (typeof text === 'string' && Buffer.byteLength(text) > 65536) giantParses++;
+      return parse(text, ...args);
+    }) as typeof JSON.parse;
+    try {
+      withRecordVersionWork(replayWork, () =>
+        rebuildRecordDatabase(recoveredPath, { profileId, storage, verifyReferences }),
+      );
+    } finally {
+      JSON.parse = parse;
+    }
+    assert.equal(giantParses, 0, 'the host does not JSON.parse a giant string during cold replay');
+    assert.ok(replayWork.reconstruction.journalRecordsSpooled > 0);
+    assert.ok(replayWork.reconstruction.maxJournalRecordBufferBytes <= 65536);
+    assert.equal(replayWork.reconstruction.maxJournalRecordDecodeWindowBytes, 8192);
+    t.diagnostic(
+      JSON.stringify({
+        replay: {
+          journalRecordsSpooled: replayWork.reconstruction.journalRecordsSpooled,
+          maxJournalRecordBufferBytes: replayWork.reconstruction.maxJournalRecordBufferBytes,
+          maxJournalRecordDecodeWindowBytes:
+            replayWork.reconstruction.maxJournalRecordDecodeWindowBytes,
+        },
+      }),
+    );
+    const recovered = openDatabase(recoveredPath, profileId);
+    try {
+      attachRecordDurability(recovered, { profileId, storage, verifyReferences });
+      assert.deepEqual(
+        recovered.prepare('SELECT * FROM __record_fields ORDER BY version_id,field').all(),
+        db.prepare('SELECT * FROM __record_fields ORDER BY version_id,field').all(),
+        'cold replay independently reproduces accepted field history',
+      );
+      assert.equal(
+        recovered
+          .prepare(
+            "SELECT json_extract(contents_json,'$.details_json') AS details FROM __record_versions WHERE version_id=?",
+          )
+          .get(previous)!.details,
+        oldMetadata,
+      );
+      assert.equal(
+        intakeMetadataScalarMatches(intakeSourceMetadata(recovered, id).originalName, originalName),
+        true,
+      );
     } finally {
       recovered.close();
     }

@@ -325,6 +325,18 @@ bounded exact JSON-string reads through `metadata-fragment`; the existing
 checked derivative against the selected exact occurrence, preserving SQLite's
 first-member and operational last-member semantics rather than joining labels.
 
+Cold envelope construction reads selected metadata through 64 KiB SQL result
+pages, retaining the same original read witness across every page. The private,
+single-use prepared-source proof binds that database, witness, source, accepted
+HEAD, metadata bytes and representation digests; a caller-supplied digest cannot
+replace the selected read. Its bridge consumer rechecks the reconstructed text.
+Only an active, privately watched original read permits header-only maintenance
+checks; direct and unwatched paths retain complete metadata checks. Counters
+`selectedMetadataSqlPages` and `selectedMetadataSqlReadBytes` measure actual
+returned SQL pages, not SQLite's internal work. This does not yet bound every
+cold host turn: some reconstruction and hashing still use complete strings, and
+other selected-envelope and synchronous readers still fetch complete metadata.
+
 HTTP and assistant readiness cooperatively prepare complete older native
 projections before presentation. Identity preparation covers only the exact
 retained child before sealing its scope. Packet export preparation covers the

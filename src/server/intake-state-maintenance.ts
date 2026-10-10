@@ -30,6 +30,7 @@ import {
 import { intakeSourcePinKey } from './intake-source-pin.ts';
 import {
   verifyIntakeLegacyBridgeProof,
+  intakeLegacyBridgeHasOriginalSourceWatch,
   legacyBridgeStampCurrent,
   type IntakeLegacyBridgeProof,
   type IntakeLegacyBridgeStamp,
@@ -80,6 +81,7 @@ interface Publication {
   bytes: number;
   bridgeCertified: boolean;
   legacyStamp?: IntakeLegacyBridgeStamp;
+  sourceDetailsOmitted?: boolean;
   legacyStartWrites?: number;
   legacyBeforeDirty?: ReturnType<typeof sourceTextAuthorityDirtyRow>;
   compactMetadata?: {
@@ -249,24 +251,38 @@ export function prepareIntakeMaintenancePublication(
   const headKey = prefix + 'head';
   const readMeta = metadataReader(db);
   if (readMeta(headKey) !== candidate.beforeHead) fail('stale prepared head');
-  const source = sourceBinding(db, identity, readMeta, candidate.compactMetadata === undefined);
+  const sourceDetailsOmitted =
+    candidate.legacyBridge !== undefined &&
+    intakeLegacyBridgeHasOriginalSourceWatch(candidate.legacyBridge, db);
+  const source = sourceBinding(
+    db,
+    identity,
+    readMeta,
+    candidate.compactMetadata === undefined && !sourceDetailsOmitted,
+  );
   const sourcePin = readMeta(intakeSourcePinKey(identity.intakeId));
   if (candidate.legacyBridge !== undefined && candidate.compactMetadata !== undefined)
     fail('conflicting representation proofs');
+  const detailsJson = sourceDetailsOmitted
+    ? undefined
+    : (terminalStatement(db, 'SELECT details_json FROM source_files WHERE id=?').get(
+        identity.intakeId,
+      )!.details_json as string);
   const proofBinding = {
     identity,
     beforeHead: candidate.beforeHead,
     afterHead: candidate.afterHead,
     sourcePin,
-    detailsJson: terminalStatement(db, 'SELECT details_json FROM source_files WHERE id=?').get(
-      identity.intakeId,
-    )!.details_json as string,
+    detailsJson,
     writes: candidate.writes,
   };
   const compactMetadata =
     candidate.compactMetadata === undefined
       ? undefined
-      : consumeIntakeCompactMetadataProof(db, candidate.compactMetadata, proofBinding);
+      : consumeIntakeCompactMetadataProof(db, candidate.compactMetadata, {
+          ...proofBinding,
+          detailsJson: detailsJson!,
+        });
   const legacyStamp =
     candidate.legacyBridge === undefined
       ? undefined
@@ -334,6 +350,7 @@ export function prepareIntakeMaintenancePublication(
     bytes: retainedBytes,
     bridgeCertified: candidate.legacyBridge !== undefined || compactMetadata !== undefined,
     legacyStamp: compactMetadata ? undefined : legacyStamp,
+    sourceDetailsOmitted,
     compactMetadata,
     assertCurrent: compactMetadata ? candidate.assertCurrent : undefined,
   };
@@ -446,8 +463,12 @@ export function beginIntakeMaintenancePublication(
     fail('operation binding');
   if (
     readMeta(publication.headKey) !== publication.beforeHead ||
-    sourceBinding(db, publication.identity, readMeta, publication.compactMetadata === undefined) !==
-      publication.source ||
+    sourceBinding(
+      db,
+      publication.identity,
+      readMeta,
+      publication.compactMetadata === undefined && !publication.sourceDetailsOmitted,
+    ) !== publication.source ||
     (publication.compactMetadata &&
       !intakeCompactSourceRowsEqual(
         terminalStatement(
@@ -533,7 +554,8 @@ export function verifyIntakeMaintenancePublication(
         fail('legacy bridge unowned publication write');
       const readMeta = metadataReader(db);
       if (
-        sourceBinding(db, publication.identity, readMeta) !== publication.source ||
+        sourceBinding(db, publication.identity, readMeta, !publication.sourceDetailsOmitted) !==
+          publication.source ||
         readMeta(intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin ||
         readMeta(publication.headKey) !== publication.afterHead ||
         sourceTextAuthorityDirtyRow(db, publication.identity.intakeId, publication.headKey)
@@ -601,8 +623,12 @@ function verifyPublication(
   )
     fail('capture/schema changed during publication');
   if (
-    sourceBinding(db, publication.identity, readMeta, publication.compactMetadata === undefined) !==
-      publication.source ||
+    sourceBinding(
+      db,
+      publication.identity,
+      readMeta,
+      publication.compactMetadata === undefined && !publication.sourceDetailsOmitted,
+    ) !== publication.source ||
     readMeta(intakeSourcePinKey(publication.identity.intakeId)) !== publication.sourcePin ||
     (!final && boundedJson(result, HEAD_BYTES) !== publication.result)
   )
