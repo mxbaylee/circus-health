@@ -374,18 +374,35 @@ class CanonicalEngine {
       keyNumber = 0,
       keyDigits = 0,
       numeric = true;
+    const pending: string[] = [];
+    let pendingUnits = 0;
+    const flush = () => {
+      if (!pending.length) return;
+      this.raw.append(pending.join(''));
+      pending.length = 0;
+      pendingUnits = 0;
+    };
+    const append = (text: string) => {
+      pending.push(text);
+      pendingUnits += text.length;
+      if (pendingUnits >= 4096) flush();
+    };
     const emit = (char: string) => {
       if (high) {
-        if (/^[\uDC00-\uDFFF]$/.test(char)) {
-          this.raw.append(JSON.stringify(high + char).slice(1, -1));
+        const code = char.charCodeAt(0);
+        if (code >= 0xdc00 && code <= 0xdfff) {
+          append(high + char);
           high = '';
           return;
         }
-        this.raw.append(JSON.stringify(high).slice(1, -1));
+        append(JSON.stringify(high).slice(1, -1));
         high = '';
       }
-      if (/^[\uD800-\uDBFF]$/.test(char)) high = char;
-      else this.raw.append(JSON.stringify(char).slice(1, -1));
+      const code = char.charCodeAt(0);
+      if (code >= 0xd800 && code <= 0xdbff) high = char;
+      else if (code >= 0x20 && code !== 0x22 && code !== 0x5c && (code < 0xd800 || code > 0xdfff))
+        append(char);
+      else append(JSON.stringify(char).slice(1, -1));
     };
     while (true) {
       let char = this.take();
@@ -424,9 +441,13 @@ class CanonicalEngine {
         keyDigits++;
       }
       emit(char);
-      if (this.due()) yield;
+      if (this.due()) {
+        flush();
+        yield;
+      }
     }
-    if (high) this.raw.append(JSON.stringify(high).slice(1, -1));
+    if (high) append(JSON.stringify(high).slice(1, -1));
+    flush();
     this.raw.append('"');
     const bytes = this.raw.length - start;
     if (key) {

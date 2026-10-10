@@ -172,6 +172,26 @@ test('long property names values and disk nesting have fixed scratch buffers and
   }
 });
 
+test('batched string output preserves escapes and surrogate spelling across yield boundaries', async () => {
+  const value = 'x'.repeat(2047) + '\ud800' + '😀' + '\b\t\n\\"' + '\udfff' + '界'.repeat(4097);
+  const source = '{"long":' + JSON.stringify(value) + ',"name":"first","name":"selected"}';
+  for (const mode of ['canonical', 'stringify'] as const) {
+    const prepared = await prepareIntakeJsonCanonical(split(source, 1), { mode });
+    try {
+      const expected =
+        mode === 'canonical'
+          ? canonicalLiteral(JSON.parse(source))
+          : JSON.stringify(JSON.parse(source));
+      assert.equal(joined(prepared.chunks()), expected);
+      assert.equal(prepared.bytes, Buffer.byteLength(expected));
+      assert.ok(prepared.work.yields > 2);
+      assert.equal(prepared.work.maxBufferBytes, 8192);
+    } finally {
+      prepared.close();
+    }
+  }
+});
+
 test('binary64 canonical numbers match JSON.parse and the retained scalar hasher without long number materialization', async () => {
   const numbers = [
     '1' + '0'.repeat(8000) + 'e-8000',
