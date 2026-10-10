@@ -1096,6 +1096,12 @@ select the current representation after admission, while preserving the captured
 semantic version and exact operation-replay rules. This coordinates participating
 writers; other changes still invalidate the original proof.
 
+Native proposal submission retains that same operation owner throughout bounded
+batch and lookup preparation, final publication and replay. An independent
+participating clinical reader waits until submission finishes, including across
+preparation checkpoints. This admission does not refresh a changed lookup or
+physical proof, and does not hold the slot during model work.
+
 Native identity previews can share preparation across external callers. A
 disconnected HTTP response cancels only its subscriber; preparation stops when
 the last subscriber leaves. Cancellation is checked at cooperative boundaries

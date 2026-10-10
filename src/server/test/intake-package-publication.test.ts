@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { AsyncResource } from 'node:async_hooks';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { openDatabase } from '../database.ts';
+import { currentClinicalOperation, runExclusiveClinicalOperation } from '../clinical-operation.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { createBackup } from '../recovery.ts';
 import { ensureProfileDirectories, profileOriginal } from '../profile-storage.ts';
@@ -111,6 +113,55 @@ async function fixture(t: test.TestContext, direct = false, duplicatePlan = fals
   return { db, root, profileId, id: intake.id };
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
+test('native proposal preparation keeps an independent clinical reader queued until publication', async (t) => {
+  const f = await fixture(t),
+    request = input(f, 'fictional-owned-proposal'),
+    independent = new AsyncResource('fictional-independent-proposal-reader');
+  let reader: Promise<void> | undefined,
+    checkpoints = 0,
+    entered = false;
+  try {
+    const result = await submitPagedIntakeBatch(
+      f.db,
+      f.root,
+      f.profileId,
+      f.id,
+      request,
+      undefined,
+      {
+        async onCheckpoint() {
+          checkpoints++;
+          assert.ok(
+            currentClinicalOperation(f.db),
+            'preparation retains its actual clinical owner',
+          );
+          if (!reader)
+            reader = independent.runInAsyncScope(() =>
+              runExclusiveClinicalOperation(f.db, async () => {
+                entered = true;
+                const selected = getIntakeRead(f.db, f.root, f.profileId, f.id);
+                assert.equal(selected.version, request.version + 1);
+              }),
+            );
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(
+            entered,
+            false,
+            'another request cannot alter the lookup preparation interval',
+          );
+        },
+      },
+    );
+    assert.ok(checkpoints > 0, 'the real bounded proposal path yielded');
+    assert.equal(result.version, request.version + 1);
+    await reader;
+    assert.equal(entered, true);
+  } finally {
+    independent.emitDestroy();
+    await reader;
+  }
+});
+
 test('actual direct JSON batch preserves retained unit attempts and exact retry without package substitution', async (t) => {
   const f = await fixture(t, true, true);
   await prepareRetainedPlanAccess(f.db, f.profileId, f.id);

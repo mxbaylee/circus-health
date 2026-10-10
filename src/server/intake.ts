@@ -1564,7 +1564,13 @@ export async function submitPagedIntakeBatch(
 ) {
   return publishNativeIntakeProposal(db, root, profileId, id, input, observedSourcePages, options);
 }
-async function publishNativeIntakeProposal(
+function publishNativeIntakeProposal(...args: Parameters<typeof publishNativeIntakeProposalOwned>) {
+  const [db] = args;
+  return runExclusiveClinicalOperation(db, () => publishNativeIntakeProposalOwned(...args), {
+    operation: currentClinicalOperation(db),
+  });
+}
+async function publishNativeIntakeProposalOwned(
   db: DatabaseSync,
   root: string,
   profileId: string,
