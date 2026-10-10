@@ -1146,16 +1146,20 @@ export function openIntakeCollectionEnvelope(
 ): IntakeCollectionEnvelopeReader {
   return openSelectedIntakeCollectionEnvelope(db, source, options);
 }
-/** Synchronous ancestry readers classify and open the same checked selection,
- * without selecting its source and authority a second time. Every field still
- * passes the reader's normal current-source, logical and physical checks. */
-export function openIntakeCollectionEnvelopeIfNative(
+/** Synchronous ancestry readers keep the checked legacy projection or open the
+ * same native selection. Every native field still passes the reader's normal
+ * current-source, logical and physical checks. */
+export function selectIntakeCollectionEnvelope(
   db: Database,
   source: IntakeEnvelopeSource,
-): IntakeCollectionEnvelopeReader | undefined {
+): { source: IntakeEnvelopeSource; view: IntakeCollectionEnvelopeReader | undefined } {
   const captured = selectedEnvelopeStore(db, source);
-  if (!hasSelectedIntakeCollectionEnvelope(captured)) return undefined;
-  return openSelectedIntakeCollectionEnvelope(db, source, {}, captured);
+  return {
+    source: captured.source,
+    view: hasSelectedIntakeCollectionEnvelope(captured)
+      ? openSelectedIntakeCollectionEnvelope(db, source, {}, captured)
+      : undefined,
+  };
 }
 function openSelectedIntakeCollectionEnvelope(
   db: Database,

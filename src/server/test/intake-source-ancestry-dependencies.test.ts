@@ -88,6 +88,46 @@ const evidence: SourceTextEvidence = {
   issues: [],
 };
 
+test('legacy ancestry selects each checked edge once without repeating accepted authority reads', (t) => {
+  const f = fixture(t, [null, 'fictional-0', 'fictional-1']);
+  const originalGet = StatementSync.prototype.get,
+    originalRead = f.authority.storage.read;
+  let selections = 0,
+    checks = 0,
+    heads = 0;
+  t.mock.method(StatementSync.prototype, 'get', function (this: StatementSync, ...args: unknown[]) {
+    if (typeof args[0] === 'string' && args[0].startsWith('fictional-')) {
+      if (this.sourceSQL === 'SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
+        selections++;
+      if (
+        this.sourceSQL ===
+        "SELECT id,kind,sha256 FROM main.source_files WHERE id=? AND kind='intake_original'"
+      )
+        checks++;
+    }
+    return Reflect.apply(originalGet, this, args);
+  });
+  t.mock.method(f.authority.storage, 'read', function (name: string) {
+    if (name === 'head') heads++;
+    return Reflect.apply(originalRead, f.authority.storage, [name]);
+  });
+  const before = { ...intakeWorkCounters(f.db).warm };
+  assert.deepEqual(
+    [...iterateIntakeSourceAncestry(f.db, f.profileId, f.id)],
+    [
+      { id: 'fictional-2', parentId: 'fictional-1' },
+      { id: 'fictional-1', parentId: 'fictional-0' },
+      { id: 'fictional-0', parentId: undefined },
+    ],
+  );
+  assert.equal(checks, 6, 'each legacy edge is checked and rechecked');
+  assert.equal(selections, 6, 'each check selects the legacy source projection once');
+  assert.equal(heads, 6, 'each check reads the genuine accepted HEAD once');
+  assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+  t.mock.restoreAll();
+});
+
 test('native ancestry selects each checked edge once and keeps its post-yield recheck', async (t) => {
   const f = fixture(t, [null]);
   await buildIntakeCollectionEnvelope(f.db, { id: f.id });

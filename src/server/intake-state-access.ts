@@ -26,7 +26,7 @@ import { INTAKE_ENVELOPE_FORMAT, intakeEnvelopeProjectionFormatHint } from './in
 import {
   hasIntakeCollectionEnvelope,
   openIntakeCollectionEnvelope,
-  openIntakeCollectionEnvelopeIfNative,
+  selectIntakeCollectionEnvelope,
   intakeEnvelopeFilenameCell,
 } from './intake-collection-envelope.ts';
 import {
@@ -128,8 +128,17 @@ export function intakeSourceParent(db: DatabaseSync, id: string): unknown {
     .prepare("SELECT id,kind,sha256 FROM main.source_files WHERE id=? AND kind='intake_original'")
     .get(id);
   if (!source) throw Error('Source intake not found');
-  const view = openIntakeCollectionEnvelopeIfNative(db, { id, sha256: source.sha256 as string });
-  if (!view) return intakeSourceMetadata(db, id).parentSourceFileId;
+  const selectedEnvelope = selectIntakeCollectionEnvelope(db, {
+    id,
+    sha256: source.sha256 as string,
+  });
+  const view = selectedEnvelope.view;
+  if (!view)
+    return (
+      JSON.parse(selectedEnvelope.source.details_json as string) as {
+        intake: IntakeSourceMetadata;
+      }
+    ).intake.parentSourceFileId;
   const intake = view.child(view.root(), 'intake');
   if (!intake) throw Error('Source intake header missing');
   const selected = view.field(intake, 'parentSourceFileId', { bytes: 16384 });
