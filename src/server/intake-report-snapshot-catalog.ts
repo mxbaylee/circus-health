@@ -12,6 +12,7 @@ import type {
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import { INTAKE_TREE_VALUE_BYTES } from './intake-state-tree.ts';
 import { schemaOrdinal } from './intake-envelope-schema.ts';
+import type { RecordPublicationOriginals } from './record-versions.ts';
 import {
   assertClinicalOperation,
   currentClinicalOperation,
@@ -92,6 +93,8 @@ export function createReportSnapshotCatalog(
   options: {
     assertRunning?: () => void;
     onCheckpoint?: () => void | Promise<void>;
+    /** Exact retained parent proof for every prerequisite publication. */
+    originalRecordPublicationOriginals?: RecordPublicationOriginals;
     /** Source-owned publication closes its original physical proof at the fixed commit. */
     withVerifiedPublication?: (
       commit: (terminalPhysicalCurrent: () => void) => void,
@@ -168,7 +171,13 @@ export function createReportSnapshotCatalog(
             terminalPhysicalCurrent();
             collections.commitMaintenance(prepared, { assertCurrent: terminalPhysicalCurrent });
           };
-          if (publication && options.withVerifiedPublication)
+          if (options.originalRecordPublicationOriginals)
+            await collections.commitMaintenanceWithOriginalsAsync(
+              prepared,
+              options.originalRecordPublicationOriginals,
+              { assertCurrent },
+            );
+          else if (publication && options.withVerifiedPublication)
             await options.withVerifiedPublication((terminalPhysicalCurrent) => {
               commit(terminalPhysicalCurrent);
               assertCurrent();

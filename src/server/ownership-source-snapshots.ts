@@ -15,6 +15,7 @@ import {
   withIntakeWork,
   type IntakeWorkPhase,
 } from './intake-work-accounting.ts';
+import type { RecordPublicationOriginals } from './record-versions.ts';
 
 export interface OwnershipSourceSnapshotReference {
   format: 'health-ownership-source-snapshot-v1';
@@ -97,7 +98,10 @@ function open(
 export function createOwnershipSourceSnapshotPreparation(
   db: Database,
   source: IntakeEnvelopeSource,
-  options: { assertRunning?: () => void } = {},
+  options: {
+    assertRunning?: () => void;
+    originalRecordPublicationOriginals?: RecordPublicationOriginals;
+  } = {},
 ) {
   const initial = selectedEnvelopeStore(db, source),
     { collections } = initial,
@@ -234,7 +238,7 @@ export function createOwnershipSourceSnapshotPreparation(
     async finishMaintenance() {
       const prepared = await this.finish();
       try {
-        prepared.publishMaintenance();
+        await prepared.publishMaintenance();
       } finally {
         prepared.dispose();
       }
@@ -262,6 +266,28 @@ export function createOwnershipSourceSnapshotPreparation(
         publishMaintenance() {
           if (disposed) throw Error('Disposed ownership source snapshots');
           assertCurrent();
+          if (options.originalRecordPublicationOriginals)
+            return collections
+              .commitMaintenanceWithOriginalsAsync(
+                prepared,
+                options.originalRecordPublicationOriginals,
+                {
+                  assertCurrent: () => {
+                    options.assertRunning?.();
+                    if (clinicalReviewRevision(db) !== basis)
+                      throw Error('Ownership source evidence changed during publication');
+                    const current = selectedEnvelopeStore(db, source);
+                    if (
+                      current.source.sha256 !== initial.source.sha256 ||
+                      current.source.details_json !== initial.source.details_json
+                    )
+                      throw Error('Ownership source snapshot original changed');
+                  },
+                },
+              )
+              .then(() => {
+                published = true;
+              });
           collections.commitMaintenance(prepared);
           published = true;
         },

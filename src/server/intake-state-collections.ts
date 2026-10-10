@@ -11,6 +11,7 @@ import {
 } from './database.ts';
 import {
   prepareIntakeMaintenancePublication,
+  discardIntakeMaintenancePublication,
   stageIntakeCompactMetadataPublication,
   prepareIntakeCompactReadmission,
   prepareIntakeCompactTerminalPublication,
@@ -24,7 +25,16 @@ import {
   expectIntakeFrontierMetaWrite,
   finishIntakeFrontierMetaWrite,
 } from './intake-lookup-frontier-observer.ts';
-import { assertRecordCompactReadmission } from './record-versions.ts';
+import {
+  assertRecordCompactReadmission,
+  authenticateRecordTransactionPreparation,
+  commitRecordTransactionPreparation,
+  discardRecordTransactionPreparation,
+  prepareRecordTransactionWithOriginals,
+  stageRecordTransactionPreparation,
+  type RecordPublicationOriginals,
+  type RecordTransactionPreparation,
+} from './record-versions.ts';
 import {
   prepareIntakeLegacyBridgeProof,
   prepareIntakeLegacyBridgeProofAsync,
@@ -2093,6 +2103,76 @@ export function createIntakeCollections(owner: {
       }
       if (!admitted) blockIntakeFrontierReadmission(db);
       return result;
+    },
+    async commitMaintenanceWithOriginalsAsync(
+      prepared: PreparedIntakeCollectionMutation,
+      originals: RecordPublicationOriginals,
+      options: { assertCurrent?: () => void } = {},
+    ): Promise<IntakeCollectionResult> {
+      const operation = currentClinicalOperation(db);
+      if (!operation) invalid('original-backed maintenance requires its live record owner');
+      const assertCurrent = () => {
+        assertClinicalOperation(db, operation!);
+        const guarded: unknown = options.assertCurrent?.();
+        if (
+          guarded &&
+          (typeof guarded === 'object' || typeof guarded === 'function') &&
+          'then' in guarded
+        )
+          invalid('collection publication guard must finish synchronously');
+      };
+      assertCurrent();
+      const data = run(() => inspect(prepared));
+      if (data.legacyBridge || data.compactMetadata)
+        invalid('representation maintenance requires its specialized original proof');
+      const current = run(() => selected()),
+        retained = receipt(current.head, data.result.operationId, data.requestDigest);
+      if (retained) {
+        discard(prepared);
+        return structuredClone(retained);
+      }
+      if (data.before === undefined) invalid('maintenance requires initialized collection head');
+      const fingerprint = prefix + data.requestDigest,
+        capability = prepareIntakeMaintenancePublication(db, {
+          identity,
+          beforeHead: data.before,
+          afterHead: data.after,
+          writes: data.writes,
+          result: data.result,
+          operationId: data.result.operationId,
+          fingerprint,
+        });
+      let preparation: RecordTransactionPreparation | undefined;
+      try {
+        preparation = await prepareRecordTransactionWithOriginals(
+          db,
+          () => api.stage(prepared, { assertCurrent }),
+          {
+            operationId: data.result.operationId,
+            fingerprint,
+            actor: 'intake-state',
+            intakeMaintenance: capability,
+          },
+          originals,
+        );
+        assertCurrent();
+        await authenticateRecordTransactionPreparation(db, preparation);
+        assertCurrent();
+        await stageRecordTransactionPreparation(db, preparation);
+        assertCurrent();
+        const result = await commitRecordTransactionPreparation<IntakeCollectionResult>(
+          db,
+          preparation,
+        );
+        assertCurrent();
+        return result;
+      } finally {
+        try {
+          if (preparation) discardRecordTransactionPreparation(db, preparation);
+        } finally {
+          discardIntakeMaintenancePublication(capability);
+        }
+      }
     },
     commitMaintenance(
       prepared: PreparedIntakeCollectionMutation,

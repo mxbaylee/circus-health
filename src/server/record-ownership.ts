@@ -988,7 +988,7 @@ export function getRecordOwnershipReceipt(
     replayed: true,
   };
 }
-type OwnershipUnitIntent =
+export type OwnershipUnitIntent =
   | { replayed: OwnershipReceipt }
   | {
       operation: TransactionOperation;
@@ -996,13 +996,15 @@ type OwnershipUnitIntent =
       finish(committed: Omit<OwnershipReceipt, 'outcomes'>): OwnershipReceipt;
     };
 
-function commitOwnershipUnit(...args: Parameters<typeof ownershipUnitIntent>): OwnershipReceipt {
-  const intent = ownershipUnitIntent(...args);
+function commitOwnershipUnit(
+  ...args: Parameters<typeof prepareRecordOwnershipPlannedUnit>
+): OwnershipReceipt {
+  const intent = prepareRecordOwnershipPlannedUnit(...args);
   if ('replayed' in intent) return intent.replayed;
   return intent.finish(transaction(args[0], intent.run, intent.operation));
 }
 
-function ownershipUnitIntent(
+export function prepareRecordOwnershipPlannedUnit(
   db: Database,
   root: string,
   profileId: string,

@@ -64,6 +64,7 @@ import {
   assertRecordReadOwnerTerminal,
   closeRecordReadOwner,
   type RecordReadOwner,
+  type RecordPublicationOriginals,
 } from './record-versions.ts';
 import {
   captureOwnershipReadInterval,
@@ -851,7 +852,10 @@ export async function prepareOwnershipReportPlan(
                 yield readOwnershipStreamContribution(db, kind, recordId, String(row.source_id));
             });
           },
-          async prepareSourceSnapshots(this: { stageSourceSnapshots(): void }) {
+          async prepareSourceSnapshots(
+            this: { stageSourceSnapshots(): void },
+            originalRecordPublicationOriginals?: RecordPublicationOriginals,
+          ) {
             return runExclusiveClinicalOperation(
               db,
               async () => {
@@ -881,6 +885,9 @@ export async function prepareOwnershipReportPlan(
                         assertCurrent();
                         plan!.assertCurrent();
                       },
+                      ...(originalRecordPublicationOriginals
+                        ? { originalRecordPublicationOriginals }
+                        : {}),
                     },
                   );
                 for (const item of store.records) {

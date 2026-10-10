@@ -12,12 +12,27 @@ import type { Database } from './database.ts';
 import { HttpError } from './database.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import { ownershipRequest, object, text, invalid } from './record-ownership-input.ts';
-import { previewRecordOwnership, commitRecordOwnershipPlannedUnit } from './record-ownership.ts';
+import { previewRecordOwnership, prepareRecordOwnershipPlannedUnit } from './record-ownership.ts';
 import { type PreparedOwnershipNamePlan } from './ownership-name-plan.ts';
-import { getNote } from './notes.ts';
 import { childOwnershipOperation, ownershipPlans } from './ownership-groups.ts';
 import { ownershipHash } from './ownership-journal.ts';
-import type { OwnershipCommit, OwnershipPreview } from '../shared/record-ownership.ts';
+import {
+  authenticateRecordTransactionPreparation,
+  captureRecordPublicationOriginals,
+  closeRecordPublicationOriginals,
+  commitRecordTransactionPreparation,
+  discardRecordTransactionPreparation,
+  prepareRecordTransactionWithOriginals,
+  stageRecordTransactionPreparation,
+  type RecordPublicationOriginals,
+  type RecordTransactionPreparation,
+} from './record-versions.ts';
+import { captureOwnershipReportOriginalProof } from './ownership-report-plan.ts';
+import type {
+  OwnershipCommit,
+  OwnershipPreview,
+  OwnershipReceipt,
+} from '../shared/record-ownership.ts';
 import type { OwnershipPreviewReference } from '../shared/ownership-name-reference.ts';
 
 const selectedPlans = new WeakMap<
@@ -307,6 +322,143 @@ export async function commitNativeRecordOwnership(
     { operation: currentClinicalOperation(db) },
   );
 }
+const approvedOwnershipChildren = new WeakMap<
+  object,
+  {
+    parent: PreparedOwnershipReportPlan;
+    originals: RecordPublicationOriginals;
+    parentScope: string;
+    group: string;
+    operationId: string;
+    selection: string;
+    destination: string;
+    relationships: string;
+    names: string;
+  }
+>();
+function approveOwnershipChild(
+  parent: PreparedOwnershipReportPlan,
+  originals: RecordPublicationOriginals,
+  parentScope: string,
+  group: OwnershipPreview['commitGroups'][number],
+  operationId: string,
+  childRequest: ReturnType<PreparedOwnershipReportPlan['requestForGroup']>,
+  relationships: readonly { decisionId: string; action: 'withdraw' }[],
+  names: readonly { key: string; outcome: string }[],
+) {
+  const capability = Object.freeze({});
+  approvedOwnershipChildren.set(capability, {
+    parent,
+    originals,
+    parentScope,
+    group: ownershipHash(group),
+    operationId,
+    selection: ownershipHash(childRequest.selection),
+    destination: ownershipHash(childRequest.destination),
+    relationships: ownershipHash(
+      [...relationships].sort((a, b) => a.decisionId.localeCompare(b.decisionId)),
+    ),
+    names: ownershipHash(names),
+  });
+  return capability;
+}
+function consumeApprovedOwnershipChild(
+  capability: object,
+  parent: PreparedOwnershipReportPlan,
+  originals: RecordPublicationOriginals,
+  parentScope: string,
+  group: OwnershipPreview['commitGroups'][number],
+  operationId: string,
+  child: PreparedOwnershipReportPlan,
+  current: OwnershipPreview,
+  relationships: readonly { decisionId: string; action: 'withdraw' }[],
+  approvedNames: readonly { key: string; outcome: string }[],
+) {
+  const grant = approvedOwnershipChildren.get(capability);
+  approvedOwnershipChildren.delete(capability);
+  const actualNames = [...child.plan.choices()].sort((a, b) => a.key.localeCompare(b.key));
+  const expectedNames = approvedNames
+    .filter((choice) => child.plan.has(choice.key))
+    .sort((a, b) => a.key.localeCompare(b.key));
+  const actualRelationships = [...child.choices()]
+    .filter(
+      (choice): choice is { relationshipId: string; withdraw: true } => 'relationshipId' in choice,
+    )
+    .map((choice) => ({ decisionId: choice.relationshipId, action: 'withdraw' as const }))
+    .sort((a, b) => a.decisionId.localeCompare(b.decisionId));
+  if (
+    !grant ||
+    grant.parent !== parent ||
+    grant.originals !== originals ||
+    grant.parentScope !== parentScope ||
+    grant.group !== ownershipHash(group) ||
+    grant.operationId !== operationId ||
+    grant.selection !== ownershipHash(current.request.selection) ||
+    grant.destination !== ownershipHash(current.request.destination) ||
+    grant.relationships !==
+      ownershipHash([...relationships].sort((a, b) => a.decisionId.localeCompare(b.decisionId))) ||
+    grant.relationships !== ownershipHash(actualRelationships) ||
+    grant.names !== ownershipHash(approvedNames) ||
+    ownershipHash(expectedNames) !== ownershipHash(actualNames)
+  )
+    throw new HttpError(409, 'OWNERSHIP_CHANGED', 'The approved group changed before saving');
+}
+async function publishPreparedOwnershipUnit(
+  db: Database,
+  root: string,
+  profileId: string,
+  input: OwnershipCommit,
+  namePlan: PreparedOwnershipNamePlan,
+  report: PreparedOwnershipReportPlan,
+  originals: RecordPublicationOriginals,
+  parent?: { operationId: string; fingerprint: string; groups: OwnershipPreview['commitGroups'] },
+): Promise<{
+  receipt: OwnershipReceipt;
+  destination?: { noteId: string; expectedVersion: number };
+}> {
+  const intent = prepareRecordOwnershipPlannedUnit(
+    db,
+    root,
+    profileId,
+    input,
+    parent,
+    namePlan,
+    report,
+  );
+  if ('replayed' in intent) return { receipt: intent.replayed };
+  let preparation: RecordTransactionPreparation | undefined;
+  try {
+    preparation = await prepareRecordTransactionWithOriginals(
+      db,
+      () => {
+        const committed = intent.run();
+        const destination = db
+          .prepare("SELECT id,version FROM notes WHERE kind='person' AND person_id=?")
+          .get(committed.destinationPersonId);
+        if (!destination) throw Error('Accepted ownership destination has no People entry');
+        return {
+          committed,
+          destination: {
+            noteId: String(destination.id),
+            expectedVersion: Number(destination.version),
+          },
+        };
+      },
+      intent.operation,
+      originals,
+    );
+    await authenticateRecordTransactionPreparation(db, preparation);
+    await stageRecordTransactionPreparation(db, preparation);
+    const accepted = await commitRecordTransactionPreparation<{
+      committed: ReturnType<typeof intent.run>;
+      destination: { noteId: string; expectedVersion: number };
+    }>(db, preparation);
+    return { receipt: intent.finish(accepted.committed), destination: accepted.destination };
+  } finally {
+    if (preparation) discardRecordTransactionPreparation(db, preparation);
+  }
+}
+
 async function commitNativeOwnershipOwned(
   db: Database,
   root: string,
@@ -358,73 +510,90 @@ async function commitNativeOwnershipOwned(
     if (!receipt) throw Error('Accepted correction is missing its durable outcome reference');
     return { ...receipt, replayed: false };
   };
-  if (preview.commitGroups.length <= 1) {
-    await report.prepareSourceSnapshots();
-    await report.withVerifiedPublication(() =>
-      commitRecordOwnershipPlannedUnit(
+  const original = captureOwnershipReportOriginalProof(report, db, profileId);
+  const originals = await captureRecordPublicationOriginals(db, profileId, original);
+  try {
+    if (preview.commitGroups.length <= 1) {
+      await report.prepareSourceSnapshots(originals);
+      await publishPreparedOwnershipUnit(
         db,
         root,
         profileId,
-        input,
+        supplied,
         selected.plan,
-        undefined,
         report,
-      ),
-    );
-    return published();
-  }
-  const fingerprint = ownershipHash({ ...supplied, request }),
-    approvedChoices = selected.plan.approvedChoices();
-  let destination = request.destination;
-  for (const group of preview.commitGroups) {
-    let child: PreparedOwnershipReportPlan | undefined;
-    try {
-      if ('noteId' in destination)
-        destination = { ...destination, expectedVersion: getNote(db, destination.noteId).version };
-      const childRequest = { ...report.requestForGroup(group), destination };
-      const prepared = await prepare(db, root, profileId, childRequest, {
-        approvedRelationshipDecisions: () => report.relationshipChoicesForGroup(group),
-      });
-      child = prepared.report;
-      const childPlan = child;
-      for (const choice of approvedChoices())
-        if (child.plan.has(choice.key)) child.plan.choose(choice.key, choice.outcome);
-      const current = await child.finalizeVerified();
-      await child.prepareSourceSnapshots();
-      const receipt = await child.withVerifiedPublication(() =>
-        commitRecordOwnershipPlannedUnit(
+        originals,
+      );
+      return published();
+    }
+    const fingerprint = ownershipHash({ ...supplied, request }),
+      approvedChoices = [...selected.plan.approvedChoices()()];
+    let destination = request.destination;
+    for (const group of preview.commitGroups) {
+      let child: PreparedOwnershipReportPlan | undefined;
+      try {
+        const childOperationId = childOwnershipOperation(supplied.operationId, group.id),
+          relationshipChoices = [...report.relationshipChoicesForGroup(group)],
+          childRequest = { ...report.requestForGroup(group), destination },
+          approvedChild = approveOwnershipChild(
+            report,
+            originals,
+            preview.scopeToken,
+            group,
+            childOperationId,
+            childRequest,
+            relationshipChoices,
+            approvedChoices,
+          );
+        const prepared = await prepare(db, root, profileId, childRequest, {
+          approvedRelationshipDecisions: () => relationshipChoices,
+        });
+        child = prepared.report;
+        const childPlan = child;
+        for (const choice of approvedChoices)
+          if (child.plan.has(choice.key)) child.plan.choose(choice.key, choice.outcome);
+        const current = await child.finalizeVerified();
+        consumeApprovedOwnershipChild(
+          approvedChild,
+          report,
+          originals,
+          preview.scopeToken,
+          group,
+          childOperationId,
+          child,
+          current,
+          relationshipChoices,
+          approvedChoices,
+        );
+        await child.prepareSourceSnapshots(originals);
+        const accepted = await publishPreparedOwnershipUnit(
           db,
           root,
           profileId,
           {
-            operationId: childOwnershipOperation(supplied.operationId, group.id),
+            operationId: childOperationId,
             request: current.request,
             scopeToken: current.scopeToken,
             version: current.version,
           },
           childPlan.plan,
-          { operationId: supplied.operationId, fingerprint, groups: preview.commitGroups },
           childPlan,
-        ),
-      );
-      if ('newPerson' in destination) {
-        const note = db
-          .prepare("SELECT id FROM notes WHERE kind='person' AND person_id=?")
-          .get(receipt.destinationPersonId);
-        if (!note) throw Error('Ownership destination is unavailable');
-        destination = {
-          noteId: String(note.id),
-          expectedVersion: getNote(db, String(note.id)).version,
-        };
+          originals,
+          { operationId: supplied.operationId, fingerprint, groups: preview.commitGroups },
+        );
+        if (!accepted.destination) throw Error('Accepted group destination version unavailable');
+        destination = accepted.destination;
+      } catch (error) {
+        if (!ownershipPlans(db, supplied.operationId).length) throw error;
+        return published();
+      } finally {
+        child?.close();
       }
-    } catch (error) {
-      if (!ownershipPlans(db, supplied.operationId).length) throw error;
-      return published();
-    } finally {
-      child?.close();
     }
+    return published();
+  } finally {
+    closeRecordPublicationOriginals(originals);
   }
-  return published();
 }
 
 function selectedOwnershipReportPlan(db: Database, profileId: string, token: string) {

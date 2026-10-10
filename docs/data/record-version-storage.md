@@ -65,8 +65,18 @@ then requires a distinct issuer-bound final token, unchanged source bindings and
 the frozen write roster. General revision advances while clinical-review
 revision stays unchanged. Explicit invalidation, lock and unrelated rollback
 still revoke retained preparations. Compact-metadata and legacy representation
-bridges retain their specialized paths; this support does not activate public
-ownership checkpoints by itself.
+bridges retain their specialized paths.
+
+Native ownership commits capture the selected parent originals before prerequisite
+snapshot publication. Snapshot checkpoints and final adoption use that same
+capability. Each approved child executes its business intent in preparation once;
+final publication replays the frozen effects. Private one-use grants bind the
+parent, group, operation, reviewed choices and destination. Later children reuse
+the destination identity and version returned by the preceding accepted child,
+not a newly observed destination version. Fictional checks cover a single unit,
+two independent groups with an existing destination, and two groups creating one
+new destination. They do not qualify every clinical, name, link or report-selection
+combination, nor remove complete physical verification.
 
 ## Current data and searchable history
 
