@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { crc32 } from 'node:zlib';
 import { openSync, closeSync, fstatSync, writeSync } from 'node:fs';
-import { fromFd, type Entry, type LocalFileHeader, type ZipFile } from 'yauzl';
+import { fromFd, Entry, type LocalFileHeader, type ZipFile } from 'yauzl';
 import { pathToFileURL } from 'node:url';
 import type { Readable, Writable } from 'node:stream';
 import {
@@ -10,6 +10,15 @@ import {
   type InspectedPackageMember,
   type PackageInspectionWork,
 } from './intake-package-worker.ts';
+
+import {
+  readPackageRecords,
+  writePackageRecord,
+  validPackageDescriptor,
+  safePackageFilename,
+  emptyPackageTraversalWork,
+  type PackageCentralDescriptor,
+} from './intake-package-protocol.ts';
 
 const MIB = 1024 * 1024;
 /** With bit 3 clear the local declarations are authoritative. ZIP64 replaces
@@ -363,9 +372,288 @@ export async function inspectPackageToProtocol(
     if (!transportError) output.off('error', onError);
   }
 }
+/** Explicit bounded path. Legacy array callers and metadata safeguards above
+ * remain unchanged until the package authority/consumer migration is complete. */
+export async function inspectBoundedPackageToProtocol(
+  sourceFd: number,
+  outputFd: number | undefined,
+  mode: 'inventory' | 'selected',
+  input: Readable,
+  output: Writable,
+): Promise<boolean> {
+  const commands = readPackageRecords(input)[Symbol.asyncIterator]();
+  const work = emptyPackageTraversalWork();
+  let current: PackageCentralDescriptor | undefined;
+  let archive: ZipFile | undefined;
+  // A failed Writable can emit its error after invoking the write callback.
+  let transportFailure: Error | undefined;
+  output.on('error', (error) => {
+    transportFailure = error;
+  });
+  const send = (message: unknown) => writePackageRecord(output, message);
+  const command = async () => {
+    const item = await commands.next();
+    if (item.done)
+      throw new PackageInspectionError('ZIP receiver disconnected', 'PACKAGE_PROTOCOL');
+    return item.value;
+  };
+  const fail = (message: string, reason: string): never => {
+    throw new PackageInspectionError(
+      message,
+      reason,
+      current?.filename,
+      current?.ordinal ?? undefined,
+    );
+  };
+  const ack = async (sequence: number) => {
+    const next = await command();
+    if (next.type !== 'ack' || next.sequence !== sequence)
+      fail('ZIP metadata acknowledgement does not match', 'PACKAGE_PROTOCOL');
+  };
+  try {
+    const begin = await command();
+    const source = fstatSync(sourceFd);
+    if (
+      begin.type !== 'begin' ||
+      begin.mode !== mode ||
+      !source.isFile() ||
+      begin.bytes !== source.size
+    )
+      fail('ZIP source binding does not match', 'PACKAGE_SOURCE');
+    archive = await new Promise<ZipFile>((resolve, reject) =>
+      fromFd(
+        sourceFd,
+        { lazyEntries: true, autoClose: false, strictFileNames: true, validateEntrySizes: true },
+        (error, zip) => (error ? reject(error) : resolve(zip!)),
+      ),
+    );
+    let archiveFailure: Error | undefined;
+    archive.on('error', (error) => {
+      archiveFailure = error;
+    });
+    const verify = async (d: PackageCentralDescriptor, expectedHash?: string) => {
+      if (!validPackageDescriptor(d) || d.directory || d.ordinal === null)
+        fail('ZIP checked descriptor is invalid', 'PACKAGE_SELECTION');
+      current = d;
+      if (d.localHeaderOffset + 30 > source.size || !Number.isSafeInteger(d.localHeaderOffset + 30))
+        fail('ZIP member header exceeds source bounds', 'PACKAGE_HEADER');
+      const entry = Object.assign(new Entry(), {
+        relativeOffsetOfLocalHeader: d.localHeaderOffset,
+        compressedSize: d.compressedBytes,
+        uncompressedSize: d.bytes,
+        compressionMethod: d.compression,
+        generalPurposeBitFlag: d.flags,
+        crc32: d.crc32,
+        fileNameRaw: Buffer.from(d.rawName, 'base64'),
+        fileName: d.filename,
+        extraFields: [],
+        extraFieldRaw: Buffer.alloc(0),
+      });
+      const local = await archive!.readLocalFileHeaderPromise(entry);
+      if (
+        !local.fileName.equals(entry.fileNameRaw) ||
+        local.compressionMethod !== d.compression ||
+        local.generalPurposeBitFlag !== d.flags
+      )
+        fail('ZIP local header does not match checked inventory', 'PACKAGE_HEADER');
+      if (!(d.flags & 8)) {
+        const sizes = localDeclaredSizes(local);
+        if (
+          !sizes ||
+          sizes.compressed !== BigInt(d.compressedBytes) ||
+          sizes.uncompressed !== BigInt(d.bytes) ||
+          local.crc32 !== d.crc32
+        )
+          fail('ZIP local header CRC or sizes do not match checked inventory', 'PACKAGE_HEADER');
+      }
+      if (
+        !Number.isSafeInteger(local.fileDataStart + d.compressedBytes) ||
+        local.fileDataStart + d.compressedBytes > source.size
+      )
+        fail('ZIP payload exceeds source bounds', 'PACKAGE_HEADER');
+      const stream = await new Promise<Readable>((resolve, reject) =>
+        archive!.openReadStream(entry, (error, stream) =>
+          error ? reject(error) : resolve(stream!),
+        ),
+      );
+      const digest = createHash('sha256');
+      let bytes = 0,
+        checksum = 0,
+        lastProgress = 0;
+      work.descriptorReads++;
+      for await (const value of stream) {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        bytes = add(bytes, chunk.length);
+        if (bytes > d.bytes) fail('ZIP expanded size disagrees with inventory', 'PACKAGE_SIZE');
+        work.memberReadBytes = add(work.memberReadBytes, chunk.length);
+        work.hashBytes = add(work.hashBytes, chunk.length);
+        work.crcBytes = add(work.crcBytes, chunk.length);
+        work.peakChunkBytes = Math.max(work.peakChunkBytes, chunk.length);
+        digest.update(chunk);
+        checksum = crc32(chunk, checksum);
+        if (outputFd !== undefined) {
+          let offset = 0;
+          while (offset < chunk.length) {
+            const n = writeSync(outputFd, chunk, offset, chunk.length - offset);
+            if (!n) fail('ZIP staging write made no progress', 'PACKAGE_STORAGE');
+            offset += n;
+            work.writtenBytes = add(work.writtenBytes, n);
+          }
+        }
+        if (work.memberReadBytes - lastProgress >= MIB) {
+          await send({ type: 'progress', work });
+          lastProgress = work.memberReadBytes;
+        }
+      }
+      const sourceHash = digest.digest('hex');
+      if (bytes !== d.bytes) fail('ZIP expanded size disagrees with inventory', 'PACKAGE_SIZE');
+      if (checksum !== d.crc32) fail('ZIP checksum disagrees with inventory', 'PACKAGE_CHECKSUM');
+      if (expectedHash !== undefined && sourceHash !== expectedHash)
+        fail('ZIP member hash disagrees with selected inventory', 'PACKAGE_CHANGED');
+      work.membersVerified++;
+      return sourceHash;
+    };
+    if (mode === 'selected') {
+      if (outputFd === undefined || !fstatSync(outputFd).isFile() || fstatSync(outputFd).size !== 0)
+        fail('ZIP output must be an empty private regular file', 'PACKAGE_SELECTION');
+      const selected = await command();
+      const d = selected.descriptor as PackageCentralDescriptor;
+      if (
+        selected.type !== 'selected' ||
+        !validPackageDescriptor(d) ||
+        typeof selected.sourceHash !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(selected.sourceHash)
+      )
+        fail('ZIP selected capability is invalid', 'PACKAGE_SELECTION');
+      const sourceHash = await verify(d, selected.sourceHash as string);
+      await send({ type: 'selected_verified', descriptor: d, sourceHash, work });
+      await ack(0);
+      await send({ type: 'complete', work });
+      return true;
+    }
+    let centralOrdinal = 0,
+      ordinal = 0,
+      expandedBytes = 0;
+    for await (const entry of archive.eachEntry()) {
+      current = undefined;
+      const name = entry.fileName;
+      const d: PackageCentralDescriptor = {
+        centralOrdinal,
+        ordinal: name.endsWith('/') ? null : ordinal,
+        filename: name,
+        rawName: entry.fileNameRaw.toString('base64'),
+        directory: name.endsWith('/'),
+        localHeaderOffset: entry.relativeOffsetOfLocalHeader,
+        compressedBytes: entry.compressedSize,
+        bytes: entry.uncompressedSize,
+        compression: entry.compressionMethod as 0 | 8,
+        flags: entry.generalPurposeBitFlag,
+        crc32: entry.crc32,
+        externalAttributes: entry.externalFileAttributes >>> 0,
+      };
+      if (!safePackageFilename(name)) fail('ZIP central declaration is unsafe', 'PACKAGE_METADATA');
+      current = d;
+      if (d.flags & 1) fail('Encrypted ZIP members are unsupported', 'PACKAGE_ENCRYPTED');
+      if (![0, 8].includes(d.compression))
+        fail('Unsupported ZIP compression', 'PACKAGE_COMPRESSION');
+      if (d.directory && d.bytes !== 0)
+        fail('ZIP directory carries unexpected data', 'PACKAGE_DIRECTORY');
+      if (!validPackageDescriptor(d))
+        fail('ZIP central declaration is unsafe or unsupported', 'PACKAGE_METADATA');
+      work.centralDeclarations++;
+      if (!d.directory) {
+        expandedBytes = add(expandedBytes, d.bytes);
+        ordinal++;
+      }
+      await send({ type: 'declaration', descriptor: d, work });
+      await ack(centralOrdinal);
+      centralOrdinal++;
+      current = undefined;
+    }
+    current = undefined;
+    if (archiveFailure || centralOrdinal !== archive.entryCount)
+      fail('ZIP central inventory did not complete', 'PACKAGE_FORMAT');
+    const summary = { entries: centralOrdinal, members: ordinal, expandedBytes };
+    await send({ type: 'central_complete', summary, work });
+    await ack(centralOrdinal);
+    for (let selectedOrdinal = 0; selectedOrdinal < ordinal; selectedOrdinal++) {
+      await send({ type: 'need_descriptor', ordinal: selectedOrdinal });
+      const next = await command();
+      const d = next.descriptor as PackageCentralDescriptor;
+      if (
+        !['descriptor', 'verified_descriptor'].includes(String(next.type)) ||
+        !validPackageDescriptor(d) ||
+        d.ordinal !== selectedOrdinal
+      )
+        fail('ZIP descriptor order disagrees with inventory', 'PACKAGE_PROTOCOL');
+      if (next.type === 'verified_descriptor') {
+        // This command exists only on the host-owned inherited protocol. The
+        // host checks accepted prefix roots and the current source lease; no
+        // caller-provided descriptor can reach this shortcut.
+        if (typeof next.sourceHash !== 'string' || !/^[a-f0-9]{64}$/.test(next.sourceHash))
+          fail('Retained ZIP verification digest is invalid', 'PACKAGE_PROTOCOL');
+        work.membersReused++;
+        work.reusedPayloadBytes = add(work.reusedPayloadBytes, d.bytes);
+        await send({ type: 'member_reused', descriptor: d, sourceHash: next.sourceHash, work });
+        await ack(selectedOrdinal);
+        continue;
+      }
+      const sourceHash = await verify(d);
+      await send({ type: 'member_verified', descriptor: d, sourceHash, work });
+      await ack(selectedOrdinal);
+    }
+    current = undefined;
+    if (archiveFailure) fail('ZIP source failed during verification', 'PACKAGE_FORMAT');
+    await send({ type: 'complete', summary, work });
+    return true;
+  } catch (error) {
+    if (transportFailure) throw transportFailure;
+    const code = (error as NodeJS.ErrnoException).code;
+    const reasonCode =
+      error instanceof PackageInspectionError
+        ? error.reasonCode
+        : ['ENOSPC', 'EDQUOT'].includes(code || '')
+          ? 'PACKAGE_STORAGE_FULL'
+          : ['EIO', 'EROFS', 'EACCES', 'EBADF'].includes(code || '')
+            ? 'PACKAGE_STORAGE'
+            : 'PACKAGE_FORMAT';
+    const message =
+      reasonCode === 'PACKAGE_STORAGE_FULL'
+        ? 'Extraction storage is full; free runtime or archive space and retry.'
+        : reasonCode === 'PACKAGE_STORAGE'
+          ? 'Extraction storage is unavailable; restore writable storage and retry.'
+          : error instanceof PackageInspectionError
+            ? error.message
+            : 'ZIP inventory or member could not be safely read';
+    await send({
+      type: 'error',
+      reasonCode,
+      message,
+      filename: current?.filename,
+      ordinal: current?.ordinal ?? undefined,
+      work,
+    });
+    return false;
+  } finally {
+    archive?.close();
+    await commands.return(undefined);
+  }
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    if (
+    if (process.argv[2] === '--bounded-inventory' || process.argv[2] === '--checked-member') {
+      if (
+        !(await inspectBoundedPackageToProtocol(
+          3,
+          process.argv[2] === '--checked-member' ? 4 : undefined,
+          process.argv[2] === '--checked-member' ? 'selected' : 'inventory',
+          process.stdin,
+          process.stdout,
+        ))
+      )
+        process.exitCode = 1;
+    } else if (
       !(await inspectPackageToProtocol(
         3,
         process.argv[2] === undefined ? null : Number(process.argv[2]),

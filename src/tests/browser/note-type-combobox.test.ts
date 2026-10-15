@@ -102,11 +102,36 @@ test(
     await page.getByLabel('I have saved my recovery key').check();
     await page.getByRole('button', { name: 'Verify recovery key', exact: true }).click();
     await page.getByLabel('Recovery key').fill(recovery);
+    const verified = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'POST' &&
+        /^\/api\/profile-setups\/[^/]+\/verify$/.test(new URL(response.url()).pathname),
+      { timeout: 5000 },
+    );
     await page.getByRole('button', { name: 'Open profile' }).click();
-    await page
-      .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
-      .getByRole('button', { name: 'Skip', exact: true })
-      .click();
+    const verification = await verified;
+    assert.equal(verification.status(), 201, 'recovery verification must succeed');
+    try {
+      await page
+        .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
+        .getByRole('button', { name: 'Skip', exact: true })
+        .click();
+    } catch (error) {
+      const dialogs = await page
+        .getByRole('dialog')
+        .evaluateAll((elements) =>
+          elements.map(
+            (element) =>
+              element.getAttribute('aria-label') ||
+              element.getAttribute('aria-labelledby') ||
+              'unnamed',
+          ),
+        );
+      t.diagnostic(
+        `after verification: HTTP ${verification.status()}, dialogs ${JSON.stringify(dialogs)}, alerts ${await page.getByRole('alert').count()}`,
+      );
+      throw error;
+    }
     const setup = page.getByRole('dialog', { name: 'Care contacts' });
     for (const step of ['Primary care provider', 'Emergency contact']) {
       await setup.getByRole('heading', { name: step, exact: true }).waitFor();

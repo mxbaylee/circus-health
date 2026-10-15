@@ -134,7 +134,7 @@ export async function withPrivateChildStage<T>(
     fsyncIntakeFileSync(fd);
     closeSync(fd);
     fd = undefined;
-    return publish({ path, bytes, sha256, prefix });
+    return await publish({ path, bytes, sha256, prefix });
   } finally {
     if (fd !== undefined) closeSync(fd);
     // The publication may have adopted this file. Never remove the published

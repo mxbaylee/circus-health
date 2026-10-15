@@ -114,7 +114,17 @@ export async function physicalPasskeyJourney(
   await page.getByRole('button', { name: 'Verify recovery key', exact: true }).click();
   const verification = page.getByRole('dialog', { name: 'Open profile', exact: true });
   await verification.getByLabel('Recovery key', { exact: true }).fill(recovery);
+  const verified = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return (
+      url.origin === origin &&
+      /^\/api\/profile-setups\/[A-Za-z0-9_-]+\/verify$/.test(url.pathname) &&
+      response.request().method() === 'POST'
+    );
+  });
   await verification.getByRole('button', { name: 'Open profile', exact: true }).click();
+  assert.equal((await verified).status(), 201);
+  await page.getByRole('dialog', { name: 'Recovery unlocked', exact: true }).waitFor();
   const created = await api<{ id: string }[]>('/api/profiles');
   assert.equal(created.length, 1);
   ownProfile(created[0].id);

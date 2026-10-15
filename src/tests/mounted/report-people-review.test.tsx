@@ -1,12 +1,18 @@
+import { replaceProfiles, selectProfile } from '../../app/data/profile';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ReportPeopleReview,
   type IntakePeopleQueue,
   type IntakePersonProposal,
 } from '../../app/features/intake/ReportPeopleReview';
 
+const profile = { id: 'fictional-people-review', name: 'Fictional Reader', placebo: true };
+beforeEach(() => {
+  replaceProfiles([profile]);
+  selectProfile(profile);
+});
 const person = (overrides: Partial<IntakePersonProposal> = {}): IntakePersonProposal => ({
   id: 'person-proposal-1',
   version: 'person-proposal-v3',
@@ -32,7 +38,7 @@ const person = (overrides: Partial<IntakePersonProposal> = {}): IntakePersonProp
     {
       label: 'Page 2',
       locator: 'page 2, care team',
-      contentUrl: '/original#page=2',
+      contentUrl: '/api/sources/fictional-people/content#page=2',
       textAnchor: 'Follow up with Dr. Rowan Finch.',
       supports: ['fullName', 'relationship'],
       page: 2,
@@ -41,7 +47,7 @@ const person = (overrides: Partial<IntakePersonProposal> = {}): IntakePersonProp
   source: {
     sourceRecordId: 'fictional-source-record',
     filename: 'fictional-care-plan.pdf',
-    contentUrl: '/original#page=2',
+    contentUrl: '/api/sources/fictional-people/content#page=2',
     originalSourceFileId: 'fictional-source-file',
     originalSha256: 'fictional-sha256',
     member: null,
@@ -145,7 +151,7 @@ describe('report People review', () => {
     expect(screen.getByText('Follow up with Dr. Rowan Finch.')).toBeVisible();
     expect(screen.getByRole('link', { name: 'Open original' })).toHaveAttribute(
       'href',
-      '/original#page=2',
+      '/api/profiles/fictional-people-review/sources/fictional-people/content#page=2',
     );
 
     await user.click(screen.getByRole('button', { name: 'Update Dr. Rowan Finch' }));

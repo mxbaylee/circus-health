@@ -25,7 +25,9 @@ export function ImportAcceptanceOutcomes({
   receipt: IntakeReportAcceptanceReceipt | null;
   unsent?: UnsentSelection[];
 }) {
-  const people = useResource<IntakeIdentityPerson[]>(receipt && !receipt.atomic ? '/people' : null);
+  const people = useResource<IntakeIdentityPerson[]>(
+    receipt && !receipt.atomic ? '/record-ownership/people' : null,
+  );
   if (!receipt && !unsent.length) return null;
   const name = (personId?: string) => {
     if (!personId) return 'Person not confirmed';

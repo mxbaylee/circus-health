@@ -5,6 +5,7 @@ import {
   currentProfile,
   replaceProfiles,
   selectProfile,
+  subscribeProfileIdentity,
   useProfile,
   useProfiles,
 } from '../data/profile';
@@ -46,6 +47,7 @@ function ProfileSession({ children }: { children: ReactNode }) {
   }, []);
   useEffect(() => {
     const controller = new AbortController();
+    const unsubscribeIdentity = subscribeProfileIdentity(() => controller.abort());
     api<Profile[]>('/profiles', { signal: controller.signal })
       .then(({ data }) => {
         if (controller.signal.aborted) return;
@@ -68,20 +70,29 @@ function ProfileSession({ children }: { children: ReactNode }) {
         if (!controller.signal.aborted)
           setError(error instanceof ApiError ? error.message : 'Unable to reach the local server.');
       });
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      unsubscribeIdentity();
+    };
   }, [revision]);
   useEffect(() => {
     if (!loaded) return;
     let controller: AbortController | undefined;
+    let identityEpoch = 0;
+    const unsubscribeIdentity = subscribeProfileIdentity(() => {
+      identityEpoch++;
+      controller?.abort();
+    });
     const refresh = () => {
       if (document.visibilityState === 'hidden') return;
       controller?.abort();
       const request = new AbortController();
+      const requestEpoch = identityEpoch;
       controller = request;
       api<Profile[]>('/profiles', { signal: request.signal })
         .then(({ data }) => {
           // Refresh lock state after another tab opens a profile, without selecting it here.
-          if (!request.signal.aborted) replaceProfiles(data);
+          if (!request.signal.aborted && requestEpoch === identityEpoch) replaceProfiles(data);
         })
         .catch(() => {
           /* Keep the current screen available during a transient outage. */
@@ -91,6 +102,7 @@ function ProfileSession({ children }: { children: ReactNode }) {
     document.addEventListener('visibilitychange', refresh);
     return () => {
       controller?.abort();
+      unsubscribeIdentity();
       window.removeEventListener('focus', refresh);
       document.removeEventListener('visibilitychange', refresh);
     };
@@ -128,6 +140,7 @@ function ProfileSession({ children }: { children: ReactNode }) {
               </p>
               <ProfileManagement
                 initialMode={profiles.length ? 'list' : 'create'}
+                handoffHost="startup"
                 triggerLabel={profiles.length ? 'Choose profile' : 'Create profile'}
               />
             </div>
@@ -151,5 +164,13 @@ export function ProfileSwitcher({
   onBack,
   backLabel,
 }: { onBack?: () => void; backLabel?: string } = {}) {
-  return <ProfileManagement onBack={onBack} backLabel={backLabel} />;
+  const [handoffProfileId] = useState(() => currentProfile()?.id);
+  return (
+    <ProfileManagement
+      handoffHost="active"
+      handoffProfileId={handoffProfileId}
+      onBack={onBack}
+      backLabel={backLabel}
+    />
+  );
 }

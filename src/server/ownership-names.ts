@@ -1,9 +1,18 @@
-import { readStoredIntakeDetails, intakeIdentityConfirmations } from './intake-state-access.ts';
+import {
+  iterateIntakeIdentityReferences,
+  readIntakeIdentityReference,
+} from './intake-lookup-projection.ts';
+import { ownershipIntakeScopes } from './ownership-intake-scopes.ts';
+import type { IntakeIdentityReceipt } from '../shared/intake-identity.ts';
+import {
+  openIntakeIdentityReference,
+  intakeIdentityTargetMembership,
+} from './intake-identity-reference.ts';
 import { json, type Database } from './database.ts';
 import { canonicalIdentityName, safeSourceIdentityName } from '../shared/self-identity.ts';
 import type { OwnershipNameEffect, OwnershipRequest } from '../shared/record-ownership.ts';
 import { ownershipHash, appendOwnershipDecision } from './ownership-journal.ts';
-import { activeIdentityReceipts, type NameSupport } from './name-associations.ts';
+import type { NameSupport } from './name-associations.ts';
 import { getNote, rememberSourceNameInTransaction } from './notes.ts';
 
 interface CorrectionNameSupport {
@@ -28,28 +37,30 @@ function sourceNameScopes(
   const locator = json(source.locator_json) as { originalSourceFileId?: string };
   const intakeId = locator.originalSourceFileId || String(source.source_file_id);
   const file = db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(intakeId);
-  const workflow = readStoredIntakeDetails(db, intakeId)?.workflow;
   const exact = support.filter((s) => s.sourceRecordIds.includes(sourceRecordId));
-  return (workflow?.reportGroups || [])
-    .filter((group) =>
-      exact.length
-        ? exact.some((s) => s.intakeId === intakeId && s.groupId === group.id)
-        : group.versions
-            .at(-1)
-            ?.members.some((m) => m.occurrences.some((o) => o.recordId === sourceRecordId)),
-    )
-    .map((group) => ({
-      intakeId,
-      groupId: group.id,
-      sourceHash: String(file!.sha256),
-      subjectText: group.report?.subject?.text || '',
-    }));
+  return Array.from(
+    ownershipIntakeScopes(db, intakeId, sourceRecordId, {
+      latestOnly: true,
+      ...(exact.length
+        ? {
+            exactGroups: new Set(
+              exact.filter((s) => s.intakeId === intakeId).map((s) => s.groupId),
+            ),
+          }
+        : {}),
+    }),
+  ).map((group) => ({
+    intakeId,
+    groupId: group.id,
+    sourceHash: String(file!.sha256),
+    subjectText: group.subjectText,
+  }));
 }
 
 export function previewOwnershipNames(
   db: Database,
-  sources: Set<string>,
-  owners: Set<string>,
+  sources: ReadonlySet<string>,
+  owners: ReadonlySet<string>,
   request: OwnershipRequest,
 ): OwnershipNameEffect[] {
   const scopes = new Set<string>();
@@ -61,33 +72,69 @@ export function previewOwnershipNames(
     if (!source) continue;
     const locator = json(source.locator_json) as { originalSourceFileId?: string };
     const intakeId = locator.originalSourceFileId || String(source.source_file_id);
-    const workflow = readStoredIntakeDetails(db, intakeId)?.workflow;
-    for (const group of workflow?.reportGroups || [])
-      if (
-        group.versions.some((v) =>
-          v.members.some((m) => m.occurrences.some((o) => o.recordId === id)),
-        )
-      ) {
-        const key = intakeId + ':' + group.id;
-        scopes.add(key);
-        const ids = sourceScopes.get(key) || new Set<string>();
-        ids.add(id);
-        sourceScopes.set(key, ids);
-      }
+    for (const group of ownershipIntakeScopes(db, intakeId, id, { subject: false })) {
+      const key = intakeId + ':' + group.id;
+      scopes.add(key);
+      const ids = sourceScopes.get(key) || new Set<string>();
+      ids.add(id);
+      sourceScopes.set(key, ids);
+    }
   }
-  const receipts = intakeIdentityConfirmations(db);
-  const active = activeIdentityReceipts(db, receipts) || [];
+  function* active(
+    personId: string,
+    canonical?: string,
+    affectedOnly = false,
+  ): Generator<IntakeIdentityReceipt> {
+    for (const reference of iterateIntakeIdentityReferences(db)) {
+      const { header } = openIntakeIdentityReference(reference);
+      if (
+        header.personId !== personId ||
+        (canonical !== undefined && canonicalIdentityName(header.printedName) !== canonical)
+      )
+        continue;
+      // A point anti-join preserves supersession without retaining its ledger.
+      if (
+        typeof header.operationId === 'string' &&
+        db
+          .prepare(
+            "SELECT 1 FROM manual_batches WHERE title='Identity receipt supersession' AND COALESCE(CAST(json_extract(coverage_json,'$.supportOperationId') AS TEXT),'null')=? LIMIT 1",
+          )
+          .get(header.operationId)
+      )
+        continue;
+      if (
+        affectedOnly &&
+        !(
+          request.selection.type === 'report' &&
+          request.selection.intakeId === header.intakeId &&
+          request.selection.groupId === header.groupId
+        ) &&
+        !intakeIdentityTargetMembership(reference, sources).affected
+      )
+        continue;
+      yield readIntakeIdentityReference(reference) as IntakeIdentityReceipt;
+    }
+  }
   // A correction establishes new support, independent of the original receipt's
   // former owner. Follow those exact contributions on later corrections/undo.
   // See docs/import/identity-review.md#historical-attribution-and-current-name-authority.
-  const corrections =
-    activeIdentityReceipts(
-      db,
-      db
-        .prepare("SELECT coverage_json FROM manual_batches WHERE title='Ownership name support'")
-        .all()
-        .map((row) => json(row.coverage_json) as CorrectionNameSupport),
-    ) || [];
+  function* corrections(): Generator<CorrectionNameSupport> {
+    for (const row of db
+      .prepare("SELECT coverage_json FROM manual_batches WHERE title='Ownership name support'")
+      .iterate()) {
+      const receipt = json(row.coverage_json) as CorrectionNameSupport;
+      if (
+        typeof receipt.operationId === 'string' &&
+        db
+          .prepare(
+            "SELECT 1 FROM manual_batches WHERE title='Identity receipt supersession' AND COALESCE(CAST(json_extract(coverage_json,'$.supportOperationId') AS TEXT),'null')=? LIMIT 1",
+          )
+          .get(receipt.operationId)
+      )
+        continue;
+      yield receipt;
+    }
+  }
   const effects: OwnershipNameEffect[] = [];
   for (const personId of owners) {
     const row = db
@@ -96,8 +143,10 @@ export function previewOwnershipNames(
     if (!row) continue;
     const note = getNote(db, String(row.id));
     const candidates = new Map<string, string>();
-    const corrected = corrections.filter((support) => support.noteId === note.id);
-    for (const support of corrected)
+    function* corrected(): Generator<CorrectionNameSupport> {
+      for (const receipt of corrections()) if (receipt.noteId === note.id) yield receipt;
+    }
+    for (const support of corrected())
       if (
         sources.has(support.sourceRecordId) ||
         (request.selection.type === 'report' &&
@@ -105,7 +154,7 @@ export function previewOwnershipNames(
           request.selection.groupId === support.groupId)
       )
         candidates.set(canonicalIdentityName(support.name), support.name);
-    for (const r of active) {
+    for (const r of active(personId, undefined, true)) {
       const oldId = r.assignedPerson?.personId || 'patient';
       if (oldId !== personId) continue;
       const targets = r.scope.assignmentTargets || r.scope.targets;
@@ -133,16 +182,17 @@ export function previewOwnershipNames(
         candidates.set(canonicalIdentityName(source.name), source.name);
     }
     for (const [canonical, name] of candidates) {
-      const supports = active.filter(
-        (r) =>
-          (r.assignedPerson?.personId || 'patient') === personId &&
+      const support: OwnershipNameEffect['support'] = [];
+      for (const r of active(personId, canonical)) {
+        if (
+          (r.assignedPerson?.personId || 'patient') !== personId ||
           canonicalIdentityName(
             r.confirmedPrintedName || r.scope.evidencedIdentity?.fullName || '',
-          ) === canonical,
-      );
-      const support = supports.map((r) => {
+          ) !== canonical
+        )
+          continue;
         const targets = r.scope.assignmentTargets || r.scope.targets;
-        return {
+        support.push({
           operationId: r.operationId,
           sourceRecordIds: targets.map((t) => t.recordId),
           intakeId: r.scope.intakeId,
@@ -150,9 +200,11 @@ export function previewOwnershipNames(
           version: ownershipHash(r),
           affected: targets.some((t) => sources.has(t.recordId)),
           moves: targets.length > 0 && targets.every((t) => sources.has(t.recordId)),
-        };
-      });
-      const transferred = corrected.filter((s) => canonicalIdentityName(s.name) === canonical);
+        });
+      }
+      const transferred: CorrectionNameSupport[] = [];
+      for (const support of corrected())
+        if (canonicalIdentityName(support.name) === canonical) transferred.push(support);
       support.push(
         ...transferred.map((s) => ({
           operationId: s.operationId,
@@ -203,11 +255,7 @@ export function previewOwnershipNames(
             ...transferred
               .filter((s) => sources.has(s.sourceRecordId))
               .map((s) => s.sourceRecordId),
-            ...supports.flatMap((r) =>
-              (r.scope.assignmentTargets || r.scope.targets)
-                .filter((t) => sources.has(t.recordId))
-                .map((t) => t.recordId),
-            ),
+            ...support.flatMap((s) => s.sourceRecordIds.filter((id) => sources.has(id))),
             ...(note.person.sourceKnownNames || [])
               .filter((s) => canonicalIdentityName(s.name) === canonical)
               .flatMap((s) => [...(sourceScopes.get(s.intakeId + ':' + s.groupId) || [])]),

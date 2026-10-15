@@ -15,7 +15,11 @@ import { createBackup } from '../recovery.ts';
 import { rebuildProfile } from '../portable.ts';
 import { previewMappingChange } from '../clinical-import.ts';
 import { applyMappingChange } from '../mapping-actions.ts';
-import type { IntakeClinicalMapping } from '../../shared/intake.ts';
+import type { IntakeClinicalMapping, IntakeReviewRecord } from '../../shared/intake.ts';
+import type { IntakeRead } from '../../shared/intake-summary.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
+import type { IntakeClinicalReviewPage } from '../../shared/intake-clinical-review.ts';
+import type { ClinicalRecordSectionPage } from '../../shared/intake-clinical-record-sections.ts';
 import type { IntakeWithWorkflow } from '../intake-continuation.ts';
 
 type TestIntake = IntakeWithWorkflow;
@@ -645,34 +649,89 @@ test('question and plan API returns durable scoped workflow through existing res
     app = createApp({ root: f.root, databases: new Map([[f.profileId, f.db]]) });
   await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise<void>((resolve) => app.server.close(() => resolve())));
-  let item = f.upload(Buffer.from(JSON.stringify(envelope('http'))));
+  const uploaded = f.upload(Buffer.from(JSON.stringify(envelope('http'))));
+  await intake.ensureNativeIntakeSchema(f.db, f.profileId, uploaded.id);
+  let item = intake.getIntakeRead(f.db, f.root, f.profileId, uploaded.id);
+  assert.ok(isIntakeSummary(item));
   const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}/api/profiles/${f.profileId}/intakes/${encodeURIComponent(item.id)}`;
-  const post = async (action: string, body: unknown): Promise<TestIntake> => {
+  const get = async <T>(action: string): Promise<T> => {
+    const response = await fetch(base + '/' + action);
+    assert.equal(response.status, 200);
+    const envelope = await response.json();
+    assert.ok(Object.hasOwn(envelope, 'data'));
+    return envelope.data as T;
+  };
+  const post = async <T>(action: string, body: unknown): Promise<T> => {
     const response = await fetch(base + '/' + action, {
       method: 'POST',
       headers: { origin: 'http://127.0.0.1:5173', 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });
     assert.equal(response.status, 200);
-    return (await response.json()).data as TestIntake;
+    const envelope = await response.json();
+    assert.ok(Object.hasOwn(envelope, 'data'));
+    return envelope.data as T;
   };
-  item = await post('questions', {
+  const review = await get<IntakeClinicalReviewPage>('review?limit=1');
+  assert.equal(review.format, 'health-intake-clinical-review-page-v2');
+  assert.equal(review.total, 1);
+  assert.equal(review.items.length, 1);
+  assert.equal(review.nextCursor, null);
+  const selected = review.items[0]!;
+  assert.ok(selected.kind === 'value');
+  const record = selected.value as IntakeReviewRecord;
+  assert.ok(record.candidateId && record.candidateVersionId);
+  const questions = () =>
+    post<ClinicalRecordSectionPage>('review-record-section', {
+      proposalId: null,
+      recordId: record.id,
+      candidateVersionId: record.candidateVersionId,
+      section: 'questions',
+      limit: 1,
+    });
+  item = await post<IntakeRead>('questions', {
     version: item.version,
     key: 'http-question',
-    candidateId: item.workflow.candidates[0].id,
+    candidateId: record.candidateId,
     prompt: 'Confirm evidence?',
     locator: 'page 1',
   });
-  assert.equal(item.needsReview, true);
-  item = await post('answers', {
+  assert.ok(isIntakeSummary(item));
+  assert.ok(item.review.state === 'exact');
+  assert.equal(item.review.counts.needsReview, true);
+  assert.equal(item.collections.questions.total, 1);
+  const asked = await questions();
+  assert.equal(asked.format, 'health-clinical-record-section-page-v1');
+  assert.equal(asked.total, 1);
+  assert.equal(asked.items.length, 1);
+  assert.equal(asked.nextCursor, null);
+  const question = asked.items[0]!.control;
+  assert.ok(question.kind === 'question');
+  assert.equal(question.status, 'unanswered');
+  item = await post<IntakeRead>('answers', {
     version: item.version,
     operationId: 'http-answer',
-    questionId: item.workflow.questions[0].id,
+    questionId: question.id,
     answer: 'Checked against the original',
   });
-  assert.equal(item.workflow.questions[0].status, 'answered');
-  item = await post('plan', { version: item.version });
-  const plan = (await (await fetch(base + '/plan')).json()).data;
-  assert.equal(plan.intakeId, item.id);
-  assert.equal(plan.plans[0].id, item.workflow.plans[0].id);
+  assert.ok(isIntakeSummary(item));
+  const answered = await questions();
+  assert.equal(answered.total, 1);
+  assert.equal(answered.items.length, 1);
+  assert.equal(answered.nextCursor, null);
+  const answer = answered.items[0]!.control;
+  assert.ok(answer.kind === 'question');
+  assert.equal(answer.id, question.id);
+  assert.equal(answer.status, 'answered');
+  assert.equal(answer.answer, 'Checked against the original');
+  item = await post<IntakeRead>('plan', { version: item.version });
+  assert.ok(isIntakeSummary(item));
+  assert.ok(item.activePlan.state === 'exact' && item.activePlan.plan);
+  const plan = await get<IntakeRead>('plan');
+  assert.ok(isIntakeSummary(plan));
+  assert.equal(plan.id, item.id);
+  assert.equal(plan.version, item.version);
+  assert.ok(plan.activePlan.state === 'exact' && plan.activePlan.plan);
+  assert.equal(plan.activePlan.plan.id, item.activePlan.plan.id);
+  assert.equal(plan.collections.plans.total, 1);
 });

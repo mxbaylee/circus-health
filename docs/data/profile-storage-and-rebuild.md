@@ -53,15 +53,60 @@ Source text uses partitioned immutable page/list storage rather than a document-
 
 Keep a consistent copy of the encrypted durable directory and the recovery kit separately. Default encrypted HTTP routes reject the legacy plaintext backup/copy routes. The npm backup/restore aliases have been removed, and the retired recovery CLI refuses operations before reading archive inputs or changing a destination. Use the [complete encrypted-directory procedure](../setup/deployment.md#backup-and-recovery); access recovery, archive restore, cache reconstruction and portable export are distinct operations.
 
+The isolated plaintext `createBackup` helper writes its existing `circus-health-portable-v1` table JSON from the completed private SQLite backup. Its row transport reads individual TEXT/BLOB columns in bounded pieces and yields during export; it does not take a second full database backup or make the portable JSON authoritative over originals and accepted versions. The source originals and staged output are checked again before publication, and contributor copies retain their selected-source certification through the asynchronous export and consume a fresh physical publication seal at the final rename. Export supports ordinary main-schema rowid tables with visible columns, the shape produced by the supported profile schema. A `WITHOUT ROWID` table, hidden/generated column or table shadowing every rowid alias is refused explicitly instead of silently omitting rows. This changes no portable or backup manifest format; older complete exports remain readable by their existing restore path. The SQLite engine and restore parser can still materialize whole values, so this is a bounded host-side export transport, not whole-copy memory closure.
+
 Synthetic backend and container tests cover cache loss, integrity failures, interrupted publication, profile/session isolation, selective history restoration, and recovery. Real-device WebAuthn PRF and real configured model-provider checks remain release gates; these tests do not establish them.
 
 ## Contributor private-copy retention
+
+The private copy and portable export transports use pinned N-API FFI bindings for incremental SQLite TEXT/BLOB reads and writes. Signed 64-bit row identities are passed exactly as decimal strings; native pointers stay internal to the adapter. The main thread initializes and retains the binding before copy workers are created. An uninitialized worker refuses before loading the addon: the inherited readiness marker orders native-library lifetime and is not an authorization or durability capability. The system SQLite library, file/connection witnesses and accepted-source checks remain required. The binding opens only private snapshots and transfer files: it refuses a path with a `-wal` or `-shm` sidecar and any URI other than an immutable descriptor alias, because a second SQLite library in the process does not share node:sqlite's POSIX lock state and could truncate a live `-shm` that node:sqlite still maps. Live profile databases, including committed-column reads, are read through node:sqlite only. The binding is not recovery authority and does not remove whole-value work inside SQLite. Other native facilities retain their existing binding. Clean dependency installation can require a native compiler; see [contributor prerequisites](../../CONTRIBUTING.md#before-you-start).
+
+The private copy transfer spool disables synchronous flushing only on its two
+temporary SQLite connections. It is never reopened as crash-recovery evidence:
+an interrupted or failed preparation must discard it and start from accepted
+source authority. Two-pass source hashes, complete native readback, physical
+sealing and target transaction checks remain mandatory. This does not change
+target database settings, accepted-record durability, final file synchronization,
+stored formats or the operator recovery procedure.
+
+Each spooled value is written once through incremental blob I/O and read back
+once; the spool keeps the readback-verified bytes as a BLOB and target
+statements read them through a single UTF-8 TEXT cast instead of rewriting every
+complete value inside the spool. Its insert statement is compiled once per
+transfer. Target statements themselves remain single synchronous SQLite
+statements inside the unpublished target transaction, and SQLite still
+materializes each compared or inserted value whole.
+
+Copy equality proves the original source, HEAD bytes and physical scope before
+every resumed comparison window and again before a completed result or any exit
+leaves the guard. A window runs bounded row quanta back to back without a
+yield, starting at one quantum and doubling to at most 16, so the complete
+proof runs once per window rather than once per quantum. The proof preceding
+the next window closes both the yield and the window, so a same-byte HEAD
+replacement made inside a synchronous step is still refused before further
+comparison.
+
+Existing-profile opening compares the cache with a rebuild of its indexed
+accepted head before catch-up, then with a complete rebuild of the selected head
+afterwards. Each table is compared by an order-independent SHA-256 digest of its
+normalized rows (the digest of the sorted per-row digests plus the row count),
+not by spooling and sorting every row value. The selected rebuild is always
+read completely and both rebuilds still verify their originals. Before the
+first cache read, per-table SQLite change sessions are opened; for the second
+comparison, a cache table is read again unless it had a primary key with no
+NULL key at that capture, its session changeset is still empty, its row count
+and definition are unchanged and no other connection has committed. Only
+tables catch-up changed are then read again. Published-copy activation relies on the target
+attachment's own baseline-cache and selected-HEAD reconstructions; it no longer
+repeats an identical selected comparison immediately afterwards.
 
 The isolated contributor `profile-lifecycle` facility uses a [filesystem accepted-record journal](contributor-record-authority.md), with explicit portable snapshot artifacts. Its private copy takes current accepted state and originals; prior application generations and chats are not copied. It is a private real-data copy, not anonymization. The default encrypted HTTP routes still reject legacy plaintext copy routes, and the supported npm → Compose setup is unchanged.
 
 Contributor callers generate a lowercase UUIDv4 `operationId` before requesting a copy and retain it for retries. The ID is bound to the normalized requested display name, source and one target; reusing it for different inputs refuses. Operation intent lives under `data/operations/profile-copies/`, and unpublished staging under `data/operations/profile-staging/`. These private operation artifacts belong with external untracked profile storage, not in Git. Blank and placebo creation require no new copy identity.
 
 While holding the source writer lease, the implementation checks the source and backup against an independent reconstruction from selected record authority. It rejects dirty/conflicted or invalid evidence without publishing unacknowledged source changes, before rebinding owner/path/source-text state and installing fresh target intake evidence. Original files are retained and verified. Portable artifacts include exact staged intake, pins and retained source receipts, with bounded validation during load/rebuild; subsequent runtime writes use the target journal. See [intake copy and receipt details](intake-state-storage.md#contributor-private-copy-publication-and-retry).
+
+Source-text receipt inventory reuses that first complete source comparison only while its original source and independently reconstructed database read intervals remain unchanged. Each inventory lookup checks those original witnesses; it does not acquire a new baseline or repeat the whole table comparison. Complete original-file verification remains required. Actual native row and encoded-byte counters distinguish this avoided comparison from cold reconstruction, target comparison and physical checks. This does not bound native whole-column allocations or the remaining synchronous copy phases, and changes no stored format or operator procedure.
 
 The staged journal is validated before final directory rename publishes the destination; registry publication and runtime activation follow. Unpublished-stage cleanup does not erase a published destination. Automatic re-preparation requires that no ambiguous publication marker remains. A retry with the same operation can recover that destination even if the source has changed or is absent. Before first registration, selected destination heads and name must equal the pinned preparation. After completed registration, recovery preserves later accepted destination edits, its current name and current head, including after complete SQLite cache loss. Active-target retries still verify durable readiness. Corrupt or missing selected evidence fails explicitly. A valid earlier accepted SQLite cache may catch up from the published head; conflicting or unacknowledged SQL changes refuse rather than being silently accepted or erased. A persisted published/attempted-publication intent with missing final storage requires explicit recovery, not a new copy under the old operation ID. A crash after saving the attempted marker but before rename also takes that conservative refusal path: preserve intent and any archive/stage evidence because restart cannot prove nonpublication. Only a live caught failure with its original stage still present and no final destination can clear the marker safely.
 

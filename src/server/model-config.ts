@@ -3,16 +3,8 @@ import { isIP } from 'node:net';
 import { relative } from 'node:path';
 import { validateProxyConfig } from './proxy-model-bridge.ts';
 import type { ProxyConfig } from './proxy-model-bridge.ts';
-
-export class ModelError extends Error {}
-/** Distinguish a local reading slice from an initial or provider context rejection. */
-export class ModelContextLimitError extends ModelError {
-  readonly origin: 'slice' | 'initial' | 'provider';
-  constructor(message: string, origin: 'slice' | 'initial' | 'provider') {
-    super(message);
-    this.origin = origin;
-  }
-}
+import { ModelError } from './model-errors.ts';
+export { ModelError, ModelContextLimitError } from './model-errors.ts';
 const fail = (message: string): never => {
   throw new ModelError(message);
 };

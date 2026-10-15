@@ -62,11 +62,14 @@ export function intakeVersionConflictFacts(
   id: string,
   expected: unknown,
   current: number,
-  rawCurrent: string,
+  rawCurrent: string | { logicalBinding: string },
 ) {
+  const currentDigest =
+    typeof rawCurrent === 'string'
+      ? digest(rawCurrent)
+      : 'logical:' + digest(rawCurrent.logicalBinding);
   const entries = histories.get(db)?.get(id) || [];
-  const valid =
-    entries.at(-1)?.version === current && entries.at(-1)?.digest === digest(rawCurrent);
+  const valid = entries.at(-1)?.version === current && entries.at(-1)?.digest === currentDigest;
   const changes =
     valid && Number.isSafeInteger(expected)
       ? entries.filter((entry) => entry.version > Number(expected) && entry.version <= current)
@@ -92,4 +95,41 @@ export function intakeVersionConflictFacts(
     questionChanges: changes.filter((entry) => entry.category === 'question').length,
     otherVersionChanges: changes.filter((entry) => entry.category === 'workflow_update').length,
   };
+}
+
+/** Bounded host mutation observation. The selected logical binding, not a full
+ * exported workflow or auxiliary receipt head, proves the observed predecessor. */
+export function observeIntakeLogicalVersion(
+  db: DatabaseSync,
+  id: string,
+  before: { version: number; logicalBinding: string },
+  after: { version: number; logicalBinding: string },
+  change:
+    | 'proposal'
+    | 'acceptance'
+    | 'source_text'
+    | 'identity_confirmation'
+    | 'review'
+    | 'question'
+    | 'plan'
+    | 'workflow_update',
+): void {
+  if (before.version === after.version) return;
+  let sources = histories.get(db);
+  if (!sources) histories.set(db, (sources = new Map()));
+  const previous = sources.get(id) || [];
+  const changes =
+    previous.at(-1)?.version === before.version &&
+    previous.at(-1)?.digest === 'logical:' + digest(before.logicalBinding)
+      ? [...previous]
+      : [];
+  changes.push({
+    version: after.version,
+    category: change,
+    at: Date.now(),
+    digest: 'logical:' + digest(after.logicalBinding),
+  });
+  sources.delete(id);
+  sources.set(id, changes.slice(-32));
+  if (sources.size > 64) sources.delete(sources.keys().next().value!);
 }

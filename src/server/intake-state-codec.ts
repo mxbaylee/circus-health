@@ -26,25 +26,65 @@ const immutableValues = new WeakMap<object, { nodes: number; depth: number }>();
 /** Internal ownership boundary: only pass normalized input or checked decoder output.
  * Newly owned branches freeze once; retained immutable branches are not traversed. */
 export function freezeValidatedIntakeJson(value: IntakeJson): IntakeJson {
-  const freeze = (child: ChatJson): { nodes: number; depth: number } => {
+  const steps = freezeValidatedIntakeJsonSteps(value);
+  for (;;) {
+    const next = steps.next();
+    if (next.done) return next.value;
+  }
+}
+
+export function* freezeValidatedIntakeJsonSteps(value: IntakeJson): Generator<void, IntakeJson> {
+  let visits = 0;
+  // Post-order traversal preserves the same retained-branch accounting while
+  // allowing cold reconstruction to yield between independently owned nodes.
+  const children = function* (child: object): Generator<ChatJson> {
+    if (Array.isArray(child)) {
+      for (const nested of child) yield nested;
+    } else {
+      for (const name in child) if (Object.hasOwn(child, name)) yield (child as IntakeJson)[name]!;
+    }
+  };
+  const stack: Array<{
+    child: object;
+    nested: Generator<ChatJson>;
+    size: { nodes: number; depth: number };
+  }> = [];
+  const enter = (child: ChatJson): { nodes: number; depth: number } | undefined => {
     if (!child || typeof child !== 'object') return { nodes: 1, depth: 0 };
     const retained = immutableValues.get(child);
     if (retained) {
       recordIntakeWork('immutableNodesReused');
       return retained;
     }
-    const size = { nodes: 1, depth: 0 };
-    for (const nested of Object.values(child)) {
-      const descendant = freeze(nested);
-      size.nodes += descendant.nodes;
-      size.depth = Math.max(size.depth, descendant.depth + 1);
-    }
-    Object.freeze(child);
-    immutableValues.set(child, size);
-    recordIntakeWork('immutableNodesFrozen');
-    return size;
+    stack.push({ child, nested: children(child), size: { nodes: 1, depth: 0 } });
+    return undefined;
   };
-  freeze(value);
+  enter(value);
+  while (stack.length) {
+    const frame = stack[stack.length - 1]!;
+    const next = frame.nested.next();
+    if (!next.done) {
+      const descendant = enter(next.value);
+      if (descendant) {
+        frame.size.nodes += descendant.nodes;
+        frame.size.depth = Math.max(frame.size.depth, descendant.depth + 1);
+      }
+    } else {
+      Object.freeze(frame.child);
+      immutableValues.set(frame.child, frame.size);
+      recordIntakeWork('immutableNodesFrozen');
+      stack.pop();
+      const parent = stack[stack.length - 1];
+      if (parent) {
+        parent.size.nodes += frame.size.nodes;
+        parent.size.depth = Math.max(parent.size.depth, frame.size.depth + 1);
+      }
+    }
+    if (++visits === 64) {
+      visits = 0;
+      yield;
+    }
+  }
   return value;
 }
 
@@ -176,6 +216,55 @@ export function serializeIntakeJson(value: IntakeJson): string {
   return text;
 }
 
+/** Exact JSON.stringify pieces for already validated intake JSON. String work is
+ * split before encoding so a single large scalar cannot monopolize a turn. */
+export function* iterateSerializedIntakeJson(value: IntakeJson): Generator<string> {
+  const active = new Set<object>();
+  const encoded = function* (input: ChatJson): Generator<string> {
+    if (typeof input === 'string') {
+      yield '"';
+      for (let at = 0; at < input.length;) {
+        let end = Math.min(input.length, at + 4096);
+        if (end < input.length && /[\uD800-\uDBFF]/.test(input[end - 1]!)) end--;
+        yield JSON.stringify(input.slice(at, end)).slice(1, -1);
+        at = end;
+      }
+      yield '"';
+      return;
+    }
+    if (!input || typeof input !== 'object') {
+      yield JSON.stringify(input);
+      return;
+    }
+    if (active.has(input)) throw Error('Cyclic intake JSON');
+    active.add(input);
+    try {
+      if (Array.isArray(input)) {
+        yield '[';
+        for (let index = 0; index < input.length; index++) {
+          if (index) yield ',';
+          yield* encoded(input[index] ?? null);
+        }
+        yield ']';
+      } else {
+        yield '{';
+        let first = true;
+        for (const name of Object.keys(input)) {
+          if (!first) yield ',';
+          first = false;
+          yield JSON.stringify(name);
+          yield ':';
+          yield* encoded(input[name]!);
+        }
+        yield '}';
+      }
+    } finally {
+      active.delete(input);
+    }
+  };
+  yield* encoded(value);
+}
+
 function targetAt(state: IntakeJson, path: string[]): ChatJson {
   let current: ChatJson = state;
   for (const name of path) {
@@ -293,9 +382,23 @@ export function applyIntakeChanges(
   raw: unknown,
   budget = chatDecodeBudget(),
 ): IntakeJson {
+  const steps = applyIntakeChangesSteps(initial, raw, budget);
+  for (;;) {
+    const next = steps.next();
+    if (next.done) return next.value;
+  }
+}
+
+/** The same decoder with a work boundary between changes. */
+export function* applyIntakeChangesSteps(
+  initial: IntakeJson | undefined,
+  raw: unknown,
+  budget = chatDecodeBudget(),
+): Generator<void, IntakeJson> {
   if (!Array.isArray(raw) || raw.length > MAX_ITEMS || (initial !== undefined && !object(initial)))
     fail();
   let state = initial;
+  let applied = 0;
   for (const change of raw) {
     if (
       change &&
@@ -311,6 +414,7 @@ export function applyIntakeChanges(
       if (!object(next)) fail();
       state = next;
     }
+    if (++applied % 64 === 0) yield;
   }
   if (!state) fail();
   return state;

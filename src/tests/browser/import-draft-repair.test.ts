@@ -1,5 +1,11 @@
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { stopFixtureImport } from './manual-import-fixture.ts';
+import {
+  fixtureApi,
+  fixtureProposalId,
+  fixtureReview,
+  fixtureNativeFeedReady,
+} from './native-intake-fixture.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AppOptions } from '../../server/index.ts';
 import type { Browser } from 'playwright';
@@ -195,7 +201,7 @@ test(
     const proposedBody = await proposedResponse.json();
     assert(proposedResponse.ok(), JSON.stringify(proposedBody));
     await page.goto(url + '/#/import');
-    await page.reload();
+    await fixtureNativeFeedReady(page, prefix, () => page.reload());
     await page.getByText('Fictional original-only date', { exact: true }).waitFor();
     assert.match(await page.locator('body').innerText(), /Fictional original-only date/);
     await page
@@ -229,12 +235,14 @@ test(
     await assistant.getByRole('button', { name: 'Apply reviewed change' }).click();
     const applied = await appliedResponse;
     assert(applied.ok(), await applied.text());
-    const review = await page.request.get(
-      url +
-        prefix +
-        `/intakes/${encodeURIComponent(uploaded.id)}/review?proposalId=${encodeURIComponent(proposedBody.data.proposals[0].id)}`,
+    const api = fixtureApi(page, url);
+    const proposalId = await fixtureProposalId(api, prefix, uploaded.id);
+    const review = await fixtureReview(
+      api,
+      prefix +
+        `/intakes/${encodeURIComponent(uploaded.id)}/review?proposalId=${encodeURIComponent(proposalId)}`,
     );
-    assert(review.ok(), await review.text());
-    assert.equal((await review.json()).data.records[0].mapping.date, '2025-06-07');
+    assert.equal(review.records.length, 1);
+    assert.equal(review.records[0]!.mapping.date, '2025-06-07');
   },
 );

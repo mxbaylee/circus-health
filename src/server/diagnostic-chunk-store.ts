@@ -9,17 +9,10 @@ import {
 } from 'node:fs';
 import { resolve } from 'node:path';
 import { encryptObject, decryptObject, type VaultKey } from './vault-crypto.ts';
-
-export interface DiagnosticChunkLimits {
-  maxChunkBytes: number;
-  maxChunks: number;
-  maxBytes: number;
-}
-export const diagnosticChunkLimits: Readonly<DiagnosticChunkLimits> = Object.freeze({
-  maxChunkBytes: 64 * 1024,
-  maxChunks: 256,
-  maxBytes: 16 * 1024 * 1024,
-});
+import { isVaultDiagnosticWriter, type VaultDiagnosticWriter } from './vault-store.ts';
+import { withManagedPhysicalMutation } from './clinical-review-physical-epoch.ts';
+import { diagnosticChunkLimits, type DiagnosticChunkLimits } from './diagnostic-chunk-limits.ts';
+export { diagnosticChunkLimits, type DiagnosticChunkLimits } from './diagnostic-chunk-limits.ts';
 export interface DiagnosticChunkInventory {
   chunks: { sequence: number; encryptedBytes: number }[];
   nextSequence: number;
@@ -51,6 +44,7 @@ export function openDiagnosticChunkStore(options: {
   key: VaultKey;
   guard?: () => void;
   limits?: Partial<DiagnosticChunkLimits>;
+  writer?: VaultDiagnosticWriter;
 }): DiagnosticChunkStore {
   const { profileId, guard: authorize } = options;
   const limits = { ...diagnosticChunkLimits, ...options.limits };
@@ -64,6 +58,9 @@ export function openDiagnosticChunkStore(options: {
   if (limits.maxBytes < limits.maxChunkBytes + 4096)
     throw Error('Diagnostic retention must fit one bounded chunk');
   const directory = resolve(options.directory);
+  const writer = options.writer;
+  if (writer && !isVaultDiagnosticWriter(writer, directory, profileId))
+    throw Error('Invalid vault diagnostic writer');
   let key: VaultKey | null = options.key;
   let chunks: DiagnosticChunkInventory['chunks'] | null = null;
   let nextSequence = 1;
@@ -87,6 +84,11 @@ export function openDiagnosticChunkStore(options: {
   const path = (sequence: number) =>
     resolve(directory, String(sequence).padStart(16, '0') + '.enc');
   const purpose = (sequence: number) => `diagnostic-events-v1:${sequence}`;
+  const remove = (path: string) => {
+    guard();
+    if (writer) rmSync(path);
+    else withManagedPhysicalMutation(() => rmSync(path));
+  };
   const syncDirectory = () => {
     const fd = openSync(directory, 'r');
     try {
@@ -99,7 +101,7 @@ export function openDiagnosticChunkStore(options: {
   const trim = () => {
     while (chunks!.length > limits.maxChunks || encryptedBytes() > limits.maxBytes) {
       const oldest = chunks![0]!;
-      rmSync(path(oldest.sequence));
+      remove(path(oldest.sequence));
       chunks!.shift();
       work.evictions++;
       syncDirectory();
@@ -139,7 +141,7 @@ export function openDiagnosticChunkStore(options: {
     if (found.length > limits.maxChunks + 1 || interrupted.length > 1)
       throw Error('Diagnostic inventory exceeds recovery allowance');
     for (const file of interrupted) {
-      rmSync(file);
+      remove(file);
       syncDirectory();
     }
     found.sort((a, b) => a.sequence - b.sequence);
@@ -218,7 +220,8 @@ export function openDiagnosticChunkStore(options: {
         return 'replayed';
       }
       // Atomic authenticated publication writes this payload only, without any medical manifest/head.
-      encryptObject(path(sequence), bytes, key!, profileId, purpose(sequence));
+      if (writer) writer(sequence, bytes);
+      else encryptObject(path(sequence), bytes, key!, profileId, purpose(sequence));
       work.chunkWrites++;
       work.plaintextBytesWritten += bytes.byteLength;
       chunks!.push({ sequence, encryptedBytes: lstatSync(path(sequence)).size });

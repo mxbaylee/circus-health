@@ -4,6 +4,11 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { ProfileProvider } from '../../app/components/ProfileProvider';
 import { ThemeToggle } from '../../app/components/ThemeToggle';
 import {
+  checkConnection,
+  connectionSnapshot,
+  startConnectionMonitor,
+} from '../../app/data/connection';
+import {
   clearProfile,
   currentProfile,
   replaceProfiles,
@@ -89,6 +94,72 @@ it.each(['focus', 'visibilitychange'])(
     expect(screen.queryByText('Archive')).not.toBeInTheDocument();
   },
 );
+
+it('ignores a pre-switch connection-recovery registry response but accepts a fresh lock', async () => {
+  const first = { ...profile, locked: false },
+    other = { ...first, id: 'fictional-other', name: 'Other' };
+  let profileReads = 0,
+    runtimeReads = 0,
+    freshLock = false,
+    releaseStale!: (response: Response) => void,
+    staleStarted!: () => void;
+  const staleReady = new Promise<void>((resolve) => {
+    staleStarted = resolve;
+  });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (url === '/api/runtime') {
+        runtimeReads++;
+        return new Response(JSON.stringify(runtimeReads === 1 ? {} : { encrypted: true }), {
+          status: runtimeReads === 1 ? 503 : 200,
+        });
+      }
+      if (url === '/api/profiles') {
+        profileReads++;
+        if (profileReads === 2) {
+          staleStarted();
+          return new Promise<Response>((resolve) => {
+            releaseStale = resolve;
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            data: freshLock ? [first, { ...other, locked: true }] : [first, other],
+          }),
+        );
+      }
+      return new Response(null, { status: 404 });
+    }),
+  );
+  render(
+    <ProfileProvider>
+      <p>Archive</p>
+    </ProfileProvider>,
+  );
+  expect(await screen.findByText('Archive')).toBeVisible();
+  const stop = startConnectionMonitor();
+  try {
+    await waitFor(() => expect(connectionSnapshot().status).toBe('unavailable'));
+    const recoveries = connectionSnapshot().recoveries;
+    await waitFor(async () => {
+      await act(async () => checkConnection());
+      expect(connectionSnapshot().recoveries).toBeGreaterThan(recoveries);
+    });
+    await waitFor(() => expect(profileReads).toBe(2));
+    await staleReady;
+    act(() => selectProfile(other));
+    await act(async () => releaseStale(new Response(JSON.stringify({ data: [first] }))));
+    expect(currentProfile()?.id).toBe(other.id);
+    expect(screen.getByText('Archive')).toBeVisible();
+
+    freshLock = true;
+    fireEvent(window, new Event('focus'));
+    await waitFor(() => expect(currentProfile()).toBeNull());
+  } finally {
+    stop();
+  }
+});
 
 it('offers one direct create action when the archive has no profiles', async () => {
   profilesResponse([]);

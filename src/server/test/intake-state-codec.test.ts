@@ -1,17 +1,86 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
+import { exact, decode } from '../intake-state-evidence.ts';
+import { intakeWorkCounters, withIntakeWork } from '../intake-work-accounting.ts';
 import { chatDecodeBudget, ChatDecodeLimitError } from '../chat-journal-codec.ts';
 import {
   applyIntakeChanges,
+  applyIntakeChangesSteps,
   applyIntakeChangesIsolated,
   freezeValidatedIntakeJson,
+  freezeValidatedIntakeJsonSteps,
   cloneValidatedIntakeJson,
   intakeChanges,
   normalizeIntakeJson,
   serializeIntakeJson,
+  iterateSerializedIntakeJson,
   type IntakeChange,
   type IntakeJson,
 } from '../intake-state-codec.ts';
+
+test('chunked intake serialization preserves exact JSON bytes and bounded scalar pieces', () => {
+  const value = normalizeIntakeJson({
+    escaped: 'quote " slash \\ control \n lone \ud800 low \udc00',
+    boundary: `${'a'.repeat(4095)}\ud83d\ude03${'b'.repeat(4095)}`,
+    array: [null, -0, true, { '01': 'value', '1': 'next' }],
+  });
+  const pieces = [...iterateSerializedIntakeJson(value)];
+  assert.equal(pieces.join(''), serializeIntakeJson(value));
+  assert.ok(pieces.every((piece) => piece.length <= 4100));
+  assert.ok(pieces.length > 8);
+});
+
+test('cooperative delta application preserves the synchronous state and budget', () => {
+  const before = normalizeIntakeJson({ a: ['fictional', 1], b: { old: true } });
+  const after = normalizeIntakeJson({ b: { old: false }, a: ['fictional', 2, 3], c: 'new' });
+  const changes = [
+    ...intakeChanges(before, after),
+    ...Array.from({ length: 128 }, (_, index) => ({
+      op: 'set' as const,
+      path: [`extra${index}`],
+      value: index,
+    })),
+  ];
+  const syncBudget = chatDecodeBudget();
+  const cooperativeBudget = chatDecodeBudget();
+  const expected = applyIntakeChanges(normalizeIntakeJson(before), changes, syncBudget);
+  const steps = applyIntakeChangesSteps(normalizeIntakeJson(before), changes, cooperativeBudget);
+  let yields = 0;
+  for (;;) {
+    const next = steps.next();
+    if (next.done) {
+      assert.equal(serializeIntakeJson(next.value), serializeIntakeJson(expected));
+      break;
+    }
+    yields++;
+  }
+  assert.equal(yields, Math.floor(changes.length / 64));
+  assert.deepEqual(cooperativeBudget, syncBudget);
+});
+
+test('cooperative ownership freeze yields without changing retained-branch behavior', () => {
+  const shared = freezeValidatedIntakeJson(normalizeIntakeJson({ accepted: ['fictional'] }));
+  const root = { entries: Array.from({ length: 130 }, (_, index) => ({ index })), shared };
+  const steps = freezeValidatedIntakeJsonSteps(root);
+  let yields = 0;
+  for (;;) {
+    const next = steps.next();
+    if (next.done) {
+      assert.equal(next.value, root);
+      break;
+    }
+    yields++;
+  }
+  assert.ok(yields >= 2);
+  assert.ok(Object.isFrozen(root));
+  assert.ok(Object.isFrozen(root.entries));
+  assert.ok(root.entries.every(Object.isFrozen));
+  const detached = cloneValidatedIntakeJson(root).entries;
+  assert.ok(Array.isArray(detached));
+  assert.equal(detached.length, 130);
+  assert.equal(freezeValidatedIntakeJson(root), root);
+});
 
 test('owned subtree preparation preserves logical node/depth limits and refuses forged frozen data', () => {
   const owned = freezeValidatedIntakeJson(normalizeIntakeJson({ values: [1, 2, 3] }));
@@ -653,4 +722,109 @@ test('genuinely large reordered-alphabet changes remain valid, while unresolved 
       ),
     ChatDecodeLimitError,
   );
+});
+
+test('evidence key schemas are literal sets, including separators, without mutating the schema', () => {
+  assert.throws(() => exact({ ['a\0b']: 1 }, ['a', 'b']), /Invalid intake state: schema/);
+  assert.throws(() => exact({ a: 1, ['b\0c']: 2 }, ['a\0b', 'c']), /Invalid intake state: schema/);
+  const keys = Object.freeze(['b', 'a']);
+  exact({ a: 1, b: 2 }, keys);
+  assert.deepEqual(keys, ['b', 'a']);
+  exact(Object.assign(Object.create(null), { ['__proto__']: 1, constructor: 2 }), [
+    'constructor',
+    '__proto__',
+  ]);
+  exact({ ['a\0b']: 1 }, ['a\0b']);
+  assert.throws(() => exact({ a: 1, b: 2 }, ['a', 'a']), /schema/);
+  assert.throws(() => exact(Object.create({ a: 1 }), ['a']), /schema/);
+  assert.throws(() => exact(Object.defineProperty({}, 'a', { value: 1 }), ['a']), /schema/);
+  for (const value of [null, undefined, [], '', 1, true])
+    assert.throws(() => exact(value, []), /schema/);
+});
+
+test('evidence decoding preserves the original UTF-8, JSON and byte-limit decisions', () => {
+  const oldDecode = (value: unknown, max: number): unknown => {
+    if (typeof value !== 'string' || Buffer.byteLength(value) > max) throw Error('encoded bytes');
+    if (Buffer.from(value).toString('utf8') !== value) throw Error('UTF-8');
+    try {
+      return JSON.parse(value) as unknown;
+    } catch {
+      throw Error('JSON');
+    }
+  };
+  const compare = (value: unknown, max: number) => {
+    let expected: unknown;
+    try {
+      expected = oldDecode(value, max);
+    } catch (error) {
+      assert.throws(() => decode(value, max), {
+        message: `Invalid intake state: ${(error as Error).message}`,
+      });
+      return;
+    }
+    assert.deepEqual(decode(value, max), expected);
+  };
+  // Every individual UTF-16 code unit, including literal control characters and
+  // both unpaired-surrogate ranges. This is an independent old-wire oracle.
+  for (let unit = 0; unit <= 0xffff; unit++) compare(`"${String.fromCharCode(unit)}"`, 8);
+  for (const text of [
+    '',
+    'null',
+    'false',
+    '-0',
+    '1e400',
+    '"\\ud800"',
+    '"\\udfff"',
+    '"\\ud800\\udfff"',
+    '"\ud800\udc00"',
+    '"\udbff\udfff"',
+    '"\ud800\ud800"',
+    '"\udfff\ud800"',
+    '"\ud800x\udfff"',
+    '{"same":1,"same":2}',
+    '{"fictional":"é🎪\u2028\ufffd"}',
+    '"' + 'é🎪'.repeat(8192) + '"',
+    '\ufeffnull',
+    'true trailing',
+  ]) {
+    const size = Buffer.byteLength(text);
+    for (const max of [Math.max(0, size - 1), size, size + 1]) compare(text, max);
+  }
+  for (const input of [null, undefined, 123, {}, Buffer.from('null')]) compare(input, 8);
+});
+
+test('evidence validation avoids repeated key sorting and UTF-8 buffer round trips', () => {
+  const db = new DatabaseSync(':memory:');
+  const text = JSON.stringify({ value: 'Fictional é🎪 evidence '.repeat(128) });
+  const originalFrom = Buffer.from;
+  const originalSort = Array.prototype.sort;
+  let copies = 0,
+    sorts = 0;
+  try {
+    Buffer.from = ((...args: unknown[]) => {
+      if (args[0] === text) copies++;
+      return Reflect.apply(originalFrom, Buffer, args);
+    }) as typeof Buffer.from;
+    Array.prototype.sort = function (compare) {
+      sorts++;
+      return originalSort.call(this, compare);
+    };
+    withIntakeWork(db, 'warm', () => {
+      for (let i = 0; i < 64; i++) {
+        const value = decode(text, 8192);
+        exact(value, ['value']);
+      }
+    });
+  } finally {
+    Buffer.from = originalFrom;
+    Array.prototype.sort = originalSort;
+    db.close();
+  }
+  const work = intakeWorkCounters(db).warm;
+  assert.equal(work.jsonParseCalls, 64);
+  assert.equal(work.jsonParseBytes, 64 * Buffer.byteLength(text));
+  assert.equal(copies, 0, 'validated strings do not need a fresh UTF-8 buffer');
+  assert.equal(sorts, 0, 'fixed schema checks do not sort either key array');
+  assert.equal(work.evidenceDecodeCopyBytes, 0);
+  assert.equal(work.evidenceBufferCopiedBytes, 0);
 });

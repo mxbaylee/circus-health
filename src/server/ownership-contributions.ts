@@ -1,4 +1,4 @@
-import { readStoredIntakeDetails } from './intake-state-access.ts';
+import { ownershipIntakeScopes } from './ownership-intake-scopes.ts';
 import type { Database, SqliteRow } from './database.ts';
 import { HttpError, json } from './database.ts';
 import { clinicalTables, type ClinicalKind } from './clinical-references.ts';
@@ -8,7 +8,11 @@ import {
   latestOwnershipDecision,
   appendOwnershipDecision,
 } from './ownership-journal.ts';
-import type { HealthRecordEnvelope, IntakeClinicalMapping } from '../shared/intake.ts';
+import type {
+  HealthRecordEnvelope,
+  IntakeClinicalMapping,
+  IntakeReviewDraftHistory,
+} from '../shared/intake.ts';
 import type { OwnershipContribution } from '../shared/record-ownership.ts';
 
 export interface AcceptedContribution {
@@ -19,6 +23,11 @@ export interface AcceptedContribution {
   mapping: IntakeClinicalMapping;
   intakeId: string;
   candidateVersionId: string | null;
+  /** Native review audit remains in the exact immutable source-bound snapshot. */
+  reviewDraftHistory?: IntakeReviewDraftHistory;
+  reviewDraftId?: string;
+  proposalId?: string | null;
+  candidateId?: string;
   revision: number;
 }
 export function retainAcceptedContribution(
@@ -47,6 +56,7 @@ export function ownershipContributions(
   db: Database,
   kind: ClinicalKind,
   recordId: string,
+  options: { scopes?: (intakeId: string, recordId: string) => string[] | undefined } = {},
 ): SourceContribution[] {
   const row = db
     .prepare(`SELECT source_record_id FROM ${clinicalTables[kind]} WHERE id=?`)
@@ -97,11 +107,12 @@ export function ownershipContributions(
     return {
       sourceRecordId: id,
       sourceFileId: originalId,
-      reportScopes: (readStoredIntakeDetails(db, originalId)?.workflow?.reportGroups || [])
-        .filter((g) =>
-          g.versions.at(-1)?.members.some((m) => m.occurrences.some((o) => o.recordId === id)),
-        )
-        .map((g) => originalId + ':' + g.id),
+      reportScopes:
+        options.scopes?.(originalId, id) ??
+        Array.from(
+          ownershipIntakeScopes(db, originalId, id, { latestOnly: true, subject: false }),
+          (group) => originalId + ':' + group.id,
+        ),
       contentUrl: `/api/sources/${encodeURIComponent(originalId)}/content`,
       locator: envelope?.provenance?.locator || locator,
       version: ownershipHash([source, evidence, accepted, transitions]),

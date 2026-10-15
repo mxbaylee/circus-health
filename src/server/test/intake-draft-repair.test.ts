@@ -1,7 +1,9 @@
+import { firstReportGroup } from '../../shared/intake-report-group-links.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter, once } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -72,7 +74,7 @@ function fixture(t: TestContext) {
     bytes,
   });
   const review = intake.reviewIntake(db, root, profileId, uploaded.id);
-  const groupId = review.records[0]!.reportGroups![0]!.groupId;
+  const groupId = firstReportGroup(review.records[0]!.reportGroups)!.groupId;
   const selection: IntakeDraftRepairSelection = {
     format: 'intake-draft-repair-selection-v1',
     intakeId: uploaded.id,
@@ -143,7 +145,7 @@ for (const fallback of [false, true])
     const scope = resolveIntakeDraftRepairScope(f.db, f.root, f.profileId, {
       format: 'intake-draft-repair-selection-v1',
       intakeId: item.id,
-      groupId: record.reportGroups![0]!.groupId,
+      groupId: firstReportGroup(record.reportGroups)!.groupId,
       rows: [
         {
           proposalId: review.proposalId,
@@ -649,7 +651,7 @@ test('changed originals and over-bound locators fail before repair evidence can 
       resolveIntakeDraftRepairScope(overBound.db, overBound.root, overBound.profileId, {
         format: 'intake-draft-repair-selection-v1',
         intakeId: uploaded.id,
-        groupId: review.records[0]!.reportGroups![0]!.groupId,
+        groupId: firstReportGroup(review.records[0]!.reportGroups)!.groupId,
         rows: [
           {
             proposalId: null,
@@ -698,254 +700,336 @@ test('changed originals and over-bound locators fail before repair evidence can 
   );
 });
 
-test('production assistant keeps repair chats tool-isolated and reads an original-only date', async (t) => {
-  fictionalModel(t);
-  const root = mkdtempSync(join(tmpdir(), 'fictional-repair-host-'));
-  const profileId = 'cedar';
-  const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
-  attachPersonalDurability(db, { root, profileId: profileId });
-  const original = Buffer.from(
-    'Fictional comparison section\nCollection date: 2025-06-07\nNo other date applies.\n',
-  );
-  const uploaded = intake.uploadIntake(db, root, profileId, {
-    filename: 'fictional-original.txt',
-    newProviderName: 'Fictional Clinic',
-    bytes: original,
-  });
-  const draft = envelope('original-only-date', '', 'Method A') as HealthRecordEnvelope & {
-    clinical: Record<string, unknown>;
-  };
-  delete draft.clinical.date;
-  delete draft.clinical.method;
-  draft.payload = { literal: 'Model draft omitted the collection date.' };
-  draft.provenance.locator = 'characters 0–78';
-  const proposed = intake.proposeConversion(db, root, profileId, uploaded.id, {
-    version: uploaded.version,
-    jsonlText: JSON.stringify(draft),
-    summary: 'Fictional incomplete model-shaped draft',
-    runId: 'fictional-first-model-run',
-    modelIdentity: {
-      backend: 'fictional',
-      model: 'fictional-incomplete-model',
-      reasoningEffort: null,
-      instructionVersion: 'fictional-v1',
-    },
-  });
-  const proposalId = proposed.proposals[0]!.id;
-  const review = intake.reviewIntake(db, root, profileId, uploaded.id, proposalId);
-  const record = review.records[0]!;
-  assert.equal(record.mapping.date, '');
-  assert.equal(JSON.stringify(draft.payload).includes('2025-06-07'), false);
-  const selection: IntakeDraftRepairSelection = {
-    format: 'intake-draft-repair-selection-v1',
-    intakeId: uploaded.id,
-    groupId: record.reportGroups![0]!.groupId,
-    rows: [
-      {
-        proposalId,
-        recordId: record.id,
-        candidateVersionId: record.candidateVersionId!,
-        fields: ['date', 'method'],
-      },
-    ],
-  };
-  type Callbacks = Parameters<
-    NonNullable<Parameters<typeof createAssistant>[0]['bridgeFactory']>
-  >[0];
-  const bridges: { callbacks: Callbacks; tools: HealthTool[] }[] = [];
-  let genericExtensionCalls = 0;
-  const repair = intakeDraftRepairAssistantExtensions();
-  const genericTool: HealthTool = {
-    type: 'function',
-    name: 'health_review_import',
-    description: 'Fictional generic mapping mutation',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  };
-  const extensions: AssistantActionExtensions = {
-    tools: [genericTool, ...repair.tools],
-    call(tool, args, context) {
-      if (tool === genericTool.name) {
-        genericExtensionCalls++;
-        return { mutated: true };
-      }
-      return repair.call(tool, args, context);
-    },
-    apply: repair.apply,
-    reconcile: repair.reconcile,
-  };
-  const assistant = createAssistant({
-    root,
-    databases: new Map([[profileId, db]]),
-    availability: () => ({ available: true, readiness: 'ready' }),
-    connectionCheck: () => ({ available: true, readiness: 'ready' }),
-    journalWriter: () => {},
-    actionExtensions: extensions,
-    bridgeFactory(callbacks) {
-      const bridge = {
-        callbacks,
-        tools: [] as HealthTool[],
-        async start(_instructions: string, tools: HealthTool[]) {
-          this.tools = tools;
-          return { model: 'fictional-repair-model', backend: 'fictional' };
-        },
-        async turn() {
-          callbacks.onEvent?.('turn/started', { turn: { id: 'fictional-repair-turn' } });
-        },
-        async cancel() {},
-        close() {},
+for (const native of [false, true])
+  test(
+    `production assistant keeps ${native ? 'native' : 'legacy'} repair chats tool-isolated and reads an original-only date`,
+    { timeout: 120000 },
+    async (t) => {
+      fictionalModel(t);
+      const root = mkdtempSync(join(tmpdir(), 'fictional-repair-host-'));
+      const profileId = 'cedar';
+      const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+      attachPersonalDurability(db, { root, profileId: profileId });
+      const original = Buffer.from(
+        'Fictional comparison section\nCollection date: 2025-06-07\nNo other date applies.\n',
+      );
+      const uploaded = intake.uploadIntake(db, root, profileId, {
+        filename: 'fictional-original.txt',
+        newProviderName: 'Fictional Clinic',
+        bytes: original,
+      });
+      const draft = envelope('original-only-date', '', 'Method A') as HealthRecordEnvelope & {
+        clinical: Record<string, unknown>;
       };
-      bridges.push(bridge);
-      return bridge;
-    },
-  });
-  t.after(() => {
-    assistant.close();
-    db.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-  const waitForBridge = async (count: number) => {
-    for (let attempt = 0; attempt < 20 && bridges.length < count; attempt++) await tick();
-    assert.equal(bridges.length, count);
-  };
-  const chat = assistant.create(profileId, {
-    message: 'Recover the selected missing date from the original section.',
-    context: { route: '#/import', intakeRepair: selection },
-  });
-  await waitForBridge(1);
-  const exactTools = [
-    'health_assistant_progress',
-    'health_intake_draft_repair_read',
-    'health_intake_draft_repair_review',
-  ];
-  assert.deepEqual(bridges[0]!.tools.map((tool) => tool.name).sort(), exactTools.slice().sort());
-  await assert.rejects(
-    async () =>
-      await bridges[0]!.callbacks.onTool!({
-        tool: 'health_intake_read',
-        arguments: { id: uploaded.id },
-        callId: 'malicious-generic-read',
-      }),
-    (error: unknown) => error instanceof HttpError && error.code === 'DRAFT_REPAIR_TOOL',
-  );
-  await assert.rejects(
-    async () =>
-      await bridges[0]!.callbacks.onTool!({
-        tool: 'health_intake_propose',
-        arguments: {
-          id: uploaded.id,
-          version: proposed.version,
-          jsonlText: JSON.stringify(draft),
-          summary: 'Unadvertised generic conversion attempt',
+      delete draft.clinical.date;
+      delete draft.clinical.method;
+      draft.payload = { literal: 'Model draft omitted the collection date.' };
+      draft.provenance.locator = 'characters 0–78';
+      const proposed = intake.proposeConversion(db, root, profileId, uploaded.id, {
+        version: uploaded.version,
+        jsonlText: JSON.stringify(draft),
+        summary: 'Fictional incomplete model-shaped draft',
+        runId: 'fictional-first-model-run',
+        modelIdentity: {
+          backend: 'fictional',
+          model: 'fictional-incomplete-model',
+          reasoningEffort: null,
+          instructionVersion: 'fictional-v1',
         },
-        callId: 'malicious-intake-propose',
-      }),
-    (error: unknown) => error instanceof HttpError && error.code === 'DRAFT_REPAIR_TOOL',
-  );
-  await assert.rejects(
-    async () =>
-      await bridges[0]!.callbacks.onTool!({
-        tool: genericTool.name,
-        arguments: {},
-        callId: 'malicious-generic-extension',
-      }),
-    (error: unknown) => error instanceof HttpError && error.code === 'DRAFT_REPAIR_TOOL',
-  );
-  assert.equal(genericExtensionCalls, 0);
-  assert.equal(intake.getIntake(db, root, profileId, uploaded.id).proposals.length, 1);
+      });
+      const proposalId = proposed.proposals[0]!.id;
+      const review = intake.reviewIntake(db, root, profileId, uploaded.id, proposalId);
+      const record = review.records[0]!;
+      assert.equal(record.mapping.date, '');
+      assert.equal(JSON.stringify(draft.payload).includes('2025-06-07'), false);
+      const selection: IntakeDraftRepairSelection = {
+        format: 'intake-draft-repair-selection-v1',
+        intakeId: uploaded.id,
+        groupId: firstReportGroup(record.reportGroups)!.groupId,
+        rows: [
+          {
+            proposalId,
+            recordId: record.id,
+            candidateVersionId: record.candidateVersionId!,
+            fields: ['date', 'method'],
+          },
+        ],
+      };
+      if (native) {
+        const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+        const { clearIntakeStateCache } = await import('../intake-state-storage.ts');
+        await buildIntakeCollectionEnvelope(db, { id: uploaded.id });
+        clearIntakeStateCache(db);
+      }
+      type Callbacks = Parameters<
+        NonNullable<Parameters<typeof createAssistant>[0]['bridgeFactory']>
+      >[0];
+      const bridges: { callbacks: Callbacks; tools: HealthTool[] }[] = [];
+      const progress = new EventEmitter();
+      let genericExtensionCalls = 0;
+      const repair = intakeDraftRepairAssistantExtensions();
+      const genericTool: HealthTool = {
+        type: 'function',
+        name: 'health_review_import',
+        description: 'Fictional generic mapping mutation',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      };
+      const extensions: AssistantActionExtensions = {
+        tools: [genericTool, ...repair.tools],
+        call(tool, args, context) {
+          if (tool === genericTool.name) {
+            genericExtensionCalls++;
+            return { mutated: true };
+          }
+          return repair.call(tool, args, context);
+        },
+        apply: repair.apply,
+        applyAsync: repair.applyAsync,
+        reconcile: repair.reconcile,
+      };
+      const options: Parameters<typeof createAssistant>[0] = {
+        root,
+        databases: new Map([[profileId, db]]),
+        availability: () => ({ available: true, readiness: 'ready' }),
+        connectionCheck: () => ({ available: true, readiness: 'ready' }),
+        journalWriter: () => {
+          progress.emit('change');
+        },
+        ...(!native ? { actionExtensions: extensions } : {}),
+        bridgeFactory(callbacks) {
+          const bridge = {
+            callbacks,
+            tools: [] as HealthTool[],
+            async start(_instructions: string, tools: HealthTool[]) {
+              this.tools = tools;
+              return { model: 'fictional-repair-model', backend: 'fictional' };
+            },
+            async turn() {
+              callbacks.onEvent?.('turn/started', { turn: { id: 'fictional-repair-turn' } });
+            },
+            async cancel() {},
+            close() {},
+          };
+          bridges.push(bridge);
+          progress.emit('change');
+          return bridge;
+        },
+      };
+      const app = native
+        ? (await import('../index.ts')).createApp({
+            root,
+            databases: options.databases,
+            assistantOptions: options,
+            // This fixture represents a paused import selected for manual repair.
+            intakeBatchOptions: { authorized: () => false },
+          })
+        : undefined;
+      const assistant = app?.assistant || createAssistant(options);
+      if (app) await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+      t.after(() => {
+        if (app) app.close();
+        else {
+          assistant.close();
+          db.close();
+        }
+        rmSync(root, { recursive: true, force: true });
+      });
+      const waitForBridge = async (count: number) => {
+        while (bridges.length < count) {
+          if (chat?.status === 'failed') break;
+          await once(progress, 'change', { signal: t.signal });
+        }
+        assert.equal(bridges.length, count, chat?.error || undefined);
+      };
+      let chat: ReturnType<typeof assistant.create> | undefined;
+      chat = assistant.create(profileId, {
+        message: 'Recover the selected missing date from the original section.',
+        context: { route: '#/import', intakeRepair: selection },
+      });
+      await waitForBridge(1);
+      const exactTools = [
+        'health_assistant_progress',
+        'health_intake_draft_repair_read',
+        'health_intake_draft_repair_review',
+      ];
+      assert.deepEqual(
+        bridges[0]!.tools.map((tool) => tool.name).sort(),
+        exactTools.slice().sort(),
+      );
+      await assert.rejects(
+        async () =>
+          await bridges[0]!.callbacks.onTool!({
+            tool: 'health_intake_read',
+            arguments: { id: uploaded.id },
+            callId: 'malicious-generic-read',
+          }),
+        (error: unknown) => error instanceof HttpError && error.code === 'DRAFT_REPAIR_TOOL',
+      );
+      await assert.rejects(
+        async () =>
+          await bridges[0]!.callbacks.onTool!({
+            tool: 'health_intake_propose',
+            arguments: {
+              id: uploaded.id,
+              version: proposed.version,
+              jsonlText: JSON.stringify(draft),
+              summary: 'Unadvertised generic conversion attempt',
+            },
+            callId: 'malicious-intake-propose',
+          }),
+        (error: unknown) => error instanceof HttpError && error.code === 'DRAFT_REPAIR_TOOL',
+      );
+      await assert.rejects(
+        async () =>
+          await bridges[0]!.callbacks.onTool!({
+            tool: genericTool.name,
+            arguments: {},
+            callId: 'malicious-generic-extension',
+          }),
+        (error: unknown) => error instanceof HttpError && error.code === 'DRAFT_REPAIR_TOOL',
+      );
+      assert.equal(genericExtensionCalls, 0);
+      const selected = intake.getIntakeRead(db, root, profileId, uploaded.id);
+      assert.equal(
+        'format' in selected ? selected.collections.proposals.total : selected.proposals.length,
+        1,
+      );
 
-  bridges[0]!.callbacks.onEvent?.('error', {
-    willRetry: false,
-    message: 'Fictional interruption before source read',
-  });
-  assistant.retry(profileId, chat.id);
-  await waitForBridge(2);
-  assert.deepEqual(bridges[1]!.tools.map((tool) => tool.name).sort(), exactTools.slice().sort());
-  bridges[1]!.callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
-  assert.throws(
-    () =>
+      bridges[0]!.callbacks.onEvent?.('error', {
+        willRetry: false,
+        message: 'Fictional interruption before source read',
+      });
+      assistant.retry(profileId, chat.id);
+      await waitForBridge(2);
+      assert.deepEqual(
+        bridges[1]!.tools.map((tool) => tool.name).sort(),
+        exactTools.slice().sort(),
+      );
+      bridges[1]!.callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+      assert.throws(
+        () =>
+          assistant.send(profileId, chat.id, {
+            message: 'Try to replace the retained scope.',
+            context: { intakeRepair: selection },
+          }),
+        (error: unknown) => error instanceof HttpError && error.code === 'DRAFT_REPAIR_SCOPE',
+      );
+      assert.equal(bridges.length, 2);
       assistant.send(profileId, chat.id, {
-        message: 'Try to replace the retained scope.',
-        context: { intakeRepair: selection },
-      }),
-    (error: unknown) => error instanceof HttpError && error.code === 'DRAFT_REPAIR_SCOPE',
-  );
-  assert.equal(bridges.length, 2);
-  assistant.send(profileId, chat.id, {
-    message: 'Continue this exact selected repair.',
-    context: { route: '#/' },
-  });
-  await waitForBridge(3);
-  assert.deepEqual(bridges[2]!.tools.map((tool) => tool.name).sort(), exactTools.slice().sort());
-  const scope = bridges[2]!.callbacks.onTool
-    ? (assistant.get(profileId, chat.id).context!.intakeRepair as IntakeDraftRepairScopeForTest)
-    : (() => {
-        throw new Error('Expected tool callback');
-      })();
-  const row = scope.rows[0]!;
-  const source = (await bridges[2]!.callbacks.onTool!({
-    tool: 'health_intake_draft_repair_read',
-    arguments: {
-      scopeToken: scope.scopeToken,
-      recordId: row.recordId,
-      evidenceId: row.evidence[0]!.id,
-    },
-    callId: 'read-retained-original',
-  })) as { original: { text: string } };
-  assert.match(source.original.text, /2025-06-07/);
-  const unresolved = (await bridges[2]!.callbacks.onTool!({
-    tool: 'health_intake_draft_repair_review',
-    arguments: {
-      scopeToken: scope.scopeToken,
-      edits: [],
-      unresolvedNotes: ['The original section does not state a method.'],
-      reason: 'Keep the absent method unresolved.',
-      propose: false,
-    },
-    callId: 'retain-absent-method',
-  })) as { preview: { rows: unknown[]; unresolvedNotes: string[] } };
-  assert.deepEqual(unresolved.preview.rows, []);
-  assert.equal(unresolved.preview.unresolvedNotes.length, 1);
-  assert.equal(chat.proposals.length, 0);
-  const preview = (await bridges[2]!.callbacks.onTool!({
-    tool: 'health_intake_draft_repair_review',
-    arguments: {
-      scopeToken: scope.scopeToken,
-      edits: [
-        {
+        message: 'Continue this exact selected repair.',
+        context: { route: '#/' },
+      });
+      await waitForBridge(3);
+      assert.deepEqual(
+        bridges[2]!.tools.map((tool) => tool.name).sort(),
+        exactTools.slice().sort(),
+      );
+      const scope = bridges[2]!.callbacks.onTool
+        ? (assistant.get(profileId, chat.id).context!.intakeRepair as IntakeDraftRepairScopeForTest)
+        : (() => {
+            throw new Error('Expected tool callback');
+          })();
+      const row = scope.rows[0]!;
+      const source = (await bridges[2]!.callbacks.onTool!({
+        tool: 'health_intake_draft_repair_read',
+        arguments: {
+          scopeToken: scope.scopeToken,
           recordId: row.recordId,
-          candidateVersionId: row.candidateVersionId,
-          field: 'date',
-          after: '2025-06-07',
-          evidenceIds: [row.evidence[0]!.id],
+          evidenceId: row.evidence[0]!.id,
         },
-      ],
-      unresolvedNotes: [],
-      reason: 'The bounded retained original contains one explicit collection date.',
-      propose: true,
+        callId: 'read-retained-original',
+      })) as { original: { text: string } };
+      assert.match(source.original.text, /2025-06-07/);
+      const unresolved = (await bridges[2]!.callbacks.onTool!({
+        tool: 'health_intake_draft_repair_review',
+        arguments: {
+          scopeToken: scope.scopeToken,
+          edits: [],
+          unresolvedNotes: ['The original section does not state a method.'],
+          reason: 'Keep the absent method unresolved.',
+          propose: false,
+        },
+        callId: 'retain-absent-method',
+      })) as { preview: { rows: unknown[]; unresolvedNotes: string[] } };
+      assert.deepEqual(unresolved.preview.rows, []);
+      assert.equal(unresolved.preview.unresolvedNotes.length, 1);
+      assert.equal(chat.proposals.length, 0);
+      const preview = (await bridges[2]!.callbacks.onTool!({
+        tool: 'health_intake_draft_repair_review',
+        arguments: {
+          scopeToken: scope.scopeToken,
+          edits: [
+            {
+              recordId: row.recordId,
+              candidateVersionId: row.candidateVersionId,
+              field: 'date',
+              after: '2025-06-07',
+              evidenceIds: [row.evidence[0]!.id],
+            },
+          ],
+          unresolvedNotes: [],
+          reason: 'The bounded retained original contains one explicit collection date.',
+          propose: true,
+        },
+        callId: 'preview-original-date',
+      })) as { id: string };
+      bridges[2]!.callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (app) {
+          const address = app.server.address();
+          assert.ok(address && typeof address === 'object');
+          const response: Response = await fetch(
+            `http://127.0.0.1:${address.port}/api/profiles/${profileId}/assistant/chats/${chat.id}/apply`,
+            {
+              method: 'POST',
+              headers: { Origin: 'http://localhost:5173', 'Content-Type': 'application/json' },
+              body: JSON.stringify({ proposalId: preview.id }),
+            },
+          );
+          const body = await response.json();
+          assert.equal(response.status, 200, JSON.stringify(body));
+          assert.equal(
+            body.data.proposals.find((proposal: { id: string }) => proposal.id === preview.id)
+              .status,
+            'applied',
+          );
+        } else await assistant.applyRead(profileId, chat.id, preview.id);
+      }
+      const { prepareCollectionClinicalReviewDependencies, prepareCollectionClinicalReview } =
+        await import('../intake-review-collection-host.ts');
+      if (native)
+        await prepareCollectionClinicalReviewDependencies(
+          db,
+          root,
+          profileId,
+          uploaded.id,
+          proposalId,
+        );
+      const reviewed = native
+        ? prepareCollectionClinicalReview(db, root, profileId, uploaded.id, proposalId)
+        : undefined;
+      assert.equal(reviewed?.status, native ? 'ready' : undefined);
+      assert.equal(
+        (reviewed?.status === 'ready'
+          ? reviewed.session.review
+          : intake.reviewIntake(db, root, profileId, uploaded.id, proposalId)
+        ).records[0]!.mapping.date,
+        '2025-06-07',
+      );
+      assert.deepEqual(intake.getIntakeOriginal(db, root, profileId, uploaded.id).bytes, original);
+      chat.proposals.push({
+        id: 'generic-approval-bypass',
+        kind: 'classification',
+        title: 'Unrelated accepted-record action',
+        summary: 'Must not apply in a repair chat',
+        status: 'pending',
+        changes: {},
+      });
+      assert.throws(
+        () => assistant.apply(profileId, chat.id, 'generic-approval-bypass'),
+        (error: unknown) => error instanceof HttpError && error.code === 'DRAFT_REPAIR_PROPOSAL',
+      );
     },
-    callId: 'preview-original-date',
-  })) as { id: string };
-  bridges[2]!.callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
-  assistant.apply(profileId, chat.id, preview.id);
-  assistant.apply(profileId, chat.id, preview.id);
-  assert.equal(
-    intake.reviewIntake(db, root, profileId, uploaded.id, proposalId).records[0]!.mapping.date,
-    '2025-06-07',
   );
-  assert.deepEqual(intake.getIntakeOriginal(db, root, profileId, uploaded.id).bytes, original);
-  chat.proposals.push({
-    id: 'generic-approval-bypass',
-    kind: 'classification',
-    title: 'Unrelated accepted-record action',
-    summary: 'Must not apply in a repair chat',
-    status: 'pending',
-    changes: {},
-  });
-  assert.throws(
-    () => assistant.apply(profileId, chat.id, 'generic-approval-bypass'),
-    (error: unknown) => error instanceof HttpError && error.code === 'DRAFT_REPAIR_PROPOSAL',
-  );
-});
 
 type IntakeDraftRepairScopeForTest = ReturnType<typeof resolveIntakeDraftRepairScope>;

@@ -1,3 +1,4 @@
+import { apiUrl } from '../../data/api';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ExternalLink, UserRound, UsersRound } from 'lucide-react';
 import type {
@@ -5,6 +6,7 @@ import type {
   IntakePersonProposal,
   IntakePersonProposalState,
 } from '../../../shared/intake-people';
+import type { CollectionPersonProposal } from '../../../shared/intake-clinical-pages';
 
 export type { IntakePeopleQueue, IntakePersonProposal } from '../../../shared/intake-people';
 
@@ -15,7 +17,7 @@ const statusLabel: Record<IntakePersonProposalState, string> = {
   saved: 'Saved',
 };
 
-function contactSummary(proposal: IntakePersonProposal) {
+function contactSummary(proposal: IntakePersonProposal | CollectionPersonProposal) {
   return (
     proposal.person.relationship ||
     proposal.person.email ||
@@ -25,7 +27,9 @@ function contactSummary(proposal: IntakePersonProposal) {
   );
 }
 
-export function ReportPeopleReview({
+export function ReportPeopleReview<
+  Proposal extends IntakePersonProposal | CollectionPersonProposal,
+>({
   queue,
   preferredState,
   preferredPersonId,
@@ -35,15 +39,15 @@ export function ReportPeopleReview({
   onDisposition,
   onApply,
 }: {
-  queue: IntakePeopleQueue;
+  queue: Omit<IntakePeopleQueue, 'people'> & { people: Proposal[] };
   preferredState?: Extract<IntakePersonProposalState, 'pending' | 'later'>;
   preferredPersonId?: string;
   busy: boolean;
   loadingMore: boolean;
   onLoadMore: () => void;
-  onDisposition: (proposal: IntakePersonProposal, state: 'pending' | 'later' | 'excluded') => void;
+  onDisposition: (proposal: Proposal, state: 'pending' | 'later' | 'excluded') => void;
   onApply: (
-    proposal: IntakePersonProposal,
+    proposal: Proposal,
     choice: { action: 'add' } | { action: 'update'; noteId: string; version: number },
   ) => void;
 }) {
@@ -137,7 +141,7 @@ export function ReportPeopleReview({
           <div>
             <h4>Original evidence</h4>
             <a
-              href={focused.evidence[0]?.contentUrl || focused.source.contentUrl}
+              href={apiUrl(focused.evidence[0]?.contentUrl || focused.source.contentUrl)}
               target="_blank"
               rel="noreferrer"
             >

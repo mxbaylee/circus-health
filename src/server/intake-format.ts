@@ -47,6 +47,23 @@ export type IntakeValidationResult =
   | (IntakeValidation & { valid: true; entries: IntakeEntry[] })
   | (IntakeValidation & { valid: false; entries?: IntakeEntry[] });
 
+/** Clone selected JSON data without turning immutable raw-number leaves into
+ * ordinary objects or rounding their source spelling. */
+const literalSharedValues = new WeakSet<object>();
+/** Internal immutable handles may retain their checked traversal when copied for policy. */
+export function registerLiteralSharedValue(value: object) {
+  if (!Object.isFrozen(value)) throw Error('Shared literal values must be immutable');
+  literalSharedValues.add(value);
+}
+export function cloneLiteral<T>(value: T): T {
+  if (JSON.isRawJSON(value) || value === null || typeof value !== 'object') return value;
+  if (literalSharedValues.has(value)) return value;
+  if (Array.isArray(value)) return value.map((item) => cloneLiteral(item)) as T;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, cloneLiteral(item)]),
+  ) as T;
+}
+
 export function parseLiteralJSON(text: string): unknown {
   if (Buffer.byteLength(text) > 2 * 1024 * 1024)
     throw new Error('A JSONL row exceeds 2 MiB; split source sections with locators');

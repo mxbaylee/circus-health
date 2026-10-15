@@ -33,6 +33,11 @@ import { storedIntakeDetails, intakeDetails, registerIntakeFile } from '../intak
 import { readIntakeEnvelopeText, stageIntakeEnvelope } from '../intake-authority.ts';
 import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
 import { contributorAuthorityPath } from '../contributor-record-storage.ts';
+import {
+  contributorCopyComparisonGuardWork,
+  contributorCopyEqualityWork,
+  contributorCopyWorkerWork,
+} from '../contributor-durability.ts';
 import { normalizeIntakeJson, serializeIntakeJson } from '../intake-state-codec.ts';
 import { digest } from '../intake-state-evidence.ts';
 
@@ -416,55 +421,85 @@ test('real contributor copy retains exact active review, originals and human tex
   assert.ok(targetFiles.size > 0);
 });
 
-test('unpublished failure matrix cleans staging and retries from the currently coherent source', async (t) => {
-  for (const checkpoint of [
-    'validated',
-    'staged',
-    'before-export',
-    'exported',
-    'before-publication',
-  ] as const)
-    await t.test(checkpoint, async (child) => {
-      const f = await fixture(child);
-      const operationId = randomUUID();
-      let targetId = '';
-      const options: CreateProfileLifecycleOptions = {
-        root: f.root,
-        databases: f.databases,
-        copyCheckpoint(point, context) {
-          targetId = context.targetProfileId;
-          if (point === checkpoint) throw Error('fictional interrupted ' + checkpoint);
-        },
+// One top-level test per checkpoint: each scenario is a full interrupted copy
+// plus a full retry, so each gets its own default timeout rather than sharing one.
+for (const checkpoint of [
+  'validated',
+  'staged',
+  'before-export',
+  'exported',
+  'before-publication',
+] as const)
+  test(`unpublished failure at ${checkpoint} cleans staging and retries from the currently coherent source`, async (child) => {
+    const f = await fixture(child);
+    const operationId = randomUUID();
+    let targetId = '';
+    const started = Date.now(),
+      phaseWork: Array<{
+        stage: string;
+        elapsedMs: number;
+        worker: object;
+        equality: object;
+        guard: object;
+      }> = [],
+      mark = (stage: string) => {
+        phaseWork.push({
+          stage,
+          elapsedMs: Date.now() - started,
+          worker: contributorCopyWorkerWork(f.db),
+          equality: contributorCopyEqualityWork(f.db),
+          guard: contributorCopyComparisonGuardWork(f.db),
+        });
+        console.info(
+          JSON.stringify({
+            fixture: 'fictional-unpublished-copy-matrix',
+            scenario: checkpoint,
+            phaseWork: phaseWork[phaseWork.length - 1],
+          }),
+        );
       };
-      const interrupted = createProfileLifecycle(options);
-      await assert.rejects(
-        interrupted.create({ name: copiedName, operationId }, f.source.id),
-        /fictional interrupted/,
-      );
-      assert.equal(f.databases.has(targetId), false);
-      assert.equal(
-        readProfileRegistry(f.root).profiles.some((p) => p.id === targetId),
-        false,
-      );
-      assert.equal(existsSync(profilePaths(f.root, targetId).root), false);
-      assert.deepEqual(readdirSync(resolve(f.root, 'data/operations/profile-staging')), []);
-      assert.deepEqual(retainedFiles(f.root, f.source.id), f.sourceFiles);
-      createNote(f.db, {
-        title: 'Fictional source advanced',
-        content: 'Fresh coherent source state after unpublished interruption',
-      });
-      exportCuration(f.db, f.root, f.source.id);
-      const retry = await f.actions.create({ name: copiedName, operationId }, f.source.id);
-      verify(f, retry.id);
-      assert.equal(
-        f.databases
-          .get(retry.id)!
-          .prepare("SELECT count(*) n FROM notes WHERE title='Fictional source advanced'")
-          .get()!.n,
-        1,
-      );
+    const options: CreateProfileLifecycleOptions = {
+      root: f.root,
+      databases: f.databases,
+      copyCheckpoint(point, context) {
+        targetId = context.targetProfileId;
+        mark('interrupted:' + point);
+        if (point === checkpoint) throw Error('fictional interrupted ' + checkpoint);
+      },
+    };
+    const interrupted = createProfileLifecycle(options);
+    mark('interrupted:start');
+    await assert.rejects(
+      interrupted.create({ name: copiedName, operationId }, f.source.id),
+      /fictional interrupted/,
+    );
+    mark('interrupted:finished');
+    assert.equal(f.databases.has(targetId), false);
+    assert.equal(
+      readProfileRegistry(f.root).profiles.some((p) => p.id === targetId),
+      false,
+    );
+    assert.equal(existsSync(profilePaths(f.root, targetId).root), false);
+    assert.deepEqual(readdirSync(resolve(f.root, 'data/operations/profile-staging')), []);
+    assert.deepEqual(retainedFiles(f.root, f.source.id), f.sourceFiles);
+    createNote(f.db, {
+      title: 'Fictional source advanced',
+      content: 'Fresh coherent source state after unpublished interruption',
     });
-});
+    exportCuration(f.db, f.root, f.source.id);
+    mark('source:advanced');
+    mark('retry:start');
+    const retry = await f.actions.create({ name: copiedName, operationId }, f.source.id);
+    mark('retry:finished');
+    verify(f, retry.id);
+    assert.equal(
+      f.databases
+        .get(retry.id)!
+        .prepare("SELECT count(*) n FROM notes WHERE title='Fictional source advanced'")
+        .get()!.n,
+      1,
+    );
+  });
 
 test('real immutable-write and staged selected-head failures refuse publication and clean only the unpublished target', async (t) => {
   for (const kind of ['immutable-write', 'staged-head'] as const)

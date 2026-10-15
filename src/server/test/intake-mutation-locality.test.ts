@@ -270,7 +270,17 @@ function qualifyLocality(
       assert.ok(frameBytes < 3200, `${size} ${label}: ${frameBytes} frame bytes`);
       assert.ok(acceptedBytes < 10_000, `${size} ${label}: ${acceptedBytes} accepted bytes`);
       assert.equal(publications, 1);
-      assert.equal(immutableObjects, 2, 'one changed-record segment and one commit');
+      assert.equal(
+        afterMutationRecord.operation.segmentIndexPagesWritten -
+          priorRecord.operation.segmentIndexPagesWritten,
+        1,
+        'one bounded manifest page indexes the changed-record segment',
+      );
+      assert.equal(
+        immutableObjects,
+        3,
+        'one changed-record segment, one manifest page and one commit',
+      );
       assert.ok(Buffer.byteLength(heads[0]!.value) < 1000);
       assert.ok(Buffer.byteLength(receipts[0]!.value) < 1000);
       assert.equal(readIntakeEnvelopeText(db, { id }), JSON.stringify(value));

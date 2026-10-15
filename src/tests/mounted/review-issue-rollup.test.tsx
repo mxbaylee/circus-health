@@ -87,6 +87,32 @@ function Harness({
   );
 }
 
+it('shows every proposed identity name even when the question text does not name anyone', async () => {
+  const first = issue('first-name', {
+    kind: 'identity',
+    prompt: 'Who does this record belong to?',
+    selfSuggestion: { fullName: 'Fictional Fern Meadow' },
+  });
+  const second = issue('late-name', {
+    kind: 'identity',
+    prompt: 'Who does this record belong to?',
+    selfSuggestion: { fullName: 'Fictional Willow Brook' },
+  });
+  render(
+    <ReviewIssue
+      issue={first}
+      relatedIssues={[first, second]}
+      mapping={{}}
+      busy={false}
+      onLater={() => {}}
+      onResolve={() => {}}
+    />,
+  );
+  expect(screen.getByText('Suggested name: Fictional Fern Meadow')).toBeVisible();
+  await userEvent.setup().click(screen.getByText('2 related questions'));
+  expect(screen.getByText('· Suggested name: Fictional Willow Brook')).toBeVisible();
+});
+
 describe('document date question rollup', () => {
   it('reaches the native retained-question history control by keyboard', async () => {
     const user = userEvent.setup();

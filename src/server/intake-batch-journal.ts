@@ -4,21 +4,29 @@ import {
   existsSync,
   fstatSync,
   fsyncSync,
-  linkSync,
-  mkdirSync,
-  openSync,
   opendirSync,
   readSync,
   realpathSync,
-  renameSync,
   statSync,
-  unlinkSync,
-  writeFileSync,
 } from 'node:fs';
+import {
+  mkdirSync,
+  openSync,
+  writeFileSync,
+  renameSync,
+  writeExclusiveJournalFileSync,
+  linkExclusiveJournalFileSync,
+} from './journal-physical-write.ts';
 import { dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { HttpError } from './database.ts';
+import {
+  clearJournalActivityIndex,
+  forgetJournalActivityScope,
+  publishedJournalActivity,
+} from './journal-activity-index.ts';
 import { profilePaths } from './profile-storage.ts';
+import { portableWork } from './portable-work.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
 import type { ChatChange } from './chat-journal-codec.ts';
 import { flockExclusiveNonblocking, flockUnlock } from '../shared/flock.ts';
@@ -39,6 +47,17 @@ export {
   pendingIntakeBatchChanges,
 } from './intake-batch-mutations.ts';
 
+const nativePhysicalPath = realpathSync.native;
+function physicalPath(path: string): string {
+  try {
+    const resolved = nativePhysicalPath(path);
+    if (resolved === path) return resolved;
+  } catch {
+    // Preserve the existing resolver's error and alias behavior below.
+  }
+  // Native realpath can normalize spelling on case-insensitive filesystems.
+  return realpathSync(path);
+}
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // UUID names deliberately remain discoverable by older readers, which refuse v3.
 const EVENT = /^(\d{12})-([0-9a-f-]{36})\.json$/;
@@ -139,15 +158,15 @@ function sameHead(a: Head | null, b: Head): boolean {
 }
 function fingerprint(file: string): string {
   count('authorityStats');
-  if (realpathSync(file) !== file) invalid();
+  if (physicalPath(file) !== file) invalid();
   const stat = statSync(file, { bigint: true });
   if ((!stat.isFile() && !stat.isDirectory()) || (stat.isFile() && stat.nlink !== 1n)) invalid();
   return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs, stat.nlink].join(':');
 }
 function directory(root: string, profileId: string, id: string, create = false): string {
   if (!UUID.test(id)) missing();
-  const base = realpathSync(profilePaths(root, profileId).root);
-  if (base !== join(realpathSync(root), 'data', 'profiles', profileId)) invalid();
+  const base = physicalPath(profilePaths(root, profileId).root);
+  if (base !== join(physicalPath(root), 'data', 'profiles', profileId)) invalid();
   let path = base;
   for (const segment of ['intake-batches', id, 'events']) {
     path = join(path, segment);
@@ -156,7 +175,7 @@ function directory(root: string, profileId: string, id: string, create = false):
       mkdirSync(path, { mode: 0o700 });
       sync(dirname(path));
     }
-    if (realpathSync(path) !== path) invalid();
+    if (physicalPath(path) !== path) invalid();
   }
   return path;
 }
@@ -165,7 +184,7 @@ function pending(directory: string): string {
   const created = !existsSync(path);
   mkdirSync(path, { recursive: true, mode: 0o700 });
   if (created) sync(dirname(path));
-  if (realpathSync(path) !== path) invalid();
+  if (physicalPath(path) !== path) invalid();
   return path;
 }
 function sync(directory: string): void {
@@ -184,7 +203,7 @@ function quarantine(path: string, name: string): void {
   sync(path);
 }
 function readBytes(file: string, head = false, stagedTwin?: string): Buffer {
-  if (realpathSync(file) !== file) invalid();
+  if (physicalPath(file) !== file) invalid();
   const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const info = fstatSync(fd);
@@ -192,7 +211,7 @@ function readBytes(file: string, head = false, stagedTwin?: string): Buffer {
     if (!info.isFile() || (head && info.size > 4096)) invalid();
     if (info.nlink !== 1) {
       // Only an unselected candidate may retain the exact staging link across a crash.
-      if (info.nlink !== 2 || !stagedTwin || realpathSync(stagedTwin) !== stagedTwin) invalid();
+      if (info.nlink !== 2 || !stagedTwin || physicalPath(stagedTwin) !== stagedTwin) invalid();
       const twin = openSync(stagedTwin, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
         const other = fstatSync(twin);
@@ -214,11 +233,13 @@ function readBytes(file: string, head = false, stagedTwin?: string): Buffer {
       const size = readSync(fd, bytes, offset, bytes.length - offset, null);
       if (!size) invalid();
       count(head ? 'headReadBytes' : 'eventReadBytes', size);
+      portableWork('journalReadBytes', size);
       offset += size;
     }
     const extra = readSync(fd, Buffer.alloc(1), 0, 1, null);
     if (extra) {
       count(head ? 'headReadBytes' : 'eventReadBytes', extra);
+      portableWork('journalReadBytes', extra);
       invalid();
     }
     count(head ? 'headReads' : 'eventReads');
@@ -512,11 +533,14 @@ function remember(batch: IntakeBatch, basis: Basis): void {
   scopes.set(basis.scope, references);
 }
 export function forgetIntakeBatchJournal(batch: object): void {
+  const prior = bases.get(batch);
+  if (prior) forgetJournalActivityScope(prior.scope);
   bases.delete(batch);
   const tracker = batchMutations(batch);
   if (tracker) tracker.valid = false;
 }
 export function clearIntakeBatchJournalCache(root: string, profileId?: string): void {
+  clearJournalActivityIndex(root, profileId);
   const selected = profileId ? resolve(profilePaths(root, profileId).root) : null;
   for (const [scope, references] of scopes) {
     if (selected ? scope !== selected : !scope.startsWith(resolve(root) + '/')) continue;
@@ -554,7 +578,7 @@ export function refreshIntakeBatch(
 export function listIntakeBatches(root: string, profileId: string): IntakeBatch[] {
   const base = join(profilePaths(root, profileId).root, 'intake-batches');
   if (!existsSync(base)) return [];
-  if (realpathSync(base) !== base) invalid();
+  if (physicalPath(base) !== base) invalid();
   const list: IntakeBatch[] = [],
     iterator = opendirSync(base);
   try {
@@ -577,16 +601,10 @@ function publishHead(path: string, head: Head): void {
   count('headSerializationCalls');
   count('headSerializedBytes', Buffer.byteLength(serialized));
   const temporary = join(pending(path), 'current.' + randomUUID() + '.pending');
-  const fd = openSync(temporary, 'wx', 0o600);
-  try {
-    writeFileSync(fd, serialized);
-    count('headWrites');
-    count('headWriteBytes', Buffer.byteLength(serialized));
-    fsyncSync(fd);
-    count('fileSyncCalls');
-  } finally {
-    closeSync(fd);
-  }
+  writeExclusiveJournalFileSync(temporary, serialized);
+  count('headWrites');
+  count('headWriteBytes', Buffer.byteLength(serialized));
+  count('fileSyncCalls');
   renameSync(temporary, join(path, 'current'));
   notifyPublication(dirname(dirname(dirname(path))), head.batchId, [
     ...(head.tail ? [head.tail.name] : []),
@@ -597,7 +615,7 @@ function publishHead(path: string, head: Head): void {
 }
 function lease(path: string): number {
   const file = join(dirname(path), 'writer.lock');
-  if (existsSync(file) && realpathSync(file) !== file) invalid();
+  if (existsSync(file) && physicalPath(file) !== file) invalid();
   const fd = openSync(file, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
   try {
     const stat = fstatSync(fd);
@@ -711,18 +729,11 @@ export function writeIntakeBatch(
     };
     const temporary = join(pending(path), next.name + '.pending');
     event = join(path, next.name);
-    const fd = openSync(temporary, 'wx', 0o600);
-    try {
-      writeFileSync(fd, serialized);
-      count('eventWrites');
-      count('eventWriteBytes', Buffer.byteLength(serialized));
-      fsyncSync(fd);
-      count('fileSyncCalls');
-    } finally {
-      closeSync(fd);
-    }
-    linkSync(temporary, event);
-    unlinkSync(temporary);
+    const staged = writeExclusiveJournalFileSync(temporary, serialized);
+    count('eventWrites');
+    count('eventWriteBytes', Buffer.byteLength(serialized));
+    count('fileSyncCalls');
+    linkExclusiveJournalFileSync(staged, event);
     // Persist removal of the staging link before selecting single-link authority.
     sync(dirname(temporary));
     sync(path);
@@ -744,7 +755,9 @@ export function writeIntakeBatch(
       directoryStat: fingerprint(path),
       orphans: [],
     });
+    publishedJournalActivity(root, profileId, 'batch', batch.id);
   } catch (error) {
+    clearJournalActivityIndex(root, profileId);
     forgetIntakeBatchJournal(batch);
     if (event && existsSync(event)) {
       try {
@@ -773,34 +786,53 @@ export function copyIntakeBatchJournals(
   root: string,
   profileId: string,
   targetRoot: string,
+  { onFile }: { onFile?: (path: string) => void } = {},
 ): string[] {
-  const copied: string[] = [];
-  for (const batch of listIntakeBatches(root, profileId)) {
-    const path = directory(root, profileId, batch.id),
-      head = readHead(path, profileId, batch.id);
-    const save = (name: string, bytes: Buffer) => {
-      const relative = `${profilePaths(root, profileId).relativeRoot}/intake-batches/${batch.id}/events/${name}`;
-      const target = resolve(targetRoot, relative);
-      mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
-      if (realpathSync(dirname(target)) !== dirname(target)) invalid();
-      writeFileSync(target, bytes, { flag: 'wx', mode: 0o600 });
-      copied.push(relative);
-      if (name !== 'current') {
-        count('copiedEvents');
-        count('copiedEventBytes', bytes.length);
-        count('copyValidationReads');
-        count('copyValidationReadBytes', bytes.length);
+  const copied: string[] = [],
+    base = join(profilePaths(root, profileId).root, 'intake-batches');
+  if (!existsSync(base)) return copied;
+  if (physicalPath(base) !== base) invalid();
+  const iterator = opendirSync(base);
+  try {
+    for (let entry = iterator.readSync(); entry; entry = iterator.readSync()) {
+      count('directoryEntries');
+      if (!UUID.test(entry.name)) continue;
+      const id = entry.name;
+      let path: string;
+      try {
+        path = directory(root, profileId, id);
+      } catch (error) {
+        if (error instanceof HttpError && error.code === 'INTAKE_BATCH_NOT_FOUND') continue;
+        throw error;
       }
-    };
-    cold(path, profileId, batch.id, head, save);
-    if (head) save('current', Buffer.from(JSON.stringify(head)));
-    notifyPublication(
-      resolve(profilePaths(targetRoot, profileId).root),
-      batch.id,
-      copied
-        .filter((name) => name.includes('/' + batch.id + '/events/'))
-        .map((name) => name.slice(name.lastIndexOf('/') + 1)),
-    );
+      const head = readHead(path, profileId, id),
+        names: string[] = [];
+      const save = (name: string, bytes: Buffer) => {
+        const relative = `${profilePaths(root, profileId).relativeRoot}/intake-batches/${id}/events/${name}`;
+        const target = resolve(targetRoot, relative);
+        mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+        if (physicalPath(dirname(target)) !== dirname(target)) invalid();
+        portableWork('outputBytes', bytes.length);
+        portableWork('maxOutputChunkBytes', bytes.length, true);
+        writeFileSync(target, bytes, { flag: 'wx', mode: 0o600 });
+        if (onFile) onFile(relative);
+        else copied.push(relative);
+        names.push(name);
+        if (name !== 'current') {
+          count('copiedEvents');
+          count('copiedEventBytes', bytes.length);
+          count('copyValidationReads');
+          count('copyValidationReadBytes', bytes.length);
+        }
+      };
+      // Cold validation reconstructs only this journal and keeps its existing
+      // per-journal budget. Never register every batch in the warm cache.
+      if (!cold(path, profileId, id, head, save)) continue;
+      if (head) save('current', Buffer.from(JSON.stringify(head)));
+      notifyPublication(resolve(profilePaths(targetRoot, profileId).root), id, names);
+    }
+    return copied;
+  } finally {
+    iterator.closeSync();
   }
-  return copied;
 }

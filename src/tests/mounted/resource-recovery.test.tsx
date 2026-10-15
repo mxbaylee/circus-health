@@ -1,5 +1,5 @@
-import { useEffect } from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { useEffect, useLayoutEffect } from 'react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
@@ -7,7 +7,7 @@ import { NoteEditor } from '../../app/features/notes/NoteEditor';
 import { ResourceState } from '../../app/components/ResourceState';
 import { ConnectionNotices } from '../../app/components/ConnectionStatus';
 import { startConnectionMonitor } from '../../app/data/connection';
-import { useResource } from '../../app/data/api';
+import { useResource, type Resource } from '../../app/data/api';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
 import type { Note } from '../../shared/api';
 
@@ -46,6 +46,26 @@ const original: Note = {
 };
 const reply = (data: unknown, status = 200) =>
   new Response(JSON.stringify(status < 400 ? { data } : { error: data }), { status });
+const deferredResponse = () => {
+  let resolve!: (response: Response) => void;
+  const promise = new Promise<Response>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
+function ResourceProbe({ path, commits }: { path: string | null; commits: Resource<Note>[] }) {
+  const resource = useResource<Note>(path);
+  useLayoutEffect(() => {
+    commits.push(resource);
+  });
+  return (
+    <>
+      <button onClick={resource.reload}>Reload probe</button>
+      <output aria-label="Resource content">{resource.data?.content || ''}</output>
+      {resource.error && <p role="alert">{resource.error.message}</p>}
+    </>
+  );
+}
 let remote: Note, readUnavailable: boolean, writeStatus: number, writes: any[];
 beforeEach(() => {
   const profile = {
@@ -117,6 +137,116 @@ function mount(refresh?: () => void) {
     <RouterProvider router={createMemoryRouter([{ path: '*', element: <Harness /> }])} />,
   );
 }
+
+it('marks every reload commit pending before effects while retaining data and its stable callback', async () => {
+  const commits: Resource<Note>[] = [],
+    firstReload = deferredResponse(),
+    nextReload = deferredResponse(),
+    fetch = vi
+      .fn()
+      .mockResolvedValueOnce(reply(original))
+      .mockReturnValueOnce(firstReload.promise)
+      .mockReturnValueOnce(nextReload.promise);
+  vi.stubGlobal('fetch', fetch);
+  render(<ResourceProbe path="/notes/fictional-reload" commits={commits} />);
+  await screen.findByText('Accepted text');
+  const reload = commits.at(-1)!.reload;
+  commits.length = 0;
+  fireEvent.click(screen.getByRole('button', { name: 'Reload probe' }));
+  await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+  expect(commits.length).toBeGreaterThan(0);
+  expect(
+    commits.every(
+      (resource) => resource.refreshing && !resource.loading && resource.reload === reload,
+    ),
+  ).toBe(true);
+  commits.length = 0;
+  fireEvent.click(screen.getByRole('button', { name: 'Reload probe' }));
+  await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+  await act(async () => firstReload.resolve(reply({ ...original, content: 'Superseded reload' })));
+  expect(screen.getByLabelText('Resource content')).toHaveTextContent('Accepted text');
+  expect(commits.every((resource) => resource.refreshing && resource.reload === reload)).toBe(true);
+  await act(async () => nextReload.resolve(reply({ ...original, content: 'Current reload' })));
+  await screen.findByText('Current reload');
+  expect(commits.at(-1)!.refreshing).toBe(false);
+  expect(commits.at(-1)!.reload).toBe(reload);
+});
+
+it('marks a failed empty resource loading on the reload commit and settles its next failure', async () => {
+  const commits: Resource<Note>[] = [],
+    next = deferredResponse();
+  vi.stubGlobal(
+    'fetch',
+    vi
+      .fn()
+      .mockResolvedValueOnce(
+        reply({ code: 'FICTIONAL_MISSING', message: 'First fictional refusal' }, 409),
+      )
+      .mockReturnValueOnce(next.promise),
+  );
+  render(<ResourceProbe path="/notes/fictional-failed-reload" commits={commits} />);
+  await screen.findByText('First fictional refusal');
+  commits.length = 0;
+  fireEvent.click(screen.getByRole('button', { name: 'Reload probe' }));
+  expect(commits.length).toBeGreaterThan(0);
+  expect(
+    commits.every(
+      (resource) => resource.loading && !resource.refreshing && resource.error === null,
+    ),
+  ).toBe(true);
+  await act(async () =>
+    next.resolve(reply({ code: 'FICTIONAL_MISSING', message: 'Second fictional refusal' }, 409)),
+  );
+  await screen.findByText('Second fictional refusal');
+  expect(commits.at(-1)!.loading).toBe(false);
+  expect(commits.at(-1)!.refreshing).toBe(false);
+});
+
+for (const change of ['path', 'profile', 'inactive'] as const)
+  it(`keeps an old in-flight response out of a replaced resource (${change})`, async () => {
+    const commits: Resource<Note>[] = [],
+      old = deferredResponse(),
+      current = deferredResponse(),
+      fetch = vi.fn().mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise);
+    vi.stubGlobal('fetch', fetch);
+    const props = { path: '/notes/fictional-old-resource', commits },
+      view = render(<ResourceProbe {...props} />);
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    if (change === 'profile') {
+      const next = {
+        id: 'fictional-replaced-resource',
+        name: 'Fictional Rowan',
+        placebo: true,
+        locked: false,
+      };
+      await act(async () => {
+        replaceProfiles([next]);
+        selectProfile(next);
+      });
+    } else
+      view.rerender(
+        <ResourceProbe
+          {...props}
+          path={change === 'path' ? '/notes/fictional-new-resource' : null}
+        />,
+      );
+    if (change !== 'inactive') {
+      await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+      await act(async () => current.resolve(reply({ ...original, content: 'Current scope' })));
+      await screen.findByText('Current scope');
+    } else {
+      expect(commits.at(-1)!.loading).toBe(false);
+      fireEvent.click(screen.getByRole('button', { name: 'Reload probe' }));
+      expect(commits.at(-1)!.loading).toBe(false);
+      expect(commits.at(-1)!.refreshing).not.toBe(true);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+    await act(async () => old.resolve(reply({ ...original, content: 'Old superseded scope' })));
+    expect(screen.getByLabelText('Resource content')).not.toHaveTextContent('Old superseded scope');
+    if (change !== 'inactive')
+      expect(screen.getByLabelText('Resource content')).toHaveTextContent('Current scope');
+    else expect(screen.getByLabelText('Resource content')).toBeEmptyDOMElement();
+  });
 
 it('keeps the same editor mounted and adopts a newer read only when the editor is clean', async () => {
   mount();

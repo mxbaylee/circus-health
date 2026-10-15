@@ -42,6 +42,7 @@ export interface OwnershipContribution {
   acceptedMapping: IntakeClinicalMapping | null;
 }
 export interface OwnershipPreviewRecord extends OwnershipRecordReference {
+  reviewedDecision?: NonNullable<OwnershipRequest['decisions']>[number];
   version: string;
   title: string;
   owner: IntakeIdentityPerson;

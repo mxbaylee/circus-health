@@ -1,3 +1,4 @@
+import { reviewIssueScratchCounts } from '../intake-review-issue-state.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { zipFixture } from '../../tests/fixtures/zip.ts';
 import test from 'node:test';
@@ -12,6 +13,8 @@ import * as intake from '../intake.ts';
 import {
   previewDirectRecordCorrection,
   applyDirectRecordCorrection,
+  previewDirectRecordCorrectionPrepared,
+  applyDirectRecordCorrectionPrepared,
   handleClinicalReviewRoute,
 } from '../clinical-review-routes.ts';
 import { getObservation } from '../queries.ts';
@@ -604,10 +607,223 @@ test('package correction support requires the exact retained member, not outer Z
     supportingEvidence: [{ ...ref, originalSourceFileId: exact.sourceFileId }],
   });
   assert.equal(preview.supportingEvidence[0]!.memberId, members[0]!.memberId);
-  const applied = f.apply(preview);
+  const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+  await buildIntakeCollectionEnvelope(f.db, { id: source.id });
+  await assert.rejects(
+    () =>
+      previewDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, {
+        ...f.request,
+        supportingEvidence: [ref],
+      }),
+    { code: 'CORRECTION_EVIDENCE' },
+  );
+  await assert.rejects(
+    () =>
+      previewDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, {
+        ...f.request,
+        supportingEvidence: [{ ...ref, originalSourceFileId: sibling.sourceFileId }],
+      }),
+    { code: 'CORRECTION_EVIDENCE' },
+  );
+  const native = await previewDirectRecordCorrectionPrepared(
+    f.db,
+    f.root,
+    f.profileId,
+    preview.request,
+  );
+  assert.deepEqual(native.supportingEvidence, preview.supportingEvidence);
+  const applied = await applyDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, {
+    ...native.request,
+    version: native.version,
+    previewToken: native.previewToken,
+    operationId: 'native-package-support',
+  });
   assert.equal(
     applied.receipt.result.supportingEvidence![0]!.originalSourceFileId,
     exact.sourceFileId,
   );
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+});
+
+test('native correction support keeps exact candidate scope, byte checks and replay without hydrating the workflow', async (t) => {
+  const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+  const { prepareCorrectionSupportingEvidence } = await import('../record-correction-support.ts');
+  const f = fixture(t),
+    incoming = f.incoming();
+  const input = { ...f.request, supportingEvidence: [incoming.ref] },
+    legacy = f.preview(input);
+  await buildIntakeCollectionEnvelope(f.db, { id: incoming.item.id });
+  const native = await previewDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, input);
+  assert.deepEqual(native.supportingEvidence, legacy.supportingEvidence);
+  const assertNoPolicies = () => {
+    assert.equal(reviewIssueScratchCounts(f.db).databases, 0);
+    assert.equal(reviewIssueScratchCounts(f.db).rows, 0);
+    assert.equal(reviewIssueScratchCounts(f.db).scopes, 0);
+  };
+  assertNoPolicies();
+  for (let attempt = 0; attempt < 4; attempt++) {
+    assert.deepEqual(
+      (await previewDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, input))
+        .supportingEvidence,
+      legacy.supportingEvidence,
+    );
+    assertNoPolicies();
+  }
+  await assert.rejects(
+    () =>
+      previewDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, {
+        ...input,
+        supportingEvidence: [{ ...incoming.ref, recordId: incoming.ref.recordId + ':wrong' }],
+      }),
+    { code: 'CORRECTION_EVIDENCE_CHANGED' },
+  );
+  await assert.rejects(
+    () =>
+      previewDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, {
+        ...input,
+        supportingEvidence: [{ ...incoming.ref, candidateVersionId: 'wrong-version' }],
+      }),
+    { code: 'CORRECTION_EVIDENCE_CHANGED' },
+  );
+  await assert.rejects(
+    () =>
+      prepareCorrectionSupportingEvidence(
+        f.db,
+        f.root,
+        f.profileId,
+        Array.from({ length: 9 }, () => incoming.ref),
+      ),
+    { code: 'CORRECTION_EVIDENCE' },
+  );
+  assertNoPolicies();
+  const proof = await prepareCorrectionSupportingEvidence(
+    f.db,
+    f.root,
+    f.profileId,
+    input.supportingEvidence,
+  );
+  assert.ok(Number(reviewIssueScratchCounts(f.db).scopes) > 0);
+  assert.ok(Number(reviewIssueScratchCounts(f.db).rows) > 0);
+  assert.throws(
+    () =>
+      previewDirectRecordCorrection(
+        f.db,
+        f.root,
+        f.profileId,
+        {
+          ...input,
+          supportingEvidence: [{ ...incoming.ref, originalSourceFileId: f.original.id }],
+        },
+        proof,
+      ),
+    { code: 'CORRECTION_EVIDENCE_CHANGED' },
+  );
+  proof.dispose();
+  proof.dispose();
+  assertNoPolicies();
+  const request = {
+    ...native.request,
+    version: native.version,
+    previewToken: native.previewToken,
+    operationId: 'native-support',
+  };
+  const applied = await applyDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, request);
+  const file = f.db.prepare('SELECT path FROM source_files WHERE id=?').get(incoming.item.id)!;
+  writeFileSync(profileOriginal(f.root, file.path, f.profileId), 'Changed fictional original');
+  await assert.rejects(() =>
+    previewDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, input),
+  );
+  const replay = await applyDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, request);
+  assert.equal(replay.replayed, true);
+  assertNoPolicies();
+  assert.deepEqual(replay.receipt, applied.receipt);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+});
+
+test('correction supporting originals retain checked ancestry beyond ten nested sources', async (t) => {
+  const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+  const { intakeWorkCounters } = await import('../intake-work-accounting.ts');
+  const { correctionSupportingSourceRoot } = await import('../record-correction-support.ts');
+  const { registerRawIntakeFixture, memoryRecordAuthority } =
+    await import('./helpers/intake-authority-fixture.ts');
+  const f = fixture(t);
+  const outer = intake.uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-nested-collection.txt',
+    bytes: Buffer.from('Fictional outer collection'),
+  });
+  let id = outer.id;
+  // Explicit nested inspection has no depth product limit. Correction support
+  // must follow those same retained edges, without rejecting a valid original.
+  for (let depth = 0; depth < 11; depth++) {
+    id = intake.retainIntakeChildren(f.db, f.root, f.profileId, id, [
+      {
+        filename: `fictional-nested-${depth}.txt`,
+        locator: `Fictional nested occurrence ${depth}`,
+        bytes: Buffer.from(`Fictional nested original ${depth}: literal 14.00 mg`),
+      },
+    ])[0]!.id;
+  }
+  const source = intake.getIntake(f.db, f.root, f.profileId, id);
+  const proposed = intake.proposeConversion(f.db, f.root, f.profileId, id, {
+    version: source.version,
+    summary: 'Fictional deepest supporting occurrence',
+    jsonlText: JSON.stringify(envelope('deep-supporting', '14.00')),
+  });
+  const proposalId = proposed.proposals[0]!.id;
+  const record = intake.reviewIntake(f.db, f.root, f.profileId, id, proposalId).records[0]!;
+  const ref: CorrectionSupportingReference = {
+    intakeId: id,
+    proposalId,
+    recordId: record.id,
+    candidateId: record.candidateId!,
+    candidateVersionId: record.candidateVersionId!,
+    originalSourceFileId: id,
+  };
+  const input = { ...f.request, supportingEvidence: [ref] };
+  const legacy = f.preview(input);
+  assert.equal(correctionSupportingSourceRoot(f.db, f.profileId, id), outer.id);
+  await buildIntakeCollectionEnvelope(f.db, { id });
+  const before = { ...intakeWorkCounters(f.db).warm };
+  const selected = await previewDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, input);
+  assert.deepEqual(selected.supportingEvidence, legacy.supportingEvidence);
+  const request = {
+    ...selected.request,
+    version: selected.version,
+    previewToken: selected.previewToken,
+    operationId: 'fictional-deep-support',
+  };
+  const applied = await applyDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, request);
+  assert.equal(applied.receipt.result.supportingEvidence![0]!.originalSourceFileId, id);
+  const replay = await applyDirectRecordCorrectionPrepared(f.db, f.root, f.profileId, request);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.receipt, applied.receipt);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+  assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
+  assert.equal(reviewIssueScratchCounts(f.db).databases, 0);
+  assert.throws(() => correctionSupportingSourceRoot(f.db, 'foreign', id), {
+    code: 'PROFILE_BOUNDARY',
+  });
+  const ancestryDb = openDatabase(':memory:', f.profileId);
+  memoryRecordAuthority(ancestryDb);
+  t.after(() => ancestryDb.close());
+  registerRawIntakeFixture(
+    ancestryDb,
+    'fictional-cycle-a',
+    JSON.stringify({ intake: { parentSourceFileId: 'fictional-cycle-b' } }),
+  );
+  registerRawIntakeFixture(
+    ancestryDb,
+    'fictional-cycle-b',
+    JSON.stringify({ intake: { parentSourceFileId: 'fictional-cycle-a' } }),
+  );
+  registerRawIntakeFixture(
+    ancestryDb,
+    'fictional-missing-parent',
+    JSON.stringify({ intake: { parentSourceFileId: 'fictional-missing' } }),
+  );
+  for (const bad of ['fictional-cycle-a', 'fictional-missing-parent', 'fictional-missing'])
+    assert.throws(() => correctionSupportingSourceRoot(ancestryDb, f.profileId, bad), {
+      code: 'CORRECTION_EVIDENCE',
+    });
 });

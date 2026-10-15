@@ -11,6 +11,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { request } from 'node:http';
+import { Worker } from 'node:worker_threads';
 import { openDatabase, revision, type Database } from '../database.ts';
 import { ensureProfileDirectories, profilePaths } from '../profile-storage.ts';
 import { attachPersonalDurability, exportCuration, recoverPendingProfile } from '../portable.ts';
@@ -19,9 +20,11 @@ import { uploadIntake } from '../intake.ts';
 import { writeChat, readChat } from '../assistant-journal.ts';
 import {
   rebuildStartup,
+  rebuildStartupBounded,
   validateDataDirectory,
   validateRuntimeDirectory,
   recordStartupMetrics,
+  type StartupProfileMetric,
 } from '../startup-rebuild.ts';
 import { acquireStorageLock } from '../storage-lock.ts';
 import type { StorageLock } from '../storage-lock.ts';
@@ -31,6 +34,7 @@ import {
   startRuntime as startEncryptedRuntime,
 } from '../runtime.ts';
 import { createBackup, restoreBackup } from '../recovery.ts';
+import { intakeCopyNativeSqlite } from '../intake-copy-native-sqlite.ts';
 
 function fixture(
   t: TestContext,
@@ -189,6 +193,123 @@ test('two startups reconstruct all profiles with identical logical content and r
     'Accepted edit',
   );
   db.close();
+});
+
+test('startup worker bounded portable projection preserves selected content and receipt counts', async (t) => {
+  const f = fixture(t, ['cedar'], true);
+  const note = createNote(f.dbs.get('cedar')!, {
+    title: 'Fictional bounded startup',
+    content: 'Accepted portable detail',
+  });
+  removeWorking(f);
+  const baseline = rebuildStartup(f);
+  const bounded = await rebuildStartupBounded(f);
+  const actual = bounded.receipt.profiles[0]!;
+  const expected = baseline.receipt.profiles[0]!;
+  assert.equal(actual.outcome, 'success');
+  for (const field of [
+    'acceptedSourcesSha256',
+    'inputBytes',
+    'inputRecords',
+    'sourceRecords',
+    'originalFiles',
+    'logicalSha256',
+  ] as const)
+    assert.deepEqual(actual[field], expected[field], field);
+  assert.deepEqual(actual.counts, expected.counts);
+  const db = new DatabaseSync(bounded.databases[0]![1], { readOnly: true });
+  try {
+    assert.equal(
+      db.prepare('SELECT content FROM notes WHERE id=?').get(note.id)?.content,
+      'Accepted portable detail',
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('bounded startup refuses a target rewrite in the activation progress callback', async (t) => {
+  const f = fixture(t, ['cedar'], true);
+  removeWorking(f);
+  let injected = false;
+  await assert.rejects(
+    rebuildStartupBounded({
+      ...f,
+      progress(event) {
+        if (event.phase !== 'activate' || event.outcome !== 'starting' || injected) return;
+        injected = true;
+        const staged = readdirSync(f.runtimeDirectory).find((name) =>
+          name.startsWith('.building-'),
+        );
+        assert.ok(staged);
+        const database = resolve(f.runtimeDirectory, staged, 'cedar.sqlite');
+        writeFileSync(database, readFileSync(database));
+      },
+    }),
+    /projection terminal source or target changed/i,
+  );
+  assert.equal(injected, true);
+  assert.equal(
+    readdirSync(f.runtimeDirectory).some((name) => name.startsWith('generation-')),
+    false,
+  );
+});
+
+test('startup worker rebuilds a portable profile with accepted content and receipt', async (t) => {
+  const f = fixture(t, ['cedar'], true);
+  const note = createNote(f.dbs.get('cedar')!, {
+    title: 'Fictional portable runtime note',
+    content: 'Accepted in the worker rebuild',
+  });
+  removeWorking(f);
+  const runtimeDirectory = createTestRuntimeDirectory();
+  // The parent prewarms the native binding before a worker first imports it.
+  intakeCopyNativeSqlite();
+  const worker = new Worker(new URL('../startup-worker.ts', import.meta.url), {
+    workerData: {
+      dataDirectory: f.dataDirectory,
+      runtimeDirectory,
+      profileIds: ['cedar'],
+    },
+  });
+  t.after(async () => {
+    await worker.terminate();
+    rmSync(runtimeDirectory, { recursive: true, force: true });
+  });
+  const result = await new Promise<{
+    receipt: { profiles: StartupProfileMetric[] };
+  }>((resolve, reject) => {
+    worker.on(
+      'message',
+      (message: {
+        failure?: string;
+        result?: { receipt: { profiles: StartupProfileMetric[] } };
+      }) => {
+        if (message.failure) reject(new Error(message.failure));
+        else if (message.result) resolve(message.result);
+      },
+    );
+    worker.once('error', reject);
+    worker.once('exit', (code) => reject(new Error(`Startup worker exited ${code}`)));
+  });
+  const profile = result.receipt.profiles[0];
+  assert.ok(profile);
+  assert.match(profile.acceptedSourcesSha256!, /^[0-9a-f]{64}$/);
+  assert.ok((profile.inputRecords ?? 0) > 0);
+  assert.match(profile.logicalSha256!, /^[0-9a-f]{64}$/);
+  const active = readdirSync(runtimeDirectory).find((name) => name.startsWith('generation-'));
+  assert.ok(active);
+  const db = new DatabaseSync(resolve(runtimeDirectory, active, 'cedar.sqlite'), {
+    readOnly: true,
+  });
+  try {
+    assert.equal(
+      db.prepare('SELECT content FROM notes WHERE id=?').get(note.id)?.content,
+      'Accepted in the worker rebuild',
+    );
+  } finally {
+    db.close();
+  }
 });
 
 test('acknowledged edits survive SIGKILL and total SQLite loss despite failed publication', (t) => {

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { modelConfig, publicModelConfig, ModelError } from './model-config.ts';
+import { modelConfig, publicModelConfig } from './model-config.ts';
+import { ModelError } from './model-errors.ts';
 import {
   ProxyModelBridge,
   proxyCapabilities,
@@ -130,7 +131,7 @@ export function createModelBridge(
         const current = receipts.get(key(config, options.profileId));
         if (current) current.capabilities.pdf = false;
       }
-      options.onEvent?.(method, params);
+      return options.onEvent?.(method, params);
     },
   });
 }

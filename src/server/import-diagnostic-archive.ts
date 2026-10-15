@@ -1,5 +1,6 @@
 import { setImmediate as yieldToRequests } from 'node:timers/promises';
-import { diagnosticChunkLimits, type DiagnosticChunkStore } from './diagnostic-chunk-store.ts';
+import { diagnosticChunkLimits } from './diagnostic-chunk-limits.ts';
+import type { DiagnosticChunkStore } from './diagnostic-chunk-store.ts';
 import type { ImportDiagnosticEvent } from './import-diagnostics.ts';
 import type {
   ImportDiagnosticArchive,

@@ -7,8 +7,12 @@ import { randomUUID } from 'node:crypto';
 import { openDatabase, transaction, type Database } from '../database.ts';
 import { createProfileLifecycle, type ProfileCopyCheckpointContext } from '../profile-lifecycle.ts';
 import { getIntake, uploadIntake, reviewIntake, proposeConversion } from '../intake.ts';
-import { createManualSourceRecord } from '../intake-manual-source-record.ts';
 import {
+  createManualSourceRecord,
+  createManualSourceRecordRead,
+} from '../intake-manual-source-record.ts';
+import {
+  disposeManualSourceCopyPlan,
   prepareManualSourceCopy,
   stageManualSourceCopy,
   copiedManualSourceRecordApplies,
@@ -20,15 +24,44 @@ import { setVisibility } from '../visibility.ts';
 import { readIntakeEnvelopeText } from '../intake-authority.ts';
 import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
 import { profilePaths } from '../profile-storage.ts';
-import { rebuildContributorDatabase } from '../contributor-durability.ts';
+import {
+  rebuildContributorDatabase,
+  contributorCopyEqualityWork,
+} from '../contributor-durability.ts';
+import { contributorAuthorityPath } from '../contributor-record-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import type { ManualSourceRecordRequest } from '../../shared/intake-manual-source-record.ts';
+import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
+import { iterateIntakeEnvelopeText } from '../intake-collection-envelope.ts';
 
 const proofs = (db: Database) =>
   db
     .prepare("SELECT key,value FROM app_meta WHERE key GLOB 'intake_manual_copy:*' ORDER BY key")
     .all() as Array<{ key: string; value: string }>;
-async function fixture(t: TestContext, family = false) {
+const comparedRows = (db: Database) =>
+  db
+    .prepare(
+      "SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '__record_*'",
+    )
+    .all()
+    .reduce((count, table) => {
+      const name = String(table.name).replaceAll('"', '""');
+      const rows = db.prepare(`SELECT * FROM main."${name}"`).all();
+      return (
+        count +
+        rows.filter(
+          (row) =>
+            table.name !== 'app_meta' ||
+            !(
+              typeof row.key === 'string' &&
+              ((row.key.startsWith('personal_') &&
+                !/^personal_(assistant|restore)_/.test(row.key)) ||
+                row.key === 'curation_revision')
+            ),
+        ).length
+      );
+    }, 0);
+async function fixture(t: TestContext, family = false, fullName = 'Fictional child') {
   const root = mkdtempSync(resolve(tmpdir(), 'fictional-manual-copy-'));
   const databases = new Map<string, Database>();
   let beforeStage: (context: ProfileCopyCheckpointContext) => void = () => {};
@@ -54,7 +87,7 @@ async function fixture(t: TestContext, family = false) {
     ? createNote(db, {
         kind: 'person',
         title: 'Fictional child',
-        person: { fullName: 'Fictional child' },
+        person: { fullName },
       })
     : getNote(db, 'person-note:self');
   const original = uploadIntake(db, root, source.id, {
@@ -134,12 +167,62 @@ async function fixture(t: TestContext, family = false) {
   };
 }
 
+// This host integration converts a 270KB retained Unicode author receipt, copies
+// and rebuilds selected authority, then replays the exact manual operation.
+test(
+  'native schema copy preserves real manual author receipt and source pins through selected authority rebuild',
+  { timeout: 90000 },
+  async (t) => {
+    const f = await fixture(t, true, '界'.repeat(90000));
+    await buildIntakeCollectionEnvelope(f.db, { id: f.original.id });
+    const sourceText = [...iterateIntakeEnvelopeText(f.db, { id: f.original.id })].join('');
+    const copy = await f.copy(),
+      target = f.databases.get(copy.id)!;
+    assert.equal(
+      [...iterateIntakeEnvelopeText(target, { id: f.original.id })].join(''),
+      sourceText,
+    );
+    const receipt = f.manual.intake.proposals[0]!.manualSourceRecord!;
+    const scope = {
+      profileId: copy.id,
+      intakeId: f.original.id,
+      sourceHash: f.original.sha256,
+      proposalId: f.manual.proposalId,
+      proposalHash: String(
+        target.prepare('SELECT sha256 FROM source_files WHERE id=?').get(f.manual.proposalId)!
+          .sha256,
+      ),
+    };
+    assert.equal(copiedManualSourceRecordApplies(target, scope, receipt), true);
+    assert.equal(receipt.profileId, f.source.id);
+    assert.equal(proofs(target).length, 1);
+    const replay = await createManualSourceRecordRead(
+      target,
+      f.root,
+      copy.id,
+      f.original.id,
+      f.request,
+    );
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.proposalId, f.manual.proposalId);
+    assert.ok('format' in replay.intake);
+    assert.equal(proofs(target).length, 1);
+  },
+);
+
 test('genuine contributor manual copy preserves exact receipt, review and replay and supports new acceptance and nested authorship', async (t) => {
   const f = await fixture(t);
+  const sourceRows = comparedRows(f.db);
   const before = readIntakeEnvelopeText(f.db, { id: f.original.id });
   const attribution = f.review(f.source.id).records[0].identityAttribution!;
   const first = await f.copy(),
     target = f.databases.get(first.id)!;
+  assert.equal(
+    contributorCopyEqualityWork(f.db).rows,
+    sourceRows,
+    'actual manual receipt copy compares source rows once before inventory reuse',
+  );
+  assert.ok(contributorCopyEqualityWork(f.db).bytes > 0);
   assert.equal(readIntakeEnvelopeText(target, { id: f.original.id }), before);
   assert.deepEqual(f.review(first.id).records[0].identityAttribution, attribution);
   const replay = createManualSourceRecord(target, f.root, first.id, f.original.id, f.request);
@@ -347,15 +430,21 @@ test('copy proof survives later source-text changes while existing stale-source 
 test('source advancement between preparation and staging refuses the unpublished copy', async (t) => {
   const f = await fixture(t);
   let destination: string | undefined;
+  let advancedHead: Buffer | undefined;
+  const sourceHead = resolve(contributorAuthorityPath(f.root, f.source.id), 'head');
   f.setBeforeStage((context) => {
     destination = context.targetProfileId;
     transaction(f.db, () =>
       f.db.prepare("INSERT INTO app_meta VALUES('fictional:advanced','retained')").run(),
     );
+    advancedHead = readFileSync(sourceHead);
   });
-  await assert.rejects(f.copy(), /source selected head changed/);
+  await assert.rejects(f.copy(), { message: 'Copy original read interval changed' });
   assert.ok(destination);
+  assert.ok(advancedHead);
   assert.equal(existsSync(profilePaths(f.root, destination).root), false);
+  assert.equal(existsSync(resolve(contributorAuthorityPath(f.root, destination), 'head')), false);
+  assert.deepEqual(readFileSync(sourceHead), advancedHead);
   assert.equal(
     f.db.prepare("SELECT value FROM app_meta WHERE key='fictional:advanced'").get()?.value,
     'retained',
@@ -389,6 +478,7 @@ test('fabricated plans and published targets cannot mint copy proofs even when s
       undefined,
     );
   }
+  assert.equal(disposeManualSourceCopyPlan(plan), undefined, 'synchronous plan closes now');
 });
 
 test('total contributor cache loss reconstructs missing copied manual proof from accepted authority', async (t) => {

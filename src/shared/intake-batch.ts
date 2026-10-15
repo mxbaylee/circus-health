@@ -115,7 +115,9 @@ export interface IntakeBatchItem {
   status: IntakeBatchItemStatus;
   reason: string | null;
   chatId: string | null;
+  /** Legacy complete snapshots. When proposalState is present these IDs are historical only. */
   proposalIds: string[];
+  proposalState?: { format: 'health-intake-proposal-summary-v2'; total: number; href: string };
   /** Explicit Resume asks for another model pass despite already reviewable work. */
   forceModelResume?: boolean;
   reading: IntakeBatchReadingState | null;

@@ -5,9 +5,17 @@ import {
   exactLargeImportPages,
   gradeLargeImportReview,
   type LargeImportReviewInput,
+  type NativeLargeImportReviewAuthority,
 } from './large-import-review-grader.ts';
 import type { IntakeReportGroupMember, IntakeReviewRecord } from '../shared/intake.ts';
 
+function inlineReportGroups(record: IntakeReviewRecord) {
+  assert.ok(
+    Array.isArray(record.reportGroups),
+    'Fictional oracle snapshots contain complete inline report membership',
+  );
+  return record.reportGroups;
+}
 function snapshots(): LargeImportReviewInput {
   const oracle = createLargeImportOracle();
   const people = Object.fromEntries(
@@ -62,7 +70,7 @@ function snapshots(): LargeImportReviewInput {
   const authorities = oracle.reports.map((report) => {
     const bound = people[report.personKey]!;
     const members: IntakeReportGroupMember[] = records
-      .filter((record) => record.reportGroups![0]!.groupId === report.key)
+      .filter((record) => inlineReportGroups(record)[0]!.groupId === report.key)
       .map((record) => ({
         candidateId: record.candidateId!,
         candidateVersionId: record.candidateVersionId!,
@@ -186,6 +194,112 @@ function snapshots(): LargeImportReviewInput {
 }
 const grade = (input: LargeImportReviewInput) => gradeLargeImportReview(input);
 const first = (input: LargeImportReviewInput) => input.reviews[0]!.records[0]!;
+
+function nativeSnapshots(): LargeImportReviewInput<NativeLargeImportReviewAuthority> {
+  const input = snapshots(),
+    review = input.reviews[0]!,
+    emptyCoverage = {
+      total: 0,
+      covered: 0,
+      uncovered: 0,
+      status: 'empty' as const,
+      sourceCount: 0,
+      bySource: { items: [], total: 0, nextCursor: null },
+    };
+  return {
+    ...input,
+    authorities: input.authorities.map(({ retained, queue, identity }, groupOrdinal) => {
+      const records = review.records
+        .filter((record) =>
+          inlineReportGroups(record).some((group) => group.groupId === queue.groupId),
+        )
+        .map((record) => ({
+          kind: 'record' as const,
+          groupId: queue.groupId,
+          proposalId: review.proposalId,
+          reviewToken: review.reviewToken,
+          queueState: 'pending' as const,
+          selectable: true,
+          record: { ...record, queueState: 'pending' as const, selectable: true },
+        }));
+      return {
+        format: 'qualification-native-report-v1',
+        group: {
+          ...queue,
+          format: 'health-intake-report-group-v2',
+          groupOrdinal,
+          sourceScope: null,
+          report: retained.report,
+          reportContext: null,
+          peopleCounts: { pending: 0, later: 0, excluded: 0, saved: 0 },
+          sourceCoverage: { current: emptyCoverage, saved: emptyCoverage },
+          sourceReview: null,
+          records: { intakeId: queue.intakeId, groupId: queue.groupId },
+          people: { intakeId: queue.intakeId, groupId: queue.groupId },
+        },
+        sourceHash: retained.sourceHash!,
+        identity,
+        records: [
+          {
+            format: 'health-intake-report-record-page-v2',
+            intakeId: review.intakeId,
+            version: review.version,
+            view: 'all',
+            scope: 'clinical_records',
+            records,
+            totalRecords: records.length,
+            nextCursor: null,
+          },
+        ],
+      };
+    }),
+  };
+}
+
+test('native qualification binds every public occurrence to its captured review generation', () => {
+  assert.equal(gradeLargeImportReview(nativeSnapshots()).passed, true);
+  for (const token of ['stale-unrelated-review-token', '']) {
+    const input = nativeSnapshots();
+    input.authorities[0]!.records[0]!.records[0]!.reviewToken = token;
+    const result = gradeLargeImportReview(input);
+    assert.equal(result.passed, false);
+    assert.ok(result.authorityIssues.includes('conflictingAuthority'));
+  }
+  const missing = nativeSnapshots();
+  delete (missing.authorities[0]!.records[0]!.records[0]! as { reviewToken?: string }).reviewToken;
+  assert.ok(gradeLargeImportReview(missing).authorityIssues.includes('conflictingAuthority'));
+});
+
+test('native qualification refuses missing or conflicting exact captured occurrence pins', () => {
+  const absent = nativeSnapshots(),
+    entry = absent.authorities[0]!.records[0]!.records[0]!;
+  entry.proposalId = 'fictional-other-proposal';
+  assert.ok(gradeLargeImportReview(absent).authorityIssues.includes('conflictingAuthority'));
+  const conflict = nativeSnapshots();
+  conflict.reviews = [
+    ...conflict.reviews,
+    { ...conflict.reviews[0]!, reviewToken: 'fictional-other-generation' },
+  ];
+  assert.ok(gradeLargeImportReview(conflict).authorityIssues.includes('conflictingAuthority'));
+});
+
+test('an unloaded membership reference cannot qualify from its navigation hint', () => {
+  const input = snapshots(),
+    record = first(input);
+  const firstGroup = inlineReportGroups(record)[0]!;
+  record.reportGroups = {
+    format: 'health-intake-report-group-links-v1',
+    count: 1,
+    first: firstGroup,
+    selection: {
+      candidateId: record.candidateId!,
+      candidateVersionId: record.candidateVersionId!,
+      recordId: record.id,
+      proposalId: input.reviews[0]!.proposalId,
+    },
+  };
+  assert.equal(grade(input).passed, false);
+});
 
 function scopedSelfSnapshots() {
   const input = snapshots();
@@ -338,7 +452,7 @@ test('another person cannot borrow the Self projection fallback', () => {
   record.mapping.personId = undefined;
   record.identityReview!.assignedPerson = undefined;
   const authority = input.authorities.find(
-    (item) => item.retained.id === record.reportGroups![0]!.groupId,
+    (item) => item.retained.id === inlineReportGroups(record)[0]!.groupId,
   )!;
   authority.identity.assignedPerson = undefined;
   assert.equal(grade(input).ownershipResolved, false);
@@ -434,7 +548,7 @@ test('wrong original, broad pages, missing split half and wrong report fail attr
       input.reviews[0]!.records.at(-1)!.evidence.pop();
     },
     (input: LargeImportReviewInput) => {
-      first(input).reportGroups![0]!.groupId = input.authorities[1]!.retained.id;
+      inlineReportGroups(first(input))[0]!.groupId = input.authorities[1]!.retained.id;
     },
     (input: LargeImportReviewInput) => {
       input.authorities[0]!.retained.report!.anchor.text = 'An unrelated heading';
@@ -526,7 +640,7 @@ test('wrong ownership, unresolved issues and conflicting/missing bindings cannot
 test('missing report authority cannot hide wrong or unresolved ownership', () => {
   for (const personId of [undefined, 'wrong-person']) {
     const input = snapshots();
-    first(input).reportGroups![0]!.groupId = 'missing-group';
+    inlineReportGroups(first(input))[0]!.groupId = 'missing-group';
     first(input).mapping.personId = personId;
     const result = grade(input);
     assert.equal(result.ownershipResolved, false);
@@ -595,9 +709,9 @@ test('valid older introducing versions pass but invented versions and membership
   authority.queue.groupVersionId = 'latest-version';
   authority.identity.scope!.groupVersionId = 'latest-version';
   assert.equal(grade(input).passed, true);
-  first(input).reportGroups![0]!.groupVersionId = 'unretained-version';
+  inlineReportGroups(first(input))[0]!.groupVersionId = 'unretained-version';
   assert.equal(grade(input).passed, false);
-  first(input).reportGroups![0]!.groupVersionId = authority.retained.versions[0]!.id;
+  inlineReportGroups(first(input))[0]!.groupVersionId = authority.retained.versions[0]!.id;
   authority.retained.versions[0]!.members = [];
   assert.equal(grade(input).passed, false);
 });

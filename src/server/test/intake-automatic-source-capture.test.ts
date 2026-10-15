@@ -10,9 +10,9 @@ import { attachPersonalDurability } from '../portable.ts';
 import {
   uploadIntake,
   getIntake,
+  getIntakeRead,
   proposeConversion,
   reviewIntake,
-  currentIntakeInterpretations,
   prepareIntakeImport,
 } from '../intake.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
@@ -24,6 +24,9 @@ import {
 } from '../intake-source-extraction.ts';
 import type { RecordStorage } from '../record-versions.ts';
 import type { IntakeBatchReadingState } from '../../shared/intake-batch.ts';
+import { selectedFixtureReview } from './helpers/selected-intake.ts';
+import { prepareCurrentIntakeInterpretations } from '../intake-current-interpretations.ts';
+import { proposalDependenciesCurrent } from '../intake-proposal-dependencies.ts';
 async function waitFor(check: () => boolean) {
   const end = Date.now() + 10000;
   while (!check() && Date.now() < end) await new Promise((r) => setTimeout(r, 5));
@@ -217,15 +220,16 @@ test('an early reviewable proposal does not stop later source capture and readin
   const captured = getIntakeSourceText(f.db, f.root, f.profileId, f.long.id);
   assert.notEqual(captured.revision!.id, before.revision!.id);
   assert.equal(sourceTextExtractionPending(captured), false);
-  assert.ok(getIntake(f.db, f.root, f.profileId, f.long.id).version > proposed.version);
+  assert.ok(getIntakeRead(f.db, f.root, f.profileId, f.long.id).version > proposed.version);
   const proposalId = proposed.proposals.at(-1)!.id;
   assert.equal(
-    reviewIntake(f.db, f.root, f.profileId, f.long.id, proposalId).sourceTextStale,
+    (await selectedFixtureReview(f.db, f.root, f.profileId, f.long.id, proposalId)).sourceTextStale,
     false,
   );
   assert.ok(
-    currentIntakeInterpretations(f.db, f.profileId, f.long.id).proposalIds.includes(proposalId),
+    (await prepareCurrentIntakeInterpretations(f.db, f.profileId, f.long.id)).hasCurrentProposal,
   );
+  assert.equal(proposalDependenciesCurrent(f.db, proposalId), true);
 });
 
 test('an unrelated source append preserves a measured proposal review token', async (t) => {

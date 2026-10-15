@@ -13,6 +13,7 @@ import {
 import { readWithRecovery, separateReadGeneration } from './read-recovery.ts';
 import { connectionSnapshot, subscribeConnection } from './connection.ts';
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { holdoutTrace } from './holdout-trace.ts';
 import {
   currentProfile,
   currentProfiles,
@@ -130,7 +131,10 @@ export async function api<T>(path: string, options: ApiOptions = {}): Promise<Ap
       serverRequestId = receivedId;
       recordClientRequest(operationId, receivedId);
     }
+    const peopleRead = read && path.startsWith('/intakes/people/');
+    if (peopleRead) holdoutTrace('people.api.decode-start');
     const payload = await response.json().catch(() => null);
+    if (peopleRead) holdoutTrace('people.api.decode-done');
     recordClientPhase(operationId, 'response_decode', headersAt);
     if (path !== '/profiles' && path !== '/api/profiles' && profileId !== currentProfile()?.id)
       throw new ApiError('Profile changed before this request completed.', 'PROFILE_CHANGED');
@@ -231,12 +235,15 @@ export function useResource<T>(path: string | null, performanceKind?: 'review_op
   const profile = useProfile();
   const key = `${profile?.id ?? ''}:${path ?? ''}`;
   const [revision, setRevision] = useState(0);
-  const [state, setState] = useState<Omit<Resource<T>, 'reload'> & { key: string }>({
+  const [state, setState] = useState<
+    Omit<Resource<T>, 'reload'> & { key: string; settledRevision: number }
+  >({
     data: null,
     meta: undefined,
     loading: !!path,
     error: null,
     key,
+    settledRevision: revision,
   });
   const reload = useCallback(() => setRevision((value) => value + 1), []);
   useEffect(() => {
@@ -251,7 +258,14 @@ export function useResource<T>(path: string | null, performanceKind?: 'review_op
   }, [path, reload]);
   useEffect(() => {
     if (!path) {
-      setState({ data: null, meta: undefined, loading: false, error: null, key });
+      setState({
+        data: null,
+        meta: undefined,
+        loading: false,
+        error: null,
+        key,
+        settledRevision: revision,
+      });
       return;
     }
     const controller = new AbortController();
@@ -264,7 +278,14 @@ export function useResource<T>(path: string | null, performanceKind?: 'review_op
             refreshing: previous.data !== null,
             error: null,
           }
-        : { data: null, meta: undefined, loading: true, error: null, key },
+        : {
+            data: null,
+            meta: undefined,
+            loading: true,
+            error: null,
+            key,
+            settledRevision: revision,
+          },
     );
     api<T>(path, { signal: controller.signal, operationId: operation?.operationId })
       .then((response) => {
@@ -289,6 +310,7 @@ export function useResource<T>(path: string | null, performanceKind?: 'review_op
             refreshing: false,
             error: null,
             key,
+            settledRevision: revision,
           });
         operation?.afterRender(controller.signal.aborted ? 'cancelled' : 'completed');
       })
@@ -303,6 +325,7 @@ export function useResource<T>(path: string | null, performanceKind?: 'review_op
             error:
               error instanceof ApiError ? error : new ApiError('Unable to reach the local server.'),
             key,
+            settledRevision: revision,
           }));
       });
     return () => {
@@ -310,9 +333,19 @@ export function useResource<T>(path: string | null, performanceKind?: 'review_op
       operation?.finish('cancelled');
     };
   }, [path, key, revision, performanceKind]);
+  const { settledRevision, ...current } = state;
+  // A reload gates its old data on the revision render, before effects start
+  // the new request. Only that request's settled response clears the gate.
+  const pending = !!path && settledRevision !== revision;
   // Never expose the preceding resource while the next URL is loading.
   return state.key === key
-    ? { ...state, reload }
+    ? {
+        ...current,
+        ...(pending
+          ? { loading: current.data === null, refreshing: current.data !== null, error: null }
+          : {}),
+        reload,
+      }
     : { data: null, meta: undefined, loading: !!path, error: null, reload };
 }
 

@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { observeIntakeVersion, intakeVersionConflictFacts } from '../import-version-diagnostics.ts';
+import {
+  observeIntakeVersion,
+  observeIntakeLogicalVersion,
+  intakeVersionConflictFacts,
+} from '../import-version-diagnostics.ts';
 import {
   createImportDiagnostics,
   beginImportPhase,
@@ -10,6 +14,47 @@ import {
 import { withDiagnosticContext } from '../import-diagnostic-error.ts';
 import { HttpError } from '../database.ts';
 import { ModelToolValidationError } from '../model-tool-validation.ts';
+
+test('logical-root observations remain bounded and cannot cite rollback or legacy digest history', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    const one = { version: 1, logicalBinding: 'fictional-logical-root-a' };
+    const two = { version: 2, logicalBinding: 'fictional-logical-root-b' };
+    const three = { version: 3, logicalBinding: 'fictional-logical-root-c' };
+    observeIntakeLogicalVersion(db, 'fictional-source', one, two, 'plan');
+    observeIntakeLogicalVersion(db, 'fictional-source', two, three, 'identity_confirmation');
+    const facts = intakeVersionConflictFacts(db, 'fictional-source', 1, 3, three);
+    assert.equal(facts.versionHistoryComplete, true);
+    assert.equal(facts.planChanges, 1);
+    assert.equal(facts.identityChanges, 1);
+    assert.doesNotMatch(JSON.stringify(facts), /fictional/);
+    assert.equal(
+      intakeVersionConflictFacts(db, 'fictional-source', 1, 2, two).versionHistoryComplete,
+      false,
+    );
+    assert.equal(
+      intakeVersionConflictFacts(db, 'fictional-source', 1, 3, three.logicalBinding)
+        .lastChangeCategory,
+      'unknown',
+    );
+    const changed = { version: 3, logicalBinding: 'fictional-other-root-at-same-version' };
+    observeIntakeLogicalVersion(
+      db,
+      'fictional-source',
+      changed,
+      { version: 4, logicalBinding: 'fictional-root-d' },
+      'question',
+    );
+    const afterGap = intakeVersionConflictFacts(db, 'fictional-source', 1, 4, {
+      logicalBinding: 'fictional-root-d',
+    });
+    assert.equal(afterGap.versionHistoryComplete, false);
+    assert.equal(afterGap.planChanges, 0);
+    assert.equal(afterGap.questionChanges, 1);
+  } finally {
+    db.close();
+  }
+});
 
 test('version observations distinguish identity from later proposal changes, remain private and reject rolled-back state', () => {
   const db = new DatabaseSync(':memory:');

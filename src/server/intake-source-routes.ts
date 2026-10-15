@@ -1,8 +1,13 @@
-import { createManualSourceRecord } from './intake-manual-source-record.ts';
+import { createManualSourceRecordRead } from './intake-manual-source-record.ts';
 import type { ManualSourceRecordRequest } from '../shared/intake-manual-source-record.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
-import { getIntake, readIntake, getIntakePlan, currentIntakeInterpretations } from './intake.ts';
+import {
+  getIntakeRead,
+  readIntakeLiteralWindow,
+  getIntakePlan,
+  currentIntakeInterpretations,
+} from './intake.ts';
 import {
   currentIntakeSourceTextRevisionId,
   getIntakeSourceText,
@@ -22,6 +27,12 @@ import type {
   SourceTextReviewRequest,
   SourceReaderCoverage,
 } from '../shared/intake-source-text.ts';
+import { isIntakeSummary } from '../shared/intake-summary.ts';
+import {
+  prepareCollectionReaderCoverage,
+  readCollectionReaderCoverage,
+} from './intake-source-reader-index.ts';
+import { openCollectionReaderPlan } from './intake-source-reader-unit.ts';
 
 interface SourceRoute {
   db: DatabaseSync;
@@ -33,14 +44,14 @@ interface SourceRoute {
   input?: Record<string, unknown>;
 }
 
-function readerCoverage(
+async function readerCoverage(
   db: DatabaseSync,
   root: string,
   profileId: string,
   id: string,
   sourceHash: string,
   params: URLSearchParams,
-): SourceReaderCoverage {
+): Promise<SourceReaderCoverage> {
   const offset = Number(params.get('readerOffset') || 0),
     limit = Number(params.get('readerLimit') || 20);
   if (
@@ -55,6 +66,46 @@ function readerCoverage(
       'SOURCE_TEXT_INVALID',
       'Choose a reader offset and limit from 1 to 50',
     );
+  const selected = getIntakeRead(db, root, profileId, id);
+  if (isIntakeSummary(selected)) {
+    if (
+      (params.has('readerVersion') && Number(params.get('readerVersion')) !== selected.version) ||
+      (offset > 0 && !params.has('readerVersion'))
+    )
+      throw new HttpError(409, 'VERSION_CONFLICT', 'Reload reader observations before continuing');
+    const assertSelected = () => {
+      const current = getIntakeRead(db, root, profileId, id);
+      if (current.version !== selected.version || current.sha256 !== sourceHash)
+        throw new HttpError(
+          409,
+          'VERSION_CONFLICT',
+          'Reload reader observations before continuing',
+        );
+    };
+    assertSelected();
+    await prepareCollectionReaderCoverage(db, root, profileId, id, {
+      assertRunning: assertSelected,
+    });
+    const prepared = readCollectionReaderCoverage(db, profileId, id, { offset, limit });
+    const plans = new Map<string, ReturnType<typeof openCollectionReaderPlan>>();
+    const entries = prepared.entries.map((entry) => {
+      let plan = plans.get(entry.planAddress);
+      if (!plan) {
+        plan = openCollectionReaderPlan(db, root, profileId, id, entry.planAddress);
+        plans.set(entry.planAddress, plan);
+      }
+      return plan.entry(entry.unitOrdinal, entry.stale);
+    });
+    prepared.assertCurrent();
+    assertSelected();
+    return {
+      intakeVersion: selected.version,
+      summary: prepared.summary,
+      entries,
+      offset,
+      nextOffset: offset + limit < prepared.total ? offset + limit : null,
+    };
+  }
   const view = getIntakePlan(db, root, profileId, id);
   if (
     (params.has('readerVersion') && Number(params.get('readerVersion')) !== view.version) ||
@@ -126,16 +177,16 @@ export async function intakeSourceRoute({
   params,
   input,
 }: SourceRoute) {
-  const original = getIntake(db, root, profileId, id);
+  const original = getIntakeRead(db, root, profileId, id);
   const assertRunning = () => {
     // Revalidate after every worker await; a locked/closed profile or changed original
     // must never publish a late worker result. The vault also authorizes response delivery.
-    if (getIntake(db, root, profileId, id).sha256 !== original.sha256)
+    if (getIntakeRead(db, root, profileId, id).sha256 !== original.sha256)
       throw new HttpError(409, 'SOURCE_CHANGED', 'Reload the retained source');
   };
   if (input) {
     if (action === 'source-records')
-      return createManualSourceRecord(
+      return createManualSourceRecordRead(
         db,
         root,
         profileId,
@@ -175,7 +226,7 @@ export async function intakeSourceRoute({
     });
     return {
       ...response,
-      readerCoverage: readerCoverage(db, root, profileId, id, response.sourceHash, params),
+      readerCoverage: await readerCoverage(db, root, profileId, id, response.sourceHash, params),
       extractionFailure: getIntakeSourceExtractionFailure(db, profileId, id, response.sourceHash),
     };
   }
@@ -230,13 +281,21 @@ export async function intakeSourceRoute({
     original.mimeType !== 'application/pdf' &&
     !['image/png', 'image/jpeg', 'image/webp'].includes(original.mimeType)
   ) {
-    const literal = readIntake(db, root, profileId, id, {
+    const literal = readIntakeLiteralWindow(db, root, profileId, id, {
       offset: (page - 1) * 24000,
       limit: 24000,
     });
     return { text: literal.text, offset: literal.offset, nextOffset: literal.nextOffset };
   }
-  const preview = await readIntakeEvidence({ db, root, profileId, id, page, assertRunning });
+  const preview = await readIntakeEvidence({
+    db,
+    root,
+    profileId,
+    id,
+    page,
+    assertRunning,
+    pagedContext: isIntakeSummary(original),
+  });
   assertRunning();
   if (revisionId !== currentIntakeSourceTextRevisionId(db, profileId, id))
     throw new HttpError(409, 'SOURCE_TEXT_CHANGED', 'Source text changed while rendering');

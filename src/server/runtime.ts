@@ -19,6 +19,9 @@ import {
 import { createVaultApp } from './vault-app.ts';
 import { readBuildIdentity } from './build-identity.ts';
 import { writeChat } from './assistant-journal.ts';
+import { readProfileRegistry } from './profile-registry.ts';
+import { hasContributorAuthority } from './contributor-record-storage.ts';
+import { intakeCopyNativeSqlite } from './intake-copy-native-sqlite.ts';
 
 interface RuntimeOptions {
   dataDirectory?: string;
@@ -149,6 +152,9 @@ export async function startLegacyRuntime({
       server.once('error', reject);
       server.listen(port, host, done);
     });
+    const selectedProfiles = profileIds ?? readProfileRegistry(root).profiles.map((p) => p.id);
+    if (selectedProfiles.some((profileId) => !hasContributorAuthority(root, profileId)))
+      intakeCopyNativeSqlite();
     worker = new Worker(new URL('./startup-worker.ts', import.meta.url), {
       workerData: {
         dataDirectory,

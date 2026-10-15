@@ -2,7 +2,10 @@ import { createHash } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import { json, observeTransactionOutcome } from './database.ts';
+import { json } from './database.ts';
+import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
+const outcomes = createTransactionOutcomeIssuer();
+export const intakeSourceContextTerminalOutcome = outcomes.recognizes;
 import { sourceContextEnvelope } from './clinical-import.ts';
 import { MAX_INTAKE_BYTES, validateJSONL } from './intake-format.ts';
 import { readIntakeFileSync, recordIntakeFileHash } from './intake-file-work.ts';
@@ -48,7 +51,7 @@ function scoped(db: DatabaseSync, root: string, profileId: string): Scope {
     clearSourceContextClassificationCache(db);
     scope = { binding, collections: new Map(), dispose: () => {} };
     const collections = scope.collections;
-    scope.dispose = observeTransactionOutcome(db, (outcome) => {
+    scope.dispose = outcomes.observe(db, (outcome) => {
       if (!outcome.succeeded) collections.clear();
     });
     scopes.set(db, scope);

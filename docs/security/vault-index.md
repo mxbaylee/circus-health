@@ -12,6 +12,18 @@ The unlocked profile vault maps logical private file names to immutable encrypte
 
 Cold open reads the committed chain once, recomputes cumulative usage, validates object metadata and file bindings, and reconstructs disposable maps. Referenced content files must exist and be ordinary unlinked files. Content authentication, size and digest are checked when read or materialized. Historical content and index generations remain retained. A captured manifest selects its exact index ancestry and record head even when later, unreferenced generations are also present in a backup.
 
+The supported existing-profile unlock performs complete recovery validation in a
+private worker. Handoff reconstructs the vault on the HTTP process through bounded
+tree, index-generation, object-stat and digest-initialization steps, yielding after
+at most 64 steps and checking the original attempt authority around each turn.
+It does not repeat complete history or intake validation synchronously. Complete
+worker validation, main index reconstruction and the terminal original physical
+witness sweep are separate cold/recovery work; they are not change-local write
+costs. Existing contributor/test synchronous APIs retain the same validation.
+The [unlock contract](profile-encryption.md#unlock-caching-and-locking) describes
+the exact physical witness, cancellation and conservative concurrent-write retry
+boundary. The encrypted object, head and index formats are unchanged.
+
 Publication failures close the affected writer and discard reconstructed maps, pending bindings/metadata, digest lookups and workspace fingerprints. A failure after manifest replacement can have committed successfully despite the exception; reopen follows the actual authenticated manifest. A failure before replacement leaves the previous commit authoritative. Unreferenced staged artifacts are not adopted or deleted as evidence. Missing manifests with retained artifacts fail explicitly rather than initializing over them. Profile locking/closure clears the same disposable state.
 
 ## Selected processing-queue files

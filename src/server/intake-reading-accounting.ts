@@ -177,8 +177,9 @@ export function intakeReadingAccounting(
         "SELECT json_extract(details_json,'$.intake.locator') locator FROM source_files WHERE id=? AND sha256=? AND json_extract(details_json,'$.intake.parentSourceFileId')=?",
       )
       .get(intake.id, intake.sha256, intake.parentSourceFileId) as { locator?: string } | undefined;
+    const matchesLocator = stored ? intakeFirstLocatorMatcher(db, intake.id) : () => false;
     const member = parent.index.members?.find(
-      (member) => member.sourceHash === intake.sha256 && member.locator === stored?.locator,
+      (member) => member.sourceHash === intake.sha256 && matchesLocator(member.locator),
     );
     const units =
       member &&
@@ -216,3 +217,4 @@ export function intakeReadingAccounting(
         : 'unknown';
   return result;
 }
+import { intakeFirstLocatorMatcher } from './intake-state-access.ts';

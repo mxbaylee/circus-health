@@ -74,12 +74,16 @@ function needsSetup(note: Note) {
 export function ProfileManagement({
   initialOpen = false,
   initialMode = 'list',
+  handoffHost = 'active',
+  handoffProfileId,
   triggerLabel,
   onBack,
   backLabel = 'Back',
 }: {
   initialOpen?: boolean;
   initialMode?: 'list' | 'create';
+  handoffHost?: 'startup' | 'active';
+  handoffProfileId?: string;
   triggerLabel?: string;
   onBack?: () => void;
   backLabel?: string;
@@ -217,7 +221,9 @@ export function ProfileManagement({
     }
   };
   useEffect(() => {
+    if (handoffHost === 'startup') return;
     const selected = currentProfile();
+    if (handoffProfileId !== undefined && selected?.id !== handoffProfileId) return;
     if (storageHandoff && selected?.id === storageHandoff) {
       storageHandoff = null;
       setOpen(true);

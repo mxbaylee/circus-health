@@ -1,12 +1,16 @@
 import { configuredModelIdentity } from './model-bridge.ts';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 import { workflowHash } from './intake-workflow.ts';
+import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
 import { activeMappingRules } from './clinical-import.ts';
 import { HttpError } from './database.ts';
 import { INTAKE_SCHEMA_INSTRUCTIONS } from './intake-format.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type {
   IntakeExtractionUnit,
+  IntakeExtractionPlan,
   IntakeMetadata,
   IntakePackageMember,
 } from '../shared/intake.ts';
@@ -85,6 +89,61 @@ export interface PlannedExtractionUnit extends IntakeExtractionUnit {
   sharedHeadings?: { start: number; end: number }[];
 }
 
+/** The existing occurrence recipe, shared by eager legacy and paged plans.
+ * A byte-identical member in a different occurrence retains its distinct ID. */
+export function packageMemberUnit(member: IntakePackageMember): PlannedExtractionUnit {
+  const value = {
+    kind: 'package_member' as const,
+    memberId: member.memberId,
+    sourceHash: member.sourceHash,
+    filename: member.filename,
+    locator: member.locator,
+    bytes: member.bytes,
+    duplicateOf: member.duplicateOf,
+    note: 'Inventory only. Read and account for this occurrence; filenames and byte reuse never establish clinical record identity.',
+  };
+  return { id: 'unit:' + workflowHash(value), ...value, status: 'pending', attempts: [] };
+}
+
+/** Hash the exact existing [sourceId, pins, orderedUnitIds] JSON preimage.
+ * This performs one O(N) pass for new pins, retaining only one ID at a time.
+ * Callers bind the source/inventory/pins across this pass and check replay first.
+ * No aggregate unit-list JSON or alternate public identity grammar is introduced. */
+export async function streamedExtractionPlanId(
+  db: DatabaseSync,
+  sourceId: string,
+  pins: IntakeExtractionPlan['pins'] & { connectionIdentity?: string },
+  unitIds: Iterable<string> | AsyncIterable<string>,
+  assertRunning: () => void = () => {},
+): Promise<{ id: string; unitCount: number }> {
+  const digest = createHash('sha256');
+  const write = (text: string) => {
+    digest.update(text);
+    withIntakeWork(db, 'warm', () =>
+      recordIntakeWork('packagePlanHashBytes', Buffer.byteLength(text)),
+    );
+  };
+  assertRunning();
+  write('[' + JSON.stringify(sourceId) + ',' + JSON.stringify(pins) + ',[');
+  let unitCount = 0;
+  for await (const id of unitIds) {
+    assertRunning();
+    if (typeof id !== 'string' || !/^unit:[a-f0-9]{64}$/.test(id))
+      throw Error('Invalid extraction unit identity');
+    if (unitCount === Number.MAX_SAFE_INTEGER) throw Error('Extraction unit count overflow');
+    if (unitCount) write(',');
+    write(JSON.stringify(id));
+    unitCount++;
+    withIntakeWork(db, 'warm', () => recordIntakeWork('packagePlanUnitIds'));
+    // Yield between bounded batches so a large new plan cannot monopolize
+    // interactive requests. This is scheduling, not a wall-clock pass target.
+    if (unitCount % 64 === 0) await setImmediate();
+  }
+  assertRunning();
+  write(']]');
+  return { id: 'plan:' + digest.digest('hex'), unitCount };
+}
+
 interface ExtractionUnitInput {
   unitSize?: number;
   overlap?: number;
@@ -119,8 +178,14 @@ export function extractionUnits(
   index: EvidenceIndex,
   input: ExtractionUnitInput = {},
 ): PlannedExtractionUnit[] {
-  const units: PlannedExtractionUnit[] = [],
-    count = Number(input.unitSize ?? (index.kind === 'pdf' ? 2 : 25));
+  return [...iterateExtractionUnits(index, input)];
+}
+/** The existing unit recipe in exact order, without retaining all plan units. */
+export function* iterateExtractionUnits(
+  index: EvidenceIndex,
+  input: ExtractionUnitInput = {},
+): Generator<PlannedExtractionUnit> {
+  const count = Number(input.unitSize ?? (index.kind === 'pdf' ? 2 : 25));
   const overlap = Number(input.overlap ?? (index.kind === 'pdf' ? 0 : Math.min(1, count - 1)));
   if (
     !Number.isSafeInteger(count) ||
@@ -135,25 +200,21 @@ export function extractionUnits(
       'PLAN_INPUT',
       'Choose a unit size of 1–50 and smaller nonnegative context overlap',
     );
-  const push = (value: Omit<PlannedExtractionUnit, 'id' | 'status' | 'attempts'>): void => {
-    units.push({ id: 'unit:' + workflowHash(value), ...value, status: 'pending', attempts: [] });
-  };
+  const unit = (
+    value: Omit<PlannedExtractionUnit, 'id' | 'status' | 'attempts'>,
+  ): PlannedExtractionUnit => ({
+    id: 'unit:' + workflowHash(value),
+    ...value,
+    status: 'pending',
+    attempts: [],
+  });
   if (index.kind === 'zip') {
     for (const member of index.members || []) {
       if (index.inventoryVersion === 1) {
-        push({
-          kind: 'package_member',
-          memberId: member.memberId,
-          sourceHash: member.sourceHash,
-          filename: member.filename,
-          locator: member.locator,
-          bytes: member.bytes,
-          duplicateOf: member.duplicateOf,
-          note: 'Inventory only. Read and account for this occurrence; filenames and byte reuse never establish clinical record identity.',
-        });
+        yield packageMemberUnit(member);
         continue;
       }
-      const memberUnits: PlannedExtractionUnit[] = ['zip', 'image', 'unsupported'].includes(
+      const memberUnits: Iterable<PlannedExtractionUnit> = ['zip', 'image', 'unsupported'].includes(
         member.index.kind,
       )
         ? [
@@ -170,20 +231,20 @@ export function extractionUnits(
                 'Read this supplied member explicitly; no automatic nested extraction.',
             } as unknown as PlannedExtractionUnit,
           ]
-        : extractionUnits(member.index, input);
-      for (const unit of memberUnits) {
-        const { id: _id, status: _status, attempts: _attempts, ...value } = unit;
-        push({
+        : iterateExtractionUnits(member.index, input);
+      for (const memberUnit of memberUnits) {
+        const { id: _id, status: _status, attempts: _attempts, ...value } = memberUnit;
+        yield unit({
           ...value,
           sourceFileId: member.sourceFileId,
           sourceHash: member.sourceHash,
           filename: member.filename,
-          locator: `${member.locator}; ${unit.locator}`,
+          locator: `${member.locator}; ${memberUnit.locator}`,
         });
       }
     }
     for (const member of index.unsupportedMembers || [])
-      push({
+      yield unit({
         kind: 'unsupported',
         locator: member.locator,
         filename: member.filename,
@@ -192,7 +253,7 @@ export function extractionUnits(
   } else if (index.kind === 'pdf') {
     for (let start = 1; start <= index.pages!;) {
       const end = Math.min(index.pages!, start + count - 1);
-      push({
+      yield unit({
         kind: 'pdf',
         locator: `pages ${start}–${end}`,
         pages: Array.from({ length: end - start + 1 }, (_, i) => start + i),
@@ -201,7 +262,7 @@ export function extractionUnits(
       start = end + 1 - overlap;
     }
   } else if (index.kind === 'image') {
-    push({
+    yield unit({
       kind: 'image',
       locator: 'whole retained image',
       note: 'One host-indexed image occurrence. Read the visual original before recording an explicit disposition.',
@@ -212,7 +273,7 @@ export function extractionUnits(
         for (let start = 0; start < section.rows.length;) {
           const rows = section.rows.slice(start, start + count),
             end = start + rows.length;
-          push({
+          yield unit({
             kind: 'html',
             locator: `${section.locator}, rows ${start + 1}–${end}`,
             start: rows[0]!.start,
@@ -229,7 +290,7 @@ export function extractionUnits(
       } else {
         for (let start = section.start!; start < section.end!;) {
           const end = Math.min(section.end!, start + 12000);
-          push({
+          yield unit({
             kind: index.kind as 'html' | 'text',
             locator: `characters ${start}–${end}`,
             start,
@@ -247,5 +308,4 @@ export function extractionUnits(
       'PLAN_UNSUPPORTED',
       'This format has no resumable text/page index yet. Originals remain available.',
     );
-  return units;
 }

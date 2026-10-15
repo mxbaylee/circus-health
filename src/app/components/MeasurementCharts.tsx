@@ -330,7 +330,11 @@ export function MeasurementCharts({
                               )}
                               <RecordCorrectionBadges extra={point.extra} />
                             </Link>
-                            <RecordCorrectionHistory extra={point.extra} />
+                            <RecordCorrectionHistory
+                              extra={point.extra}
+                              kind="observation"
+                              recordId={point.id}
+                            />
                           </div>
                         ))
                       ) : (

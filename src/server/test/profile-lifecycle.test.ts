@@ -204,8 +204,11 @@ test('closing the app during a copy prevents publication', async (t) => {
     p.id,
   );
   actions.close();
-  await assert.rejects(copy, /stopped/);
-  assert.equal(readProfileRegistry(root).profiles.length, 1);
+  await assert.rejects(copy, { status: 503, code: 'PROFILE_STOPPED' });
+  assert.deepEqual(
+    readProfileRegistry(root).profiles.map((profile) => profile.id),
+    [p.id],
+  );
 });
 test('busy profiles cannot be removed or copied', async (t) => {
   const { root, databases, actions } = fixture(t);

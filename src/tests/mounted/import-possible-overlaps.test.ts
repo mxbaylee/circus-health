@@ -35,6 +35,27 @@ it('surfaces same-file literal/date/unit overlaps even when source labels differ
   expect(possibleSavedOverlapCount(incoming, mapping)).toBe(1);
   expect(incoming).toEqual(before);
 });
+it('preserves an explicitly verified overlap cue when saved evidence remains referenced', () => {
+  const evidence = {
+    format: 'health-saved-evidence-v1' as const,
+    kind: 'observation' as const,
+    recordId: 'fictional-saved',
+    count: 10001,
+    digest: 'fictional-digest',
+    scopeDigest: 'fictional-scope',
+    stateHash: 'fictional-state',
+    url: '/api/clinical-review/saved-evidence?reference=fictional',
+  };
+  expect(possibleSavedOverlapCount(record({ evidence, originalOverlap: true }), mapping)).toBe(1);
+  expect(possibleSavedOverlapCount(record({ evidence, originalOverlap: false }), mapping)).toBe(0);
+  expect(possibleSavedOverlapCount(record({ evidence }), mapping)).toBe(0);
+  expect(
+    possibleSavedOverlapCount(record({ evidence, originalOverlap: true }), {
+      ...mapping,
+      unit: '',
+    }),
+  ).toBe(0);
+});
 
 it.each([
   ['unknown date', { date: '' }],

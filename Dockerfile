@@ -1,5 +1,6 @@
 FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df AS dependencies
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential python3 && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 RUN HUSKY=0 npm ci
 
@@ -22,7 +23,7 @@ RUN CRS_BUILD_REVISION="$CRS_BUILD_REVISION" CRS_BUILD_WORKTREE="$CRS_BUILD_WORK
 FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df AS runtime
 ENV NODE_ENV=production CRS_DATA_DIR=/archive/data CRS_RUNTIME_DIR=/run/health CRS_PORT=3001 PLAYWRIGHT_BROWSERS_PATH=/opt/playwright CRS_AI_BACKEND=litellm
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends qpdf tesseract-ocr tesseract-ocr-eng && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends libsqlite3-0 qpdf tesseract-ocr tesseract-ocr-eng && rm -rf /var/lib/apt/lists/*
 COPY LICENSE THIRD-PARTY-NOTICES.md /app/
 COPY --from=build /app/package.json /app/package-lock.json ./
 COPY --from=build /app/node_modules ./node_modules

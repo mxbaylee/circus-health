@@ -1,3 +1,7 @@
+import {
+  isGenericNameConfirmation,
+  isGenericNameConfirmationWork,
+} from '../intake-identity-policy.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,7 +22,58 @@ import {
   assessIdentityPolicy,
   identityBoundaryRepairApplies,
   identityReceiptAppliesToCurrentBoundary,
+  identityCompetingClaimsEqual,
+  identityCompetingClaimsEqualWork,
 } from '../intake-identity-policy.ts';
+
+test('competing identity claims preserve duplicate multiplicity, own versions and stable order beyond 32', () => {
+  const claim = (n: number) => ({
+    groupId: 'duplicate-B',
+    groupVersionId: 'version-' + n,
+    subject: { locator: 'page 1', text: 'Fictional subject ' + n },
+  });
+  const all = function* () {
+    for (let n = 0; n < 70; n++) yield claim(n);
+  };
+  assert.equal(identityCompetingClaimsEqual(all(), all()), true);
+  assert.equal(
+    identityCompetingClaimsEqual([claim(0), claim(0)], [claim(0), claim(1)]),
+    false,
+    'a prior claim can only cover one occurrence',
+  );
+  assert.equal(
+    identityCompetingClaimsEqual([claim(0), claim(1)], [claim(1), claim(0)]),
+    false,
+    'same-ID order retains the original occurrence sequence',
+  );
+  assert.equal(
+    identityCompetingClaimsEqual(
+      all(),
+      (function* () {
+        for (let n = 0; n < 70; n++) yield claim(n === 69 ? 0 : n);
+      })(),
+    ),
+    false,
+    'off-page changed version cannot borrow another witness',
+  );
+  assert.equal(identityCompetingClaimsEqual([claim(0)], [claim(0), claim(1)]), false);
+  assert.equal(identityCompetingClaimsEqual([claim(0), claim(1)], [claim(0)]), false);
+  const inspected = identityCompetingClaimsEqualWork(
+    (function* () {
+      for (let n = 0; n < 1000; n++) yield undefined;
+      yield claim(0);
+    })(),
+    [claim(0)],
+  );
+  let yields = 0,
+    next = inspected.next();
+  while (!next.done) {
+    yields++;
+    next = inspected.next();
+  }
+  assert.equal(next.value, true);
+  assert.equal(yields, 1002, 'even inspected non-competing records yield cooperatively');
+});
 
 const heading = 'Fictional Alder report';
 const patient = 'Iris Meadow';
@@ -1870,5 +1925,48 @@ test('a Self receipt on one report cannot authorize a later narrative name as th
   assert.equal(
     intake.getIntake(f.db, f.root, f.profileId, f.item.id).workflow!.identityConfirmations?.length,
     1,
+  );
+});
+
+test('routine identity checks yield through complete off-page saved people without changing ambiguity', () => {
+  const issue = {
+    field: 'subject',
+    questionId: null,
+    prompt: 'Does this record for Fictional Fern, DOB: 1990-03-08 belong to you?',
+    textAnchor: 'Patient: Fictional Fern DOB: 1990-03-08',
+  };
+  const self = {
+    noteId: 'person-note:self' as const,
+    version: 1,
+    fullName: 'Fictional Iris',
+    birthDate: null,
+    knownNames: [],
+  };
+  let visits = 0;
+  function* people(duplicate = false) {
+    for (let n = 0; n < 1000; n++) {
+      visits++;
+      yield {
+        personId: 'p' + n,
+        noteId: 'note' + n,
+        version: 1,
+        fullName: n === 999 || (duplicate && n === 998) ? 'Fictional Fern' : 'Fictional Other',
+        birthDate: '1990-03-08',
+        knownNames: [],
+      };
+    }
+  }
+  const work = isGenericNameConfirmationWork(issue, 'Patient: Fictional Fern', self, people());
+  assert.equal(work.next().done, false);
+  assert.equal(visits, 0, 'Self inspection yields before enumerating saved people');
+  let next = work.next();
+  while (!next.done) next = work.next();
+  assert.equal(next.value, true);
+  assert.equal(visits, 1000, 'late unique owner is checked completely');
+  assert.equal(isGenericNameConfirmation(issue, 'Patient: Fictional Fern', self, people()), true);
+  assert.equal(
+    isGenericNameConfirmation(issue, 'Patient: Fictional Fern', self, people(true)),
+    false,
+    'two saved owners remain ambiguous',
   );
 });

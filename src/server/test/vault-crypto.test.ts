@@ -1,9 +1,18 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import sodium from 'libsodium-wrappers-sumo';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import {
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  renameSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
+import { setImmediate as yieldHost } from 'node:timers/promises';
 import {
   freshKey,
   recoveryPhrase,
@@ -14,6 +23,8 @@ import {
   decryptObject,
 } from '../vault-crypto.ts';
 import { openVault } from '../vault-store.ts';
+import { captureManagedPhysicalEpoch } from '../clinical-review-physical-epoch.ts';
+import { openDiagnosticChunkStore } from '../diagnostic-chunk-store.ts';
 function dir(t: TestContext) {
   const p = mkdtempSync(resolve(tmpdir(), 'circus-vault-test-'));
   t.after(() => rmSync(p, { recursive: true, force: true }));
@@ -55,6 +66,84 @@ test('encrypted streams authenticate multiple frames, owner, purpose and complet
   ciphertext[100] ^= 1;
   writeFileSync(path, ciphertext);
   assert.throws(() => decryptObject(path, key, 'p-one', 'source'));
+});
+
+test('background diagnostics preserve evidence witnesses without exempting authority writes', async (t) => {
+  const root = dir(t),
+    key = freshKey(),
+    vault = openVault({ directory: root, profileId: 'p-fictional', key, initialize: true });
+  t.after(() => vault.close());
+  const expected = captureManagedPhysicalEpoch();
+  assert.ok(expected);
+  const summary = Buffer.from('{"fictional":"summary"}');
+  await yieldHost();
+  vault.writePerformanceSummary(summary);
+  assert.equal(captureManagedPhysicalEpoch(), expected);
+  assert.deepEqual(vault.readPerformanceSummary(), summary);
+  const chunks = vault.diagnosticChunks();
+  assert.equal(chunks.append(1, summary), 'appended');
+  assert.deepEqual(chunks.read(1), summary);
+  assert.equal(captureManagedPhysicalEpoch(), expected);
+  const standalone = openDiagnosticChunkStore({
+    directory: resolve(root, 'standalone'),
+    key,
+    profileId: 'p-fictional',
+  });
+  standalone.append(1, summary);
+  assert.notEqual(captureManagedPhysicalEpoch(), expected);
+  standalone.close();
+  const beforeAuthority = captureManagedPhysicalEpoch();
+  encryptObject(resolve(root, 'authority.enc'), summary, key, 'p-fictional', 'source');
+  assert.notEqual(captureManagedPhysicalEpoch(), beforeAuthority);
+});
+
+for (const replacement of ['symlink', 'directory', 'ancestor', 'ciphertext'] as const)
+  test(`warm diagnostic writers refuse ${replacement} redirection`, (t) => {
+    const parent = dir(t),
+      root = resolve(parent, 'profile'),
+      key = freshKey();
+    const vault = openVault({ directory: root, profileId: 'p-fictional', key, initialize: true });
+    t.after(() => vault.close());
+    const summary = Buffer.from('fictional diagnostic');
+    vault.writePerformanceSummary(summary);
+    const chunks = vault.diagnosticChunks();
+    chunks.append(1, summary);
+    const outside = resolve(parent, 'unrelated');
+    mkdirSync(outside);
+    const sentinel = resolve(outside, 'recent-performance.enc');
+    writeFileSync(sentinel, 'retained original');
+    if (replacement === 'ancestor') {
+      renameSync(root, resolve(parent, 'original-profile'));
+      mkdirSync(root);
+      mkdirSync(resolve(root, 'diagnostics'));
+      mkdirSync(resolve(root, 'diagnostics/events'));
+    } else if (replacement === 'ciphertext') {
+      rmSync(resolve(root, 'diagnostics/recent-performance.enc'));
+      symlinkSync(sentinel, resolve(root, 'diagnostics/recent-performance.enc'));
+    } else {
+      renameSync(resolve(root, 'diagnostics'), resolve(root, 'original-diagnostics'));
+      if (replacement === 'symlink') symlinkSync(outside, resolve(root, 'diagnostics'));
+      else {
+        mkdirSync(resolve(root, 'diagnostics'));
+        mkdirSync(resolve(root, 'diagnostics/events'));
+      }
+    }
+    assert.throws(() => vault.writePerformanceSummary(Buffer.from('replacement')));
+    if (replacement !== 'ciphertext') assert.throws(() => chunks.append(2, summary));
+    assert.equal(readFileSync(sentinel, 'utf8'), 'retained original');
+  });
+
+test('a caller cannot counterfeit a vault diagnostic writer', (t) => {
+  assert.throws(
+    () =>
+      openDiagnosticChunkStore({
+        directory: dir(t),
+        profileId: 'p-fictional',
+        key: freshKey(),
+        writer() {},
+      }),
+    /Invalid vault diagnostic writer/,
+  );
 });
 test('vault stores identical originals once with separate references and hides names', (t) => {
   const root = dir(t),

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { EventEmitter } from 'node:events';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
@@ -76,15 +77,15 @@ function routes(f: Fixture) {
       action,
       db: f.db,
       profileId: 'cookie-dough',
-      req: {} as IncomingMessage,
-      res: {
+      req: new EventEmitter() as IncomingMessage,
+      res: Object.assign(new EventEmitter(), {
         writeHead: (_status: number, h: Record<string, string>) => {
           headers = h;
         },
         end: (value: string | Uint8Array) => {
           body = Buffer.from(value);
         },
-      } as unknown as ServerResponse,
+      }) as unknown as ServerResponse,
       respond: (value: unknown) => {
         response = value;
       },
@@ -103,9 +104,9 @@ function routes(f: Fixture) {
       {},
       {
         method: 'GET',
-        req: {
+        req: Object.assign(new EventEmitter(), {
           url: `/api/note-exports/${token}/companion?asset=${encodeURIComponent(asset)}`,
-        } as IncomingMessage,
+        }) as IncomingMessage,
         ...overrides,
       },
     );
@@ -116,9 +117,9 @@ function routes(f: Fixture) {
       {},
       {
         method: 'GET',
-        req: {
+        req: Object.assign(new EventEmitter(), {
           url: `/api/note-exports/${token}/inspection?key=${encodeURIComponent(key)}`,
-        } as IncomingMessage,
+        }) as IncomingMessage,
         ...overrides,
       },
     );

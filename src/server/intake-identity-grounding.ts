@@ -1,19 +1,22 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
+import { observeDatabaseClose } from './database.ts';
 import { canonicalLiteral } from './intake-format.ts';
+import { finishClinicalReviewWork } from './clinical-review-work.ts';
+import { disposableSqlite } from './disposable-sqlite.ts';
 import type { BirthDateEvidence } from './intake-evidence-dates.ts';
 import {
   identityOriginalFingerprint,
   competingIdentityBoundaries,
 } from './intake-identity-policy.ts';
 import type { IntakeReportGroup, IntakeReviewIssue, IntakeWorkflow } from '../shared/intake.ts';
-import type { IntakeIdentityReceipt } from '../shared/intake-identity.ts';
+import type { IdentityGroundingReceipt } from './intake-identity-policy.ts';
 
 type Question = Pick<IntakeReviewIssue, 'prompt' | 'textAnchor'>;
 export type IdentityGroundingLookup = (
   group: IntakeReportGroup,
   issue: Question,
-  receipt: IntakeIdentityReceipt,
+  receipt: IdentityGroundingReceipt,
 ) => boolean;
 interface Boundary {
   profileId: string;
@@ -25,17 +28,100 @@ const hash = (value: unknown) => createHash('sha256').update(canonicalLiteral(va
 // Ephemeral original-grounding cache, never recovery authority. No page text is retained.
 // Labelled DOB facts, including whether a printed DOB label was unreadable, are
 // re-derived from the exact original after a cold restart.
-// Each unlocked database owns at most 256 scopes, each with at most 100 exact
-// question/receipt proofs. Reopening/rebuilding uses a new database and rechecks
+// Each unlocked database owns at most 256 scopes. Legacy scopes retain at most
+// 100 exact question/receipt proofs; native scopes keep complete proofs on disk.
+// Reopening/rebuilding uses a new database and rechecks
 // the scoped original through the existing asynchronous identity review.
 interface Grounding {
+  intakeId: string;
+  semanticFingerprint: string;
   boundaryKey: string;
-  questions: Set<string>;
+  questions: Pick<Set<string>, 'has'>;
   subject: boolean;
-  nameQuestions: Set<string>;
+  nameQuestions: Pick<Set<string>, 'has'>;
   birthDates: BirthDateEvidence;
+  dispose?: () => void;
 }
 const grounded = new WeakMap<DatabaseSync, Map<string, Grounding>>();
+const generations = new WeakMap<DatabaseSync, object>();
+const generationLabels = new WeakMap<object, string>();
+/** Transport certificates compare this opaque label, never its ordering. */
+export function identityGroundingReadStamp(db: DatabaseSync): string {
+  const generation = identityGroundingGeneration(db);
+  let label = generationLabels.get(generation);
+  if (!label) generationLabels.set(generation, (label = randomUUID()));
+  return label;
+}
+const sourceGenerations = new WeakMap<
+  DatabaseSync,
+  {
+    baseline: string;
+    sources: Map<string, { stamp: string; scopes: number }>;
+  }
+>();
+function sourceGenerationState(db: DatabaseSync) {
+  let state = sourceGenerations.get(db);
+  if (!state) sourceGenerations.set(db, (state = { baseline: randomUUID(), sources: new Map() }));
+  return state;
+}
+/** Only live proof owners occupy memory; absent owners share the clear/absence stamp. */
+export function identityGroundingSourceStamp(db: DatabaseSync, intakeId: string): string {
+  identityGroundingGeneration(db);
+  const state = sourceGenerationState(db);
+  return state.baseline + ':' + (state.sources.get(intakeId)?.stamp || '');
+}
+/** Disposable proof changes participate in clinical cache/session validity even without SQL writes. */
+export function identityGroundingGeneration(db: DatabaseSync): object {
+  let generation = generations.get(db);
+  if (!generation) {
+    generations.set(db, (generation = {}));
+    if (db.isOpen) observeDatabaseClose(db, () => clearIdentityGrounding(db));
+  }
+  return generation;
+}
+function advanceGroundingGeneration(db: DatabaseSync, intakeId?: string) {
+  identityGroundingGeneration(db);
+  generations.set(db, {});
+  if (intakeId) {
+    const source = sourceGenerationState(db).sources.get(intakeId);
+    if (source) source.stamp = randomUUID();
+  }
+}
+function discardGrounding(
+  db: DatabaseSync,
+  scopes: Map<string, Grounding>,
+  key: string,
+  invalidate = true,
+) {
+  const previous = scopes.get(key);
+  if (!previous) return;
+  if (invalidate) advanceGroundingGeneration(db, previous.intakeId);
+  scopes.delete(key);
+  const state = sourceGenerationState(db),
+    source = state.sources.get(previous.intakeId);
+  if (source && --source.scopes === 0) state.sources.delete(previous.intakeId);
+  previous?.dispose?.();
+}
+/** Clear before profile lock or database close, including native SQL proof rows. */
+export function clearIdentityGrounding(db: DatabaseSync): void {
+  advanceGroundingGeneration(db);
+  const state = sourceGenerationState(db);
+  state.baseline = randomUUID();
+  state.sources.clear();
+  const scopes = grounded.get(db);
+  if (!scopes) return;
+  const failures: unknown[] = [];
+  for (const key of scopes.keys()) {
+    try {
+      discardGrounding(db, scopes, key, false);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  grounded.delete(db);
+  if (failures.length === 1) throw failures[0];
+  if (failures.length) throw new AggregateError(failures, 'Identity grounding clear failed');
+}
 const maxGroups = 256;
 const maxQuestions = 100;
 const boundaryKey = (boundary: Boundary, group: IntakeReportGroup) =>
@@ -68,15 +154,41 @@ const originalDateKey = (boundary: Boundary, group: IntakeReportGroup) =>
     group.report?.subject,
     group.report?.anchor,
   ]);
-const questionKey = (issue: Question, receipt: IntakeIdentityReceipt) =>
+const questionKey = (issue: Question, receipt: IdentityGroundingReceipt) =>
   hash([issue.prompt, issue.textAnchor, receipt.operationId, receipt.scope.scopeToken]);
+
+function semanticFingerprint(
+  boundaryKey: string,
+  subject: boolean,
+  birthDates: BirthDateEvidence,
+  proofs: Iterable<{ kind: string; proof: string }>,
+): string {
+  const digest = createHash('sha256').update(canonicalLiteral([boundaryKey, subject, birthDates]));
+  for (const { kind, proof } of proofs) digest.update('\n' + kind + ':' + proof);
+  return digest.digest('hex');
+}
+function publishGrounding(db: DatabaseSync, key: string, next: Grounding): void {
+  let scopes = grounded.get(db);
+  if (!scopes) grounded.set(db, (scopes = new Map()));
+  if (scopes.get(key)?.semanticFingerprint === next.semanticFingerprint) return;
+  // Advance before any destructive disposal. A throwing disposer cannot revive
+  // an older clinical session, even if later publication restores the same facts.
+  advanceGroundingGeneration(db, next.intakeId);
+  discardGrounding(db, scopes, key, false);
+  scopes.set(key, next);
+  const sources = sourceGenerationState(db).sources,
+    source = sources.get(next.intakeId);
+  if (source) source.scopes++;
+  else sources.set(next.intakeId, { stamp: randomUUID(), scopes: 1 });
+  while (scopes.size > maxGroups) discardGrounding(db, scopes, scopes.keys().next().value!);
+}
 
 /** Only the host's original-reading identity module supplies these proofs. */
 export function retainIdentityGrounding(
   db: DatabaseSync,
   boundary: Boundary,
   group: IntakeReportGroup,
-  questions: { issue: Question; receipt: IntakeIdentityReceipt }[],
+  questions: { issue: Question; receipt: IdentityGroundingReceipt }[],
   verifiedSubject = false,
   verifiedNameQuestions: Question[] = [],
   birthDates: BirthDateEvidence = { dates: [], unreadable: false },
@@ -87,20 +199,28 @@ export function retainIdentityGrounding(
   );
   if (proofs.size > maxQuestions || nameQuestions.size > maxQuestions)
     throw new Error('Identity grounding scope exceeds its bound');
-  let scopes = grounded.get(db);
-  if (!scopes) grounded.set(db, (scopes = new Map()));
   const key = originalDateKey(boundary, group);
+  const selectedBoundary = boundaryKey(boundary, group),
+    dates = structuredClone(birthDates);
   // Replace every proof and DOB fact atomically, including negative results.
   // Eviction must never leave a name proof without its DOB knowledge.
-  scopes.delete(key);
-  scopes.set(key, {
-    boundaryKey: boundaryKey(boundary, group),
+  publishGrounding(db, key, {
+    intakeId: boundary.intakeId,
+    semanticFingerprint: semanticFingerprint(
+      selectedBoundary,
+      verifiedSubject,
+      dates,
+      (function* () {
+        for (const proof of [...nameQuestions].sort()) yield { kind: 'name', proof };
+        for (const proof of [...proofs].sort()) yield { kind: 'question', proof };
+      })(),
+    ),
+    boundaryKey: selectedBoundary,
     questions: proofs,
     subject: verifiedSubject,
     nameQuestions,
-    birthDates: structuredClone(birthDates),
+    birthDates: dates,
   });
-  while (scopes.size > maxGroups) scopes.delete(scopes.keys().next().value!);
 }
 
 function proof(db: DatabaseSync, boundary: Boundary, group: IntakeReportGroup) {
@@ -134,8 +254,11 @@ export function identityOriginalBirthDateEvidenceLookup(db: DatabaseSync, bounda
 
 /** One synchronous review owns this snapshot. Discard it before any write or await. */
 export function identityReviewGroundingLookups(db: DatabaseSync, boundary: Boundary) {
+  const generation = identityGroundingGeneration(db);
   const entries = new Map<IntakeReportGroup, { entry?: Grounding; current: boolean }>();
   function lookup(group: IntakeReportGroup) {
+    if (!db.isOpen || identityGroundingGeneration(db) !== generation)
+      throw Error('Identity grounding snapshot changed');
     let value = entries.get(group);
     if (!value) {
       const entry = grounded.get(db)?.get(originalDateKey(boundary, group));
@@ -153,7 +276,7 @@ export function identityReviewGroundingLookups(db: DatabaseSync, boundary: Bound
       const { entry, current } = lookup(group);
       return current && entry?.nameQuestions.has(hash([issue.prompt, issue.textAnchor])) === true;
     },
-    grounded: (group: IntakeReportGroup, issue: Question, receipt: IntakeIdentityReceipt) => {
+    grounded: (group: IntakeReportGroup, issue: Question, receipt: IdentityGroundingReceipt) => {
       const { entry, current } = lookup(group);
       return current && entry?.questions.has(questionKey(issue, receipt)) === true;
     },
@@ -161,5 +284,241 @@ export function identityReviewGroundingLookups(db: DatabaseSync, boundary: Bound
       const { entry } = lookup(group);
       return entry ? structuredClone(entry.birthDates) : undefined;
     },
+  };
+}
+
+/** Host-selected native authority supplies streamed boundary commitments, never a display page. */
+export interface SelectedIdentityGroundingBoundary {
+  profileId: string;
+  intakeId: string;
+  sourceHash: string;
+  originalFingerprint(group: import('./intake-workflow.ts').WorkflowReviewGroup): string;
+  boundaryFingerprint(group: import('./intake-workflow.ts').WorkflowReviewGroup): string;
+  boundaryFingerprintWork?(
+    group: import('./intake-workflow.ts').WorkflowReviewGroup,
+  ): Generator<void, string, void>;
+}
+const selectedOriginalDateKey = (
+  boundary: SelectedIdentityGroundingBoundary,
+  group: import('./intake-workflow.ts').WorkflowReviewGroup,
+) =>
+  hash([
+    boundary.profileId,
+    boundary.intakeId,
+    boundary.sourceHash,
+    boundary.originalFingerprint(group),
+    group.id,
+    group.report?.subject,
+    group.report?.anchor,
+  ]);
+/** Native original review retains the same bounded proof set and original-date semantics. */
+export function retainSelectedIdentityGrounding(
+  db: DatabaseSync,
+  boundary: SelectedIdentityGroundingBoundary,
+  group: import('./intake-workflow.ts').WorkflowReviewGroup,
+  questions: Iterable<{ issue: Question; receipt: IdentityGroundingReceipt }>,
+  verifiedSubject = false,
+  verifiedNameQuestions: Iterable<Question> = [],
+  birthDates: BirthDateEvidence = { dates: [], unreadable: false },
+): void {
+  db.exec(
+    'CREATE TEMP TABLE IF NOT EXISTS intake_selected_identity_proofs(scope TEXT,kind TEXT,proof TEXT,PRIMARY KEY(scope,kind,proof)) WITHOUT ROWID',
+  );
+  const key = selectedOriginalDateKey(boundary, group);
+  const storageScope = randomUUID(),
+    selectedBoundary = boundary.boundaryFingerprint(group),
+    dates = structuredClone(birthDates);
+  const add = db.prepare('INSERT OR IGNORE INTO intake_selected_identity_proofs VALUES(?,?,?)');
+  const dispose = () => {
+    if (db.isOpen)
+      db.prepare('DELETE FROM intake_selected_identity_proofs WHERE scope=?').run(storageScope);
+  };
+  const proofs = (kind: string) => ({
+    has: (proof: string) =>
+      !!db
+        .prepare(
+          'SELECT 1 FROM intake_selected_identity_proofs WHERE scope=? AND kind=? AND proof=?',
+        )
+        .get(storageScope, kind, proof),
+  });
+  let next: Grounding | undefined;
+  try {
+    // Unpublished SQL staging keeps deduplication and canonical ordering bounded
+    // without destroying the complete prior scope when an input iterator fails.
+    for (const { issue, receipt } of questions)
+      add.run(storageScope, 'question', questionKey(issue, receipt));
+    for (const issue of verifiedNameQuestions)
+      add.run(storageScope, 'name', hash([issue.prompt, issue.textAnchor]));
+    next = {
+      intakeId: boundary.intakeId,
+      semanticFingerprint: semanticFingerprint(
+        selectedBoundary,
+        verifiedSubject,
+        dates,
+        (function* () {
+          for (const row of db
+            .prepare(
+              'SELECT kind,proof FROM intake_selected_identity_proofs WHERE scope=? ORDER BY kind,proof',
+            )
+            .iterate(storageScope))
+            yield { kind: String(row.kind), proof: String(row.proof) };
+        })(),
+      ),
+      boundaryKey: selectedBoundary,
+      questions: proofs('question'),
+      subject: verifiedSubject,
+      nameQuestions: proofs('name'),
+      birthDates: dates,
+      dispose,
+    };
+    publishGrounding(db, key, next);
+  } finally {
+    // Identical publication retains its prior scope/generation. Nonempty staging
+    // still changes SQLite stamps; an empty repeat performs no proof-row writes.
+    if (!next || grounded.get(db)?.get(key) !== next) dispose();
+  }
+}
+/** Native preparation owns isolated scratch across guarded turns. Publication is
+ * one synchronous memory transition; no main database transaction or proof-row
+ * write crosses a yield. Legacy callers retain their synchronous SQL wrapper. */
+export function* retainSelectedIdentityGroundingWork(
+  db: DatabaseSync,
+  boundary: SelectedIdentityGroundingBoundary,
+  group: import('./intake-workflow.ts').WorkflowReviewGroup,
+  questions: Iterable<{ issue: Question; receipt: IdentityGroundingReceipt }>,
+  verifiedSubject = false,
+  verifiedNameQuestions: Iterable<Question> = [],
+  birthDates: BirthDateEvidence = { dates: [], unreadable: false },
+): Generator<void, void, void> {
+  const generation = identityGroundingGeneration(db);
+  const assertCurrent = () => {
+    if (!db.isOpen || identityGroundingGeneration(db) !== generation)
+      throw Error('Identity grounding snapshot changed');
+  };
+  assertCurrent();
+  const key = selectedOriginalDateKey(boundary, group);
+  const selectedBoundary = boundary.boundaryFingerprintWork
+    ? yield* boundary.boundaryFingerprintWork(group)
+    : boundary.boundaryFingerprint(group);
+  assertCurrent();
+  const dates = structuredClone(birthDates);
+  const scratch = disposableSqlite('intake-grounding-proofs-');
+  let next: Grounding | undefined;
+  try {
+    scratch.db.exec(
+      'CREATE TABLE proofs(kind TEXT,proof TEXT,PRIMARY KEY(kind,proof)) WITHOUT ROWID',
+    );
+    const add = scratch.db.prepare('INSERT OR IGNORE INTO proofs VALUES(?,?)');
+    for (const { issue, receipt } of questions) {
+      add.run('question', questionKey(issue, receipt));
+      yield;
+    }
+    for (const issue of verifiedNameQuestions) {
+      add.run('name', hash([issue.prompt, issue.textAnchor]));
+      yield;
+    }
+    const digest = createHash('sha256').update(
+      canonicalLiteral([selectedBoundary, verifiedSubject, dates]),
+    );
+    for (const row of scratch.db
+      .prepare('SELECT kind,proof FROM proofs ORDER BY kind,proof')
+      .iterate()) {
+      digest.update('\n' + String(row.kind) + ':' + String(row.proof));
+      yield;
+    }
+    assertCurrent();
+    const proofs = (kind: string) => ({
+      has: (proof: string) =>
+        !!scratch.db.prepare('SELECT 1 FROM proofs WHERE kind=? AND proof=?').get(kind, proof),
+    });
+    next = {
+      intakeId: boundary.intakeId,
+      semanticFingerprint: digest.digest('hex'),
+      boundaryKey: selectedBoundary,
+      questions: proofs('question'),
+      subject: verifiedSubject,
+      nameQuestions: proofs('name'),
+      birthDates: dates,
+      dispose: scratch.close,
+    };
+    publishGrounding(db, key, next);
+  } finally {
+    // Cancellation, iterator failure, drift and identical publication dispose
+    // only this unpublished staging database. The prior complete proof survives.
+    if (!next || grounded.get(db)?.get(key) !== next) scratch.close();
+  }
+}
+/** Guard every asynchronous gap against source/clinical authority. Grounding generation
+ * is also checked before publishing a completed lookup; interrupted work is never memoized. */
+export function selectedIdentityReviewGroundingLookups(
+  db: DatabaseSync,
+  boundary: SelectedIdentityGroundingBoundary,
+) {
+  const generation = identityGroundingGeneration(db);
+  type Group = import('./intake-workflow.ts').WorkflowReviewGroup;
+  const entries = new WeakMap<Group, { entry?: Grounding; current: boolean }>();
+  const assertCurrent = () => {
+    if (!db.isOpen || identityGroundingGeneration(db) !== generation)
+      throw Error('Identity grounding snapshot changed');
+  };
+  function* lookupWork(
+    group: Group,
+  ): Generator<void, { entry?: Grounding; current: boolean }, void> {
+    assertCurrent();
+    let value = entries.get(group);
+    if (!value) {
+      const entry = grounded.get(db)?.get(selectedOriginalDateKey(boundary, group));
+      value = {
+        entry,
+        current:
+          !!entry &&
+          entry.boundaryKey ===
+            (boundary.boundaryFingerprintWork
+              ? yield* boundary.boundaryFingerprintWork(group)
+              : boundary.boundaryFingerprint(group)),
+      };
+      assertCurrent();
+      entries.set(group, value);
+    }
+    return value;
+  }
+  const work = {
+    /** Presence only chooses preparation work; it never authenticates a boundary. */
+    *originalGroundingPresentWork(group: Group): Generator<void, boolean, void> {
+      assertCurrent();
+      return grounded.get(db)?.has(selectedOriginalDateKey(boundary, group)) === true;
+    },
+    *subjectGroundedWork(group: Group): Generator<void, boolean, void> {
+      const { entry, current } = yield* lookupWork(group);
+      return current && entry?.subject === true;
+    },
+    *nameQuestionGroundedWork(group: Group, issue: Question): Generator<void, boolean, void> {
+      const { entry, current } = yield* lookupWork(group);
+      return current && entry?.nameQuestions.has(hash([issue.prompt, issue.textAnchor])) === true;
+    },
+    *groundedWork(
+      group: Group,
+      issue: Question,
+      receipt: IdentityGroundingReceipt,
+    ): Generator<void, boolean, void> {
+      const { entry, current } = yield* lookupWork(group);
+      return current && entry?.questions.has(questionKey(issue, receipt)) === true;
+    },
+    *originalBirthDateEvidenceWork(
+      group: Group,
+    ): Generator<void, BirthDateEvidence | undefined, void> {
+      const { entry } = yield* lookupWork(group);
+      return entry ? structuredClone(entry.birthDates) : undefined;
+    },
+  };
+  return {
+    ...work,
+    subjectGrounded: (group: Group) => finishClinicalReviewWork(work.subjectGroundedWork(group)),
+    nameQuestionGrounded: (group: Group, issue: Question) =>
+      finishClinicalReviewWork(work.nameQuestionGroundedWork(group, issue)),
+    grounded: (group: Group, issue: Question, receipt: IdentityGroundingReceipt) =>
+      finishClinicalReviewWork(work.groundedWork(group, issue, receipt)),
+    originalBirthDateEvidence: (group: Group) =>
+      finishClinicalReviewWork(work.originalBirthDateEvidenceWork(group)),
   };
 }

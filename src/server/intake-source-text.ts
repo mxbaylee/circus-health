@@ -1,4 +1,7 @@
-import { readStoredIntakeDetails } from './intake-state-access.ts';
+import { recordIntakeWork, withIntakeWork } from './intake-work-accounting.ts';
+import { readPreparedSourceAttention } from './intake-source-attention.ts';
+import { IntakeStateManifest } from './intake-state-manifest.ts';
+import { intakeSourceMetadata } from './intake-state-access.ts';
 import { sourceIssueCategory, sourceIssueNeedsReview } from '../shared/intake-source-issues.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { HttpError, transaction, type Database } from './database.ts';
@@ -7,6 +10,24 @@ import { profileOriginal } from './profile-storage.ts';
 import { verifyIntakeFileHash } from './intake-files.ts';
 import { readIntakeSourcePin, parseIntakeSourcePin } from './intake-source-pin.ts';
 import { DEFAULT_LIMITS } from './intake-state-evidence.ts';
+import {
+  createIntakeCopyIncrementalReader,
+  createIntakeCopyIncrementalReaderFromStandalone,
+  type IntakeCopyIncrementalReader,
+} from './intake-copy-incremental-reader.ts';
+import type { IntakeCopyTransfer } from './intake-copy-transfer.ts';
+import { intakeCopyJsonString } from './intake-copy-json.ts';
+import {
+  captureIntakeCopyReadInterval,
+  finishIntakeCopySteps,
+  finishIntakeCopyStepsAsync,
+  intakeCopyNativeSelect,
+} from './intake-copy-work.ts';
+import {
+  prepareIntakeJsonCanonicalSteps,
+  type IntakeJsonCanonicalHandle,
+  type PreparedIntakeJsonCanonical,
+} from './intake-json-canonical.ts';
 import { affectedSourcePages } from './intake-proposal-dependencies.ts';
 import { visibilityCondition, visibilitySQL } from './visibility.ts';
 import {
@@ -432,108 +453,1012 @@ function loadRevision(
   return revision;
 }
 
-/** Validate retained source-text metadata with the same decoders used by recovery and rebinding. */
+/** Validate retained source-text metadata with the same strict per-revision decoders. */
 export function validatePortableIntakeSourceText(
   tables: Record<string, Record<string, unknown>[]>,
   profileId: string,
 ): void {
-  const metadata = new Map<string, string>();
-  let bytes = 0,
-    count = 0;
-  for (const row of tables.app_meta ?? []) {
-    if (typeof row.key !== 'string' || typeof row.value !== 'string' || metadata.has(row.key))
-      corrupt();
-    if (row.key.startsWith('intake_source_text:')) {
-      bytes += Buffer.byteLength(row.key) + Buffer.byteLength(row.value);
-      if (bytes > DEFAULT_LIMITS.bytes || ++count > 200_000) corrupt();
+  validatePortableIntakeSourceTextRows({ rows: (table) => tables[table] ?? [] }, profileId);
+}
+export function validatePortableIntakeSourceTextRows(
+  source: { rows(table: string): Iterable<Record<string, unknown>> },
+  profileId: string,
+): void {
+  const manifest = new IntakeStateManifest(),
+    db = manifest.db;
+  try {
+    db.exec(
+      'CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE text_originals(id TEXT PRIMARY KEY,sha TEXT NOT NULL); CREATE TABLE revisions(key TEXT PRIMARY KEY,parent TEXT); CREATE TABLE heads(id TEXT PRIMARY KEY,revision TEXT NOT NULL); CREATE TABLE operations(id TEXT,revision TEXT); CREATE TABLE namespaces_text(id TEXT PRIMARY KEY);',
+    );
+    for (const row of source.rows('app_meta')) {
+      if (
+        typeof row.key !== 'string' ||
+        typeof row.value !== 'string' ||
+        db.prepare('SELECT 1 FROM metadata WHERE key=?').get(row.key)
+      )
+        corrupt();
+      db.prepare('INSERT INTO metadata VALUES(?,?)').run(row.key, row.value);
     }
-    metadata.set(row.key, row.value);
+    for (const row of source.rows('source_files'))
+      if (row.kind === 'intake_original') {
+        if (
+          typeof row.id !== 'string' ||
+          typeof row.sha256 !== 'string' ||
+          db.prepare('SELECT 1 FROM text_originals WHERE id=?').get(row.id)
+        )
+          corrupt();
+        db.prepare('INSERT INTO text_originals VALUES(?,?)').run(row.id, row.sha256);
+      }
+    let decodeBytes = 0;
+    const reader: MetadataReader = {
+      readMetadata(name) {
+        const raw = db.prepare('SELECT value FROM metadata WHERE key=?').get(name)?.value as
+          string | undefined;
+        decodeBytes += raw === undefined ? 0 : Buffer.byteLength(raw);
+        if (decodeBytes > DEFAULT_LIMITS.bytes) corrupt();
+        return raw;
+      },
+    };
+    for (const row of db
+      .prepare("SELECT key,value FROM metadata WHERE key GLOB 'intake_source_text:*'")
+      .iterate()) {
+      decodeBytes = 0;
+      const name = String(row.key),
+        raw = String(row.value);
+      const match =
+        /^intake_source_text:v1:(.+):(head|blob:([0-9a-f]{64})|revision:([0-9a-f-]{36})|operation:([0-9a-f-]{36}))$/.exec(
+          name,
+        );
+      if (!match) corrupt();
+      const [, intakeId, kind, blobId, revisionId, operationId] = match;
+      const original = db.prepare('SELECT sha FROM text_originals WHERE id=?').get(intakeId);
+      if (!original) corrupt();
+      db.prepare('INSERT OR IGNORE INTO namespaces_text VALUES(?)').run(intakeId);
+      if (kind === 'head') {
+        const head = parse(raw);
+        if (
+          !object(head) ||
+          head.sourceHash !== original.sha ||
+          typeof head.revisionId !== 'string' ||
+          !UUID.test(head.revisionId)
+        )
+          corrupt();
+        db.prepare('INSERT INTO heads VALUES(?,?)').run(intakeId, head.revisionId);
+      } else if (blobId) readBlob(reader, intakeId, blobId);
+      else if (operationId) {
+        const operation = parse(raw);
+        if (
+          !UUID.test(operationId) ||
+          !object(operation) ||
+          typeof operation.fingerprint !== 'string' ||
+          !HASH.test(operation.fingerprint) ||
+          typeof operation.revisionId !== 'string' ||
+          !UUID.test(operation.revisionId)
+        )
+          corrupt();
+        db.prepare('INSERT INTO operations VALUES(?,?)').run(intakeId, operation.revisionId);
+      } else {
+        const revision = loadRevision(
+          reader,
+          profileId,
+          intakeId,
+          String(original.sha),
+          revisionId,
+        );
+        db.prepare('INSERT INTO revisions VALUES(?,?)').run(
+          key(intakeId, 'revision:' + revisionId),
+          revision.parentRevisionId,
+        );
+      }
+    }
+    if (
+      db
+        .prepare(
+          'SELECT 1 FROM namespaces_text LEFT JOIN heads USING(id) WHERE heads.id IS NULL LIMIT 1',
+        )
+        .get()
+    )
+      corrupt();
+    for (const row of db.prepare('SELECT id,revision FROM heads').iterate()) {
+      let next: string | null = String(row.revision);
+      while (next !== null) {
+        const name = key(String(row.id), 'revision:' + next);
+        const revision = db.prepare('SELECT parent FROM revisions WHERE key=?').get(name);
+        if (!revision || db.prepare('SELECT 1 FROM visited WHERE key=?').get(name)) corrupt();
+        db.prepare('INSERT INTO visited VALUES(?)').run(name);
+        next = revision.parent as string | null;
+      }
+    }
+    if (
+      db
+        .prepare(
+          'SELECT 1 FROM revisions LEFT JOIN visited USING(key) WHERE visited.key IS NULL LIMIT 1',
+        )
+        .get()
+    )
+      corrupt();
+    for (const row of db.prepare('SELECT id,revision FROM operations').iterate())
+      if (
+        !db
+          .prepare('SELECT 1 FROM visited WHERE key=?')
+          .get(key(String(row.id), 'revision:' + row.revision))
+      )
+        corrupt();
+    for (const row of db
+      .prepare("SELECT key,value FROM metadata WHERE key GLOB 'intake_source_pin:v1:*'")
+      .iterate()) {
+      const intakeId = String(row.key).slice('intake_source_pin:v1:'.length),
+        pin = parseIntakeSourcePin(String(row.value));
+      if (
+        pin?.revisionId &&
+        !db
+          .prepare('SELECT 1 FROM revisions WHERE key=?')
+          .get(key(intakeId, 'revision:' + pin.revisionId))
+      )
+        corrupt();
+    }
+  } finally {
+    manifest.close();
   }
-  const originals = new Map(
-    (tables.source_files ?? [])
-      .filter((row) => row.kind === 'intake_original')
-      .map((row) => [row.id, row]),
-  );
-  let decodeBytes = 0;
-  const reader: MetadataReader = {
-    readMetadata(name) {
-      const raw = metadata.get(name);
-      decodeBytes += raw === undefined ? 0 : Buffer.byteLength(raw);
-      if (decodeBytes > DEFAULT_LIMITS.bytes) corrupt();
-      return raw;
-    },
+}
+
+/** Copy-worker validation reads the same pinned SQLite snapshot in bounded text pieces. */
+export function validatePortableIntakeSourceTextDatabase(
+  reader: Pick<IntakeCopyIncrementalReader, 'rowIds' | 'textPieces' | 'columnType'>,
+  profileId: string,
+  checkpoint: () => void = () => {},
+): void {
+  const manifest = new IntakeStateManifest(),
+    db = manifest.db;
+  type Handle = IntakeJsonCanonicalHandle;
+  type Tree = PreparedIntakeJsonCanonical;
+  type Budget = { bytes: number };
+  let steps = 0;
+  const progress = () => {
+    if (++steps % 64 === 0) checkpoint();
   };
-  const revisions = new Map<string, Pick<SourceTextRevision, 'intakeId' | 'parentRevisionId'>>();
-  const heads = new Map<string, string>();
-  const namespaces = new Set<string>();
-  const operations: Array<{ intakeId: string; revisionId: string }> = [];
-  for (const [name, raw] of metadata) {
-    if (!name.startsWith('intake_source_text:')) continue;
-    const match =
-      /^intake_source_text:v1:(.+):(head|blob:([0-9a-f]{64})|revision:([0-9a-f-]{36})|operation:([0-9a-f-]{36}))$/.exec(
-        name,
-      );
-    if (!match || !originals.has(match[1])) corrupt();
-    const [, intakeId, kind, blobId, revisionId, operationId] = match;
-    namespaces.add(intakeId);
-    const original = originals.get(intakeId)!;
-    if (kind === 'head') {
-      const head = parse(raw);
+  const field = (tree: Tree, value: Handle, name: string): Handle | undefined =>
+    tree.kind(value) === 'object' ? tree.field(value, name) : undefined;
+  const scalar = (tree: Tree, value: Handle | undefined): unknown => {
+    if (!value) return undefined;
+    const kind = tree.kind(value);
+    if (kind === 'object' || kind === 'array') return undefined;
+    return JSON.parse([...tree.pieces(value)].join(''));
+  };
+  const string = (tree: Tree, value: Handle | undefined, maxUnits?: number): string | undefined => {
+    if (!value || tree.kind(value) !== 'string') return undefined;
+    let encoded = '';
+    for (const piece of tree.pieces(value)) {
+      progress();
+      encoded += piece;
+      if (maxUnits !== undefined && encoded.length > maxUnits * 6 + 2) return undefined;
+    }
+    const decoded = JSON.parse(encoded) as string;
+    return maxUnits !== undefined && decoded.length > maxUnits ? undefined : decoded;
+  };
+  const nonemptyString = (tree: Tree, value: Handle | undefined): boolean => {
+    if (!value || tree.kind(value) !== 'string') return false;
+    let units = 0;
+    for (const piece of tree.pieces(value)) {
+      progress();
+      units += piece.length;
+      if (units > 2) return true;
+    }
+    return false;
+  };
+  const number = (tree: Tree, value: Handle | undefined): number | undefined =>
+    value && tree.kind(value) === 'number' ? (scalar(tree, value) as number) : undefined;
+  const bool = (tree: Tree, value: Handle | undefined): boolean | undefined =>
+    value && tree.kind(value) === 'boolean' ? (scalar(tree, value) as boolean) : undefined;
+  const items = (tree: Tree, value: Handle | undefined): Iterable<Handle> => {
+    if (!value || tree.kind(value) !== 'array') corrupt();
+    return tree.arrayItems(value);
+  };
+  const digest = (tree: Tree, value: Handle): string => {
+    const result = createHash('sha256');
+    for (const piece of tree.pieces(value)) {
+      result.update(piece);
+      progress();
+    }
+    return result.digest('hex');
+  };
+  const equalsString = (tree: Tree, value: Handle | undefined, expected: string): boolean => {
+    if (!value || tree.kind(value) !== 'string') return false;
+    const literal = JSON.stringify(expected);
+    let at = 0;
+    for (const piece of tree.pieces(value)) {
+      progress();
+      if (piece !== literal.slice(at, at + piece.length)) return false;
+      at += piece.length;
+    }
+    return at === literal.length;
+  };
+  const retainedDate = (tree: Tree, value: Handle | undefined): number => {
+    if (!value) return NaN;
+    // Legacy evidence used Date.parse coercion, including non-string JSON values.
+    // This one scalar still requires materialization until that contract is narrowed.
+    const retained = JSON.parse([...tree.pieces(value)].join(''));
+    return Reflect.apply(Date.parse, Date, [retained]) as number;
+  };
+  const samePieces = (left: Iterable<string>, right: Iterable<string>): boolean => {
+    const a = left[Symbol.iterator](),
+      b = right[Symbol.iterator]();
+    let nextA = a.next(),
+      nextB = b.next(),
+      offsetA = 0,
+      offsetB = 0;
+    try {
+      for (;;) {
+        while (!nextA.done && offsetA === nextA.value.length) {
+          nextA = a.next();
+          offsetA = 0;
+        }
+        while (!nextB.done && offsetB === nextB.value.length) {
+          nextB = b.next();
+          offsetB = 0;
+        }
+        if (nextA.done || nextB.done) return nextA.done === nextB.done;
+        const count = Math.min(nextA.value.length - offsetA, nextB.value.length - offsetB);
+        if (
+          nextA.value.slice(offsetA, offsetA + count) !==
+          nextB.value.slice(offsetB, offsetB + count)
+        )
+          return false;
+        offsetA += count;
+        offsetB += count;
+        progress();
+      }
+    } finally {
+      a.return?.();
+      b.return?.();
+    }
+  };
+  const columnPieces = (table: 'app_meta' | 'source_files', column: string, rowid: string) =>
+    reader.textPieces(table, column, BigInt(rowid));
+  const digestPieces = (pieces: Iterable<string>): string => {
+    const hash = createHash('sha256');
+    for (const piece of pieces) {
+      hash.update(piece, 'utf16le');
+      progress();
+    }
+    return hash.digest('hex');
+  };
+  const slicePieces = function* (
+    pieces: Iterable<string>,
+    start: number,
+    end: number,
+  ): Generator<string> {
+    let at = 0;
+    for (const piece of pieces) {
+      const from = Math.max(0, start - at),
+        to = Math.min(piece.length, end - at);
+      if (to > from) yield piece.slice(from, to);
+      at += piece.length;
+      if (at >= end) break;
+    }
+  };
+  const encodedColumn = function* (column: 'id' | 'sha256', rowid: string): Generator<string> {
+    yield '"';
+    for (const piece of columnPieces('source_files', column, rowid)) {
+      progress();
+      yield JSON.stringify(piece).slice(1, -1);
+    }
+    yield '"';
+  };
+  const equalsColumn = (
+    tree: Tree,
+    value: Handle | undefined,
+    column: 'id' | 'sha256',
+    rowid: string,
+  ): boolean =>
+    !!value &&
+    tree.kind(value) === 'string' &&
+    samePieces(tree.pieces(value), encodedColumn(column, rowid));
+  const TEXT_PREFIX = 'intake_source_text:v1:',
+    PIN_PREFIX = 'intake_source_pin:v1:';
+  const keyInfo = (rowid: string, pin = false) => {
+    const prefix = pin ? PIN_PREFIX : TEXT_PREFIX,
+      hash = createHash('sha256');
+    let beginning = '',
+      tail = '',
+      idUnits = 0,
+      validId = true,
+      total = 0;
+    const addId = (piece: string) => {
+      if (!piece) return;
+      hash.update(piece, 'utf16le');
+      idUnits += piece.length;
+      if (!pin && /[\n\r\u2028\u2029]/u.test(piece)) validId = false;
+    };
+    for (const piece of columnPieces('app_meta', 'key', rowid)) {
+      progress();
+      total += piece.length;
+      let remaining = piece;
+      if (beginning.length < prefix.length) {
+        const count = Math.min(prefix.length - beginning.length, remaining.length);
+        beginning += remaining.slice(0, count);
+        remaining = remaining.slice(count);
+        if (!prefix.startsWith(beginning)) return undefined;
+      }
+      if (!remaining) continue;
+      if (pin) addId(remaining);
+      else {
+        tail += remaining;
+        if (tail.length > 80) {
+          const excess = tail.length - 80;
+          addId(tail.slice(0, excess));
+          tail = tail.slice(excess);
+        }
+      }
+    }
+    if (beginning !== prefix) return undefined;
+    let kind = 'pin',
+      ref = '',
+      suffix = 0;
+    if (!pin) {
+      const match =
+        /:(head|blob:([0-9a-f]{64})|revision:([0-9a-f-]{36})|operation:([0-9a-f-]{36}))$/.exec(
+          tail,
+        );
+      if (!match) corrupt();
+      suffix = match[0].length;
+      kind = match[1]!.split(':')[0]!;
+      ref = match[2] ?? match[3] ?? match[4] ?? '';
+      addId(tail.slice(0, -suffix));
+      if (!idUnits || !validId) corrupt();
+    }
+    return { namespace: hash.digest('hex'), kind, ref, idEnd: total - suffix, suffix };
+  };
+  const keyIdPieces = (rowid: string, end: number, pin = false) =>
+    slicePieces(
+      columnPieces('app_meta', 'key', rowid),
+      (pin ? PIN_PREFIX : TEXT_PREFIX).length,
+      end,
+    );
+  const startsKey = (rowid: string, prefix: string): boolean => {
+    let at = 0;
+    for (const piece of columnPieces('app_meta', 'key', rowid)) {
+      const count = Math.min(piece.length, prefix.length - at);
+      if (piece.slice(0, count) !== prefix.slice(at, at + count)) return false;
+      at += count;
+      if (at === prefix.length) return true;
+    }
+    return false;
+  };
+  const requiredId = (tree: Tree, value: Handle | undefined): string => {
+    const id = string(tree, value, 128);
+    if (!id || !ID.test(id)) corrupt();
+    return id;
+  };
+  try {
+    db.exec(`
+      CREATE TABLE metadata(namespace TEXT NOT NULL,kind TEXT NOT NULL,ref TEXT NOT NULL,rowid TEXT NOT NULL,id_end INTEGER NOT NULL,PRIMARY KEY(namespace,kind,ref));
+      CREATE TABLE text_originals(namespace TEXT PRIMARY KEY,rowid TEXT NOT NULL);
+      CREATE TABLE revisions(namespace TEXT NOT NULL,revision TEXT NOT NULL,parent TEXT,PRIMARY KEY(namespace,revision));
+      CREATE TABLE heads(namespace TEXT PRIMARY KEY,revision TEXT NOT NULL);
+      CREATE TABLE operations(namespace TEXT,revision TEXT);
+      CREATE TABLE namespaces_text(namespace TEXT PRIMARY KEY,rowid TEXT NOT NULL,id_end INTEGER NOT NULL);
+      CREATE TABLE pins(namespace TEXT PRIMARY KEY,rowid TEXT NOT NULL,id_end INTEGER NOT NULL);
+      CREATE TABLE pages(page INTEGER PRIMARY KEY);
+      CREATE TABLE regions(page INTEGER NOT NULL);
+      CREATE TABLE spans(id TEXT PRIMARY KEY);
+      CREATE TABLE issues(id TEXT PRIMARY KEY);
+      CREATE TABLE relations(id TEXT PRIMARY KEY,source TEXT NOT NULL,target TEXT NOT NULL,kind TEXT NOT NULL);
+      CREATE INDEX relation_source ON relations(source);
+      CREATE TABLE degree(id TEXT PRIMARY KEY,count INTEGER NOT NULL);
+      CREATE TABLE text_visited(namespace TEXT NOT NULL,revision TEXT NOT NULL,PRIMARY KEY(namespace,revision));
+      CREATE INDEX degree_ready ON degree(count,id);
+    `);
+    for (const rowid of reader.rowIds('app_meta')) {
+      progress();
       if (
-        !object(head) ||
-        head.sourceHash !== original.sha256 ||
-        typeof head.revisionId !== 'string' ||
-        !UUID.test(head.revisionId)
+        reader.columnType('app_meta', 'key', rowid) !== 'text' ||
+        reader.columnType('app_meta', 'value', rowid) !== 'text'
       )
         corrupt();
-      heads.set(intakeId, head.revisionId);
-    } else if (blobId) readBlob(reader, intakeId, blobId);
-    else if (operationId) {
-      const operation = parse(raw);
+      const selected = keyInfo(rowid.toString());
+      if (selected) {
+        const known = db
+          .prepare('SELECT rowid,id_end FROM namespaces_text WHERE namespace=?')
+          .get(selected.namespace);
+        if (
+          known &&
+          !samePieces(
+            keyIdPieces(rowid.toString(), selected.idEnd),
+            keyIdPieces(String(known.rowid), Number(known.id_end)),
+          )
+        )
+          corrupt();
+        db.prepare('INSERT OR IGNORE INTO namespaces_text VALUES(?,?,?)').run(
+          selected.namespace,
+          rowid.toString(),
+          selected.idEnd,
+        );
+        if (
+          db
+            .prepare('SELECT 1 FROM metadata WHERE namespace=? AND kind=? AND ref=?')
+            .get(selected.namespace, selected.kind, selected.ref)
+        )
+          corrupt();
+        db.prepare('INSERT INTO metadata VALUES(?,?,?,?,?)').run(
+          selected.namespace,
+          selected.kind,
+          selected.ref,
+          rowid.toString(),
+          selected.idEnd,
+        );
+      } else {
+        if (startsKey(rowid.toString(), 'intake_source_text:')) corrupt();
+        const pin = keyInfo(rowid.toString(), true);
+        if (pin) {
+          const prior = db
+            .prepare('SELECT rowid,id_end FROM pins WHERE namespace=?')
+            .get(pin.namespace);
+          if (
+            prior &&
+            !samePieces(
+              keyIdPieces(rowid.toString(), pin.idEnd, true),
+              keyIdPieces(String(prior.rowid), Number(prior.id_end), true),
+            )
+          )
+            corrupt();
+          db.prepare('INSERT INTO pins VALUES(?,?,?)').run(
+            pin.namespace,
+            rowid.toString(),
+            pin.idEnd,
+          );
+        }
+      }
+    }
+    for (const rowid of reader.rowIds('source_files')) {
+      progress();
+      if (reader.columnType('source_files', 'kind', rowid) !== 'text') continue;
+      let kindAt = 0,
+        originalKind = true;
+      for (const piece of reader.textPieces('source_files', 'kind', rowid)) {
+        progress();
+        if (piece !== 'intake_original'.slice(kindAt, kindAt + piece.length)) originalKind = false;
+        kindAt += piece.length;
+        if (!originalKind) break;
+      }
+      if (!originalKind || kindAt !== 'intake_original'.length) continue;
       if (
-        !UUID.test(operationId) ||
-        !object(operation) ||
-        typeof operation.fingerprint !== 'string' ||
-        !HASH.test(operation.fingerprint) ||
-        typeof operation.revisionId !== 'string' ||
-        !UUID.test(operation.revisionId)
+        reader.columnType('source_files', 'id', rowid) !== 'text' ||
+        reader.columnType('source_files', 'sha256', rowid) !== 'text'
       )
         corrupt();
-      operations.push({ intakeId, revisionId: operation.revisionId });
-    } else {
-      const revision = loadRevision(
-        reader,
-        profileId,
-        intakeId,
-        String(original.sha256),
-        revisionId,
+      const namespace = digestPieces(reader.textPieces('source_files', 'id', rowid));
+      const prior = db.prepare('SELECT rowid FROM text_originals WHERE namespace=?').get(namespace);
+      if (
+        prior &&
+        !samePieces(
+          reader.textPieces('source_files', 'id', rowid),
+          columnPieces('source_files', 'id', String(prior.rowid)),
+        )
+      )
+        corrupt();
+      db.prepare('INSERT INTO text_originals VALUES(?,?)').run(namespace, rowid.toString());
+    }
+    const openRow = <T>(rowid: string, use: (tree: Tree) => T, budget?: Budget): T => {
+      const pieces = function* (): Generator<string> {
+        for (const piece of reader.textPieces('app_meta', 'value', BigInt(rowid))) {
+          if (budget) {
+            budget.bytes += Buffer.byteLength(piece);
+            if (budget.bytes > DEFAULT_LIMITS.bytes) corrupt();
+          }
+          yield piece;
+        }
+      };
+      const parseSteps = prepareIntakeJsonCanonicalSteps(pieces(), { mode: 'stringify' });
+      let tree: Tree;
+      try {
+        for (;;) {
+          const step = parseSteps.next();
+          if (step.done) {
+            tree = step.value;
+            break;
+          }
+          progress();
+        }
+      } finally {
+        parseSteps.return(undefined as never);
+      }
+      try {
+        return use(tree);
+      } finally {
+        tree.close();
+      }
+    };
+    const open = <T>(
+      namespace: string,
+      kind: string,
+      ref: string,
+      use: (tree: Tree) => T,
+      budget?: Budget,
+    ): T => {
+      const row = db
+        .prepare('SELECT rowid FROM metadata WHERE namespace=? AND kind=? AND ref=?')
+        .get(namespace, kind, ref);
+      if (!row) corrupt();
+      return openRow(String(row.rowid), use, budget);
+    };
+    const blob = <T>(
+      namespace: string,
+      ref: string,
+      use: (tree: Tree) => T,
+      budget?: Budget,
+    ): T => {
+      if (!HASH.test(ref)) corrupt();
+      return open(
+        namespace,
+        'blob',
+        ref,
+        (tree) => {
+          if (digest(tree, tree.root) !== ref) corrupt();
+          return use(tree);
+        },
+        budget,
       );
-      revisions.set(key(intakeId, `revision:${revisionId}`), {
-        intakeId: revision.intakeId,
-        parentRevisionId: revision.parentRevisionId,
+    };
+    const refs = (
+      tree: Tree,
+      value: Handle | undefined,
+      max: number,
+      use: (ref: string) => void,
+    ) => {
+      if (!value || tree.kind(value) !== 'array') corrupt();
+      let count = 0;
+      for (const item of tree.arrayItems(value)) {
+        progress();
+        const ref = string(tree, item, 64);
+        if (!ref || !HASH.test(ref) || ++count > max) corrupt();
+        use(ref);
+      }
+    };
+    const region = (tree: Tree, value: Handle | undefined) => {
+      if (!value || tree.kind(value) !== 'object') corrupt();
+      for (const entry of tree.objectFields(value))
+        if (!entry.matches('page') && !entry.matches('box')) corrupt();
+      const page = number(tree, field(tree, value, 'page'));
+      if (!Number.isSafeInteger(page) || page! < 1) corrupt();
+      db.prepare('INSERT INTO regions VALUES(?)').run(page!);
+      const box = field(tree, value, 'box');
+      if (box) {
+        const values = [...items(tree, box)].map((v) => number(tree, v));
+        if (
+          values.length !== 4 ||
+          values.some((v) => v === undefined || !Number.isFinite(v) || v < 0 || v > 1) ||
+          values[2]! <= 0 ||
+          values[3]! <= 0 ||
+          values[0]! + values[2]! > 1.000001 ||
+          values[1]! + values[3]! > 1.000001
+        )
+          corrupt();
+      }
+    };
+    const addUnique = (table: 'spans' | 'issues', id: string) => {
+      if (db.prepare(`SELECT 1 FROM ${table} WHERE id=?`).get(id)) corrupt();
+      db.prepare(`INSERT INTO ${table} VALUES(?)`).run(id);
+    };
+    const pageBlob = (tree: Tree) => {
+      const root = tree.root,
+        page = field(tree, root, 'page'),
+        spanList = field(tree, root, 'spans'),
+        issueList = field(tree, root, 'issues');
+      if (
+        tree.kind(root) !== 'object' ||
+        !page ||
+        tree.kind(page) !== 'object' ||
+        !spanList ||
+        tree.kind(spanList) !== 'array' ||
+        !issueList ||
+        tree.kind(issueList) !== 'array'
+      )
+        corrupt();
+      const pageNumber = number(tree, field(tree, page, 'page')),
+        disposition = string(tree, field(tree, page, 'disposition'), 12);
+      if (
+        !Number.isSafeInteger(pageNumber) ||
+        pageNumber! < 1 ||
+        !['extracted', 'partial', 'unreadable', 'unsupported', 'not-text'].includes(
+          disposition ?? '',
+        ) ||
+        bool(tree, field(tree, page, 'inspected')) === undefined ||
+        db.prepare('SELECT 1 FROM pages WHERE page=?').get(pageNumber!)
+      )
+        corrupt();
+      for (const name of ['width', 'height']) {
+        const value = field(tree, page, name);
+        if (
+          value &&
+          (number(tree, value) === undefined ||
+            !Number.isFinite(number(tree, value)) ||
+            number(tree, value)! <= 0)
+        )
+          corrupt();
+      }
+      db.prepare('INSERT INTO pages VALUES(?)').run(pageNumber!);
+      for (const span of tree.arrayItems(spanList)) {
+        progress();
+        if (tree.kind(span) !== 'object') corrupt();
+        addUnique('spans', requiredId(tree, field(tree, span, 'id')));
+        region(tree, field(tree, span, 'region'));
+        if (
+          !nonemptyString(tree, field(tree, span, 'text')) ||
+          !['native', 'ocr', 'structured', 'human'].includes(
+            string(tree, field(tree, span, 'provenance'), 10) ?? '',
+          )
+        )
+          corrupt();
+        const confidence = field(tree, span, 'confidence');
+        if (
+          confidence &&
+          (number(tree, confidence) === undefined ||
+            !Number.isFinite(number(tree, confidence)) ||
+            number(tree, confidence)! < 0 ||
+            number(tree, confidence)! > 1)
+        )
+          corrupt();
+        const alternatives = field(tree, span, 'alternatives');
+        if (alternatives)
+          for (const alternative of items(tree, alternatives))
+            if (
+              tree.kind(alternative) !== 'object' ||
+              !field(tree, alternative, 'text') ||
+              tree.kind(field(tree, alternative, 'text')!) !== 'string' ||
+              !field(tree, alternative, 'adapter') ||
+              tree.kind(field(tree, alternative, 'adapter')!) !== 'string'
+            )
+              corrupt();
+      }
+      for (const issue of tree.arrayItems(issueList)) {
+        progress();
+        if (tree.kind(issue) !== 'object') corrupt();
+        addUnique('issues', requiredId(tree, field(tree, issue, 'id')));
+        region(tree, field(tree, issue, 'region'));
+        if (
+          !nonemptyString(tree, field(tree, issue, 'detail')) ||
+          ![
+            'confidence',
+            'coverage',
+            'disagreement',
+            'structure',
+            'unreadable',
+            'unsupported',
+          ].includes(string(tree, field(tree, issue, 'kind'), 16) ?? '') ||
+          !['open', 'confirmed', 'corrected', 'not-text', 'unreadable', 'later'].includes(
+            string(tree, field(tree, issue, 'status'), 16) ?? '',
+          )
+        )
+          corrupt();
+      }
+    };
+    const relationBlob = (tree: Tree) => {
+      for (const relation of items(tree, tree.root)) {
+        progress();
+        if (tree.kind(relation) !== 'object') corrupt();
+        const id = requiredId(tree, field(tree, relation, 'id')),
+          from = string(tree, field(tree, relation, 'from'), 128),
+          to = string(tree, field(tree, relation, 'to'), 128),
+          kind = string(tree, field(tree, relation, 'kind'), 11),
+          provenance = string(tree, field(tree, relation, 'provenance'), 7);
+        if (
+          !from ||
+          !to ||
+          from === to ||
+          !['precedes', 'same-row', 'same-column', 'header-for'].includes(kind ?? '') ||
+          !['adapter', 'human'].includes(provenance ?? '') ||
+          db.prepare('SELECT 1 FROM relations WHERE id=?').get(id)
+        )
+          corrupt();
+        db.prepare('INSERT INTO relations VALUES(?,?,?,?)').run(id, from, to, kind!);
+        if (kind === 'precedes')
+          db.prepare(
+            'INSERT INTO degree(id,count) VALUES(?,1) ON CONFLICT(id) DO UPDATE SET count=count+1',
+          ).run(to);
+      }
+    };
+    const revision = (namespace: string, id: string, originalRowid: string): string | null => {
+      if (!UUID.test(id)) corrupt();
+      for (const table of ['pages', 'regions', 'spans', 'issues', 'relations', 'degree'])
+        db.exec(`DELETE FROM ${table}`);
+      const budget = { bytes: 0 };
+      return open(namespace, 'revision', id, (tree) => {
+        const envelope = tree.root,
+          saved = field(tree, envelope, 'value'),
+          header = saved && field(tree, saved, 'header');
+        if (
+          !saved ||
+          tree.kind(saved) !== 'object' ||
+          !header ||
+          tree.kind(header) !== 'object' ||
+          string(tree, field(tree, envelope, 'sha256'), 64) !== digest(tree, saved)
+        )
+          corrupt();
+        const parentField = field(tree, header, 'parentRevisionId'),
+          parent =
+            parentField && tree.kind(parentField) === 'null' ? null : string(tree, parentField, 36);
+        if (
+          !equalsString(tree, field(tree, header, 'format'), FORMAT) ||
+          !equalsString(tree, field(tree, header, 'id'), id) ||
+          !equalsString(tree, field(tree, header, 'profileId'), profileId) ||
+          !equalsColumn(tree, field(tree, header, 'intakeId'), 'id', originalRowid) ||
+          !equalsColumn(tree, field(tree, header, 'sourceHash'), 'sha256', originalRowid) ||
+          (parent !== null && (typeof parent !== 'string' || !UUID.test(parent))) ||
+          !Number.isFinite(retainedDate(tree, field(tree, header, 'createdAt')))
+        )
+          corrupt();
+        const adapter = field(tree, header, 'adapter'),
+          adapterName = adapter && string(tree, field(tree, adapter, 'name'), 128),
+          adapterVersion = adapter && string(tree, field(tree, adapter, 'version'), 128);
+        if (
+          !adapter ||
+          tree.kind(adapter) !== 'object' ||
+          !adapterName ||
+          adapterName.length > 128 ||
+          !adapterVersion ||
+          adapterVersion.length > 128
+        )
+          corrupt();
+        const pageChunks = field(tree, saved, 'pageChunks'),
+          pageRefs = field(tree, saved, 'pageRefs'),
+          relationLists = field(tree, saved, 'relationLists'),
+          relationRef = field(tree, saved, 'relationRef');
+        if (pageChunks) {
+          if (pageRefs) corrupt();
+          refs(tree, pageChunks, Math.ceil(MAX_PAGES / PAGE_CHUNK), (ref) =>
+            blob(
+              namespace,
+              ref,
+              (chunk) => {
+                let count = 0;
+                refs(chunk, chunk.root, PAGE_CHUNK, (pageRef) => {
+                  count++;
+                  blob(namespace, pageRef, pageBlob, budget);
+                });
+                if (!count) corrupt();
+              },
+              budget,
+            ),
+          );
+        } else refs(tree, pageRefs, MAX_PAGES, (ref) => blob(namespace, ref, pageBlob, budget));
+        const pageCount = Number(db.prepare('SELECT count(*) AS n FROM pages').get()!.n);
+        if (
+          !pageCount ||
+          Number(db.prepare('SELECT max(page) AS n FROM pages').get()!.n) !== pageCount ||
+          db
+            .prepare(
+              'SELECT 1 FROM regions LEFT JOIN pages USING(page) WHERE pages.page IS NULL LIMIT 1',
+            )
+            .get()
+        )
+          corrupt();
+        for (const protectedPage of items(tree, field(tree, header, 'protectedPages'))) {
+          progress();
+          const page = number(tree, protectedPage);
+          if (!Number.isSafeInteger(page) || page! < 1 || page! > pageCount) corrupt();
+        }
+        if (relationLists) {
+          if (relationRef) corrupt();
+          refs(tree, relationLists, MAX_PAGES, (ref) =>
+            blob(
+              namespace,
+              ref,
+              (chunk) => {
+                let count = 0;
+                refs(chunk, chunk.root, PAGE_CHUNK, (relation) => {
+                  count++;
+                  blob(namespace, relation, relationBlob, budget);
+                });
+                if (!count) corrupt();
+              },
+              budget,
+            ),
+          );
+        } else {
+          const ref = string(tree, relationRef, 64);
+          if (ref === undefined) corrupt();
+          blob(namespace, ref, relationBlob, budget);
+        }
+        if (
+          db
+            .prepare(
+              'SELECT 1 FROM relations LEFT JOIN spans AS a ON relations.source=a.id LEFT JOIN spans AS b ON relations.target=b.id WHERE a.id IS NULL OR b.id IS NULL LIMIT 1',
+            )
+            .get()
+        )
+          corrupt();
+        db.exec('INSERT OR IGNORE INTO degree SELECT id,0 FROM spans');
+        let visited = 0;
+        for (;;) {
+          const next = db.prepare('SELECT id FROM degree WHERE count=0 LIMIT 1').get()?.id as
+            string | undefined;
+          if (next === undefined) break;
+          visited++;
+          progress();
+          db.prepare('DELETE FROM degree WHERE id=?').run(next);
+          for (const edge of db
+            .prepare("SELECT target FROM relations WHERE source=? AND kind='precedes'")
+            .iterate(next)) {
+            db.prepare('UPDATE degree SET count=count-1 WHERE id=?').run(edge.target);
+            progress();
+          }
+        }
+        if (visited !== Number(db.prepare('SELECT count(*) AS n FROM spans').get()!.n)) corrupt();
+        const issueIndex = field(tree, saved, 'issueIndex');
+        if (issueIndex && tree.kind(issueIndex) !== 'object') {
+          const kind = tree.kind(issueIndex);
+          if (
+            kind === 'array' ||
+            (kind === 'string' && nonemptyString(tree, issueIndex)) ||
+            (kind === 'number' && number(tree, issueIndex) !== 0) ||
+            (kind === 'boolean' && bool(tree, issueIndex))
+          )
+            corrupt();
+        }
+        const chunkLists =
+          issueIndex && tree.kind(issueIndex) === 'object' && field(tree, issueIndex, 'chunkLists');
+        if (chunkLists)
+          refs(tree, chunkLists, MAX_PAGES, (ref) =>
+            blob(
+              namespace,
+              ref,
+              (chunk) => {
+                if (
+                  chunk.kind(chunk.root) !== 'array' ||
+                  chunk.arrayItems(chunk.root)[Symbol.iterator]().next().done
+                )
+                  corrupt();
+              },
+              budget,
+            ),
+          );
+        return parent as string | null;
+      });
+    };
+    for (const row of db
+      .prepare('SELECT namespace,kind,ref,rowid,id_end FROM metadata')
+      .iterate()) {
+      progress();
+      const namespace = String(row.namespace),
+        kind = String(row.kind),
+        ref = String(row.ref),
+        original = db.prepare('SELECT rowid FROM text_originals WHERE namespace=?').get(namespace);
+      if (
+        !original ||
+        !samePieces(
+          keyIdPieces(String(row.rowid), Number(row.id_end)),
+          columnPieces('source_files', 'id', String(original.rowid)),
+        )
+      )
+        corrupt();
+      if (kind === 'head')
+        open(namespace, 'head', '', (tree) => {
+          if (
+            tree.kind(tree.root) !== 'object' ||
+            !equalsColumn(
+              tree,
+              field(tree, tree.root, 'sourceHash'),
+              'sha256',
+              String(original.rowid),
+            ) ||
+            !UUID.test(string(tree, field(tree, tree.root, 'revisionId'), 36) ?? '')
+          )
+            corrupt();
+          db.prepare('INSERT INTO heads VALUES(?,?)').run(
+            namespace,
+            string(tree, field(tree, tree.root, 'revisionId'), 36)!,
+          );
+        });
+      else if (kind === 'blob') blob(namespace, ref, () => {}, { bytes: 0 });
+      else if (kind === 'operation')
+        open(namespace, 'operation', ref, (tree) => {
+          const fingerprint = string(tree, field(tree, tree.root, 'fingerprint'), 64),
+            id = string(tree, field(tree, tree.root, 'revisionId'), 36);
+          if (
+            tree.kind(tree.root) !== 'object' ||
+            !UUID.test(ref) ||
+            !fingerprint ||
+            !HASH.test(fingerprint) ||
+            !id ||
+            !UUID.test(id)
+          )
+            corrupt();
+          db.prepare('INSERT INTO operations VALUES(?,?)').run(namespace, id);
+        });
+      else
+        db.prepare('INSERT INTO revisions VALUES(?,?,?)').run(
+          namespace,
+          ref,
+          revision(namespace, ref, String(original.rowid)),
+        );
+    }
+    if (
+      db
+        .prepare(
+          'SELECT 1 FROM namespaces_text LEFT JOIN heads USING(namespace) WHERE heads.namespace IS NULL LIMIT 1',
+        )
+        .get()
+    )
+      corrupt();
+    for (const row of db.prepare('SELECT namespace,revision FROM heads').iterate()) {
+      progress();
+      let next: string | null = String(row.revision);
+      while (next !== null) {
+        progress();
+        const parent = db
+          .prepare('SELECT parent FROM revisions WHERE namespace=? AND revision=?')
+          .get(row.namespace, next);
+        if (
+          !parent ||
+          db
+            .prepare('SELECT 1 FROM text_visited WHERE namespace=? AND revision=?')
+            .get(row.namespace, next)
+        )
+          corrupt();
+        db.prepare('INSERT INTO text_visited VALUES(?,?)').run(row.namespace, next);
+        next = parent.parent as string | null;
+      }
+    }
+    if (
+      db
+        .prepare(
+          'SELECT 1 FROM revisions LEFT JOIN text_visited USING(namespace,revision) WHERE text_visited.namespace IS NULL LIMIT 1',
+        )
+        .get()
+    )
+      corrupt();
+    for (const row of db.prepare('SELECT namespace,revision FROM operations').iterate()) {
+      progress();
+      if (
+        !db
+          .prepare('SELECT 1 FROM text_visited WHERE namespace=? AND revision=?')
+          .get(row.namespace, row.revision)
+      )
+        corrupt();
+    }
+    for (const row of db.prepare('SELECT namespace,rowid,id_end FROM pins').iterate()) {
+      progress();
+      openRow(String(row.rowid), (tree) => {
+        const pin = tree.root;
+        if (tree.kind(pin) === 'null') return;
+        if (tree.kind(pin) !== 'object') corrupt();
+        const revisionField = field(tree, pin, 'revisionId'),
+          revisionId =
+            revisionField && tree.kind(revisionField) === 'null'
+              ? null
+              : string(tree, revisionField, 36),
+          dependency = field(tree, pin, 'dependencyToken'),
+          version = number(tree, field(tree, pin, 'version'));
+        if (
+          (revisionId !== null && typeof revisionId !== 'string') ||
+          !dependency ||
+          (tree.kind(dependency) !== 'null' && tree.kind(dependency) !== 'string') ||
+          bool(tree, field(tree, pin, 'requiresInterpretation')) === undefined ||
+          !Number.isSafeInteger(version) ||
+          version! < 1
+        )
+          corrupt();
+        if (revisionId) {
+          const selected = db
+            .prepare('SELECT rowid,id_end FROM namespaces_text WHERE namespace=?')
+            .get(row.namespace);
+          if (
+            !selected ||
+            !samePieces(
+              keyIdPieces(String(row.rowid), Number(row.id_end), true),
+              keyIdPieces(String(selected.rowid), Number(selected.id_end)),
+            ) ||
+            !db
+              .prepare('SELECT 1 FROM revisions WHERE namespace=? AND revision=?')
+              .get(row.namespace, revisionId)
+          )
+            corrupt();
+        }
       });
     }
-  }
-  const selected = new Set<string>();
-  for (const intakeId of namespaces) if (!heads.has(intakeId)) corrupt();
-  for (const [intakeId, revisionId] of heads) {
-    let next: string | null = revisionId;
-    while (next !== null) {
-      const revisionKey = key(intakeId, `revision:${next}`);
-      const revision = revisions.get(revisionKey);
-      if (!revision || selected.has(revisionKey)) corrupt();
-      selected.add(revisionKey);
-      next = revision.parentRevisionId;
-    }
-  }
-  if (selected.size !== revisions.size) corrupt();
-  for (const { intakeId, revisionId } of operations)
-    if (!selected.has(key(intakeId, `revision:${revisionId}`))) corrupt();
-  for (const [name, raw] of metadata) {
-    if (!name.startsWith('intake_source_pin:v1:')) continue;
-    const intakeId = name.slice('intake_source_pin:v1:'.length);
-    const pin = parseIntakeSourcePin(raw);
-    if (pin?.revisionId && !revisions.has(key(intakeId, `revision:${pin.revisionId}`))) corrupt();
+  } finally {
+    manifest.close();
   }
 }
 export function getIntakeSourceTextReviewHistory(
@@ -593,7 +1518,7 @@ export function rebindCopiedIntakeSourceText(
     throw new Error('Source-text copy rebinding requires an unpublished destination profile');
   const revisions = db
     .prepare("SELECT key FROM app_meta WHERE key LIKE 'intake_source_text:v1:%:revision:%'")
-    .all();
+    .iterate();
   for (const row of revisions) {
     const match = /^intake_source_text:v1:(.+):revision:([0-9a-f-]{36})$/.exec(String(row.key));
     if (!match) corrupt();
@@ -611,6 +1536,241 @@ export function rebindCopiedIntakeSourceText(
       encode({ value, sha256: hash(value) }),
       row.key,
     );
+  }
+}
+
+function* reboundSourceTextValue(
+  tree: PreparedIntakeJsonCanonical,
+  value: IntakeJsonCanonicalHandle,
+  previousProfileId: string,
+  profileId: string,
+  revisionId: string,
+): Generator<string> {
+  if (tree.kind(value) !== 'object') corrupt();
+  const header = tree.field(value, 'header');
+  if (!header || tree.kind(header) !== 'object') corrupt();
+  const emit = function* (
+    object: IntakeJsonCanonicalHandle,
+    replacement: (field: {
+      name(): Iterable<string>;
+      value: IntakeJsonCanonicalHandle;
+      matches(name: string): boolean;
+    }) => Iterable<string> | undefined,
+  ): Generator<string> {
+    let first = true;
+    yield '{';
+    for (const field of tree.objectFields(object)) {
+      if (!first) yield ',';
+      first = false;
+      yield* field.name();
+      yield ':';
+      yield* replacement(field) ?? tree.pieces(field.value);
+    }
+    yield '}';
+  };
+  let headerSeen = false;
+  yield* emit(value, (field) => {
+    if (!field.matches('header')) return undefined;
+    headerSeen = true;
+    return (function* () {
+      let profileSeen = false;
+      let copiedSeen = false;
+      let first = true;
+      yield '{';
+      for (const part of tree.objectFields(header)) {
+        if (!first) yield ',';
+        first = false;
+        yield* part.name();
+        yield ':';
+        if (part.matches('profileId')) {
+          profileSeen = true;
+          yield JSON.stringify(profileId);
+        } else if (part.matches('copiedFrom')) {
+          copiedSeen = true;
+          yield JSON.stringify({ profileId: previousProfileId, revisionId });
+        } else yield* tree.pieces(part.value);
+      }
+      if (!profileSeen) {
+        if (!first) yield ',';
+        first = false;
+        yield '"profileId":' + JSON.stringify(profileId);
+      }
+      if (!copiedSeen) {
+        if (!first) yield ',';
+        yield '"copiedFrom":' + JSON.stringify({ profileId: previousProfileId, revisionId });
+      }
+      yield '}';
+    })();
+  });
+  if (!headerSeen) corrupt();
+}
+
+type RebindReader = Pick<
+  IntakeCopyIncrementalReader,
+  'rowIds' | 'rowIdsLike' | 'textPieces' | 'columnType' | 'close'
+>;
+const REBIND_KEYS = 'intake_source_text:v1:%:revision:%';
+const hasCopiedSourceTextRevisions = (db: Database, checkpoint: () => void): boolean => {
+  checkpoint();
+  const found = !!intakeCopyNativeSelect(
+    db,
+    "SELECT 1 AS present FROM main.app_meta WHERE key LIKE 'intake_source_text:v1:%:revision:%' LIMIT 1",
+    checkpoint,
+  ).get();
+  checkpoint();
+  return found;
+};
+function* copiedSourceTextRevisions(
+  reader: RebindReader,
+  checkpoint: () => void,
+): Generator<{ rowid: bigint; key: string; intakeId: string; revisionId: string }> {
+  for (const rowid of reader.rowIdsLike('app_meta', 'key', REBIND_KEYS)) {
+    checkpoint();
+    if (reader.columnType('app_meta', 'key', rowid) !== 'text') corrupt();
+    let name = '';
+    for (const piece of reader.textPieces('app_meta', 'key', rowid)) {
+      // A selected key longer than this cannot pass the existing owner ID check.
+      if (name.length + piece.length > 300) corrupt();
+      name += piece;
+      checkpoint();
+    }
+    const match = /^intake_source_text:v1:(.+):revision:([0-9a-f-]{36})$/.exec(name);
+    if (!match) corrupt();
+    const [, intakeId, revisionId] = match;
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_:-]{0,200}$/.test(intakeId)) corrupt();
+    yield { rowid, key: name, intakeId, revisionId };
+  }
+}
+
+function copiedSourceTextTree(reader: RebindReader, rowid: bigint, checkpoint: () => void) {
+  if (reader.columnType('app_meta', 'value', rowid) !== 'text') corrupt();
+  return prepareIntakeJsonCanonicalSteps(reader.textPieces('app_meta', 'value', rowid), {
+    mode: 'stringify',
+    assertRunning: checkpoint,
+  });
+}
+
+function* copiedSourceTextAfterSteps(
+  tree: PreparedIntakeJsonCanonical,
+  previousProfileId: string,
+  profileId: string,
+  revisionId: string,
+): Generator<void, () => Iterable<string>> {
+  if (tree.kind(tree.root) !== 'object') corrupt();
+  const value = tree.field(tree.root, 'value');
+  if (!value || tree.kind(value) !== 'object') corrupt();
+  const expected = intakeCopyJsonString(tree, tree.field(tree.root, 'sha256'), 66);
+  const original = createHash('sha256');
+  let pieces = 0;
+  for (const piece of tree.pieces(value)) {
+    original.update(piece);
+    if (++pieces % 16 === 0) yield;
+  }
+  if (expected !== original.digest('hex')) corrupt();
+  const header = tree.field(value, 'header');
+  if (!header || tree.kind(header) !== 'object') corrupt();
+  if (intakeCopyJsonString(tree, tree.field(header, 'profileId'), 130) !== previousProfileId)
+    corrupt();
+  if (intakeCopyJsonString(tree, tree.field(header, 'id'), 38) !== revisionId) corrupt();
+  const digest = createHash('sha256');
+  for (const piece of reboundSourceTextValue(
+    tree,
+    value,
+    previousProfileId,
+    profileId,
+    revisionId,
+  )) {
+    digest.update(piece);
+    if (++pieces % 16 === 0) yield;
+  }
+  const reboundHash = digest.digest('hex');
+  return function* () {
+    yield '{"value":';
+    yield* reboundSourceTextValue(tree, value, previousProfileId, profileId, revisionId);
+    yield ',"sha256":"' + reboundHash + '"}';
+  };
+}
+
+/** Stage source-text owner changes without changing the copied database. */
+export async function prepareCopiedIntakeSourceTextTransfer(
+  db: Database,
+  previousProfileId: string,
+  profileId: string,
+  transfer: IntakeCopyTransfer,
+  checkpoint: () => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const current = captureIntakeCopyReadInterval(db, previousProfileId);
+  const check = () => {
+    signal?.throwIfAborted();
+    checkpoint();
+    current();
+  };
+  if (!hasCopiedSourceTextRevisions(db, check)) return;
+  const reader = await createIntakeCopyIncrementalReader(db, check);
+  try {
+    await reader.validateSourceTextInWorker(previousProfileId, signal, check);
+    for (const revision of copiedSourceTextRevisions(reader, check)) {
+      check();
+      const tree = await finishIntakeCopyStepsAsync(
+        copiedSourceTextTree(reader, revision.rowid, check),
+        signal,
+      );
+      try {
+        const after = await finishIntakeCopyStepsAsync(
+          copiedSourceTextAfterSteps(tree, previousProfileId, profileId, revision.revisionId),
+          signal,
+        );
+        await transfer.put('revision-before', revision.key, () =>
+          reader.textPieces('app_meta', 'value', revision.rowid),
+        );
+        await transfer.put('revision-after', revision.key, after);
+        check();
+      } finally {
+        tree.close();
+      }
+    }
+    check();
+  } finally {
+    reader.close();
+  }
+}
+
+/** The encrypted copy path runs in its dedicated setup worker. */
+export function prepareCopiedIntakeSourceTextTransferSync(
+  db: Database,
+  previousProfileId: string,
+  profileId: string,
+  transfer: IntakeCopyTransfer,
+  checkpoint: () => void,
+): void {
+  const check = () => {
+    checkpoint();
+    if (!db.isOpen || db.isTransaction) throw Error('Source-text copy reader interval changed');
+  };
+  if (!hasCopiedSourceTextRevisions(db, check)) return;
+  const reader = createIntakeCopyIncrementalReaderFromStandalone(db, check);
+  try {
+    validatePortableIntakeSourceTextDatabase(reader, previousProfileId, check);
+    for (const revision of copiedSourceTextRevisions(reader, check)) {
+      check();
+      const tree = finishIntakeCopySteps(copiedSourceTextTree(reader, revision.rowid, check));
+      try {
+        const after = finishIntakeCopySteps(
+          copiedSourceTextAfterSteps(tree, previousProfileId, profileId, revision.revisionId),
+        );
+        transfer.putSync('revision-before', revision.key, () =>
+          reader.textPieces('app_meta', 'value', revision.rowid),
+        );
+        transfer.putSync('revision-after', revision.key, after);
+        check();
+      } finally {
+        tree.close();
+      }
+    }
+    check();
+  } finally {
+    reader.close();
   }
 }
 export function currentIntakeSourceTextRevisionId(
@@ -644,8 +1804,8 @@ export function intakeSourceTextInterpretationRevisionId(
   const row = owner(db, profileId, intakeId);
   // The durable intake projection keeps the last material revision. The common
   // current-head path must not walk hundreds of whole-document approval receipts.
-  const metadata = readStoredIntakeDetails(db, intakeId);
   const pin = readIntakeSourcePin(db, intakeId);
+  const metadata = pin ? undefined : intakeSourceMetadata(db, intakeId);
   const material = pin ? pin.revisionId : metadata ? metadata.sourceTextRevisionId : null;
   if (id === head && typeof material === 'string') return material;
   let revision = loadRevision(db, profileId, intakeId, row.sha256, id);
@@ -697,6 +1857,7 @@ export function getIntakeSourceText(
   intakeId: string,
   revisionId?: string,
 ): IntakeSourceText {
+  withIntakeWork(db, 'warm', () => recordIntakeWork('sourceTextReadCalls'));
   const row = source(db, root, profileId, intakeId),
     id = revisionId ?? currentIntakeSourceTextRevisionId(db, profileId, intakeId);
   return id
@@ -736,6 +1897,44 @@ function issueSummary(pages: SourceTextPage[], issues: SourceTextIssue[]): Sourc
 }
 
 /** Metadata-only queue. Completed originals never occupy an attention page. */
+function sourceAttentionSections(
+  db: Database,
+  profileId: string,
+  file: { id: string; sha256: string },
+) {
+  const head = currentIntakeSourceTextRevisionId(db, profileId, file.id);
+  if (!head) return 0;
+  const saved = loadStoredRevision(db, profileId, file.id, file.sha256, head);
+  let sections = saved.issueIndex?.summary.attentionSections;
+  if (sections === undefined) {
+    const pages = new Set<number>();
+    if (saved.issueIndex)
+      for (const chunk of saved.issueIndex.chunks) {
+        const issues = readBlob(db, file.id, chunk.ref) as SourceTextIssue[];
+        for (const issue of issues) if (sourceIssueNeedsReview(issue)) pages.add(issue.region.page);
+      }
+    else
+      for (const ref of saved.pageRefs) {
+        const page = readBlob(db, file.id, ref) as { issues: SourceTextIssue[] };
+        for (const issue of page.issues)
+          if (sourceIssueNeedsReview(issue)) pages.add(issue.region.page);
+      }
+    sections = pages.size;
+  }
+  if (!Number.isSafeInteger(sections) || sections < 0 || sections > saved.pageRefs.length)
+    corrupt();
+  return sections;
+}
+export async function listSourceAttentionRead(
+  db: Database,
+  profileId: string,
+  offset = 0,
+): Promise<SourceAttentionQueue> {
+  if (!Number.isSafeInteger(offset) || offset < 0) bad('Invalid source attention offset');
+  return readPreparedSourceAttention(db, profileId, offset, (file) =>
+    sourceAttentionSections(db, profileId, file),
+  );
+}
 export function listSourceAttention(
   db: Database,
   profileId: string,
@@ -753,40 +1952,24 @@ export function listSourceAttention(
         ) +
         " ORDER BY json_extract(f.details_json,'$.intake.createdAt') DESC,f.id",
     )
-    .all() as { id: string; sha256: string }[];
+    .iterate() as Iterable<{ id: string; sha256: string }>;
   const items: SourceAttentionQueue['items'] = [];
+  let total = 0,
+    sectionsTotal = 0;
   for (const file of files) {
-    const head = currentIntakeSourceTextRevisionId(db, profileId, file.id);
-    if (!head) continue;
-    const saved = loadStoredRevision(db, profileId, file.id, file.sha256, head);
-    let sections = saved.issueIndex?.summary.attentionSections;
-    if (sections === undefined) {
-      const pages = new Set<number>();
-      if (saved.issueIndex)
-        for (const chunk of saved.issueIndex.chunks) {
-          const issues = readBlob(db, file.id, chunk.ref) as SourceTextIssue[];
-          for (const issue of issues)
-            if (sourceIssueNeedsReview(issue)) pages.add(issue.region.page);
-        }
-      else
-        for (const ref of saved.pageRefs) {
-          const page = readBlob(db, file.id, ref) as { issues: SourceTextIssue[] };
-          for (const issue of page.issues)
-            if (sourceIssueNeedsReview(issue)) pages.add(issue.region.page);
-        }
-      sections = pages.size;
+    const sections = sourceAttentionSections(db, profileId, file);
+    if (sections > 0) {
+      if (total >= offset && items.length < 30) items.push({ intakeId: file.id, sections });
+      total++;
+      sectionsTotal += sections;
     }
-    if (!Number.isSafeInteger(sections) || sections < 0 || sections > saved.pageRefs.length)
-      corrupt();
-    if (sections > 0) items.push({ intakeId: file.id, sections });
   }
-  const window = items.slice(offset, offset + 30);
   return {
-    sections: items.reduce((sum, item) => sum + item.sections, 0),
-    total: items.length,
-    items: window,
+    sections: sectionsTotal,
+    total,
+    items,
     offset,
-    nextOffset: offset + window.length < items.length ? offset + window.length : null,
+    nextOffset: offset + items.length < total ? offset + items.length : null,
   };
 }
 function persistIssueIndex(db: Database, revision: SourceTextRevision): StoredIssueIndexRefs {

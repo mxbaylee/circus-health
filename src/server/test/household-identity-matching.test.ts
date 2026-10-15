@@ -336,6 +336,10 @@ test('a guarantor substring cannot automatically own the patient report or becom
   });
   // Keep the report decision without a redundant primary-name alias or Person write.
   assert.deepEqual(getNote(f.db, 'person-note:self'), savedSelfNote);
+  assert.ok(
+    'validation' in confirmed,
+    'This direct legacy fixture retains its full intake contract',
+  );
   const receipt = confirmed.workflow!.identityConfirmations!.find(
     (entry) => entry.operationId === input.operationId,
   )!;

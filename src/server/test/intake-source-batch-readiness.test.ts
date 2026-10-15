@@ -12,15 +12,18 @@ import { createIntakeBatchManager } from '../intake-batches.ts';
 import { writeIntakeBatch, cloneIntakeBatch } from '../intake-batch-journal.ts';
 import type { IntakeBatch } from '../../shared/intake-batch.ts';
 import {
-  currentIntakeInterpretations,
-  getIntake,
-  proposeConversion,
-  reviewIntake,
+  ensureNativeIntakeSchema,
+  getIntakeRead,
+  proposeConversionRead,
+  reviewIntakeRead,
   uploadIntake,
 } from '../intake.ts';
 import { extractIntakeSourceText } from '../intake-source-extraction.ts';
 import { reviewIntakeSourceText } from '../intake-source-text.ts';
 import { fictionalModel } from './fictional-model.ts';
+import { prepareCurrentIntakeInterpretations } from '../intake-current-interpretations.ts';
+import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
 
 for (const kind of ['ready-original', 'existing-proposal'] as const)
   for (const outcome of ['current', 'empty', 'failed', 'fresh'] as const)
@@ -75,14 +78,38 @@ for (const kind of ['ready-original', 'existing-proposal'] as const)
           newProviderName: 'Fictional clinic',
         });
         const extracted = await extractIntakeSourceText({ db, root, profileId, id: source.id });
+        await ensureNativeIntakeSchema(db, profileId, source.id);
         const propose = () =>
-          proposeConversion(db, root, profileId, source.id, {
-            version: getIntake(db, root, profileId, source.id).version,
+          proposeConversionRead(db, root, profileId, source.id, {
+            version: getIntakeRead(db, root, profileId, source.id).version,
             jsonlText,
             summary: 'Fictional interpretation',
           });
-        if (kind === 'existing-proposal') propose();
-        const oldProposal = getIntake(db, root, profileId, source.id).proposals.at(-1)?.id ?? null;
+        const latestProposalId = () => {
+          const view = openIntakeCollectionEnvelope(db, { id: source.id });
+          const selected = view.child(view.root(), 'intake')!;
+          const proposals = view.children(selected, 'proposals', { items: 4, bytes: 32768 });
+          assert.equal(proposals.complete, true, 'all fictional proposals fit a bounded page');
+          assert.equal(proposals.records.length, view.childCount(selected, 'proposals'));
+          const last = proposals.records.at(-1);
+          if (!last) return null;
+          const id = view.field(last, 'id', { bytes: 8192 });
+          assert.ok(id.kind === 'value' && typeof id.value === 'string');
+          return id.value;
+        };
+        const review = async (proposalId: string | null) => {
+          const page = await reviewIntakeRead(db, root, profileId, source.id, proposalId, {
+            items: 1,
+            bytes: 65536,
+          });
+          assert.ok('format' in page && page.format === 'health-intake-clinical-review-page-v2');
+          assert.equal(page.total, 1);
+          assert.equal(page.items.length, 1);
+          assert.equal(page.nextCursor, null);
+          return page;
+        };
+        if (kind === 'existing-proposal') await propose();
+        const oldProposal = latestProposalId();
         let sends = 0;
         const chat = {
           id: 'fictional-chat',
@@ -108,6 +135,49 @@ for (const kind of ['ready-original', 'existing-proposal'] as const)
             if (batch.id === id && reached(batch)) return batch as IntakeBatch;
           throw new Error('Batch observation ended before publication');
         };
+        // Each case exercises its first enqueue. Re-enqueueing an already owned
+        // original intentionally returns the retained batch, even after completion.
+        if (outcome !== 'current') {
+          reviewIntakeSourceText(
+            db,
+            root,
+            profileId,
+            source.id,
+            {
+              operationId: randomUUID(),
+              expectedRevisionId: extracted.sourceText.revision!.id,
+              sourceHash: source.sha256,
+              action: 'correct',
+              scope: { page: 1 },
+              spans: [
+                {
+                  id: 'fictional-correction',
+                  text: 'Fictional source value 21.00 mg.',
+                  region: { page: 1 },
+                  provenance: 'human',
+                },
+              ],
+            },
+            'profile-owner',
+          );
+          assert.equal((await review(oldProposal)).sourceTextStale, true);
+          const current = await prepareCurrentIntakeInterpretations(db, profileId, source.id);
+          assert.equal(current.original, false);
+          assert.equal(current.hasCurrentProposal, false, 'no retained proposal is current');
+          assert.equal(current.proposalTotal, kind === 'existing-proposal' ? 1 : 0);
+        }
+        if (outcome === 'fresh') {
+          // The clinical payload may remain identical, but corrected evidence must
+          // receive a new dependency-bound proposal and review version.
+          const fresh = await propose();
+          assert.ok(isIntakeSummary(fresh));
+          const freshId = latestProposalId();
+          assert.ok(freshId);
+          assert.notEqual(freshId, oldProposal);
+          assert.equal((await review(freshId)).sourceTextStale, false);
+        }
+        // Construction wakes the durable upload intent. Establish the selected
+        // evidence before that first enqueue; native review preparation yields.
         const manager = createIntakeBatchManager({
           root,
           databases: new Map([[profileId, db]]),
@@ -136,59 +206,15 @@ for (const kind of ['ready-original', 'existing-proposal'] as const)
           rmSync(root, { recursive: true, force: true });
         });
         const start = (operationId: string = randomUUID()) =>
-          manager.create(profileId, { operationId, intakeIds: [source.id] });
-        // Each case exercises its first enqueue. Re-enqueueing an already owned
-        // original intentionally returns the retained batch, even after completion.
-        if (outcome !== 'current') {
-          reviewIntakeSourceText(
-            db,
-            root,
-            profileId,
-            source.id,
-            {
-              operationId: randomUUID(),
-              expectedRevisionId: extracted.sourceText.revision!.id,
-              sourceHash: source.sha256,
-              action: 'correct',
-              scope: { page: 1 },
-              spans: [
-                {
-                  id: 'fictional-correction',
-                  text: 'Fictional source value 21.00 mg.',
-                  region: { page: 1 },
-                  provenance: 'human',
-                },
-              ],
-            },
-            'profile-owner',
-          );
-          assert.equal(
-            reviewIntake(db, root, profileId, source.id, oldProposal).sourceTextStale,
-            true,
-          );
-          assert.deepEqual(currentIntakeInterpretations(db, profileId, source.id), {
-            original: false,
-            proposalIds: [],
-          });
-        }
-        if (outcome === 'fresh') {
-          // The clinical payload may remain identical, but corrected evidence must
-          // receive a new dependency-bound proposal and review version.
-          const fresh = propose().proposals.at(-1)!;
-          assert.notEqual(fresh.id, oldProposal);
-          assert.equal(
-            reviewIntake(db, root, profileId, source.id, fresh.id).sourceTextStale,
-            false,
-          );
-        }
+          manager.createPrepared(profileId, { operationId, intakeIds: [source.id] });
         const firstOperationId = randomUUID();
-        const batch = start(firstOperationId);
+        const batch = await start(firstOperationId);
         if (outcome === 'current' || outcome === 'fresh') {
           assert.equal((await waitForBatch(batch.id)).status, 'complete');
           assert.equal(manager.get(profileId, batch.id).items[0].status, 'review_ready');
           assert.equal(sends, 0, 'Current evidence must avoid unnecessary rereading');
           assert.equal(
-            start(randomUUID()).scheduled,
+            (await start(randomUUID())).scheduled,
             false,
             'a completed, fully captured interpretation has no work for a new operation',
           );
@@ -216,26 +242,36 @@ for (const kind of ['ready-original', 'existing-proposal'] as const)
               'profile-owner',
             );
             assert.equal(manager.get(profileId, batch.id).status, 'complete', 'before replay');
-            assert.equal(start(batch.operationId).status, 'complete', 'original operation replays');
+            assert.equal(
+              (await start(batch.operationId)).status,
+              'complete',
+              'original operation replays',
+            );
             const reopenOperationId = randomUUID();
             assert.equal(
-              start(reopenOperationId).scheduled,
+              (await start(reopenOperationId)).scheduled,
               true,
               'new operation reopens affected evidence',
             );
             assert.equal(
-              start(reopenOperationId).scheduled,
+              (await start(reopenOperationId)).scheduled,
               false,
               'reopen operation replays exactly',
             );
             assert.equal((await waitForBatch(batch.id, true)).items[0]!.status, 'running');
             assert.equal(sends, 1);
-            const replacement = propose().proposals.at(-1)!;
-            assert.notEqual(replacement.id, oldProposal);
+            await propose();
+            const replacementId = latestProposalId();
+            assert.ok(replacementId);
+            assert.notEqual(replacementId, oldProposal);
             chat.status = 'idle';
             assert.equal((await waitForBatch(batch.id)).status, 'complete');
             assert.equal(manager.get(profileId, batch.id).items[0]!.status, 'review_ready');
-            assert.equal(start().scheduled, false, 'fresh replacement closes the reopened work');
+            assert.equal(
+              (await start()).scheduled,
+              false,
+              'fresh replacement closes the reopened work',
+            );
           }
           return;
         }
@@ -246,9 +282,6 @@ for (const kind of ['ready-original', 'existing-proposal'] as const)
         assert.equal((await waitForBatch(batch.id)).status, 'paused');
         assert.equal(manager.get(profileId, batch.id).items[0].status, 'paused');
         assert.equal(manager.get(profileId, batch.id).items[0].reason, 'no_proposal');
-        assert.equal(
-          reviewIntake(db, root, profileId, source.id, oldProposal).sourceTextStale,
-          true,
-        );
+        assert.equal((await review(oldProposal)).sourceTextStale, true);
       },
     );

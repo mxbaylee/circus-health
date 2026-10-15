@@ -1,5 +1,84 @@
 import { createHash, randomBytes } from 'node:crypto';
-import type { Intake, IntakeExtractionUnit } from '../shared/intake.ts';
+import type { Intake } from '../shared/intake.ts';
+
+/** Diagnostic-only source metadata. These independently bounded iterables are
+ * never a clinical workflow or acceptance capability. */
+export interface AttributionMetadataItems<T> extends Iterable<T> {
+  readonly length: number;
+}
+type Items<T> = AttributionMetadataItems<T>;
+export interface AttributionMetadataUnit {
+  id: string;
+  sourceFileId?: string;
+  memberId?: string;
+  pages?: Items<number>;
+  status: string;
+  coverage?: { kind: string };
+}
+export interface AttributionDiagnosticSource {
+  format: 'health-intake-attribution-source-v1';
+  id: string;
+  sha256: string;
+  parentSourceFileId: string | null;
+  incomplete?(): boolean;
+  proposals: Items<{ id: string }>;
+  history: Items<{
+    acceptedProposalId?: string | null;
+    clinical?: { records?: Items<{ recordId: string }> };
+  }>;
+  decisions: Items<{
+    action: string;
+    candidateId: string;
+    candidateVersionId: string;
+    recordId: string;
+  }>;
+  reportAcceptances: Items<{
+    receipt: {
+      receipts: Items<{
+        intakeId: string;
+        proposalId: string | null;
+        records: Items<{ candidateId: string; candidateVersionId: string; recordId: string }>;
+      }>;
+    };
+  }>;
+  plans: Items<{
+    id: string;
+    status: string;
+    units: Items<AttributionMetadataUnit>;
+    batches: Items<{ id: string; coverage: Items<{ unitId: string }> }>;
+  }>;
+  candidates: Items<{
+    id: string;
+    versions: Items<{
+      id: string;
+      status: string;
+      occurrences: Items<{
+        proposalId: string | null;
+        recordId: string;
+        batchId?: string | null;
+        locator?: string;
+      }>;
+    }>;
+  }>;
+}
+function legacyDiagnosticSource(intake: Intake): AttributionDiagnosticSource {
+  return {
+    format: 'health-intake-attribution-source-v1',
+    id: intake.id,
+    sha256: intake.sha256,
+    parentSourceFileId: intake.parentSourceFileId || null,
+    proposals: intake.proposals,
+    history: intake.importHistory?.length
+      ? intake.importHistory
+      : intake.imported
+        ? [{ acceptedProposalId: intake.acceptedProposalId, clinical: intake.imported.clinical }]
+        : [],
+    decisions: intake.workflow?.decisions || [],
+    reportAcceptances: intake.workflow?.reportAcceptances || [],
+    plans: intake.workflow?.plans || [],
+    candidates: intake.workflow?.candidates || [],
+  };
+}
 
 const MAX_SCOPES = 2048;
 const MAX_WINDOWS = 4096;
@@ -242,12 +321,14 @@ interface YieldScope extends AttributionScope {
   sharedProposedOccurrences: Set<string>;
   sharedAcceptedRecords: Set<string>;
 }
-function unitScopes(intake: Intake, unit: IntakeExtractionUnit): AttributionScope[] {
+function unitScopes(
+  intake: AttributionDiagnosticSource,
+  unit: AttributionMetadataUnit,
+  bounded: <T>(items: Items<T>) => T[],
+): AttributionScope[] {
   const source = { sourceFileId: unit.sourceFileId || intake.id, memberId: unit.memberId || null };
-  const pages = [...new Set(unit.pages?.filter((page) => count(page) && page > 0) || [])];
-  return pages.length
-    ? pages.slice(0, MAX_SCOPES).map((page) => ({ ...source, page }))
-    : [{ ...source, page: null }];
+  const pages = [...new Set(bounded(unit.pages || []).filter((page) => count(page) && page > 0))];
+  return pages.length ? pages.map((page) => ({ ...source, page })) : [{ ...source, page: null }];
 }
 
 /**
@@ -256,30 +337,51 @@ function unitScopes(intake: Intake, unit: IntakeExtractionUnit): AttributionScop
  * Historical plans and versions remain separate from current coverage and yield.
  */
 export function exportImportAttribution({
-  intakes,
+  intakes: inputIntakes,
   chats,
   salt = randomBytes(32),
   selectionIncomplete = false,
   historyIncomplete = false,
 }: {
-  intakes: Intake[];
+  intakes: (Intake | AttributionDiagnosticSource)[];
   chats: unknown[];
   salt?: Uint8Array;
   selectionIncomplete?: boolean;
   historyIncomplete?: boolean;
 }) {
-  const omittedSources = Math.max(0, intakes.length - 1000);
+  const omittedSources = Math.max(0, inputIntakes.length - 1000);
   const omittedChats = Math.max(0, chats.length - 100);
-  intakes = intakes.slice(0, 1000);
+  const intakes = inputIntakes
+    .slice(0, 1000)
+    .map((source) =>
+      'format' in source && source.format === 'health-intake-attribution-source-v1'
+        ? source
+        : legacyDiagnosticSource(source as Intake),
+    );
   chats = chats.slice(0, 100);
   let metadataWork = 0,
     omittedMetadataItems = 0,
     exportScopes = 0;
-  const bounded = <T>(items: T[]): T[] => {
+  const bounded = <T>(items: Items<T>): T[] => {
     const admitted = Math.min(items.length, MAX_METADATA_WORK - metadataWork);
     metadataWork += admitted;
     omittedMetadataItems += items.length - admitted;
-    return admitted === items.length ? items : items.slice(0, admitted);
+    if (Array.isArray(items)) return admitted === items.length ? items : items.slice(0, admitted);
+    const result: T[] = [],
+      iterator = items[Symbol.iterator]();
+    try {
+      for (let i = 0; i < admitted; i++) {
+        const next = iterator.next();
+        if (next.done) {
+          omittedMetadataItems += admitted - i;
+          break;
+        }
+        result.push(next.value);
+      }
+    } finally {
+      iterator.return?.();
+    }
+    return result;
   };
   const pseudonym = (value: string) =>
     createHash('sha256').update(salt).update(value).digest('hex').slice(0, 20);
@@ -354,9 +456,9 @@ export function exportImportAttribution({
       'Historical reads, missing provider usage, unscoped records, missing page text-layer counts and truncated scopes are unknown, never zero estimates. A measured zero text-layer count does not mean an empty or administrative page.',
     omittedImports,
     imports: [...imports].map(([id, checkpoints]) => {
-      const belongs = (intake: Intake): boolean => {
+      const belongs = (intake: AttributionDiagnosticSource): boolean => {
         const seen = new Set<string>();
-        let current: Intake | undefined = intake;
+        let current: AttributionDiagnosticSource | undefined = intake;
         while (current && !seen.has(current.id)) {
           if (current.id === id) return true;
           seen.add(current.id);
@@ -435,12 +537,15 @@ export function exportImportAttribution({
         unscopedAccepted = new Set<string>();
       const acceptedVersionKeys = new Set<string>();
       const acceptedVersionRecords = new Set<string>();
-      const acceptedRecordKey = (source: string, proposal: string | null, record: string) =>
-        key([source, proposal, record]);
+      const acceptedRecordKey = (
+        source: string,
+        proposal: string | null | undefined,
+        record: string,
+      ) => key([source, proposal, record]);
       // A coordinator receipt may live on another source. Match its target intake,
       // then deduplicate by target/candidate/version/record, not coordinator storage.
       for (const intake of bounded(intakes))
-        for (const acceptance of bounded(intake.workflow?.reportAcceptances || []))
+        for (const acceptance of bounded(intake.reportAcceptances))
           for (const receipt of bounded(acceptance.receipt.receipts)) {
             if (!sourceIds.has(receipt.intakeId)) continue;
             for (const record of bounded(receipt.records)) {
@@ -460,19 +565,7 @@ export function exportImportAttribution({
             }
           }
       for (const intake of bounded(sources)) {
-        const workflow = intake.workflow;
-        const history: Array<
-          Pick<NonNullable<Intake['importHistory']>[number], 'acceptedProposalId' | 'clinical'>
-        > = intake.importHistory?.length
-          ? intake.importHistory
-          : intake.imported
-            ? [
-                {
-                  acceptedProposalId: intake.acceptedProposalId,
-                  clinical: intake.imported.clinical,
-                },
-              ]
-            : [];
+        const history = intake.history;
         for (const receipt of bounded(history))
           for (const record of bounded(receipt.clinical?.records || [])) {
             const recordKey = acceptedRecordKey(
@@ -486,18 +579,18 @@ export function exportImportAttribution({
         for (const proposal of bounded(intake.proposals))
           proposals.add(key([intake.id, proposal.id]));
         const decisions = new Set(
-          bounded(workflow?.decisions || [])
+          bounded(intake.decisions)
             .filter((decision) => decision.action === 'accept')
             .map((decision) =>
               key([decision.candidateId, decision.candidateVersionId, decision.recordId]),
             ),
         );
         const batches = new Map<string, AttributionScope[]>();
-        for (const plan of bounded(workflow?.plans || [])) {
+        for (const plan of bounded(intake.plans)) {
           const units = bounded(plan.units);
           const byUnit = new Map(units.map((unit) => [unit.id, unit]));
           for (const unit of units)
-            for (const scope of bounded(unitScopes(intake, unit))) {
+            for (const scope of bounded(unitScopes(intake, unit, bounded))) {
               const row = page(scope);
               if (!row) continue;
               const unitKey = key([intake.id, plan.id, unit.id]);
@@ -514,7 +607,7 @@ export function exportImportAttribution({
             for (const coverage of bounded(batch.coverage)) {
               const unit = byUnit.get(coverage.unitId);
               if (!unit) continue;
-              for (const scope of bounded(unitScopes(intake, unit))) {
+              for (const scope of bounded(unitScopes(intake, unit, bounded))) {
                 const normalized = normalizeScope(scope);
                 scopes.set(key(normalized), normalized);
               }
@@ -522,7 +615,7 @@ export function exportImportAttribution({
             batches.set(batch.id, [...scopes.values()]);
           }
         }
-        for (const candidate of bounded(workflow?.candidates || []))
+        for (const candidate of bounded(intake.candidates))
           for (const version of bounded(candidate.versions)) {
             const versionKey = key([intake.id, candidate.id, version.id]);
             for (const occurrence of bounded(version.occurrences)) {
@@ -624,6 +717,7 @@ export function exportImportAttribution({
         }
       }
       truncated ||=
+        sources.some((source) => source.incomplete?.()) ||
         selectionIncomplete ||
         historyIncomplete ||
         omittedMetadataItems > 0 ||

@@ -1,4 +1,5 @@
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { observeRecoveryChoiceClick } from './recovery-choice-click-diagnostic.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { Browser } from 'playwright';
 import type { Note } from '../../shared/api.ts';
@@ -124,6 +125,7 @@ for (const prfOutput of ['buffer', 'array'])
       const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } }),
         errors: string[] = [],
         savedRequests = [];
+      const recoveryChoiceDiagnostic = observeRecoveryChoiceClick(page);
       page.on('pageerror', (error) => errors.push(error.message));
       page.on('request', (request) => {
         if (request.url().endsWith('/passkeys/confirm')) savedRequests.push(request.url());
@@ -248,6 +250,15 @@ for (const prfOutput of ['buffer', 'array'])
           },
           { path, body },
         );
+      const waitForRecoveryVerification = () =>
+        page.waitForResponse((response) => {
+          const responseUrl = new URL(response.url());
+          return (
+            responseUrl.origin === origin &&
+            /^\/api\/profile-setups\/[^/]+\/verify$/.test(responseUrl.pathname) &&
+            response.request().method() === 'POST'
+          );
+        });
       assert.equal((await api('/api/runtime')).value.encrypted, true);
       assert.deepEqual((await api('/api/profiles')).value.data, []);
       await page.getByRole('button', { name: 'Create profile', exact: true }).click();
@@ -280,11 +291,30 @@ for (const prfOutput of ['buffer', 'array'])
       assert.equal(await verification.locator('form').getAttribute('method'), 'post');
       await capture('open-profile');
       await verification.getByLabel('Recovery key', { exact: true }).fill(recovery);
-      await verification.getByRole('button', { name: 'Open profile', exact: true }).click();
-      await page
-        .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
-        .getByRole('button', { name: 'Add passkey', exact: true })
-        .click();
+      try {
+        const [verified] = await Promise.all([
+          waitForRecoveryVerification(),
+          verification.getByRole('button', { name: 'Open profile', exact: true }).click(),
+        ]);
+        assert.equal(verified.status(), 201, 'recovery verification must succeed');
+        const recoveryChoice = page.getByRole('dialog', {
+          name: 'Recovery unlocked',
+          exact: true,
+        });
+        await recoveryChoice.waitFor();
+        await recoveryChoice.getByRole('button', { name: 'Add passkey', exact: true }).click();
+      } catch (error) {
+        let diagnostic = 'Recovery choice actionability: unavailable:diagnostic-failed';
+        try {
+          diagnostic =
+            'Recovery choice actionability: ' +
+            JSON.stringify(await recoveryChoiceDiagnostic('Add passkey'));
+        } catch {}
+        try {
+          t.diagnostic(diagnostic);
+        } catch {}
+        throw error;
+      }
       const dialog = page.getByRole('dialog', { name: 'Add passkey for Fictional Passkey Robin' });
       await dialog.getByRole('status').filter({ hasText: 'Confirm your passkey' }).waitFor();
       await page.waitForFunction(() => typeof window.releaseConfirmation === 'function');
@@ -503,11 +533,24 @@ for (const prfOutput of ['buffer', 'array'])
       await login.getByRole('button', { name: 'Use recovery key', exact: true }).click();
       await login.locator('input[name="password"]:focus').waitFor();
       await login.getByLabel('Recovery key', { exact: true }).fill(recovery);
-      await login.getByRole('button', { name: 'Open profile', exact: true }).click();
-      await page
-        .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
-        .getByRole('button', { name: 'Skip', exact: true })
-        .click();
+      const [recovered] = await Promise.all([
+        page.waitForResponse((response) => {
+          const responseUrl = new URL(response.url());
+          return (
+            responseUrl.origin === origin &&
+            /^\/api\/profiles\/[^/]+\/unlock$/.test(responseUrl.pathname) &&
+            response.request().method() === 'POST'
+          );
+        }),
+        login.getByRole('button', { name: 'Open profile', exact: true }).click(),
+      ]);
+      assert.equal(recovered.status(), 200, 'recovery fallback unlock must succeed');
+      const recoveredChoice = page.getByRole('dialog', {
+        name: 'Recovery unlocked',
+        exact: true,
+      });
+      await recoveredChoice.waitFor();
+      await recoveredChoice.getByRole('button', { name: 'Skip', exact: true }).click();
       assert.equal((await api('/api/profiles')).value.data[0].locked, false);
       assert.deepEqual(
         await page.evaluate(() => window.passkeyCalls),

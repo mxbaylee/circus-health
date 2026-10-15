@@ -2,13 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { HttpError } from './database.ts';
-import { durableWrite, type CompleteLoadedPortable } from './portable.ts';
+import { durableWrite, type PortableManifest } from './portable.ts';
 import { validProfileId } from './profiles.ts';
 import { selectedContributorHead } from './contributor-durability.ts';
 
 interface SelectedCopyHeads {
-  personal: CompleteLoadedPortable['personal']['manifest'];
-  curation: CompleteLoadedPortable['curation']['manifest'];
+  personal: PortableManifest;
+  curation: PortableManifest;
 }
 export interface ProfileCopyOperation {
   format: 'health-profile-copy-operation-v1';
@@ -101,7 +101,7 @@ export function writeCopyOperation(root: string, operation: ProfileCopyOperation
 }
 export function selectCopyHeads(
   operation: ProfileCopyOperation,
-  portable: CompleteLoadedPortable,
+  portable: { personal: { manifest: PortableManifest }; curation: { manifest: PortableManifest } },
   root?: string,
 ): ProfileCopyOperation {
   return {
@@ -112,7 +112,7 @@ export function selectCopyHeads(
 }
 export function verifyCopyHeads(
   operation: ProfileCopyOperation,
-  portable: CompleteLoadedPortable,
+  portable: { personal: { manifest: PortableManifest }; curation: { manifest: PortableManifest } },
   root?: string,
 ): void {
   if (

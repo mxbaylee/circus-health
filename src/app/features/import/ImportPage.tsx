@@ -1,3 +1,15 @@
+import { hostGroundedIdentity, identityGroundingRefreshKey } from './identity-grounding';
+import { holdoutTrace } from '../../data/holdout-trace';
+import { recordLabel, recordValue, recordSaveBlockReason } from './import-feed-presentation';
+import { readSelectedClinicalReview } from '../../data/intake-clinical-review';
+import { firstReportGroup } from '../../../shared/intake-report-group-links';
+import { isIntakeSummary, type IntakePublicRead } from '../../../shared/intake-summary';
+import {
+  isCollectionImportFeed,
+  type CollectionImportFeed,
+} from '../../../shared/intake-clinical-pages';
+import { CollectionImportReview } from './CollectionImportReview';
+import { ImportReadingActivity } from './ImportReadingActivity';
 import { ImportAcceptanceOutcomes } from './ImportAcceptanceOutcomes';
 import type {
   IntakePartialAcceptanceReceipt,
@@ -17,6 +29,7 @@ import type {
   IntakeDraftRepairUpdate,
   IntakeImportFeed,
   IntakeImportFeedRecord,
+  IntakeImportFeedFilterKind,
   IntakeReportAcceptanceRequest,
   IntakeReportQueueGroup,
   IntakeReportSourceResult,
@@ -69,7 +82,7 @@ import {
 } from './partial-save-plan';
 import { possibleSavedOverlapCount } from './possible-overlaps';
 import {
-  acceptedRecordsForScope,
+  loadAcceptedRecordsForScope,
   appendSavedPersonDestination,
   SavedPersonDestinations,
   SavedRecordDestinations,
@@ -123,81 +136,14 @@ const kind: Record<IntakeImportFeedRecord['feedKind'], ImportReviewKind> = {
   history: 'Documents',
   unsupported: 'Documents',
 };
-const feedKind: Partial<Record<ImportReviewKind, IntakeImportFeedRecord['feedKind'] | 'person'>> = {
+const feedKind: Partial<Record<ImportReviewKind, IntakeImportFeedFilterKind>> = {
   'Test results': 'test',
   Prescriptions: 'prescription',
   Vision: 'vision',
   Procedures: 'procedure',
-  Documents: 'history',
+  Documents: 'documents',
   People: 'person',
 };
-
-function recordLabel(record: IntakeImportFeedRecord) {
-  return (
-    record.mapping.testLabel ||
-    record.mapping.medicationName ||
-    record.mapping.procedureLabel ||
-    record.mapping.documentTitle ||
-    record.mapping.label ||
-    record.title
-  );
-}
-
-function recordValue(record: IntakeImportFeedRecord) {
-  const mapping = initialDraft(record).decision.mapping;
-  if (record.feedKind === 'prescription')
-    return { value: mapping.doseText || mapping.status || 'Prescription', unit: mapping.frequency };
-  if (record.feedKind === 'procedure')
-    return { value: mapping.status || mapping.eventKind || 'Procedure', unit: '' };
-  if (record.feedKind === 'history' || record.feedKind === 'unsupported') {
-    const literal = (mapping.text || mapping.status || record.title).replace(/\s+/g, ' ').trim();
-    return { value: literal.length > 120 ? `${literal.slice(0, 117)}…` : literal, unit: '' };
-  }
-  if (record.feedKind === 'vision' && mapping.opticalPrescription) {
-    const eyes = mapping.opticalPrescription.eyes.map((eye) => {
-      const side =
-        eye.sideText ||
-        (eye.side === 'right'
-          ? 'OD'
-          : eye.side === 'left'
-            ? 'OS'
-            : eye.side === 'both'
-              ? 'OU'
-              : 'Eye');
-      const values = [
-        eye.sph && `SPH ${eye.sph.valueText}${eye.sph.unit ? ` ${eye.sph.unit}` : ''}`,
-        eye.cyl && `CYL ${eye.cyl.valueText}${eye.cyl.unit ? ` ${eye.cyl.unit}` : ''}`,
-        eye.axis && `AXIS ${eye.axis.valueText}${eye.axis.unit ? ` ${eye.axis.unit}` : ''}`,
-        eye.add && `ADD ${eye.add.valueText}${eye.add.unit ? ` ${eye.add.unit}` : ''}`,
-      ].filter(Boolean);
-      return `${side} ${values.join(' ')}`.trim();
-    });
-    const literal = eyes.filter(Boolean).join(' · ');
-    return { value: literal || 'Vision prescription', unit: '' };
-  }
-  return { value: mapping.valueText || 'Value to review', unit: mapping.unit };
-}
-
-function recordSaveBlockReason(record: IntakeImportFeedRecord): string | undefined {
-  if (record.selectable || (record.queueState !== 'pending' && record.queueState !== 'deferred'))
-    return undefined;
-  if (hasUnreviewedPairChoices(record))
-    return 'Review the possible record matches before saving this record.';
-  if (record.identityReview?.blocking)
-    return record.identityReview.message || 'Review the report identity before saving this record.';
-  const issue = record.issues?.find(
-    (candidate) => candidate.blocking && candidate.status !== 'resolved',
-  );
-  if (issue?.kind === 'identity') return 'Review the report identity before saving this record.';
-  if (issue?.kind === 'date') return 'Resolve the date question before saving this record.';
-  if (issue?.kind === 'uncertain_reading')
-    return 'Resolve the uncertain reading before saving this record.';
-  if (issue?.kind === 'information')
-    return 'Answer the required review question before saving this record.';
-  if (record.classification === 'unsupported')
-    return 'This item is kept with its original and cannot be saved as a structured record.';
-  return 'Open the full review to resolve what is blocking this record.';
-}
 
 function detailUrl(
   group: IntakeReportQueueGroup,
@@ -251,7 +197,7 @@ export function ImportPage() {
     const selection = new URLSearchParams(selectionQuery);
     const groupId = selection.get('group') || selection.get('report');
     const intakeId = selection.get('intake');
-    const params = new URLSearchParams({ view, state, limit: '100' });
+    const params = new URLSearchParams({ view, state, limit: '40', bytes: '65536' });
     if ((groupId || intakeId) && !selection.has('person')) {
       params.set('view', 'all');
       params.delete('state');
@@ -264,11 +210,16 @@ export function ImportPage() {
     if (filters.editedOnly && filters.kind !== 'People') params.set('edited', 'true');
     return `/intakes/import-feed?${params}`;
   }, [filters, selectionQuery]);
-  const feed = useResource<IntakeImportFeed>(feedPath, 'review_open');
+  const feed = useResource<IntakeImportFeed | CollectionImportFeed>(feedPath, 'review_open');
   const [pagedFeed, setPagedFeed] = useState<IntakeImportFeed | null>(null);
   const [pagedFeedScope, setPagedFeedScope] = useState('');
   const [loadingMore, setLoadingMore] = useState(false);
   const limits = useResource<{ uploadBytes: number; extractionBytes: number }>('/intakes/limits');
+  const uploadUnavailable = limits.data
+    ? undefined
+    : limits.error
+      ? 'Uploads are unavailable. Reload the page to try again.'
+      : 'Getting ready to upload…';
   const batch = useIntakeBatch(profile?.id || '');
   const [people, setPeople] = useState<IntakePersonProposal[]>([]);
   const [peopleNext, setPeopleNext] = useState<Map<string, string>>(new Map());
@@ -340,7 +291,7 @@ export function ImportPage() {
   }, [profile?.id]);
 
   useEffect(() => {
-    setPagedFeed(feed.data);
+    setPagedFeed(isCollectionImportFeed(feed.data) ? null : feed.data);
     setPagedFeedScope(`${profile?.id || ''}:${feedPath}`);
   }, [feed.data, feedPath, profile?.id]);
   const requestScope = `${profile?.id || ''}:${feedPath}`;
@@ -431,16 +382,15 @@ export function ImportPage() {
           identityReviewLoads.current.set(group.groupId, { ...load, pending: false });
           recordIdentityReviewDiagnostic(review);
           setIdentityReviews((reviews) => new Map(reviews).set(group.groupId, review));
-          const groundingRefreshKey = JSON.stringify([
+          const groundingRefreshKey = identityGroundingRefreshKey(
             signature,
-            review.scope?.scopeToken,
+            review,
             data.blocks
               .filter((block) => block.groupId === group.groupId)
               .map((block) => block.reviewToken),
-          ]);
+          );
           if (
-            ['prior_confirmation', 'evidenced_match'].includes(review.status) &&
-            !review.blocking &&
+            hostGroundedIdentity(review) &&
             identityGroundingRefreshes.current.get(group.groupId) !== groundingRefreshKey &&
             data.blocks.some(
               (block) =>
@@ -523,10 +473,13 @@ export function ImportPage() {
     void Promise.all(
       [...new Set(acceptedBlocks.map((block) => block.intakeId))].map(
         async (intakeId) =>
-          [intakeId, (await api<Intake>(`/intakes/${encodeURIComponent(intakeId)}`)).data] as const,
+          [
+            intakeId,
+            (await api<IntakePublicRead>(`/intakes/${encodeURIComponent(intakeId)}`)).data,
+          ] as const,
       ),
     )
-      .then((intakes) => {
+      .then(async (intakes) => {
         if (cancelled || activeProfile.current !== requestedProfile) return;
         const byIntake = new Map(intakes);
         const next = new Map<string, IntakeAcceptedRecord>();
@@ -534,11 +487,16 @@ export function ImportPage() {
           const intake = byIntake.get(block.intakeId);
           if (!intake) continue;
           const rows = block.records.filter((record) => record.queueState === 'accepted');
-          const accepted = acceptedRecordsForScope(intake, {
-            groupId: block.groupId,
-            proposalId: block.proposalId,
-            recordIds: rows.map((record) => record.id),
-          });
+          const accepted = await loadAcceptedRecordsForScope(
+            intake.id,
+            {
+              groupId: block.groupId,
+              proposalId: block.proposalId,
+              recordIds: rows.map((record) => record.id),
+            },
+            intake,
+          );
+          if (cancelled) return;
           for (const row of rows) {
             const destination = accepted.find((record) => record.recordId === row.id);
             if (destination) next.set(row.feedKey, destination);
@@ -672,9 +630,18 @@ export function ImportPage() {
     setHistoricalSelection({ key, loading: true });
     void (async () => {
       try {
-        const intake = (await api<Intake>(`/intakes/${encodeURIComponent(intakeId)}`)).data;
+        const intake = (await api<IntakePublicRead>(`/intakes/${encodeURIComponent(intakeId)}`))
+          .data;
         let groupId: string | undefined;
-        if (recordId || proposal !== null) {
+        if (isIntakeSummary(intake) && recordId) {
+          const selected = await readSelectedClinicalReview(intakeId, proposalId ?? null, recordId);
+          groupId = firstReportGroup(
+            selected.record.kind === 'record'
+              ? selected.record.record.reportGroups
+              : selected.record.reportGroups,
+          )?.groupId;
+          if (!groupId) throw new Error('That exact record has no retained report link.');
+        } else if (!isIntakeSummary(intake) && (recordId || proposal !== null)) {
           const query = proposalId ? `?proposalId=${encodeURIComponent(proposalId)}` : '';
           const review = (
             await api<IntakeReview>(`/intakes/${encodeURIComponent(intakeId)}/review${query}`)
@@ -684,9 +651,19 @@ export function ImportPage() {
             : review.records[0];
           if (recordId && !exactRecord)
             throw new Error('That exact record is no longer present in the selected proposal.');
-          groupId = exactRecord?.reportGroups?.[0]?.groupId;
+          groupId = firstReportGroup(exactRecord?.reportGroups)?.groupId;
         }
-        groupId ||= intake.workflow?.reportGroups?.[0]?.id;
+        if (!groupId && isIntakeSummary(intake)) {
+          const selected = (
+            await api<IntakeImportFeed | CollectionImportFeed>(
+              intake.links.reports + '&view=all&limit=1',
+            )
+          ).data;
+          groupId = isCollectionImportFeed(selected)
+            ? selected.records[0]?.groupId || selected.groups[0]?.groupId
+            : selected.blocks[0]?.groupId;
+        } else if (!groupId && !isIntakeSummary(intake))
+          groupId = intake.workflow?.reportGroups?.[0]?.id;
         if (!groupId)
           throw new Error('This historical link does not identify a retained report to review.');
         if (!cancelled) setHistoricalSelection({ key, groupId, loading: false });
@@ -971,7 +948,16 @@ export function ImportPage() {
             ? data.people.counts.saved
             : data.people.counts.excluded
       : 0;
-    const activeFiles = (data?.activity.runningFiles || 0) + (data?.activity.queuedFiles || 0);
+    const nativeActivity = isCollectionImportFeed(feed.data) ? feed.data.activity : undefined;
+    const activity = nativeActivity || data?.activity;
+    const activeFiles = Math.max(
+      (activity?.runningFiles || 0) + (activity?.queuedFiles || 0),
+      batch.batch?.status === 'running'
+        ? batch.batch.items.filter((item) =>
+            ['queued', 'running', 'starting'].includes(item.status),
+          ).length
+        : 0,
+    );
     const pausedItem = batch.batch?.items.find(hasPausedIntakeReading);
     const currentItem =
       batch.batch?.items.find((item) => ['running', 'starting'].includes(item.status)) ||
@@ -1049,7 +1035,7 @@ export function ImportPage() {
             Prescriptions: data.kindCounts.prescription,
             Vision: data.kindCounts.vision,
             Procedures: data.kindCounts.procedure,
-            Documents: data.kindCounts.history,
+            Documents: data.kindCounts.history + data.kindCounts.unsupported,
             People: peopleCount,
           }
         : undefined,
@@ -1182,6 +1168,7 @@ export function ImportPage() {
     batch.batch,
     batch.busy,
     displayedFeed,
+    feed.data,
     filters,
     identityReviews,
     identityReviewErrors,
@@ -1205,8 +1192,22 @@ export function ImportPage() {
     kind: ClientOperationSummary['kind'] = 'review_action',
     counts: ClientOperationSummary['counts'] = { actions: 1 },
   ): Promise<boolean> {
-    if (busy || acceptance.busy || acceptance.recovering || acceptance.recoveryOperationId)
+    holdoutTrace('perform.enter');
+    holdoutTrace(busy ? 'perform.busy.true' : 'perform.busy.false');
+    holdoutTrace(
+      acceptance.busy ? 'perform.acceptance-busy.true' : 'perform.acceptance-busy.false',
+    );
+    holdoutTrace(acceptance.recovering ? 'perform.recovering.true' : 'perform.recovering.false');
+    holdoutTrace(
+      acceptance.recoveryOperationId
+        ? 'perform.receipt-pending.true'
+        : 'perform.receipt-pending.false',
+    );
+    if (busy || acceptance.busy || acceptance.recovering || acceptance.recoveryOperationId) {
+      holdoutTrace('perform.refused');
       return false;
+    }
+    holdoutTrace('perform.admitted');
     const requestedProfile = profile?.id;
     if (!requestedProfile) return false;
     const prefix = `/api/profiles/${encodeURIComponent(requestedProfile)}`;
@@ -1264,6 +1265,7 @@ export function ImportPage() {
   }
 
   async function freshPerson(prefix: string, proposal: IntakePersonProposal) {
+    holdoutTrace('people.fresh.start');
     let cursor: string | null = null;
     do {
       const query = new URLSearchParams({ limit: '100' });
@@ -1273,10 +1275,16 @@ export function ImportPage() {
           `${prefix}/intakes/people/${encodeURIComponent(proposal.groupId)}?${query}`,
         )
       ).data;
+      holdoutTrace('people.fresh.api-returned');
       const current = page.people.find((item) => item.id === proposal.id);
-      if (current) return current;
+      if (current) {
+        holdoutTrace('people.fresh.found');
+        return current;
+      }
       cursor = page.peopleNextCursor;
+      if (cursor) holdoutTrace('people.fresh.next-page');
     } while (cursor);
+    holdoutTrace('people.fresh.missing');
     throw new Error(`${proposal.person.fullName} changed. Review People again.`);
   }
 
@@ -1407,6 +1415,7 @@ export function ImportPage() {
             proposalVersion: proposal.version,
             action: 'add',
           }));
+          holdoutTrace('people.apply.start');
           const response = await exactMutation(operationKey, () =>
             requestApi<IntakePersonApplyResult>(`${prefix}/intakes/people-apply`, {
               operationId,
@@ -2039,6 +2048,102 @@ export function ImportPage() {
     },
   };
 
+  const fullDetailSelection =
+    detailSelection &&
+    (!detailSelection.recordId ||
+      detailSelection.personId ||
+      searchParams.get('review') === 'full');
+  if (!feed.data && !(feed.error && fullDetailSelection))
+    return (
+      <div className="page import-page">
+        {feed.error ? (
+          <div className="import-error" role="alert">
+            {feed.error.message}{' '}
+            <button className="button secondary" onClick={feed.reload}>
+              Retry import review
+            </button>
+          </div>
+        ) : (
+          <LoadingIndicator label="Opening import review…" layout="centered" />
+        )}
+      </div>
+    );
+
+  if (isCollectionImportFeed(feed.data))
+    return (
+      <CollectionImportReview
+        initial={feed.data}
+        selection={detailSelection}
+        selectionLoading={activeHistoricalSelection?.loading}
+        selectionError={activeHistoricalSelection?.error}
+        path={feedPath}
+        firstPage={feed}
+        onChanged={feed.reload}
+        sourceProps={sourceReviewProps}
+        onUpload={upload}
+        uploadUnavailable={uploadUnavailable}
+        busy={busy}
+        status={uploadStatus || notice || operationStatus || ''}
+        error={error || batch.error || feed.error?.message || ''}
+        reading={
+          <>
+            {batch.pendingCreate && (
+              <p role="status">
+                Your originals are retained. The reading request still needs confirmation.
+                <button
+                  className="button secondary"
+                  type="button"
+                  disabled={batch.busy}
+                  onClick={() =>
+                    void batch
+                      .retryCreate()
+                      .then(() => feed.reload())
+                      .catch(() => {})
+                  }
+                >
+                  Retry reading
+                </button>
+              </p>
+            )}
+            {batch.batch && (
+              <ImportReadingActivity
+                activity={model.activity}
+                onStop={
+                  batch.batch.status === 'running'
+                    ? async () => {
+                        await batch.stop();
+                        feed.reload();
+                      }
+                    : undefined
+                }
+                onRetryExceptions={
+                  batch.batch.items.some((item) => item.exceptions?.length)
+                    ? async () => {
+                        await batch.retryExceptions();
+                        feed.reload();
+                      }
+                    : undefined
+                }
+                onResume={
+                  (batch.batch.status === 'stopped' ||
+                    (batch.batch.status === 'paused' &&
+                      batch.batch.reason !== 'needs_user_action' &&
+                      !batch.batch.automaticRun)) &&
+                  batch.batch.items.some(
+                    (item) => hasPausedIntakeReading(item) || !!item.resumeAutomaticRun,
+                  )
+                    ? async () => {
+                        await batch.resume();
+                        feed.reload();
+                      }
+                    : undefined
+                }
+              />
+            )}
+          </>
+        }
+      />
+    );
   return (
     <div className="page import-page">
       {(error || acceptance.error || batch.error) && (
@@ -2118,16 +2223,15 @@ export function ImportPage() {
             Open Import
           </button>
         </section>
-      ) : detailSelection &&
-        (!detailSelection.recordId ||
-          detailSelection.personId ||
-          searchParams.get('review') === 'full') ? (
-        <ImportDetailReview
-          selection={detailSelection}
-          onBack={closeDetail}
-          onChanged={feed.reload}
-          onUseSource={source}
-        />
+      ) : fullDetailSelection ? (
+        feed.loading && !feed.data ? null : (
+          <ImportDetailReview
+            selection={detailSelection}
+            onBack={closeDetail}
+            onChanged={feed.reload}
+            onUseSource={source}
+          />
+        )
       ) : (
         <ImportReviewPresentation
           requestedRecordId={
@@ -2149,11 +2253,16 @@ export function ImportPage() {
           }
           preserveSourceReview={preserveSourceReview}
           beforeReviewChange={async () => {
+            holdoutTrace('before-review.enter');
             if (pendingSourceReviews.current.size) {
+              holdoutTrace('before-review.pending-draft');
               setNotice('Save or discard the source review draft before changing the review view.');
               return false;
             }
-            return (await closeInlineReview.current?.()) ?? true;
+            holdoutTrace('before-review.close-start');
+            const result = (await closeInlineReview.current?.()) ?? true;
+            holdoutTrace('before-review.close-done');
+            return result;
           }}
           renderRecordReview={(record, close) => {
             if (!record.detailUrl) return null;
@@ -2200,6 +2309,7 @@ export function ImportPage() {
           actions={{
             busy:
               busy || acceptance.busy || acceptance.recovering || !!acceptance.recoveryOperationId,
+            uploadUnavailable,
             onFiles: upload,
             onSave: save,
             onLater: (ids) => disposition(ids, 'later'),
