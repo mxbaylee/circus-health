@@ -128,7 +128,7 @@ export interface ProxyModelBridgeOptions {
   durableRetries?: boolean;
   onEvent?: BridgeEventHandler;
   onTool?: BridgeToolHandler;
-  onExit?: (error: ModelError) => void;
+  onExit?: ((error: ModelError) => void) | ((error: ModelError) => Promise<void>);
   fetchImpl?: typeof fetch;
   resolveHost?: ResolveHost;
   onDiagnostic?: DiagnosticHandler;
@@ -1109,7 +1109,7 @@ export class ProxyModelBridge {
   readonly config: ProxyConfig;
   readonly onEvent: BridgeEventHandler;
   readonly onTool: BridgeToolHandler;
-  readonly onExit: (error: ModelError) => void;
+  readonly onExit: ((error: ModelError) => void) | ((error: ModelError) => Promise<void>);
   readonly durableRetries: boolean;
   readonly beforeRequest: (() => void | Promise<void>) | undefined;
   readonly fetchImpl: typeof fetch | undefined;
@@ -1184,9 +1184,9 @@ export class ProxyModelBridge {
     await this.onEvent('turn/started', { turn: { id: this.turnId } });
     this.completion = this.diagnostics
       .run(turnContext, () => this.loop(text))
-      .catch((error) => {
+      .catch(async (error) => {
         if (!this.closed)
-          this.onExit(
+          await this.onExit(
             error instanceof ModelError
               ? error
               : new ModelError('AI returned an unsupported response.'),
@@ -1195,6 +1195,23 @@ export class ProxyModelBridge {
       .finally(() => {
         this.running = false;
       });
+    // turn() dispatches a background lifetime. Keep its rejected completion
+    // available to explicit awaiters while observing terminal publication
+    // failures even when the host has already locked or closed this job.
+    void this.completion.catch(() => {
+      try {
+        this.diagnostics.record(
+          'import.phase.failed',
+          {
+            phase: 'assistant_terminal_publication',
+            reasonCode: 'terminal_publication_failed',
+          },
+          turnContext,
+        );
+      } catch {
+        /* Optional diagnostics cannot change callback acknowledgement. */
+      }
+    });
     return { turn: { id: this.turnId } };
   }
   private async request(body: unknown, exposedCallIds: string[] = []): Promise<unknown> {

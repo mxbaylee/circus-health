@@ -915,9 +915,16 @@ test(
       const visited = new Set<string>();
       const groups = new Set<string>();
       do {
-        const query = new URLSearchParams({ view: 'all', limit: '40', bytes: '65536' });
+        // This helper looks up one known delivery. Scope the API query too,
+        // rather than paging unrelated activity that may legitimately change
+        // between requests and invalidate a whole-profile cursor.
+        const query = new URLSearchParams({ intakeId, view: 'all', limit: '40', bytes: '65536' });
         if (cursor) query.set('cursor', cursor);
         const feed = await request<CollectionImportFeed>('/intakes/import-feed?' + query);
+        assert.ok(
+          feed.groups.every((group) => group.intakeId === intakeId),
+          'exact delivery lookup returns only the requested intake',
+        );
         const matches = feed.groups.filter((group) => group.intakeId === intakeId);
         for (const ref of matches) {
           if (groups.has(ref.groupId)) continue;

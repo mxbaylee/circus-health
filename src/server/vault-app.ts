@@ -3,7 +3,11 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
 import { authorizationSignalAborted } from './authorization-signal.ts';
-import { assistantCompactOwnerCurrent, type AssistantCompactOwner } from './assistant.ts';
+import {
+  assistantCompactOwnerCurrent,
+  assistantRequestAccountingCurrent,
+  type AssistantCompactOwner,
+} from './assistant.ts';
 import {
   intakeBatchOwnerCurrent,
   type IntakeBatchOwner,
@@ -192,6 +196,48 @@ export function withVaultAssistantAuthorization<T>(owner: AssistantCompactOwner,
   if (!vaultCompactAuthorizationCurrent(authorization, data.db, data.profileId))
     throw new HttpError(423, 'PROFILE_LOCKED', 'Assistant access changed');
   return compactAuthorizationContext.run(authorization, run);
+}
+const assistantRequestAccounting = new WeakMap<
+  AssistantCompactOwner,
+  Map<string, CompactAuthorizationData | undefined>
+>();
+/** Retain only the actual dispatch's session, database and vault lifetime. This
+ * issuer never supplies a compact clinical/source authorization token. */
+export function captureVaultAssistantRequestAccounting(
+  owner: AssistantCompactOwner,
+  requestId: string,
+): void {
+  const authorization = assistantAuthorizations.get(owner);
+  const data = authorization && compactAuthorizations.get(authorization);
+  if (
+    !assistantRequestAccountingCurrent(owner, data?.db, data?.profileId, requestId) ||
+    (data && !vaultCompactAuthorizationCurrent(authorization!, data.db, data.profileId))
+  )
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Assistant dispatch changed');
+  let requests = assistantRequestAccounting.get(owner);
+  if (!requests) assistantRequestAccounting.set(owner, (requests = new Map()));
+  if (!requests.has(requestId)) requests.set(requestId, data);
+}
+export function withVaultAssistantRequestAccounting<T>(
+  owner: AssistantCompactOwner,
+  requestId: string,
+  run: () => T,
+): T {
+  const requests = assistantRequestAccounting.get(owner);
+  if (!requests?.has(requestId))
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Assistant dispatch changed');
+  const data = requests.get(requestId);
+  if (
+    !assistantRequestAccountingCurrent(owner, data?.db, data?.profileId, requestId) ||
+    (data &&
+      (data.lifecycle.closed ||
+        Reflect.apply(data.isOpen, data.db, []) !== true ||
+        Reflect.apply(nativeMapGet, data.sessions, [data.client.id]) !== data.client ||
+        !Reflect.apply(nativeSetHas, data.profiles, [data.profileId]) ||
+        Reflect.apply(nativeMapGet, data.opened, [data.profileId]) !== data.state))
+  )
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Assistant accounting access changed');
+  return compactAuthorizationContext.exit(run);
 }
 const sessionUnlockAuthorizations = new WeakMap<
   object,

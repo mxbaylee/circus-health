@@ -486,7 +486,7 @@ test(
     assert.deepEqual(candidates.items, []);
     assert.equal(candidates.nextCursor, null);
     assert.equal(batch.version, getIntakeRead(db, root, 'cedar', item.id).version);
-    complete(bridge);
+    await complete(bridge);
   },
 );
 
@@ -521,7 +521,7 @@ function fixture(
         },
         async turn(prompt: string) {
           this.prompt = JSON.parse(prompt.slice(prompt.indexOf('{')));
-          callbacks.onEvent?.('turn/started', { turn: { id: 'turn-1' } });
+          await callbacks.onEvent?.('turn/started', { turn: { id: 'turn-1' } });
         },
         async cancel() {},
         close() {
@@ -687,14 +687,14 @@ test(
       jsonlText: rows.join('\n'),
       summary: 'Three fictional records from one literal window; coverage remains partial',
     });
-    bridge.callbacks.onEvent('item/completed', {
+    await bridge.callbacks.onEvent('item/completed', {
       item: {
         id: 'reused-generation-item',
         type: 'agentMessage',
         text: 'Three fictional entries are proposed; coverage is still partial.',
       },
     });
-    complete(bridge);
+    await complete(bridge);
     assert.equal(
       chat.status,
       'running',
@@ -726,14 +726,14 @@ test(
         },
       ],
     });
-    bridge.callbacks.onEvent('item/completed', {
+    await bridge.callbacks.onEvent('item/completed', {
       item: {
         id: 'reused-generation-item',
         type: 'agentMessage',
         text: 'All three fictional entries are retained for review; none are accepted.',
       },
     });
-    complete(bridge);
+    await complete(bridge);
     const responseItems = chat.messages.filter((message) => message.role === 'assistant');
     assert.equal(responseItems.length, 2);
     assert.equal(responseItems[0].runId, responseItems[1].runId);
@@ -816,7 +816,7 @@ test('conversion pauses on repeated reads and retains checkpoints across resume 
   assert.equal(f.bridges[2].prompt.conversion.pendingReadWindows, saved.pendingWindows.total);
   f.assistant.cancel('cedar', chat.id);
   assert.equal(required(chat.reading).reason, 'stopped');
-  f.bridges[2].callbacks.onEvent('turn/completed', { turn: { status: 'completed' } });
+  await f.bridges[2].callbacks.onEvent('turn/completed', { turn: { status: 'completed' } });
   await tick();
   assert.equal(f.bridges.length, 3, 'late completion after Stop never schedules another turn');
 });
@@ -833,7 +833,7 @@ test('productive host slice boundaries are resumable while provider errors stay 
   f.assistant.send('cedar', chat.id, { message: 'Read evidence', context: { intakeId: item.id } });
   await waitForConversionBridge(t, f, chat);
   await call(f.bridges[0], 'intake_read', { id: item.id });
-  f.bridges[0].callbacks.onExit?.(
+  await f.bridges[0].callbacks.onExit?.(
     new ModelContextLimitError('Fictional local transcript boundary', 'slice'),
   );
   assert.equal(chat.status, 'idle');
@@ -849,7 +849,7 @@ test('productive host slice boundaries are resumable while provider errors stay 
     context: { intakeId: item.id },
   });
   await waitForConversionBridge(t, f, chat, 1);
-  f.bridges[1].callbacks.onExit?.(new Error('Fictional provider unavailable'));
+  await f.bridges[1].callbacks.onExit?.(new Error('Fictional provider unavailable'));
   assert.equal(chat.status, 'failed');
   assert.equal(chat.reading?.reason, 'error');
 });
@@ -894,7 +894,7 @@ test('a reading deadline retains the in-flight guarded tool result and blocks an
     boundaryError = error;
   }
   assert.ok(boundaryError instanceof ModelContextLimitError);
-  bridge.callbacks.onExit?.(boundaryError);
+  await bridge.callbacks.onExit?.(boundaryError);
 
   assert.equal(chat.status, 'idle');
   assert.equal(chat.reading?.reason, 'time_limit');
@@ -958,7 +958,7 @@ test('an absolute reading deadline blocks requests and generations before an ove
     'the absolute deadline denies admission before the overdue timer callback runs',
   );
   assert.equal(chat.status, 'running', 'the undispatched wakeup timer did not end the turn');
-  complete(bridge);
+  await complete(bridge);
   await tick();
 
   assert.equal(chat.status, 'idle');
@@ -1001,7 +1001,7 @@ test('a genuine context limit keeps precedence after the soft reading deadline',
   assert.ok(bridge);
 
   t.mock.timers.tick(15 * 60 * 1000);
-  bridge.callbacks.onExit?.(
+  await bridge.callbacks.onExit?.(
     new ModelContextLimitError('Fictional provider context boundary', 'provider'),
   );
 
@@ -1204,7 +1204,7 @@ test('conversion diagnostics bind the original, model run, real progress and ter
   });
   await waitForConversionBridge(t, f, chat);
   await call(f.bridges[0], 'intake_read', { id: item.id });
-  f.bridges[0].callbacks.onEvent('model/evidenceFallback', {
+  await f.bridges[0].callbacks.onEvent('model/evidenceFallback', {
     durationMs: 12,
     pageCount: 1,
     reason: 'pdf_unsupported',
@@ -1383,7 +1383,7 @@ test('two-page PDF conversion corrects premature coverage in the same model run'
     jsonlText: row(1),
     summary: 'Fictional first page retained',
   });
-  complete(bridge);
+  await complete(bridge);
   await waitForConversionBridge(t, f, chat, 1);
   assert.equal(chat.status, 'running', chat.error ?? '');
   bridge = required(f.bridges[1]);
@@ -1427,7 +1427,7 @@ test('two-page PDF conversion corrects premature coverage in the same model run'
     });
   assert.equal(chat.status, 'running', 'a fresh evidence read reset the bounded error count');
   await call(bridge, 'intake_batch', batch());
-  complete(bridge);
+  await complete(bridge);
   assert.equal(chat.status, 'idle');
   assert.equal(required(chat.reading).reason, 'reading_exhausted');
   assert.equal(required(chat.reading).readyRecords, 2);
@@ -1952,7 +1952,7 @@ test('a completely read single-page PDF member can receive reviewed extraction c
       },
     ],
   });
-  complete(f.bridge);
+  await complete(f.bridge);
   assert.equal(proposalCount(f.db, f.root, 'cedar', f.item.id), 1);
   assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', f.item.id).units[0]!.status, 'completed');
   assert.equal(required(f.chat.reading).reason, 'reading_exhausted');
@@ -2073,7 +2073,7 @@ test('an untested configured connection is checked automatically before private 
   assert.equal(checks, 1);
   assert.equal(bridges.length, 1);
   assert.equal(chat.status, 'running');
-  complete(bridges[0]);
+  await complete(bridges[0]);
 });
 
 test('failed automatic preflight sends no private chat to the model', async (t) => {
@@ -2100,10 +2100,10 @@ test('chat streams, cancels, retries without duplicating user text, and persists
   assert.equal(chat.status, 'running');
   assert.equal(bridges[0].prompt.route, '#/notes?id=abc');
   assert.throws(() => assistant.create('cedar', { message: 'Second batch' }), /already running/);
-  bridges[0].callbacks.onEvent('item/reasoning/textDelta', {
+  await bridges[0].callbacks.onEvent('item/reasoning/textDelta', {
     text: 'Never store internal reasoning',
   });
-  bridges[0].callbacks.onEvent('item/agentMessage/delta', {
+  await bridges[0].callbacks.onEvent('item/agentMessage/delta', {
     itemId: 'reply',
     delta: 'Visible partial answer',
   });
@@ -2118,14 +2118,14 @@ test('chat streams, cancels, retries without duplicating user text, and persists
   assistant.retry('cedar', chat.id);
   await tick();
   assert.equal(chat.messages.filter((m) => m.role === 'user').length, 1);
-  bridges[0].callbacks.onEvent('item/agentMessage/delta', {
+  await bridges[0].callbacks.onEvent('item/agentMessage/delta', {
     itemId: 'late',
     delta: 'Must be ignored',
   });
-  bridges[1].callbacks.onEvent('item/completed', {
+  await bridges[1].callbacks.onEvent('item/completed', {
     item: { id: 'reply-2', type: 'agentMessage', text: 'Completed answer' },
   });
-  complete(bridges[1]);
+  await complete(bridges[1]);
   assert.equal(chat.status, 'idle');
   assert.equal(required(chat.messages.at(-1)).content, 'Completed answer');
   const saved = readTestChat(root, 'cedar', chat.id);
@@ -2164,7 +2164,7 @@ test('tool reads, conversations and writes cannot be redirected into another pro
   );
   await assert.rejects(() => call(bridges[0], 'shell', { command: 'anything' }), /Unsupported/);
   assert.equal(listChats(root, 'cedar').length, 0);
-  complete(bridges[0]);
+  await complete(bridges[0]);
 });
 
 test('note proposals preserve unrelated data, require versions and apply idempotently', async (t) => {
@@ -2191,7 +2191,7 @@ test('note proposals preserve unrelated data, require versions and apply idempot
     reason: 'User-provided phone',
   });
   assert.equal(getNote(db, person.id).person.phone, undefined);
-  complete(bridges[0]);
+  await complete(bridges[0]);
   assistant.apply('cedar', chat.id, proposal.id);
   person = getNote(db, person.id);
   assert.equal(person.person.phone, '555-0100');
@@ -2210,7 +2210,7 @@ test('note proposals preserve unrelated data, require versions and apply idempot
     reason: 'Draft',
   });
   saveNote(db, person.id, { version, content: 'Intervening user edit' });
-  complete(bridges[1]);
+  await complete(bridges[1]);
   assert.throws(() => assistant.apply('cedar', chat.id, stale.id), /changed/);
   assert.equal(getNote(db, person.id).content, 'Intervening user edit');
 });
@@ -2249,7 +2249,7 @@ test('new People proposals keep contact and family history on the reviewed perso
     );
     proposals.push({ proposal, entry });
   }
-  complete(bridges[0]);
+  await complete(bridges[0]);
   for (const { proposal, entry } of proposals) {
     assistant.apply('cedar', chat.id, proposal.id);
     const saved = getNote(db, proposal.noteId);
@@ -2299,7 +2299,7 @@ test('new note save stays editable; finished notes cannot be overwritten', async
     typeLabel: 'Primary care',
     reason: 'Requested preparation',
   });
-  complete(bridges[0]);
+  await complete(bridges[0]);
   assistant.apply('cedar', chat.id, proposal.id);
   assert.equal(getNote(db, proposal.noteId).status, 'draft');
   const version = getNote(db, proposal.noteId).version;
@@ -2312,7 +2312,7 @@ test('assistant journals survive profile backup and restoration', async (t) => {
   const { assistant, db, bridges, root } = fixture(t);
   const chat = assistant.create('cedar', { message: 'Synthetic backup test' });
   await tick();
-  complete(bridges[0]);
+  await complete(bridges[0]);
   exportCuration(db, root, 'cedar');
   const backup = await createBackup(db, root, 'cedar');
   const destination = resolve(root, 'restored');
@@ -2415,7 +2415,7 @@ test('cancelled tools cannot act in a later retry or publish an in-flight intake
   });
   assert.equal(converted.collections.proposals.total, 1);
   assert.equal(chat.operations.length, 1);
-  complete(bridges[1]);
+  await complete(bridges[1]);
 });
 
 test('journal failure during streaming stops the response without throwing from the event callback', async (t) => {
@@ -2429,7 +2429,7 @@ test('journal failure during streaming stops the response without throwing from 
   const chat = assistant.create('cedar', { message: 'Keep the visible response' });
   await tick();
   fail = true;
-  assert.doesNotThrow(() =>
+  await assert.doesNotReject(async () =>
     bridges[0].callbacks.onEvent('item/completed', {
       item: { id: 'visible', type: 'agentMessage', text: 'The visible answer' },
     }),
@@ -2441,7 +2441,7 @@ test('journal failure during streaming stops the response without throwing from 
   fail = false;
   assistant.retry('cedar', chat.id);
   await tick();
-  complete(bridges[1]);
+  await complete(bridges[1]);
   assert.equal(chat.status, 'idle');
 });
 
@@ -2463,7 +2463,7 @@ test('a failed start journal keeps a recoverable failed chat instead of an unown
   fail = false;
   assistant.retry('cedar', chat.id);
   await tick();
-  complete(bridges[0]);
+  await complete(bridges[0]);
   assert.equal(assistant.get('cedar', chat.id).status, 'idle');
   assert.equal(
     assistant.get('cedar', chat.id).messages.filter((message) => message.role === 'user').length,
@@ -2536,7 +2536,7 @@ test('assistant native PDF selection uses the host capability and preserves a la
   })) as { imageContent: string; pdfContent?: string };
   assert.match(untrustedFlag.imageContent, /^data:image\/png;base64,/);
   assert.equal(untrustedFlag.pdfContent, undefined);
-  complete(bridge);
+  await complete(bridge);
 });
 
 test('assistant PDF intake preserves visual pages, text offsets, and explicit image derivatives', async (t) => {
@@ -2589,7 +2589,7 @@ test('assistant PDF intake preserves visual pages, text offsets, and explicit im
   assert.equal('intake' in read.metadata.original, false);
   assert.match(read.metadata.caution, /visual derivative/);
   assert.equal(proposalCount(db, root, 'cedar', image.id), 0);
-  complete(bridges[0]);
+  await complete(bridges[0]);
 });
 
 test('default PDF units require every listed page and leave later targets resumable', async (t) => {
@@ -2724,7 +2724,7 @@ test('default PDF units require every listed page and leave later targets resuma
   assert.equal(chat.reading?.remainingUnits, 0);
   item = getIntakeRead(f.db, f.root, 'cedar', item.id);
   assert.equal(selectedFixturePlan(f.db, f.root, 'cedar', item.id).units[1]!.status, 'completed');
-  complete(bridge);
+  await complete(bridge);
 });
 
 test('assistant accounts for one exact image only after a visual read and durable batch receipt', async (t) => {
@@ -2828,7 +2828,7 @@ test('assistant accounts for one exact image only after a visual read and durabl
   assert.equal(retained.unitAt(0)?.coverage?.kind, 'extracted');
   queue = await listIntakeReportQueueRead(db, root, 'cedar');
   assert.deepEqual(queue.activity.remainingUnits, { state: 'exact', value: 0 });
-  complete(bridge);
+  await complete(bridge);
 });
 
 const fictionalPixel = () =>
@@ -3444,7 +3444,7 @@ test('atomic assistant receipts prevent reapplying a note after a lost journal r
     content: 'Initial suggestions',
     reason: 'Requested note',
   });
-  complete(bridges[0]);
+  await complete(bridges[0]);
   fail = true;
   assert.throws(() => assistant.apply('cedar', chat.id, proposal.id), /Lost action journal write/);
   let note = getNote(db, proposal.noteId);
@@ -3508,7 +3508,7 @@ test('a newer action journal cannot claim a note was applied to older restored p
     content: 'Review before applying',
     reason: 'Requested note',
   });
-  complete(bridges[0]);
+  await complete(bridges[0]);
   // Simulate a chat journal captured later than its SQLite backup snapshot.
   const saved = structuredClone(readTestChat(root, 'cedar', chat.id));
   saved.proposals[0].status = 'applied';
@@ -3582,7 +3582,7 @@ test('classification changes retain raw evidence and retry publication without r
     sourceRecordId: 'raw-lab',
     reason: 'User reviewed the laboratory service',
   });
-  complete(bridges[0]);
+  await complete(bridges[0]);
   const original = getIntakeOriginal(db, root, 'cedar', intake.id);
   writeFileSync(original.path, 'Simulated damaged original');
   assert.throws(() => assistant.apply('cedar', chat.id, proposal.id), { code: 'SOURCE_CHANGED' });
@@ -3669,7 +3669,7 @@ test('current page resolves automatic selections in this profile and refreshes o
     required(bridges[0].instructions),
     /Default to questions about THIS PERSON'S SAVED DATA/,
   );
-  complete(bridges[0]);
+  await complete(bridges[0]);
   const person = createNote(required(databases.get('cookie-dough')), {
     kind: 'person',
     title: 'Synthetic contact',
@@ -3696,7 +3696,7 @@ test('current page resolves automatic selections in this profile and refreshes o
     'A different person starts a separate conversation',
   );
   assert.equal(required(bridges[1].prompt.messages.at(-1)).context.selection.id, person.id);
-  complete(bridges[1]);
+  await complete(bridges[1]);
 });
 
 test('page context reports missing entries and validates selection without reading outside profile', async (t) => {
@@ -3711,7 +3711,7 @@ test('page context reports missing entries and validates selection without readi
   });
   await tick();
   assert.equal(bridges[0].prompt.page.selected.record.id, note.id);
-  complete(bridges[0]);
+  await complete(bridges[0]);
   assistant.send('cedar', chat.id, {
     message: 'This draft?',
     context: { route: '/notes?id=not-yet-saved&new=1' },
@@ -3719,7 +3719,7 @@ test('page context reports missing entries and validates selection without readi
   await tick();
   assert.equal(bridges[1].prompt.page.selected.status, 'not_found');
   assert.match(bridges[1].prompt.page.contentScope, /unsaved editor text/);
-  complete(bridges[1]);
+  await complete(bridges[1]);
   assert.throws(
     () =>
       assistant.send('cedar', chat.id, {
@@ -3762,7 +3762,7 @@ test('measurement context resolves the selected type, comparison types and curre
     (await call(bridges[0], 'read', { collection: 'test_types', id: 'synthetic:bmi' })).unit,
     'kg/m2',
   );
-  complete(bridges[0]);
+  await complete(bridges[0]);
 });
 
 test('assistant cannot propose or apply role tags to Self but can update independent contacts', async (t) => {
@@ -3791,7 +3791,7 @@ test('assistant cannot propose or apply role tags to Self but can update indepen
     person: { phone: '555-0100' },
     reason: 'Update personal contact',
   });
-  complete(bridges[0]);
+  await complete(bridges[0]);
   // A pending proposal created by an older app version still goes through
   // the ordinary policy when the user applies it.
   proposal.changes.person.tags = ['Family'];
@@ -3822,7 +3822,7 @@ test('first-turn context supplies canonical identity and local time once while a
     greetingPeriod: 'morning',
   });
   assert.equal(bridges[0].prompt.conversation.firstAssistantResponse, true);
-  bridges[0].callbacks.onEvent('thread/tokenUsage/updated', {
+  await bridges[0].callbacks.onEvent('thread/tokenUsage/updated', {
     threadId: 'thread',
     turnId: 'turn-1',
     tokenUsage: {
@@ -3848,7 +3848,7 @@ test('first-turn context supplies canonical identity and local time once while a
     false,
     'a retry must not repeat the opening greeting',
   );
-  complete(bridges[1]);
+  await complete(bridges[1]);
   assert.equal(runs.length, 2);
   assert.equal(runs[0].status, 'cancelled');
   assert.equal(required(runs[0].usage).source, 'thread/tokenUsage/updated');
@@ -3877,7 +3877,7 @@ test('greeting context follows a renamed Self and falls back cleanly when local 
   assert.equal(bridges[0].prompt.identity.displayName, 'Starlight');
   assert.deepEqual(bridges[0].prompt.localTime, { available: false });
   assert.equal(bridges[0].prompt.conversation.firstAssistantResponse, true);
-  complete(bridges[0]);
+  await complete(bridges[0]);
   assert.match(required(bridges[0].instructions), /simple “Hi, \[display name\]\.?” greeting/);
   assert.equal(chat.status, 'idle');
 });
@@ -3923,7 +3923,7 @@ test('attachment associations remain pending until explicit apply and are versio
       }),
     /finished notes cannot receive attachments/,
   );
-  complete(bridges[0]);
+  await complete(bridges[0]);
   assistant.apply('cedar', chat.id, proposal.id);
   const applied = getNote(db, note.id);
   assert.equal(applied.attachments[0].assetId, asset.id);
@@ -3987,7 +3987,7 @@ test('conversational field restoration uses verified history and changes only ex
     version: note.version,
     reason: 'Restore only the earlier content',
   });
-  complete(bridges[0]);
+  await complete(bridges[0]);
   assistant.apply('cedar', chat.id, proposal.id);
   const restored = getNote(db, note.id);
   assert.equal(restored.content, 'Earlier content');
@@ -4065,7 +4065,7 @@ test('scoped assistant extensions register without replacing built-ins and appro
   assert.deepEqual(seen, [
     { name: 'health_review_import', args: { id: 'intake:synthetic' }, profileId: 'cedar' },
   ]);
-  complete(bridges[0]);
+  await complete(bridges[0]);
   assistant.apply('cedar', chat.id, 'mapping-proposal');
   assert.equal(applied, 1);
   assert.equal(chat.proposals[0].status, 'applied');
@@ -4084,7 +4084,7 @@ test('scoped assistant extensions register without replacing built-ins and appro
   });
   await tick();
   assert.equal(bridges[1].prompt.conversation.firstAssistantResponse, true);
-  complete(bridges[1]);
+  await complete(bridges[1]);
 });
 
 test('Moxie acquaintance is profile-scoped and never repeats across new chats or retries', async (t) => {
@@ -4097,7 +4097,7 @@ test('Moxie acquaintance is profile-scoped and never repeats across new chats or
   assistant.retry('cedar', chat.id);
   await tick();
   assert.equal(bridges[1].prompt.conversation.firstAcquaintance, false);
-  complete(bridges[1]);
+  await complete(bridges[1]);
   assistant.create('cedar', { message: 'New topic' });
   await tick();
   assert.equal(bridges[2].prompt.conversation.firstAssistantResponse, true);
@@ -4196,7 +4196,7 @@ test('assistant procedure exceptions survive general rules, repeated deliveries,
       category,
       reason: 'Explicit user correction',
     });
-    complete(bridge);
+    await complete(bridge);
     assistant.apply('cedar', chat.id, proposal.id);
     assistant.apply('cedar', chat.id, proposal.id);
   }
@@ -4350,7 +4350,7 @@ test('assistant can explicitly replace changed extraction pins and retains both 
   const activePlan = structuredClone(selectedFixturePlan(db, root, 'cedar', item.id));
   assert.equal(activePlan.plan.status, 'active');
   assert.notEqual(activePlan.id, first.id);
-  complete(bridge);
+  await complete(bridge);
   assistant.close();
   const restarted = createAssistant({ root, databases, ...options });
   t.after(() => restarted.close());
@@ -4386,7 +4386,7 @@ test('assistant can explicitly replace changed extraction pins and retains both 
     (error: unknown) => hasCode(error, 'MODEL_CONTEXT_CHANGED'),
   );
   assert.equal(restarted.get('cedar', resumed.id).status, 'running');
-  complete(required(bridges.at(-1)));
+  await complete(required(bridges.at(-1)));
   const destination = resolve(root, 'rebuilt-plans');
   rebuildProfile(root, 'cedar', destination);
   const rebuilt = openDatabase(profilePaths(destination, 'cedar').database, 'cedar');
@@ -4817,7 +4817,7 @@ test('fresh conversion turns retain the mapping pin and reject it after mappings
   const planned = getIntakeRead(f.db, f.root, 'cedar', f.item.id);
   const plan = selectedFixturePlan(f.db, f.root, 'cedar', f.item.id);
 
-  f.bridge.callbacks.onExit?.(
+  await f.bridge.callbacks.onExit?.(
     new ModelContextLimitError('Fictional manual initial context limit', 'initial'),
   );
   assert.equal(f.chat.status, 'idle');
@@ -5096,9 +5096,15 @@ test('one response retains raw streamed items and explicit progress across tools
   const chat = assistant.create(profileId, { message: 'Compare the fictional source notes' });
   await tick();
   const bridge = bridges[0];
-  bridge.callbacks.onEvent('item/agentMessage/delta', { itemId: 'first', delta: 'One source ' });
-  bridge.callbacks.onEvent('item/agentMessage/delta', { itemId: 'first', delta: 'lists 12.' });
-  bridge.callbacks.onEvent('item/completed', {
+  await bridge.callbacks.onEvent('item/agentMessage/delta', {
+    itemId: 'first',
+    delta: 'One source ',
+  });
+  await bridge.callbacks.onEvent('item/agentMessage/delta', {
+    itemId: 'first',
+    delta: 'lists 12.',
+  });
+  await bridge.callbacks.onEvent('item/completed', {
     item: {
       id: 'first',
       type: 'agentMessage',
@@ -5108,11 +5114,11 @@ test('one response retains raw streamed items and explicit progress across tools
   await call(bridge, 'assistant_progress', { text: 'Checking the second source.' });
   await call(bridge, 'query', { collection: 'notes' });
   await call(bridge, 'assistant_progress', { text: 'Comparing the retained notes.' });
-  bridge.callbacks.onEvent('item/agentMessage/delta', {
+  await bridge.callbacks.onEvent('item/agentMessage/delta', {
     itemId: 'second',
     delta: 'The second source lists 13; the difference remains unresolved.',
   });
-  bridge.callbacks.onEvent('item/completed', {
+  await bridge.callbacks.onEvent('item/completed', {
     item: {
       id: 'second',
       type: 'agentMessage',
@@ -5134,7 +5140,7 @@ test('one response retains raw streamed items and explicit progress across tools
       .map((operation) => operation.arguments),
     [{ text: 'Checking the second source.' }, { text: 'Comparing the retained notes.' }],
   );
-  complete(bridge);
+  await complete(bridge);
   assert.equal(chat.messages[1].status, 'complete');
   const recoveredService = createAssistant({ root, databases, ...options });
   t.after(() => recoveredService.close());
@@ -5154,17 +5160,17 @@ test('cancelled and failed responses retain completed items and isolate reused i
       const profileId = 'cookie-dough';
       const chat = assistant.create(profileId, { message: 'Read the fictional notes' });
       await tick();
-      bridges[0].callbacks.onEvent('item/completed', {
+      await bridges[0].callbacks.onEvent('item/completed', {
         item: { id: 'shared-item', type: 'agentMessage', text: 'The first note is retained.' },
       });
-      bridges[0].callbacks.onEvent('item/agentMessage/delta', {
+      await bridges[0].callbacks.onEvent('item/agentMessage/delta', {
         itemId: 'partial',
         delta: 'The second note is only partially read.',
       });
       if (terminal === 'cancel') assistant.cancel(profileId, chat.id);
       else if (terminal === 'close') assistant.close();
       else
-        bridges[0].callbacks.onEvent('error', {
+        await bridges[0].callbacks.onEvent('error', {
           message: 'Fictional tool continuation failed',
           willRetry: false,
         });
@@ -5185,18 +5191,18 @@ test('cancelled and failed responses retain completed items and isolate reused i
       if (terminal === 'close')
         assert.notEqual(retriedChat, chat, 'close discards the prior conversation cache');
       await tick();
-      bridges[0].callbacks.onEvent('item/agentMessage/delta', {
+      await bridges[0].callbacks.onEvent('item/agentMessage/delta', {
         itemId: 'shared-item',
         delta: 'Late stale text',
       });
-      bridges[1].callbacks.onEvent('item/completed', {
+      await bridges[1].callbacks.onEvent('item/completed', {
         item: {
           id: 'shared-item',
           type: 'agentMessage',
           text: 'A separately verified retry answer.',
         },
       });
-      complete(bridges[1]);
+      await complete(bridges[1]);
       assert.equal(retriedChat.messages.length, 4);
       assert.notEqual(retriedChat.messages[1].id, retriedChat.messages[3].id);
       assert.notEqual(retriedChat.messages[1].runId, retriedChat.messages[3].runId);
@@ -5219,9 +5225,10 @@ test('stream checkpoints coalesce tokens and recover an interrupted response aft
   const chat = assistant.create(profileId, { message: 'Read fictional notes' });
   await tick();
   for (const delta of ['A ', 'meaningful ', 'partial ', 'answer.'])
-    bridges[0].callbacks.onEvent('item/agentMessage/delta', { itemId: 'partial', delta });
+    await bridges[0].callbacks.onEvent('item/agentMessage/delta', { itemId: 'partial', delta });
   assert.equal(writes.filter((reason) => reason === 'assistant-stream-checkpoint').length, 0);
   t.mock.timers.tick(1000);
+  await tick();
   assert.equal(writes.filter((reason) => reason === 'assistant-stream-checkpoint').length, 1);
   const restarted = createAssistant({ root, databases, ...options });
   t.after(() => restarted.close());
@@ -5243,11 +5250,12 @@ test('a buffered stream journal failure stops safely and leaves visible partial 
   });
   const chat = assistant.create('cookie-dough', { message: 'Read fictional notes' });
   await tick();
-  bridges[0].callbacks.onEvent('item/agentMessage/delta', {
+  await bridges[0].callbacks.onEvent('item/agentMessage/delta', {
     itemId: 'partial',
     delta: 'Retained partial text.',
   });
   assert.doesNotThrow(() => t.mock.timers.tick(1000));
+  await tick();
   assert.equal(chat.status, 'failed');
   assert.match(chat.error || '', /could not be saved/);
   assert.equal(chat.messages[1].content, 'Retained partial text.');
@@ -5306,7 +5314,7 @@ test('explicit context and unreadable dispositions advance bounded accounting wi
         },
       ],
     });
-    complete(f.bridges[index]);
+    await complete(f.bridges[index]);
     await tick();
   }
   assert.equal(f.bridges.length, 2);
@@ -7672,7 +7680,7 @@ test('assistant clinical queries default to Self and can explicitly reach a Pers
   assert.equal(family.data[0].personId, person.personId);
   const detail = await call(bridge, 'read', { collection: 'documents', id: 'family-doc' });
   assert.equal(detail.personId, person.personId);
-  complete(bridge);
+  await complete(bridge);
 });
 
 test('default diagnostics explain stale batch refresh and repeated window stop without source identifiers', async (t) => {
@@ -8172,12 +8180,12 @@ for (const resolvesCoverage of [false, true])
     t.after(() => diagnostics.close());
     const f = await linkedFictionalBatchConversion(t, { diagnostics });
     await call(f.bridge, 'intake_batch', f.batch);
-    complete(f.bridge);
+    await complete(f.bridge);
     await waitForConversionBridge(t, f, f.chat, 1);
     assert.equal(f.bridges.length, 2);
     assert.equal(f.chat.reading?.pendingReadWindows, 0);
     assert.equal(f.chat.reading?.remainingUnits, 1);
-    complete(f.bridges[1]!);
+    await complete(f.bridges[1]!);
     await waitForConversionBridge(t, f, f.chat, 2);
     assert.equal(
       f.bridges.length,
@@ -8200,7 +8208,7 @@ for (const resolvesCoverage of [false, true])
         ],
       });
     }
-    complete(f.bridges[2]!);
+    await complete(f.bridges[2]!);
     await tick();
     assert.equal(f.bridges.length, 3, 'no unbounded retry loop');
     assert.equal(f.chat.reading?.reason, resolvesCoverage ? 'reading_exhausted' : 'no_progress');
@@ -8232,7 +8240,7 @@ test('a person-scoped conversation cannot switch subjects and its note proposal 
     content: 'Fictional family note',
     reason: 'Requested note',
   });
-  complete(bridges[0]);
+  await complete(bridges[0]);
   assert.throws(
     () =>
       assistant.send('cedar', chat.id, {
@@ -8528,7 +8536,7 @@ test('native package assistant dispatch retains scalar checkpoints and acknowled
   );
   await assert.rejects(
     async () =>
-      bridge.callbacks.onEvent('model/toolResultsConsumed', {
+      await bridge.callbacks.onEvent('model/toolResultsConsumed', {
         callIds: ['unknown-read', 'native-malformed'],
       }),
     SyntaxError,
@@ -8586,7 +8594,11 @@ for (const attributionOutcome of ['complete', 'closed'] as const)
     await stopped.promise;
     assert.equal(bridge.closed, true);
     assert.equal(chat.status, 'cancelled');
-    await assert.doesNotReject(async () => request);
+    if (attributionOutcome === 'closed')
+      // Database closure invalidates the admitted host frame even after Stop
+      // has preserved terminal state and closed its provider bridge.
+      await assert.rejects(async () => request, /Clinical operation is no longer active/);
+    else await assert.doesNotReject(async () => request);
     assert.equal(maintenance, 1, 'the request attributed once before Stop');
     assert.deepEqual(chat.reading, terminal!.reading);
     assert.equal(checkpoint.modelRequests, terminal!.conversionCheckpoint?.modelRequests);
@@ -8939,3 +8951,231 @@ test(
     f.assistant.cancel('cedar', f.chat.id);
   },
 );
+
+for (const outcome of ['allow', 'limit', 'reject', 'cancel', 'source-change'] as const)
+  test(`asynchronous reading request guard ${outcome} retains current pre-request checks`, async (t) => {
+    const f = await linkedFictionalBatchConversion(t);
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<boolean>();
+    t.after(() => gate.resolve(false));
+    assert.equal(
+      f.assistant.attachIntakeReadingRequestGuard('cedar', f.chat.id, async () => {
+        entered.resolve();
+        return gate.promise;
+      }),
+      true,
+    );
+    // Retain rejection immediately, including cancellation while the callback
+    // owns an unfinished promise; no provider request may pass this barrier.
+    const request = Promise.resolve(f.bridge.callbacks.beforeRequest?.());
+    const observed = request.then(
+      () => ({ error: undefined }),
+      (error: unknown) => ({ error }),
+    );
+    await entered.promise;
+    const { runExclusiveClinicalOperation } = await import('../clinical-operation.ts');
+    let hostOperations = 0;
+    await runExclusiveClinicalOperation(f.db, async () => {
+      hostOperations++;
+    });
+    assert.equal(hostOperations, 1, 'a held callback does not own the host lane');
+    if (outcome === 'cancel') f.assistant.cancel('cedar', f.chat.id);
+    if (outcome === 'source-change') {
+      const { getIntakeSourceText, reviewIntakeSourceText } =
+        await import('../intake-source-text.ts');
+      const prior = getIntakeSourceText(f.db, f.root, 'cedar', f.item.id).revision!;
+      reviewIntakeSourceText(
+        f.db,
+        f.root,
+        'cedar',
+        f.item.id,
+        {
+          operationId: randomUUID(),
+          expectedRevisionId: prior.id,
+          sourceHash: prior.sourceHash,
+          action: 'correct',
+          scope: { page: 1 },
+          spans: [
+            {
+              id: 'fictional-guard-correction',
+              text: 'Fictional corrected literal evidence.',
+              provenance: 'human',
+              region: { page: 1 },
+            },
+          ],
+        },
+        'fictional-owner',
+      );
+    }
+    if (outcome === 'reject') gate.reject(Error('Fictional checkpoint publication failed'));
+    else gate.resolve(outcome === 'limit');
+    const result = await observed;
+    if (outcome === 'allow') assert.equal(result.error, undefined);
+    else
+      assert.match(
+        String(result.error),
+        outcome === 'limit'
+          ? /reading safety guard/
+          : outcome === 'reject'
+            ? /checkpoint publication failed/
+            : outcome === 'cancel'
+              ? /no longer running/
+              : /Source text changed/,
+      );
+  });
+
+for (const boundary of ['completion', 'message', 'exit', 'stream-timer', 'tool'] as const)
+  test(`queued assistant ${boundary} retains cancellation and generation fences`, async (t) => {
+    const { runExclusiveClinicalOperation, withoutClinicalOperation } =
+      await import('../clinical-operation.ts');
+    const { deferred } = await import('./helpers/vault-fixture.ts');
+    const reasons: string[] = [];
+    const f = fixture(t, {
+      journalWriter(root, profileId, chat, reason) {
+        reasons.push(reason);
+        writeChat(root, profileId, chat, reason);
+      },
+    });
+    if (boundary === 'stream-timer') t.mock.timers.enable({ apis: ['setTimeout'] });
+    const chat = f.assistant.create('cedar', { message: 'Discuss fictional records.' });
+    await tick();
+    const bridge = f.bridges[0];
+    assert.ok(bridge);
+    if (boundary === 'stream-timer') {
+      await bridge.callbacks.onEvent('item/agentMessage/delta', {
+        itemId: 'fictional-late-stream',
+        delta: 'Fictional retained fragment.',
+      });
+    }
+    const entered = deferred<void>(),
+      release = deferred<void>();
+    t.after(() => release.resolve());
+    const held = runExclusiveClinicalOperation(f.db, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    let acknowledged = false;
+    let result: Promise<unknown> | undefined;
+    if (boundary === 'stream-timer') t.mock.timers.tick(1000);
+    else {
+      result = withoutClinicalOperation(() =>
+        Promise.resolve(
+          boundary === 'completion'
+            ? bridge.callbacks.onEvent('turn/completed', { turn: { status: 'completed' } })
+            : boundary === 'message'
+              ? bridge.callbacks.onEvent('item/completed', {
+                  item: {
+                    id: 'fictional-late-message',
+                    type: 'agentMessage',
+                    text: 'Retired text.',
+                  },
+                })
+              : boundary === 'exit'
+                ? bridge.callbacks.onExit?.(new Error('Retired failure.'))
+                : bridge.callbacks.onTool({
+                    callId: 'fictional-late-progress',
+                    tool: 'health_assistant_progress',
+                    arguments: { text: 'Retired progress.' },
+                  }),
+        ).then(
+          () => {
+            acknowledged = true;
+            return undefined;
+          },
+          (error: unknown) => {
+            acknowledged = true;
+            return error;
+          },
+        ),
+      );
+      await tick();
+      assert.equal(acknowledged, false, 'queued publication is not acknowledged early');
+    }
+    // Direct service calls here deliberately replace the lifetime while the old
+    // callback awaits admission. HTTP callers themselves use host admission.
+    f.assistant.cancel('cedar', chat.id);
+    f.assistant.retry('cedar', chat.id);
+    const afterReplacement = reasons.length;
+    release.resolve();
+    await held;
+    const error = await result;
+    await tick();
+    if (boundary === 'tool') assert.match(String(error), /no longer running/);
+    else assert.equal(error, undefined);
+    assert.equal(chat.status, 'running');
+    assert.equal(reasons.slice(afterReplacement).includes('assistant-stream-checkpoint'), false);
+    assert.equal(reasons.slice(afterReplacement).includes('assistant-message'), false);
+    assert.equal(
+      chat.messages.some((message) => message.content === 'Retired text.'),
+      false,
+    );
+    assert.equal(readTestChat(f.root, 'cedar', chat.id).status, 'running');
+  });
+
+for (const retirement of ['cancel', 'next-generation'] as const)
+  test(`queued paid request accounting survives ${retirement} without restoring model authority`, async (t) => {
+    const { runExclusiveClinicalOperation } = await import('../clinical-operation.ts');
+    const { deferred } = await import('./helpers/vault-fixture.ts');
+    const f = await linkedFictionalBatchConversion(
+      t,
+      {},
+      'Independently fictional retained accounting evidence. '.repeat(1000),
+    );
+    await f.bridge.callbacks.onEvent('model/requestStarted', {
+      requestId: 'fictional-queued-paid-request',
+      requestDigest: 'a'.repeat(64),
+      requestBytes: 456,
+      model: 'fictional-held-model',
+      attempt: 1,
+    });
+    const entered = deferred<void>(),
+      release = deferred<void>();
+    t.after(() => release.resolve());
+    const held = runExclusiveClinicalOperation(f.db, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const completed = retirement === 'next-generation' ? complete(f.bridge) : undefined;
+    const terminal = f.bridge.callbacks.onEvent('model/requestFinished', {
+      requestId: 'fictional-queued-paid-request',
+      failed: false,
+      outcome: 'response',
+      usage: { inputTokens: 100, cachedInputTokens: 30, outputTokens: 10 },
+    });
+    if (retirement === 'cancel') f.assistant.cancel('cedar', f.chat.id);
+    release.resolve();
+    await held;
+    await completed;
+    await terminal;
+    const saved = readTestChat(f.root, 'cedar', f.chat.id);
+    const attempt = saved.intakeModelAttempts!.find(
+      (value) => value.requestId === 'fictional-queued-paid-request',
+    )!;
+    assert.equal(attempt.usage!.inputTokens, 100);
+    if (retirement === 'cancel') {
+      assert.equal(attempt.outcome, 'unknown');
+      assert.equal(attempt.lateResponse!.usage!.cachedInputTokens, 30);
+      assert.equal(saved.status, 'cancelled');
+    } else {
+      assert.equal(attempt.outcome, 'response');
+      assert.equal(saved.status, 'running');
+      await waitForConversionBridge(t, f, f.chat, 1);
+      assert.equal(f.bridges[0].closed, true);
+      assert.equal(f.bridges[1].closed, false);
+    }
+    const beforeClose = readTestChat(f.root, 'cedar', f.chat.id).intakeModelAttempts;
+    f.assistant.close();
+    await assert.rejects(
+      async () =>
+        f.bridge.callbacks.onEvent('model/requestFinished', {
+          requestId: 'fictional-queued-paid-request',
+          failed: false,
+          outcome: 'response',
+          usage: { inputTokens: 100, cachedInputTokens: 30, outputTokens: 10 },
+        }),
+      /accounting access changed/,
+    );
+    assert.deepEqual(readTestChat(f.root, 'cedar', f.chat.id).intakeModelAttempts, beforeClose);
+  });

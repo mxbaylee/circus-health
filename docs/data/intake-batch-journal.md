@@ -8,6 +8,14 @@ Each batch has immutable `events/<sequence>-<UUID>.json` events and a small `eve
 
 The manager uses tracked state to record exact mutations. Assigned values are detached from outside aliases, and detached former children cannot mutate a replacement at their old path. Existing batches require a verified publication basis; an untracked replacement snapshot or stale writer cannot overwrite current progress. Complete response objects use a separate copy operation, whose work is counted separately from journaling.
 
+While a model request runs, polling compares the complete reading summary using
+the journal's durable value semantics before assigning it to tracked state.
+Identical summaries add no reading mutation to the next checkpoint. Nested
+changes still propagate, including changes made within the same source object.
+Authorization, progress observation and scheduling still run on every poll;
+the next model request still checks its budget at the request boundary. This
+suppresses redundant snapshots, not genuine progress updates.
+
 Warm publication checks the selected marker and remembered file identities under a kernel writer lock. It validates and serializes the changed evidence. The remembered state is disposable acceleration: it is not recovery authority and is invalidated on publication failure, closure and profile lock. Warm updates do not rehash every older event; cold reopening, copying and recovery verify the complete retained selected chain. Corrupt, missing or unsupported selected evidence fails visibly rather than falling back to SQLite or an earlier snapshot.
 
 Each journal path check first uses the native filesystem resolver. An exact
@@ -91,6 +99,14 @@ node --test --test-timeout=30000 src/server/test/intake-batch-journal.test.ts sr
 ## Qualification boundary
 
 The [manager growth fixture](../../src/server/test/intake-batch-journal-growth.test.ts) exercises initial state and 100, 200 and 300 real scheduler transitions, preserves earlier event and original bytes, and compares complete independently expected state after reopening. A separate actual manager callback varies untouched queue items and nested evidence while measuring a small change and a no-op. Cold reconstruction and complete response copies are attributed separately.
+
+The held-model polling case uses the actual tracked manager and journal. One
+hundred identical polls add no pending mutation, event or retained journal byte;
+nested reading changes persist and replay exactly. New records and read windows
+renew an exhausted response budget once, and another hundred unchanged polls
+neither renew it again nor add journal writes. The fixture also verifies that
+authorization checks continue and original bytes remain intact. These counts
+qualify the polling path, not total import cost or live-provider performance.
 
 The [journal regressions](../../src/server/test/intake-batch-journal.test.ts) cover mutation aliases, stale writers, retained legacy evidence, corruption and publication interruptions. Encrypted qualification exercises the real vault and its selected-file publication, including pending non-queue dependencies. The fixtures use independently fictional data and local scripted callbacks, with no provider requests.
 

@@ -372,6 +372,55 @@ unsupported adapters retain the global physical-write guard. This scoped bridge
 check is not a substitute for final consumed-artifact verification at an ordinary
 accepted-write boundary.
 
+Encrypted uploads retain that original global witness throughout bridge
+preparation. A reading-batch journal publication also flushes encrypted workspace
+authority, so it must wait for the profile's current clinical operation. Batch
+continuations group their state changes and journal publication in a short host
+operation, retaining their original generation, batch, selected item and publish
+authorization while queued. Stop, lock and closure invalidate old continuations;
+an append preserves the existing item's identity. Supported batch HTTP routes
+parse request bodies before admission and recheck the request and profile owner
+inside it, including list/get operations that can recover a journal publication.
+Contributor manager methods retain their synchronous interfaces. Admission is per
+profile; the encrypted fallback witness remains global and conservatively refuses
+any covered physical change outside that admission. This does not qualify
+simultaneous independent profile writers; the supported encrypted runtime retains
+one unlocked profile across sessions.
+
+Conversation journal publications use the same host queue. Provider events,
+stream checkpoints, terminal callbacks and tool-preparation journal writes await
+publication under the current assistant lifetime; admission rechecks that lifetime
+after waiting. Public chat operations, including reads that can recover a journal,
+also enter after request-body parsing. Provider connection tests and model work
+remain outside the queue. A newly launched model lifetime drops the initiating
+clinical frame and obtains its own authorization rather than reusing an expired
+HTTP or batch operation.
+
+Model connection checks and requests, retry waits and source-extraction workers
+run outside that host operation. Terminal source draining releases the host owner
+before starting extraction. Independently scheduled batch pumps drop the expired
+clinical frame, acquire genuine batch authorization and enter the normal queue
+for each host continuation; detachment grants no authority or queue bypass.
+Journal writes still contain only changed fields. This coordination neither
+renews a bridge baseline nor exempts physical mutations: even an equal-byte
+rewrite of covered encrypted authority invalidates the held witness.
+
+The [controlled upload regression](../../src/server/test/intake-upload-bridge-concurrency.test.ts)
+releases an earlier unavailable-model continuation, starts a public Stop and
+releases a synthetic source-review error into the genuine encrypted batch error
+publisher at the bridge's actual asynchronous proof phase. Ordinary uploads complete, prior
+original bytes and accepted source history remain unchanged, and a held model
+preflight permits another upload. The same phase still refuses a managed
+equal-byte encrypted-manifest rewrite. These controlled operations reproduce
+the refusal path; they do not establish which operation caused the historical
+CI refusal.
+
+The [conversation concurrency regression](../../src/server/test/assistant-journal-concurrency.test.ts)
+holds actual assistant callbacks at the same upload proof phase. It covers
+model completion, streamed messages, provider failure and progress-tool journal
+publication through an encrypted session. These writes remain reviewable chat
+state; coordination does not authorize model-proposed accepted-record changes.
+
 The [conversion recovery fixture](../../src/server/test/intake-envelope-build-resume.test.ts) interrupts raw and normalized builds, deletes their disposable SQLite database, reconstructs accepted authority and verifies that retry adds no duplicate prefix writes. It also refuses concurrent, malformed and changed-and-restored progress, including changes observed during the final physical checks before publication. In one 2026-10-04 run, four versus 24 fictional history entries wrote 920 versus 7,574 collection nodes and about 1.6 versus 13.2 MB of accepted journal data during cold conversion. A fixed version edit then wrote 18 nodes and three journal records at either size. With sorted deferred checkpoints (2026-10-12), the same fixtures retain 367 versus 1,807 envelope keys and write 503 versus 2,482 nodes (948 versus 7,411 before), 0.42 versus 2.15 MB of node bytes (0.81 versus 6.68 MB) and 0.87 versus 4.33 MB of journal data (1.62 versus 12.89 MB) in 9 versus 32 publications, with three immutable journal writes per publication (previously up to four). Each added history costs about 99 nodes for 72 retained keys instead of 323. For the native one-proposal JSONL fixture, the build alone wrote 3,596 / 5,885 / 14,024 / 40,233 nodes for 1 / 3 / 10 / 30 records before and 1,468 / 2,172 / 4,451 / 10,830 after (about 1.16k versus 0.32k nodes and 1.1 versus 0.30 MB per added record); publications are unchanged (21 / 29 / 54 / 123). The remaining per-record cost is the schema format's roughly eight retained keys per object field and one publication per 63 changes; neither is changed here. Tree shape affects exact counts; these small fixtures establish the distinction between cold conversion and a changed-scope edit, not acceptable large-fixture capacity or linear total conversion cost.
 
 A separate 2026-10-04 qualification used raw fictional envelopes with 16 and 64

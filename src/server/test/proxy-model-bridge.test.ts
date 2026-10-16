@@ -31,6 +31,7 @@ interface HarnessOptions {
   config?: ProxyConfig;
   beforeRequest?: ProxyModelBridgeOptions['beforeRequest'];
   onEvent?: ProxyModelBridgeOptions['onEvent'];
+  onExit?: ProxyModelBridgeOptions['onExit'];
   retryDelay?: ProxyModelBridgeOptions['retryDelay'];
   onTool?: (request: ToolRequest) => unknown | Promise<unknown>;
   resolveHost?: ProxyModelBridgeOptions['resolveHost'];
@@ -540,7 +541,10 @@ function harness(replies: Reply[], options: HarnessOptions = {}): BridgeHarness 
       events.push({ method, params });
       return options.onEvent?.(method, params);
     },
-    onExit: (error) => errors.push(error.message),
+    onExit: (error) => {
+      errors.push(error.message);
+      return options.onExit?.(error);
+    },
     onDiagnostic: (diagnostic) => diagnostics.push(JSON.parse(diagnostic)),
     resolveHost: options.resolveHost,
     diagnostics: options.diagnostics,
@@ -3073,4 +3077,49 @@ test('rejected async evidence acknowledgment prevents follow-on writes and a fal
     false,
   );
   assert.equal(f.errors.length, 1);
+});
+
+test('provider failure completion acknowledges asynchronous terminal publication', async () => {
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  const f = harness([{}], {
+    async onExit() {
+      entered.resolve();
+      await release.promise;
+    },
+  });
+  let acknowledged = false;
+  const running = run(f).then(() => {
+    acknowledged = true;
+  });
+  await entered.promise;
+  assert.equal(f.errors.length, 1);
+  assert.equal(acknowledged, false);
+  assert.equal(f.bridge.running, true);
+  release.resolve();
+  await running;
+  assert.equal(acknowledged, true);
+  assert.equal(f.bridge.running, false);
+});
+
+test('detached provider failure observes a rejected terminal publication and retains its completion error', async () => {
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  const f = harness([{}], {
+    async onExit() {
+      entered.resolve();
+      await release.promise;
+      throw new Error('Fictional terminal authorization revoked.');
+    },
+  });
+  await f.bridge.start('Fictional scoped instructions', [tool]);
+  await f.bridge.turn('Fictional evidence request');
+  await entered.promise;
+  release.resolve();
+  // No caller consumes completion during this turn of the event loop. The
+  // bridge must observe its own background rejection before a later inspection.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(f.bridge.running, false);
+  await assert.rejects(f.bridge.completion!, /Fictional terminal authorization revoked/);
+  assert.equal(f.requests.length, 1);
 });

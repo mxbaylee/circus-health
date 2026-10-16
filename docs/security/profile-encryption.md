@@ -252,3 +252,12 @@ Durable automatic-run intent never unlocks an archive. The coordinator checks th
 ## Conversation recovery state
 
 The [conversation journal](../data/conversation-journal.md) verifies profile/chat identity, immutable generation hashes and exact predecessor links. Its small commit marker and changed generations are encrypted through the existing workspace flush. In-memory diff bases use weak caller-owned keys and are explicitly cleared on app closure, profile lock and failed activation; failed encrypted flushes invalidate the affected basis. Diagnostic reads always enforce aggregate history budgets rather than bypassing them through that cache. Missing commit markers with retained history fail explicitly; the server never treats them as permission to create an empty replacement conversation.
+
+An assistant's active authorization expires when its job ends. A distinct
+request-accounting permission, captured only for an actual authenticated
+dispatch, can retain late usage for that exact request while the original session,
+database and vault lifetime remain valid. It supplies no compact clinical/source
+authorization and cannot resume the job or accept its output. Accounting enters
+the normal host queue and rechecks its original scope after waiting; profile lock,
+session revocation and app closure refuse it. See [conversation publication
+and late accounting](../data/conversation-journal.md#publication-during-encrypted-uploads).

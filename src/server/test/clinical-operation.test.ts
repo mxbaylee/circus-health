@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { setImmediate } from 'node:timers/promises';
@@ -11,6 +12,7 @@ import {
   clinicalOperationHasCallerAssertions,
   clinicalOperationImmediateUnassertedContinuation,
   runExclusiveClinicalOperation,
+  withoutClinicalOperation,
 } from '../clinical-operation.ts';
 
 function gate() {
@@ -423,6 +425,49 @@ test('caller authority checks can assert their operation without recursively inv
         { operation: owner, assertRunning: () => assertClinicalOperation(db, owner) },
       );
     });
+  } finally {
+    db.close();
+  }
+});
+
+test('a separately authorized scheduled lifetime drops only its expired clinical frame and still queues', async () => {
+  const db = new DatabaseSync(':memory:');
+  const request = new AsyncLocalStorage<object>();
+  const issuer = {};
+  const ready = gate(),
+    release = gate();
+  let background: Promise<void> | undefined;
+  let entered = false;
+  try {
+    await request.run(issuer, () =>
+      runExclusiveClinicalOperation(db, async (original) => {
+        background = withoutClinicalOperation(() =>
+          (async () => {
+            await ready.promise;
+            assert.equal(currentClinicalOperation(db), undefined);
+            assert.equal(
+              request.getStore(),
+              issuer,
+              'other request/authorization issuers are preserved',
+            );
+            assert.throws(() => assertClinicalOperation(db, original), /no longer active/);
+            await runExclusiveClinicalOperation(db, async () => {
+              entered = true;
+            });
+          })(),
+        );
+      }),
+    );
+    const foreground = runExclusiveClinicalOperation(db, async () => {
+      ready.resolve();
+      await setImmediate();
+      assert.equal(entered, false, 'detachment does not bypass the occupied lane');
+      release.resolve();
+    });
+    await release.promise;
+    await foreground;
+    await background;
+    assert.equal(entered, true);
   } finally {
     db.close();
   }

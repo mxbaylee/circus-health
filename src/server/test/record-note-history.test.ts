@@ -542,7 +542,7 @@ test('assistant restoration proposals retain the concrete indexed preview until 
           return { model: 'synthetic' };
         },
         async turn() {
-          callbacks?.onEvent('turn/started', { turn: { id: 'test-turn' } });
+          await callbacks?.onEvent('turn/started', { turn: { id: 'test-turn' } });
         },
         close() {},
         async cancel() {},
@@ -573,7 +573,7 @@ test('assistant restoration proposals retain the concrete indexed preview until 
   assert.equal(proposal.changes.previewToken, proposal.preview.previewToken);
   assert.equal(proposal.changes.expectedRevision, revision(f.db));
   assert.equal(getNote(f.db, note.id).content, 'After');
-  callbacks.onEvent('turn/completed', { turn: { status: 'completed' } });
+  await callbacks.onEvent('turn/completed', { turn: { status: 'completed' } });
   assistant.apply(f.profileId, chat.id, proposal.id);
   assert.equal(getNote(f.db, note.id).content, 'Before');
 });

@@ -46,10 +46,10 @@ const roundTrip: BridgeFactory = (callbacks) => ({
       callId: 'fictional-connection-call',
     });
     const toolResult = value as { response?: string };
-    callbacks.onEvent('item/completed', {
+    await callbacks.onEvent('item/completed', {
       item: { type: 'agentMessage', text: toolResult.response || 'Cannot read image' },
     });
-    callbacks.onEvent('turn/completed', { turn: { status: 'completed' } });
+    await callbacks.onEvent('turn/completed', { turn: { status: 'completed' } });
   },
   close() {},
 });
@@ -141,8 +141,8 @@ test('answers without the tool response revoke readiness; image configuration al
       bridgeFactory: (callbacks) => ({
         start: async () => ({ model: c.model }),
         turn: async (text) => {
-          callbacks.onEvent?.('item/completed', { item: { type: 'agentMessage', text } });
-          callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+          await callbacks.onEvent?.('item/completed', { item: { type: 'agentMessage', text } });
+          await callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
         },
         close() {},
       }),

@@ -4,11 +4,13 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setImmediate } from 'node:timers/promises';
 import type { IntakeBatch, IntakeBatchReadingState } from '../../shared/intake-batch.ts';
 import { createAssistant } from '../assistant.ts';
 import { openDatabase } from '../database.ts';
 import {
   createIntakeBatchJournalWorkCounters,
+  pendingIntakeBatchChanges,
   readIntakeBatch,
   withIntakeBatchJournalWork,
   writeIntakeBatch,
@@ -24,6 +26,11 @@ const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex
 function measured<T>(run: () => T) {
   const work = createIntakeBatchJournalWorkCounters();
   const value = withIntakeBatchJournalWork(work, run);
+  return { value, work: { ...work } };
+}
+async function measuredAsync<T>(run: () => Promise<T> | T) {
+  const work = createIntakeBatchJournalWorkCounters();
+  const value = await withIntakeBatchJournalWork(work, run);
   return { value, work: { ...work } };
 }
 function assertWarm(work: Work) {
@@ -437,7 +444,7 @@ test('actual manager request checkpoints touch one small subtree across growing 
             id: `fictional-unit-${String(transition).padStart(3, '0')}`,
             locator: 'fictional constant-size locator',
           };
-          const result = measured(() => guard({ ...reading, workUnit }));
+          const result = await measuredAsync(() => guard({ ...reading, workUnit }));
           assert.equal(result.value, false);
           assertWarm(result.work);
           assert.equal(
@@ -511,7 +518,7 @@ test('actual manager request checkpoints touch one small subtree across growing 
           });
         }
       }
-      const small = measured(() =>
+      const small = await measuredAsync(() =>
         guard({ ...reading, workUnit: { id: 'fictional-small-unit', locator: 'tiny' } }),
       );
       assertWarm(small.work);
@@ -520,7 +527,7 @@ test('actual manager request checkpoints touch one small subtree across growing 
       assert.ok(small.work.eventWriteBytes < 1024, 'unchanged retained fields are not serialized');
       journal.inspect(small.work);
       expected.items[0]!.stalls = { unitId: 'fictional-small-unit', locator: 'tiny', attempts: 0 };
-      const noChange = measured(() =>
+      const noChange = await measuredAsync(() =>
         guard({ ...reading, workUnit: { id: 'fictional-small-unit', locator: 'tiny' } }),
       );
       assertWarm(noChange.work);
@@ -600,5 +607,225 @@ test('actual manager request checkpoints touch one small subtree across growing 
       limits: 'production defaults; no pruning or capacity changes',
       receipts,
     }),
+  );
+});
+
+test('held model polling journals only changed complete reading snapshots', async (t) => {
+  fictionalModel(t);
+  type Options = Parameters<typeof createIntakeBatchManager>[0];
+  type Guard = NonNullable<Parameters<Options['assistant']['send']>[3]>['beforeModelRequest'];
+  const root = mkdtempSync(join(tmpdir(), 'fictional-reading-polls-'));
+  const profileId = 'fictional-reading-polls';
+  const db = openDatabase(profilePaths(root, profileId).database, profileId);
+  attachPersonalDurability(db, { root, profileId });
+  const databases = new Map([[profileId, db]]);
+  // Unknown future fields and undefined optionals must use the same durable
+  // semantics as current fields, including changes within the same object.
+  const reading: IntakeBatchReadingState & {
+    futureDetail: { value: string; absent?: string };
+  } = {
+    status: 'running',
+    reason: null,
+    turns: 1,
+    readyRecords: 0,
+    remainingUnits: 1,
+    pendingReadWindows: 0,
+    coverage: 'reading_progress_only',
+    modelRequests: undefined,
+    providerWait: undefined,
+    futureDetail: { value: 'fictional first value', absent: undefined },
+  };
+  const chat = { id: 'fictional-held-model-chat', status: 'running', reading };
+  const ready = Promise.withResolvers<NonNullable<Guard>>();
+  let polls = 0;
+  let publishChecks = 0;
+  let retainedBatch: IntakeBatch | undefined;
+  let waiting: { target: number; resolve: () => void } | undefined;
+  const assistant: Options['assistant'] = {
+    async ensureConnection() {},
+    cancel() {},
+    get() {
+      if (++polls >= (waiting?.target ?? Infinity)) {
+        waiting!.resolve();
+        waiting = undefined;
+      }
+      return chat;
+    },
+    isBusy: () => false,
+    create: () => chat,
+    send(_profile, _chat, _input, options) {
+      assert.ok(options?.beforeModelRequest);
+      ready.resolve(options.beforeModelRequest);
+      return chat;
+    },
+    retry() {
+      assert.fail('The held model must not start another slice');
+    },
+    attachIntakeReadingRequestGuard: () => false,
+  };
+  const manager = createIntakeBatchManager({
+    root,
+    databases,
+    assistant,
+    clock: () => new Date('2026-01-01T00:00:00.000Z'),
+    pollMs: 1,
+    authorized(_profile, _intake, operation) {
+      if (operation === 'publish') publishChecks++;
+      return true;
+    },
+    journalWriter(runtimeRoot, currentProfile, batch, reason) {
+      retainedBatch = batch;
+      writeIntakeBatch(runtimeRoot, currentProfile, batch, reason);
+    },
+  });
+  t.after(() => {
+    manager.close();
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional-held-model.txt',
+    bytes: Buffer.from('Independently fictional source for unchanged reading polls.'),
+  });
+  const batch = manager.create(profileId, {
+    operationId: 'fictional-held-model-polls',
+    intakeIds: [source.id],
+  });
+  const guard = await ready.promise;
+  async function observePolls(count: number) {
+    const observed = Promise.withResolvers<void>();
+    const abort = () => observed.reject(t.signal.reason);
+    t.signal.addEventListener('abort', abort, { once: true });
+    try {
+      if (t.signal.aborted) throw t.signal.reason;
+      waiting = { target: polls + count, resolve: observed.resolve };
+      await observed.promise;
+      // get() observes the start of inspection. Let its admitted continuation
+      // finish before inspecting the actual tracked mutations.
+      await setImmediate();
+    } finally {
+      t.signal.removeEventListener('abort', abort);
+    }
+  }
+  const durableReading = () => JSON.parse(JSON.stringify(reading));
+  await observePolls(2);
+  assert.equal(await guard(reading), false);
+  assert.ok(retainedBatch);
+  assert.deepEqual(pendingIntakeBatchChanges(retainedBatch), []);
+  const journal = retainedJournal(root, profileId, batch.id);
+  const initial = journal.inspect();
+  const checksBefore = publishChecks;
+  await observePolls(100);
+  assert.ok(publishChecks >= checksBefore + 100, 'every poll still checks authorization');
+  assert.deepEqual(pendingIntakeBatchChanges(retainedBatch), []);
+  const unchanged = await measuredAsync(() => guard(reading));
+  assert.equal(unchanged.value, false);
+  assert.equal(unchanged.work.mutationOperations, 0);
+  assert.equal(unchanged.work.eventWrites, 0);
+  assert.equal(unchanged.work.eventWriteBytes, 0);
+  const afterPolls = journal.inspect(unchanged.work);
+  assert.equal(afterPolls.retainedBytes, initial.retainedBytes);
+  assert.equal(afterPolls.retainedEvents, initial.retainedEvents);
+
+  const changes: Array<() => void> = [
+    () => {
+      reading.providerWait = {
+        requestId: 'fictional-request',
+        outcome: 'rejected',
+        classification: 'transient',
+        retryAt: null,
+      };
+    },
+    () => {
+      reading.providerWait!.retryAt = '2026-01-01T00:01:00.000Z';
+    },
+    () => {
+      reading.phase = 'preparing_results';
+    },
+    () => {
+      reading.modelRequests = 3;
+    },
+    () => {
+      reading.futureDetail.value = 'fictional changed value';
+    },
+    () => {
+      reading.providerWait = undefined;
+    },
+    () => {
+      reading.usableModelResponses = 16;
+    },
+  ];
+  for (const [index, change] of changes.entries()) {
+    change();
+    await observePolls(20);
+    assert.deepEqual(
+      pendingIntakeBatchChanges(retainedBatch),
+      [{ op: 'set', path: ['items', '0', 'reading'] }],
+      'one changed snapshot is retained regardless of repeated polls',
+    );
+    assert.deepEqual(manager.get(profileId, batch.id).items[0]!.reading, durableReading());
+    const saved = await measuredAsync(() => guard(reading));
+    assert.equal(saved.value, index === changes.length - 1, 'the response budget still applies');
+    assert.equal(saved.work.eventWrites, 1);
+    const retained = journal.inspect(saved.work);
+    assert.deepEqual(retained.fresh[0].changes, [
+      { op: 'set', path: ['items', '0', 'reading'], value: durableReading() },
+    ]);
+    assert.deepEqual(
+      readIntakeBatch(root, profileId, batch.id).items[0]!.reading,
+      durableReading(),
+    );
+  }
+
+  // Genuine progress must still renew the response budget and publish its job
+  // changes. Further identical observations must not renew or journal it again.
+  const beforeProgress = manager.get(profileId, batch.id).items[0]!.readingJob!;
+  assert.equal(beforeProgress.progressWindows, 0);
+  reading.readyRecords = 1;
+  reading.readWindows = 1;
+  await observePolls(20);
+  const expectedJob = {
+    ...beforeProgress,
+    lastProgressAt: '2026-01-01T00:00:00.000Z',
+    observed: { records: 1, windows: 1, accounted: 0 },
+    budgetAtActiveMs: 0,
+    budgetAtSlices: 1,
+    budgetAtTurns: 1,
+    budgetAtRequests: 3,
+    budgetAtResponses: 16,
+    budgetAtTokens: 0,
+    progressWindows: 1,
+  };
+  assert.deepEqual(manager.get(profileId, batch.id).items[0]!.readingJob, expectedJob);
+  assert.deepEqual(pendingIntakeBatchChanges(retainedBatch), []);
+  const progress = journal.inspect();
+  assert.deepEqual(
+    progress.fresh.map((event) => event.reason),
+    ['reading-progress'],
+  );
+  assert.deepEqual(
+    progress.fresh[0].changes.filter(
+      (change: { path: string[] }) => change.path.join('/') === 'items/0/reading',
+    ),
+    [{ op: 'set', path: ['items', '0', 'reading'], value: durableReading() }],
+  );
+  assert.deepEqual(readIntakeBatch(root, profileId, batch.id).items[0]!.readingJob, expectedJob);
+  await observePolls(100);
+  const renewed = await measuredAsync(() => guard(reading));
+  assert.equal(
+    renewed.value,
+    false,
+    'observed durable progress renews the exhausted response budget',
+  );
+  assert.equal(renewed.work.mutationOperations, 0);
+  assert.equal(renewed.work.eventWrites, 0);
+  assert.equal(renewed.work.eventWriteBytes, 0);
+  const repeatedProgress = journal.inspect(renewed.work);
+  assert.equal(repeatedProgress.retainedEvents, progress.retainedEvents);
+  assert.equal(repeatedProgress.retainedBytes, progress.retainedBytes);
+  assert.deepEqual(manager.get(profileId, batch.id).items[0]!.readingJob, expectedJob);
+  assert.deepEqual(
+    getIntakeOriginal(db, root, profileId, source.id).bytes,
+    Buffer.from('Independently fictional source for unchanged reading polls.'),
   );
 });

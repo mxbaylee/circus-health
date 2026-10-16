@@ -14,6 +14,25 @@ Warm writes use a disposable previous state tied to the caller-owned chat object
 
 ## Validation and limits
 
+### Publication during encrypted uploads
+
+Background journal publication and public chat controls share the profile's host
+operation queue with upload evidence preparation. Model/provider waits stay
+outside that queue; each resumed callback rechecks its assistant lifetime before
+changing and publishing chat state. See the [upload coordination
+contract](intake-state-storage.md#v3-bridge-and-schema-directed-envelopes).
+
+An actual dispatched request can report usage after its assistant turn is
+cancelled or completed. Its separately captured accounting permission identifies
+that request and retains the original session, database and vault lifetime. It
+permits only the matching request-attempt journal update after queue admission;
+it does not reactivate the assistant or grant source, tool or accepted-record
+authority. An interrupted attempt remains an unknown outcome, with its late
+response and measured usage recorded separately. Lock, session revocation and
+app closure prevent later accounting publication.
+
+### Journal decoding
+
 Readers verify the complete committed chain, including contiguous positive sequences, exact predecessor filenames, content hashes and profile/chat identities. Missing or corrupt required generations, malformed changes, symlinks, hardlinked content, unsupported envelopes and changed identities fail explicitly. Paths have at most 64 components; keys have at most 1,000 characters and cannot be `__proto__`, `constructor` or `prototype`. Array indexes must be canonical, existing or exactly the next append position; truncation cannot expand an array. String splice ranges must fit the existing value. Undefined object fields are omitted and undefined array entries become null, matching JSON serialization.
 
 Ordinary recovery has an aggregate 256-MiB physical read allowance and 100,000 inspected event-directory entries. Writes reserve 4 KiB for the marker and permit at most 99,999 committed generations. Across the entire replay, decoding allows one million allocated JSON nodes, one million patch/path work units and 100 million UTF-16 units of string-copy work. Individual containers have at most one million items. The marker's cumulative counters are recomputed and verified on cold reads; a warm writer refuses a save before it would produce history exceeding ordinary recovery limits. These are storage/decoding bounds, not elapsed model-work targets.

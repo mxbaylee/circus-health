@@ -14,8 +14,8 @@ const app = createVaultApp({
           return { model: 'fictional-restart', backend: 'synthetic' };
         },
         async turn(prompt) {
-          callbacks.beforeRequest?.();
-          callbacks.onEvent?.('model/requestStarted', {
+          await callbacks.beforeRequest?.();
+          await callbacks.onEvent?.('model/requestStarted', {
             requestId: randomUUID(),
             attempt: 1,
             model: 'fictional-restart',
