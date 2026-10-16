@@ -8,12 +8,19 @@ import type { IntakePersonApplyResult } from '../../../shared/intake-people';
 import { api, ApiError } from '../../data/api';
 import { readSelectedClinicalReview } from '../../data/intake-clinical-review';
 import { holdoutTrace } from '../../data/holdout-trace';
+import {
+  assertPeopleCurrent,
+  peopleReviewApproval,
+  samePeopleApproval,
+  peopleChangedMessage,
+  type PeopleReviewApproval,
+} from './people-review-approval';
 export type CollectionDisposition = 'pending' | 'later' | 'excluded';
 type Work = (
   | { kind: 'clinical'; row: CollectionFeedRecord; state: CollectionDisposition }
   | {
       kind: 'person';
-      person: CollectionPersonProposal;
+      person: PeopleReviewApproval;
       groupId: string;
       state?: CollectionDisposition;
     }
@@ -21,33 +28,42 @@ type Work = (
 /** Commands cover only the displayed selection. An uncertain command and its unsent successors remain exact. */
 export function useCollectionBulkActions({
   scope,
+  people,
   onClinicalDone,
   onPersonDone,
+  onPersonRejected,
   onPersonSaved,
   onRefresh,
 }: {
   scope: string;
+  people?: CollectionPersonProposal[];
   onClinicalDone: (key: string) => void;
   onPersonDone: (id: string) => void;
+  onPersonRejected?: (ids: string[]) => void;
   onPersonSaved: (saved: IntakePersonApplyResult, title: string) => void;
   onRefresh: () => void;
 }) {
   // Only a committed scope may own or abandon a run. A render that React never
   // commits (an interrupted or suspended transition) must not stop the run that
   // the displayed scope still owns and leave its controls disabled.
-  const committed = useRef<{ scope: string } | null>(null);
+  const committed = useRef<{ scope: string; people?: CollectionPersonProposal[] } | null>(null);
   const queue = useRef<Work[] | null>(null),
     running = useRef(false);
   const [busy, setBusy] = useState(false),
     [pending, setPending] = useState(false),
     [error, setError] = useState(''),
     [notice, setNotice] = useState('');
-  const callbacks = useRef({ onClinicalDone, onPersonDone, onPersonSaved, onRefresh });
-  callbacks.current = { onClinicalDone, onPersonDone, onPersonSaved, onRefresh };
+  const callbacks = useRef({
+    onClinicalDone,
+    onPersonDone,
+    onPersonRejected,
+    onPersonSaved,
+    onRefresh,
+  });
   useLayoutEffect(() => {
     // Synchronous with commit, so no awaited step can observe the new scope
     // while the previous run still owns the controls.
-    const owner = { scope };
+    const owner = { scope, people };
     committed.current = owner;
     queue.current = null;
     running.current = false;
@@ -59,6 +75,16 @@ export function useCollectionBulkActions({
       if (committed.current === owner) committed.current = null;
     };
   }, [scope]);
+  useLayoutEffect(() => {
+    callbacks.current = {
+      onClinicalDone,
+      onPersonDone,
+      onPersonRejected,
+      onPersonSaved,
+      onRefresh,
+    };
+    if (committed.current) committed.current.people = people;
+  });
   async function run(work: Work[]) {
     const owner = committed.current;
     const peopleRun = work.some((item) => item.kind === 'person');
@@ -121,6 +147,18 @@ export function useCollectionBulkActions({
               },
             };
           } else {
+            const assertShown = () => {
+              if (!owner.people) return;
+              const shown = owner.people.find(
+                (person) =>
+                  person.id === item.person.id &&
+                  person.intakeId === item.person.intakeId &&
+                  person.groupId === item.person.groupId,
+              );
+              if (!shown || !samePeopleApproval(item.person, shown))
+                throw new Error(peopleChangedMessage);
+            };
+            assertShown();
             const query = new URLSearchParams({
               intakeId: item.person.intakeId,
               personId: item.person.id,
@@ -139,24 +177,21 @@ export function useCollectionBulkActions({
               holdoutTrace('bulk.people.scope-mismatch');
               return;
             }
+            assertShown();
             const selected = fresh.people.find(
               (value) => value.kind === 'person' && value.person.id === item.person.id,
             );
             if (
+              fresh.intakeId !== item.person.intakeId ||
+              fresh.groupId !== item.person.groupId ||
+              item.groupId !== item.person.groupId ||
               fresh.selectedPersonId !== item.person.id ||
               !selected ||
-              selected.kind !== 'person' ||
-              selected.person.version !== item.person.version ||
-              selected.person.state === 'saved'
+              selected.kind !== 'person'
             )
-              throw new Error(
-                'A selected Person changed. Open their current evidence before retrying.',
-              );
+              throw new Error(peopleChangedMessage);
             const person = selected.person;
-            if (!item.state && (person.selfMatch || person.matches.length))
-              throw new Error(
-                `${person.person.fullName} needs an individual People match decision.`,
-              );
+            assertPeopleCurrent(item.person, person, !item.state);
             item.command = {
               path: item.state ? '/intakes/people-disposition' : '/intakes/people-apply',
               body: {
@@ -222,6 +257,13 @@ export function useCollectionBulkActions({
             ? ' The outcome is unconfirmed. Retry the exact selected action before continuing.'
             : ''),
       );
+      if (beforeWrite && peopleRun) {
+        const rejected = work.flatMap((item) =>
+          item.kind === 'person' ? ['person:' + item.person.id] : [],
+        );
+        callbacks.current.onPersonRejected?.(rejected);
+        return;
+      }
     } finally {
       if (peopleRun) holdoutTrace('bulk.people.finally');
       if (live()) {
@@ -239,22 +281,33 @@ export function useCollectionBulkActions({
     retry: () => (queue.current ? run(queue.current) : Promise.resolve()),
     disposition: (
       rows: CollectionFeedRecord[],
-      people: CollectionPersonProposal[],
+      people: PeopleReviewApproval[],
       groupId: string,
       state: CollectionDisposition,
     ) => {
       if (queue.current) return Promise.resolve();
       return run([
         ...rows.map((row) => ({ kind: 'clinical' as const, row, state })),
-        ...people.map((person) => ({ kind: 'person' as const, person, groupId, state })),
+        ...people.map((person) => ({
+          kind: 'person' as const,
+          person: peopleReviewApproval(person),
+          groupId,
+          state,
+        })),
       ]);
     },
-    addPeople: (people: CollectionPersonProposal[], groupId: string) => {
+    addPeople: (people: PeopleReviewApproval[], groupId: string) => {
       if (queue.current) {
         holdoutTrace('bulk.people.queued-refused');
         return Promise.resolve();
       }
-      return run(people.map((person) => ({ kind: 'person' as const, person, groupId })));
+      return run(
+        people.map((person) => ({
+          kind: 'person' as const,
+          person: peopleReviewApproval(person),
+          groupId,
+        })),
+      );
     },
   };
 }

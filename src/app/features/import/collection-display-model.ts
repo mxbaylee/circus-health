@@ -19,6 +19,7 @@ import { useProfile } from '../../data/profile';
 import { initialDraft } from '../intake/useReviewDrafts';
 import { hasUnreviewedPairChoices } from '../../../shared/clinical-review';
 import { recordLabel, recordValue, recordSaveBlockReason } from './import-feed-presentation';
+import { peopleReviewApproval } from './people-review-approval';
 import { possibleSavedOverlapCount } from './possible-overlaps';
 
 export const collectionKind: Record<CollectionFeedRecord['feedKind'] | 'person', ImportReviewKind> =
@@ -156,6 +157,7 @@ export function collectionDisplayRecord(
 
 export function collectionDisplayPerson(person: CollectionPersonProposal): ImportReviewRecord {
   return {
+    personApproval: peopleReviewApproval(person),
     id: `person:${person.id}`,
     reportId: person.groupId,
     kind: 'People',
@@ -190,6 +192,7 @@ export function useCollectionDisplayModel({
   filters,
   loading,
   confirmedSavedIds,
+  rejectedApprovalIds,
   selectionWindowKey,
 }: {
   data: CollectionImportFeed | null;
@@ -199,6 +202,7 @@ export function useCollectionDisplayModel({
   filters: NonNullable<ImportReviewModel['filters']>;
   loading: boolean;
   confirmedSavedIds: string[];
+  rejectedApprovalIds?: string[];
   selectionWindowKey: string;
 }) {
   const profile = useProfile();
@@ -373,6 +377,7 @@ export function useCollectionDisplayModel({
       filters,
       searchAppliedByModel: true,
       confirmedSavedIds,
+      rejectedApprovalIds,
       counts: data
         ? {
             review: data.counts.pending + (peopleCounts?.pending || 0),
@@ -392,6 +397,7 @@ export function useCollectionDisplayModel({
     filters,
     loading,
     confirmedSavedIds,
+    rejectedApprovalIds,
     selectionWindowKey,
     profile?.id,
   ]);

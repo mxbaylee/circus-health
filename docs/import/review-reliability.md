@@ -51,6 +51,41 @@ An earlier response cannot clear a newer reload's pending state. Failed refreshe
 retain the existing error gate, and changing profile or resource hides preceding
 data. This does not retry a write or replace exact selection validation.
 
+## People approval snapshots
+
+Ticking a proposed Person retains the exact proposal version and person details
+shown at that moment: name, relationship, tags, contact fields and medical history,
+within that intake and report. A background refresh that changes those inputs
+clears the tick and counts the Person in the changed-item notice. An unchanged
+Person stays selected when unrelated intake or report transport revisions advance.
+A direct row action captures the clicked Person without requiring a checkbox.
+Neither path can substitute a refreshed proposal while an editor confirmation or
+preflight read is pending. Every requested Person needs its own retained approval;
+a missing approval refuses the action before any selected Person is sent.
+
+Add and Review later, Exclude or Return to review compare fresh evidence with that
+approval. The native overview uses one exact preflight GET and one POST per
+unchanged Person. The legacy view retains its existing paged lookup: one GET for
+a Person in the first 100-proposal window, otherwise a page walk until that
+Person is found, followed by one POST. Approval pinning adds no lookup requests.
+Disposition requests may use the fresh intake transport version while retaining the approved
+Person version. Current saved state and Add eligibility, including Self and
+possible matches, remain checked. A mismatch sends no Person mutation for that
+item, revokes its approval and asks for review again. Earlier successful items
+stay successful; this is sequential work, not an atomic bulk operation.
+
+An already-issued command with an unknown outcome retains its exact body and
+operation ID for explicit retry, even if refreshing the page revokes the tick.
+Retry does not preflight or rebuild that issued command. Unsent successors still
+need their original approvals and current scope, so a stale successor stops with
+no new write. In the legacy view, same-profile navigation keeps the explicit
+People retry visible and blocks a fresh action from implicitly reusing it. A
+committed scope change, including leaving and returning, invalidates unsent work;
+a late acknowledgement cannot advance successors or mark the new view saved.
+Profile changes abandon that view's recovery controls, and a late response cannot
+clear another profile's command. These are mounted-session safeguards, not durable
+People-command reconciliation after a reload.
+
 ## Drafts, source revisions and People
 
 The upload chooser and drop area wait for the installation's upload limits and any current review action. Both native and legacy review views explain an unavailable upload state; a failed limits request remains unavailable with a reload instruction. Loading upload limits does not block clinical record selection. The server still validates each upload independently.

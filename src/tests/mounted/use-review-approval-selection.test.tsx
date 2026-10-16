@@ -57,3 +57,40 @@ it('deselects every shown snapshot before reapproving the current exact values',
   act(() => view.result.current.selectShown([current], true));
   expect(view.result.current.approvals([original.id])).toEqual([current.approval]);
 });
+
+function personRecord(): ImportReviewRecord {
+  return {
+    ...record('person:fictional-child'),
+    kind: 'People',
+    approval: undefined,
+    personApproval: {
+      intakeId: 'fictional-intake',
+      groupId: 'fictional-report',
+      id: 'fictional-child',
+      version: 'fictional-v1',
+      person: { fullName: 'Fictional Alex', relationship: 'child', tags: ['Family'] },
+    },
+  } as ImportReviewRecord;
+}
+
+for (const change of ['name', 'relationship', 'tags', 'version'] as const)
+  it(`revokes a People tick when its ${change} changes, including same-version details`, () => {
+    const original = personRecord();
+    const view = renderHook(() => useReviewApprovalSelection());
+    act(() => view.result.current.toggle(original.id, [original]));
+    const changed = structuredClone(original) as ImportReviewRecord & {
+      personApproval: {
+        version: string;
+        person: { fullName: string; relationship: string; tags: string[] };
+      };
+    };
+    if (change === 'name') changed.personApproval.person.fullName = 'Fictional Rowan';
+    if (change === 'relationship') changed.personApproval.person.relationship = 'sibling';
+    if (change === 'tags') changed.personApproval.person.tags.push('Professional');
+    if (change === 'version') changed.personApproval.version = 'fictional-v2';
+    act(() => {
+      view.result.current.revokeChanged([changed]);
+    });
+    expect(view.result.current.selected.has(original.id)).toBe(false);
+    expect(view.result.current.needsApproval.has(original.id)).toBe(true);
+  });
