@@ -2,7 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
 import { disposableSqlite } from './disposable-sqlite.ts';
-import { clinicalReviewRevision, json, type Database } from './database.ts';
+import { clinicalReviewRevision, HttpError, json, type Database } from './database.ts';
 import { intakeDiscoveryRevision } from './intake-lookup-state.ts';
 import { iterateIntakeIdentityReferences } from './intake-lookup-projection.ts';
 import { openIntakeIdentityReference } from './intake-identity-reference.ts';
@@ -126,7 +126,11 @@ export async function prepareOwnershipNamePlan(
           profileId ||
         clinicalReviewRevision(db) !== selectedRevision
       )
-        throw Error('Ownership name evidence changed; prepare a fresh plan');
+        throw new HttpError(
+          409,
+          'OWNERSHIP_CHANGED',
+          'Ownership name evidence changed; prepare a fresh plan',
+        );
     } catch (error) {
       if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
       throw error;
@@ -136,7 +140,11 @@ export async function prepareOwnershipNamePlan(
     assertStable();
     try {
       if (intakeDiscoveryRevision(db) !== frontier)
-        throw Error('Ownership name evidence source frontier changed; prepare a fresh plan');
+        throw new HttpError(
+          409,
+          'OWNERSHIP_CHANGED',
+          'Ownership name evidence source frontier changed; prepare a fresh plan',
+        );
     } catch (error) {
       if (currentTransactionToken(db)) rejectCurrentTransaction(db, error);
       throw error;

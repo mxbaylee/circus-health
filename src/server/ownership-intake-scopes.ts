@@ -3,11 +3,51 @@ import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import { readStoredIntakeDetails } from './intake-state-access.ts';
 import {
   openIntakeCollectionEnvelope,
+  type IntakeCollectionEnvelopeReader,
   type IntakeEnvelopeRecord,
 } from './intake-collection-envelope.ts';
 import { createReportSnapshotCatalog } from './intake-report-snapshot-catalog.ts';
 import { openReportMemberSnapshot } from './intake-report-member-state.ts';
 import type { IntakeReportMembersReference } from '../shared/intake-report-version.ts';
+
+/** Native writers store this small reference as an object-valued cell; also
+ * preserve the addressed-object form handled by this consumer. */
+function memberReference(
+  view: IntakeCollectionEnvelopeReader,
+  version: IntakeEnvelopeRecord,
+): IntakeReportMembersReference {
+  const field = view.field(version, 'members', { bytes: 65536 });
+  let value: unknown;
+  if (field.kind === 'value') value = field.value;
+  else {
+    const record = view.child(version, 'members');
+    if (!record || view.info(record).shape !== 'object')
+      throw Error('Ownership member snapshot reference is unavailable');
+    const properties = ['format', 'snapshotId', 'memberCount', 'occurrenceCount'];
+    value = Object.fromEntries(
+      properties.map((name) => {
+        const selected = view.field(record, name, { bytes: 65536 });
+        if (selected.kind !== 'value')
+          throw Error('Ownership member snapshot reference field is unavailable');
+        return [name, selected.value];
+      }),
+    );
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw Error('Ownership member snapshot reference is malformed');
+  const reference = value as IntakeReportMembersReference;
+  if (
+    reference.format !== 'health-intake-report-members-v1' ||
+    typeof reference.snapshotId !== 'string' ||
+    !reference.snapshotId ||
+    !Number.isSafeInteger(reference.memberCount) ||
+    reference.memberCount < 0 ||
+    !Number.isSafeInteger(reference.occurrenceCount) ||
+    reference.occurrenceCount < 0
+  )
+    throw Error('Ownership member snapshot reference is malformed');
+  return reference;
+}
 
 /** Only group identity/subject are retained; versions and member occurrences stream. */
 export function* ownershipIntakeScopes(
@@ -104,28 +144,18 @@ export function* ownershipIntakeScopes(
     // late occurrence evidence cannot be mistaken for a complete ownership scope.
     for (const version of versions) {
       if (text(version, 'format') === 'health-intake-report-group-version-v2') {
-        const members = view.child(version, 'members');
-        if (!members || view.info(members).shape !== 'object')
-          throw Error('Ownership member snapshot reference is unavailable');
-        const number = (name: string) => {
-          const value = view.field(members, name, { bytes: 65536 });
-          if (value.kind !== 'value' || typeof value.value !== 'number')
-            throw Error('Ownership member snapshot count is unavailable');
-          return value.value;
-        };
-        const reference: IntakeReportMembersReference = {
-          format: text(members, 'format') as IntakeReportMembersReference['format'],
-          snapshotId: text(members, 'snapshotId'),
-          memberCount: number('memberCount'),
-          occurrenceCount: number('occurrenceCount'),
-        };
+        const reference = memberReference(view, version);
         catalog ??= createReportSnapshotCatalog(db, source as { id: string });
         const snapshot = openReportMemberSnapshot(catalog, reference);
         for (let ordinal = 0; ordinal < reference.memberCount; ordinal++) {
           const member = snapshot.memberAt(ordinal);
           if (!member) throw Error('Ownership report member is unavailable');
-          for (let occurrence = 0; occurrence < member.occurrenceCount; occurrence++)
-            if (snapshot.occurrenceRecordId(member, occurrence) === recordId) found = true;
+          for (let occurrence = 0; occurrence < member.occurrenceCount; occurrence++) {
+            const selected = snapshot.occurrenceRecordId(member, occurrence);
+            if (typeof selected !== 'string')
+              throw Error('Ownership member lacks a record identity');
+            if (selected === recordId) found = true;
+          }
         }
         snapshot.assertCurrent();
       } else
@@ -230,14 +260,7 @@ export function* ownershipIntakeScopeOccurrences(
         latest = v === versions - 1;
       yield { groupOrdinal: g, id, versionId, recordId: null, latest, subjectText };
       if (read(version, 'format') === 'health-intake-report-group-version-v2') {
-        const members = view.child(version, 'members');
-        if (!members) throw Error('Ownership member reference is unavailable');
-        const reference = {
-          format: read(members, 'format'),
-          snapshotId: read(members, 'snapshotId'),
-          memberCount: read(members, 'memberCount'),
-          occurrenceCount: read(members, 'occurrenceCount'),
-        } as IntakeReportMembersReference;
+        const reference = memberReference(view, version);
         catalog ??= createReportSnapshotCatalog(db, source as { id: string });
         const snapshot = openReportMemberSnapshot(catalog, reference);
         for (let m = 0; m < reference.memberCount; m++) {

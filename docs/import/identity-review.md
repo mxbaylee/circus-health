@@ -160,6 +160,15 @@ Self, any active Person, and a Person created by the correction are available de
 The preview pins the displayed membership, records, source contributions, destination,
 matching decisions, relationships and name support. Changed evidence or profile state
 requires a fresh preview. A new Person is created only with the successful correction.
+Accepted native report members resolve through their bounded retained snapshot
+reference; supported older inline member lists remain readable. The first
+selected-record preview can omit record versions. Its complete record evidence
+returns the current versions for a checked preview and save. Missing or malformed
+member evidence refuses the correction; it is never treated as an empty report.
+Before saving starts, an advanced selected scope or changed destination refuses
+the checked preview with `409 OWNERSHIP_CHANGED`; obtain a fresh preview. Each
+atomic group still follows the partial-failure behavior described below.
+Opening the preview leaves accepted ownership, source evidence and history unchanged.
 Unlike ordinary report assignment, this reviewed correction can create the Person
 named by a mistaken learned Self alias: its name effects supersede the mistaken
 authority in the same transaction. Equal spelling alone does not establish one person.
