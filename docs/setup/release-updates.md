@@ -21,6 +21,8 @@ earlier setup copy/handoff behavior; do not treat a drive-probe receipt alone as
 proof of successful setup or provider import. See the
 [setup resource contract](../security/profile-encryption.md#encrypted-private-copy-setup).
 
+New model proposals now explicitly separate grounded identity questions from independent clinical uncertainties. Restart into the reviewed build to use that instruction; existing proposals are preserved. The qualification fixture uses separate unpunctuated patient and DOB labels. Its reading gate inspects all version/source-pinned reader exception pages and the exact active plan, while preserving the native feed’s unknown extraction status and referenced accounting. This bounded known-answer fixture proof does not implement a general clinical-completeness aggregate.
+
 ## Updating from `main` to this candidate
 
 The owner accepted the existing passkey compatibility baseline on 2026-10-15

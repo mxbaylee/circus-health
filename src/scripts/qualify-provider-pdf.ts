@@ -24,6 +24,7 @@ import type { ImportDiagnosticExport } from '../server/import-diagnostics.ts';
 import { isIntakeSummary, type IntakeRead } from '../shared/intake-summary.ts';
 import {
   collectQualificationFeed,
+  readQualificationReading,
   type QualificationFeedPage,
 } from './qualification-intake-read.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
@@ -107,6 +108,8 @@ interface QualificationRun {
   proposals: number;
   supersededReviewVersions: number;
   extractionComplete: boolean;
+  readingAccounting: QualificationFeedPage['activity']['readingAccounting'] | null;
+  reading: Awaited<ReturnType<typeof readQualificationReading>>;
   remainingUnits: number | null;
   coordinator: ReturnType<typeof summarizeQualificationBatch>;
   reviewEvidenceFile: string;
@@ -931,6 +934,18 @@ async function main() {
         const feed = collected.feed;
         const detail = await request<IntakeRead>(prefix + `/intakes/${uploaded.id}`);
         extracted.intake = detail;
+        retainReviewFile(reviewEvidenceFile, extracted);
+        const reading = await readQualificationReading(
+          request,
+          prefix + `/intakes/${uploaded.id}`,
+          detail,
+          fixture.sha256,
+          scenario === 'tiny' ? 1 : undefined,
+          (pages) =>
+            retainReviewFile(activeReview!.stem + '-reading.json', { partial: true, pages }),
+        );
+        retainReviewFile(activeReview.stem + '-reading.json', reading);
+        extracted.intake = detail;
         extracted.supersededReviewVersions = collected.supersededReviewVersions;
         extracted.partial = false;
         retainReviewFile(reviewEvidenceFile, extracted);
@@ -967,6 +982,8 @@ async function main() {
             : detail.proposals.length,
           supersededReviewVersions: collected.supersededReviewVersions,
           extractionComplete: feed.activity.extractionComplete,
+          readingAccounting: feed.activity.readingAccounting ?? null,
+          reading,
           remainingUnits:
             typeof feed.activity.remainingUnits === 'number'
               ? feed.activity.remainingUnits
@@ -991,7 +1008,7 @@ async function main() {
           report.reviewCaptureFailures === 0 &&
           run.grade.passed &&
           run.delivery.passed &&
-          run.extractionComplete &&
+          run.reading.passed &&
           run.remainingUnits === 0
         ) {
           let authority: ArchiveInventory | undefined;
@@ -1159,7 +1176,7 @@ async function main() {
           (!accept || run.acceptance?.passed === true) &&
           run.acceptedClinicalRecords === 0 &&
           !run.acceptedWrites &&
-          run.extractionComplete &&
+          run.reading.passed &&
           run.remainingUnits === 0 &&
           run.diagnostics.droppedEvents === 0 &&
           (!diagnosticRequested || run.diagnosticQualification?.passed === true) &&

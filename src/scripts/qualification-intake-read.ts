@@ -14,6 +14,103 @@ import {
   isCollectionImportFeed,
   type CollectionImportFeed,
 } from '../shared/intake-clinical-pages.ts';
+import { isIntakeSummary, type IntakeRead } from '../shared/intake-summary.ts';
+import type { SourceTextIssueList } from '../shared/intake-source-text.ts';
+
+/** Closed-fixture reading observations, not a claim of general clinical extraction completeness.
+ * Native feeds deliberately leave that broader claim unknown even after reading ends. */
+export async function readQualificationReading(
+  request: QualificationRead,
+  path: string,
+  intake: IntakeRead,
+  sourceHash: string,
+  expectedUnits?: number,
+  onPage?: (pages: SourceTextIssueList[]) => void,
+) {
+  check(isIntakeSummary(intake), 'inspect a bounded current intake summary');
+  const plan = intake.activePlan.state === 'exact' ? intake.activePlan.plan : null;
+  check(
+    intake.sha256 === sourceHash &&
+      intake.mimeType === 'application/pdf' &&
+      plan?.status === 'active' &&
+      plan.pins.sourceHash === sourceHash &&
+      Number.isSafeInteger(plan.unitCount) &&
+      plan.unitCount > 0 &&
+      plan.unitCount <= 1000 &&
+      (expectedUnits === undefined || plan.unitCount === expectedUnits),
+    'fixture active plan or source binding is incomplete',
+  );
+  const pages: SourceTextIssueList[] = [];
+  let offset = 0;
+  let summary: string | undefined;
+  let entries = 0;
+  const seenUnits = new Set<string>();
+  do {
+    const params = new URLSearchParams({
+      readerVersion: String(intake.version),
+      readerOffset: String(offset),
+      readerLimit: '50',
+    });
+    const page = await request<SourceTextIssueList>(path + '/source-issues?' + params);
+    pages.push(page);
+    onPage?.(pages);
+    const coverage = page.readerCoverage;
+    check(
+      page.sourceHash === sourceHash &&
+        !page.extractionFailure &&
+        coverage?.intakeVersion === intake.version &&
+        coverage.offset === offset,
+      'reading observations changed or are unavailable',
+    );
+    const selected = JSON.stringify(coverage.summary);
+    if (summary !== undefined) check(selected === summary, 'reading summary changed across pages');
+    summary = selected;
+    check(
+      coverage.summary.units === plan.unitCount &&
+        coverage.summary.pending === 0 &&
+        coverage.summary.partial === 0 &&
+        coverage.summary.unreadable === 0 &&
+        coverage.summary.context === 0 &&
+        coverage.summary.stale === 0,
+      'fixture has omitted, unread, partial, stale, context-only or unreadable units',
+    );
+    check(
+      coverage.entries.length <= 50 && (offset === 0 || coverage.entries.length > 0),
+      'reader page is missing or exceeded its bound',
+    );
+    for (const entry of coverage.entries) {
+      check(
+        entry.planId === plan.id &&
+          !seenUnits.has(entry.unitId) &&
+          entry.stale === false &&
+          entry.status === 'completed' &&
+          (entry.coverageKind === 'extracted' || entry.coverageKind === 'inspected') &&
+          !entry.pagesTruncated &&
+          !entry.notesTruncated,
+        'reader exception is unresolved, duplicated or incompletely inspected',
+      );
+      seenUnits.add(entry.unitId);
+    }
+    entries += coverage.entries.length;
+    check(entries <= plan.unitCount, 'reader observations exceeded the active plan');
+    if (coverage.nextOffset === null) break;
+    check(
+      coverage.entries.length === 50 && coverage.nextOffset === offset + 50,
+      'reader continuation omitted entries or did not advance',
+    );
+    offset = coverage.nextOffset;
+  } while (pages.length < 21);
+  check(pages.at(-1)?.readerCoverage?.nextOffset === null, 'incomplete reader observations');
+  return {
+    passed: true as const,
+    scope: 'closed_fixture_reading_observations' as const,
+    intakeVersion: intake.version,
+    sourceHash,
+    planId: plan.id,
+    unitCount: plan.unitCount,
+    pages,
+  };
+}
 
 export type QualificationFeedPage = IntakeImportFeed | CollectionImportFeed;
 export type QualificationFeedBlock = Pick<

@@ -18,11 +18,14 @@ import {
 } from './provider-qualification-fixture.ts';
 import { readQualificationIdentity } from './qualification-intake-read.ts';
 import type { QualificationFeedBlock, QualificationFeedPage } from './qualification-intake-read.ts';
+import { canonicalIdentityName } from '../shared/self-identity.ts';
 function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw Error(message);
 }
 
-const patientName = (value: string | null | undefined) => value?.replace(/\s+/g, ' ').trim();
+const matchesPatient = (value: string | null | undefined) =>
+  typeof value === 'string' &&
+  canonicalIdentityName(value) === canonicalIdentityName(qualificationPerson);
 
 const object = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -302,7 +305,7 @@ export async function performQualificationAcceptance({
           record.mapping.subject === 'self' &&
             (record.identityReview?.status === 'evidenced_match' ||
               record.identityReview?.status === 'prior_confirmation') &&
-            patientName(record.identityReview.evidencedIdentity.fullName) === qualificationPerson &&
+            matchesPatient(record.identityReview.evidencedIdentity.fullName) &&
             (record.identityReview.evidencedIdentity.birthDate === qualificationBirthDate ||
               (record.identityReview.evidencedIdentity.birthDate === undefined &&
                 record.reportGroups?.length === 1 &&
@@ -326,9 +329,9 @@ export async function performQualificationAcceptance({
           review.status !== 'conflict' &&
           !review.conflicts.length &&
           !review.selfBirthDateConflict &&
-          patientName(review.self.fullName) === qualificationPerson &&
+          matchesPatient(review.self.fullName) &&
           review.self.birthDate === qualificationBirthDate &&
-          patientName(review.evidencedIdentity.fullName) === qualificationPerson &&
+          matchesPatient(review.evidencedIdentity.fullName) &&
           (review.evidencedIdentity.birthDate === qualificationBirthDate ||
             (review.evidencedIdentity.birthDate === undefined &&
               scope.verificationMode === 'human_reviewed_original' &&

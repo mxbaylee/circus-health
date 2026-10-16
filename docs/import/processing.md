@@ -63,6 +63,8 @@ Pending records open a compact inline correction view: the original at its evide
 
 For legacy evidence without a page fragment, one unambiguous page mention attached to the same authorized original is a navigation hint. Conflicting or foreign-original hints do not select a page; out-of-range pages retain an explicit fallback notice. Page navigation does not establish region geometry, so the UI does not draw an invented highlight. The compact preview omits extracted-text controls; transcription review remains available through the report's source issues. Missing observation values display **Value to review**, never the report status such as `final`.
 
+Identity-only model concerns use grounded typed identity review issues while the clinical subject remains unknown. They must not be duplicated into clinical uncertainties: value, unit, date, source and other clinical ambiguities remain independently reviewable and are not resolved by confirming a person. This instruction applies to new model proposals; retained originals, proposals and accepted versions are not rewritten.
+
 ## Import review corrections
 
 Clinical Review and Open review use the same inline accordion. Report ownership and source changes stay in the compact report-header sidebar. The standalone clinical review page is no longer an import navigation destination; historical record links select the matching row in the import view. Value correction drafts can be saved while report ownership remains unresolved; clinical acceptance still requires ownership and every blocking field to be resolved. Failed draft saves offer an explicit discard-and-close path.

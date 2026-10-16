@@ -223,15 +223,15 @@ test(
         'FICTIONAL CLINICAL QUALIFICATION REPORT';
       const subjectLine =
         lines.find((line) => line.includes('Patient:'))?.trim() ??
-        `Patient: ${qualificationPerson}.`;
+        `Patient: ${qualificationPerson}`;
       const birth =
         lines.find((line) => line.includes('DOB:'))?.trim() ??
-        `Patient DOB: ${qualificationBirthDate}.`;
-      const patientField = /Patient:\s*(.*?)\./.exec(subjectLine)!;
+        `Patient DOB: ${qualificationBirthDate}`;
+      const patientField = /Patient:\s*(.+)$/.exec(subjectLine)!;
       const fullName = patientField[1]!;
       // This independently generated proposal selects the literal patient field,
       // not the surrounding page counter/sentence as a supposed personal name.
-      const subject = patientField[0].slice(0, -1);
+      const subject = patientField[0];
       assert.ok(subjectLine.includes(subject));
       identityByPage.set(page, {
         anchor,
