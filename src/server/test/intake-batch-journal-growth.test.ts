@@ -26,6 +26,11 @@ function measured<T>(run: () => T) {
   const value = withIntakeBatchJournalWork(work, run);
   return { value, work: { ...work } };
 }
+async function measuredAsync<T>(run: () => Promise<T> | T) {
+  const work = createIntakeBatchJournalWorkCounters();
+  const value = await withIntakeBatchJournalWork(work, run);
+  return { value, work: { ...work } };
+}
 function assertWarm(work: Work) {
   for (const key of [
     'eventReads',
@@ -437,7 +442,7 @@ test('actual manager request checkpoints touch one small subtree across growing 
             id: `fictional-unit-${String(transition).padStart(3, '0')}`,
             locator: 'fictional constant-size locator',
           };
-          const result = measured(() => guard({ ...reading, workUnit }));
+          const result = await measuredAsync(() => guard({ ...reading, workUnit }));
           assert.equal(result.value, false);
           assertWarm(result.work);
           assert.equal(
@@ -511,7 +516,7 @@ test('actual manager request checkpoints touch one small subtree across growing 
           });
         }
       }
-      const small = measured(() =>
+      const small = await measuredAsync(() =>
         guard({ ...reading, workUnit: { id: 'fictional-small-unit', locator: 'tiny' } }),
       );
       assertWarm(small.work);
@@ -520,7 +525,7 @@ test('actual manager request checkpoints touch one small subtree across growing 
       assert.ok(small.work.eventWriteBytes < 1024, 'unchanged retained fields are not serialized');
       journal.inspect(small.work);
       expected.items[0]!.stalls = { unitId: 'fictional-small-unit', locator: 'tiny', attempts: 0 };
-      const noChange = measured(() =>
+      const noChange = await measuredAsync(() =>
         guard({ ...reading, workUnit: { id: 'fictional-small-unit', locator: 'tiny' } }),
       );
       assertWarm(noChange.work);

@@ -2,6 +2,8 @@ import { readNativeAssistantSourceHeader } from './assistant-intake-header.ts';
 import {
   captureVaultAssistantAuthorization,
   withVaultAssistantAuthorization,
+  captureVaultAssistantRequestAccounting,
+  withVaultAssistantRequestAccounting,
 } from './vault-app.ts';
 import { intakeFilenameSummaryPrepared } from './intake-summary-name.ts';
 import { readStoredIntakeDetails } from './intake-state-access.ts';
@@ -80,6 +82,7 @@ import {
   assertClinicalOperation,
   currentClinicalOperation,
   runExclusiveClinicalOperation,
+  withoutClinicalOperation,
 } from './clinical-operation.ts';
 import type { Database } from './database.ts';
 import type {
@@ -602,7 +605,7 @@ interface ActiveState {
   };
   readingDeadlineReached?: boolean;
   readingDeadlineAt?: number;
-  beforeModelRequest?: (reading: IntakeBatchReadingState) => boolean;
+  beforeModelRequest?: (reading: IntakeBatchReadingState) => boolean | Promise<boolean>;
   assertAuthorized?: (operation: 'dispatch' | 'publish') => void;
 }
 
@@ -618,6 +621,8 @@ const compactOwners = new WeakMap<
     profileId: string;
     active: Map<string, ActiveState>;
     state: ActiveState;
+    chat: AssistantChat;
+    closed: () => boolean;
   }
 >();
 const compactAssertions = new WeakMap<
@@ -657,6 +662,26 @@ export function assistantCompactOwnerCurrent(
     job.profileId === profileId &&
     Reflect.apply(nativeActiveGet, job.databases, [profileId]) === job.db &&
     Reflect.apply(nativeActiveGet, job.active, [profileId]) === job.state
+  );
+}
+/** Accounting is confined to an exact dispatch retained by this genuine run.
+ * Retirement removes model/source authority without discarding its usage receipt. */
+export function assistantRequestAccountingCurrent(
+  owner: AssistantCompactOwner,
+  db: Database | undefined,
+  profileId: string | undefined,
+  requestId: string,
+): boolean {
+  const job = compactOwners.get(owner);
+  return (
+    !!job &&
+    !job.closed() &&
+    (db === undefined || job.db === db) &&
+    (profileId === undefined || job.profileId === profileId) &&
+    Reflect.apply(nativeActiveGet, job.databases, [job.profileId]) === job.db &&
+    !!job.chat.intakeModelAttempts?.some(
+      (attempt) => attempt.requestId === requestId && attempt.scope.runId === job.state.run.id,
+    )
   );
 }
 /** A generation seal does not approve an additional caller authorization closure. */
@@ -1308,7 +1333,7 @@ interface AssistantService {
 
 interface AssistantRunOptions {
   assertAuthorized?: (operation: 'dispatch' | 'publish') => void;
-  beforeModelRequest?: (reading: IntakeBatchReadingState) => boolean;
+  beforeModelRequest?: (reading: IntakeBatchReadingState) => boolean | Promise<boolean>;
 }
 
 const str = (max = 2000): ToolSchema => ({ type: 'string', maxLength: max });
@@ -1903,6 +1928,7 @@ export function createAssistant({
   diagnostics = importDiagnostics,
   beforeBatchRevalidationRetry,
 }: AssistantOptions) {
+  let accountingEpoch = 0;
   const active = new Map<string, ActiveState>(),
     cache = new Map<string, AssistantChat>();
   const journalChats = (profileId: string): AssistantChat[] =>
@@ -2132,6 +2158,23 @@ export function createAssistant({
       state.streamPersistTimer = undefined;
     }
   }
+  async function persistContinuation(
+    profileId: string,
+    chat: AssistantChat,
+    reason: string,
+    assertRunning: () => void,
+  ): Promise<void> {
+    const db = dbFor(profileId);
+    await runExclusiveClinicalOperation(
+      db,
+      async () => {
+        assertRunning();
+        if (dbFor(profileId) !== db) throw new Error('Profile access changed');
+        persist(profileId, chat, reason);
+      },
+      { operation: currentClinicalOperation(db), assertRunning },
+    );
+  }
   function noteReceipt(db: Database, profileId: string, proposal: Proposal): UnknownRecord | null {
     const row = db
       .prepare('SELECT value FROM app_meta WHERE key=?')
@@ -2340,6 +2383,16 @@ export function createAssistant({
       args = params.arguments;
     const compactOwner = compactStateOwners.get(state);
     if (compactOwner) bindCompactAssertion(assertRunning, compactOwner, generation);
+    const publish = (reason: string, update: () => void): Promise<void> =>
+      runExclusiveClinicalOperation(
+        db,
+        async () => {
+          assertRunning();
+          update();
+          persist(profileId, chat, reason);
+        },
+        { operation: currentClinicalOperation(db), assertRunning },
+      );
     if (
       state.checkpoint &&
       chat.reading &&
@@ -2347,8 +2400,9 @@ export function createAssistant({
       object(args) &&
       args.action === 'create'
     ) {
-      chat.reading.phase = 'indexing_source';
-      persist(profileId, chat, 'conversion-tool-started');
+      await publish('conversion-tool-started', () => {
+        chat.reading!.phase = 'indexing_source';
+      });
     }
     if (
       object(args) &&
@@ -2610,23 +2664,25 @@ export function createAssistant({
               ? 'reading_source'
               : 'preparing_results';
         if (chat.reading.phase !== phase) {
-          chat.reading.phase = phase;
-          persist(profileId, chat, 'conversion-tool-started');
+          await publish('conversion-tool-started', () => {
+            chat.reading!.phase = phase;
+          });
         }
       }
     }
     if (params.tool === 'health_assistant_progress') {
       const progress = { text: text(args.text, 300), at: clock().toISOString() };
-      state.run.progress = progress;
-      chat.operations.push({
-        id: params.callId,
-        tool: params.tool,
-        runId: state.run.id,
-        at: progress.at,
-        summary: 'Updated working status',
-        arguments: { text: args.text },
+      await publish('assistant-progress', () => {
+        state.run.progress = progress;
+        chat.operations.push({
+          id: params.callId,
+          tool: params.tool,
+          runId: state.run.id,
+          at: progress.at,
+          summary: 'Updated working status',
+          arguments: { text: args.text },
+        });
       });
-      persist(profileId, chat, 'assistant-progress');
       return { updated: true };
     }
     if (state.checkpoint && params.tool.startsWith('health_intake_')) {
@@ -2874,8 +2930,9 @@ export function createAssistant({
         existing: !!current,
         changes,
       };
-      chat.proposals.push(proposal);
-      persist(profileId, chat, 'note-proposed');
+      await publish('note-proposed', () => {
+        chat.proposals.push(proposal);
+      });
       result = proposal;
     } else if (params.tool === 'health_propose_classification') {
       assertAssistantRecordOwner(
@@ -2906,8 +2963,9 @@ export function createAssistant({
           category,
         },
       };
-      chat.proposals.push(proposal);
-      persist(profileId, chat, 'classification-proposed');
+      await publish('classification-proposed', () => {
+        chat.proposals.push(proposal);
+      });
       result = proposal;
     } else if (params.tool === 'health_note_history') {
       assertAssistantRecordOwner(
@@ -2969,8 +3027,9 @@ export function createAssistant({
         });
         proposal.preview = preview;
       }
-      chat.proposals.push(proposal);
-      persist(profileId, chat, 'restore-proposed');
+      await publish('restore-proposed', () => {
+        chat.proposals.push(proposal);
+      });
       result = proposal;
     } else if (params.tool === 'health_propose_attachment') {
       const current = n.getNote(db, stringArgument(args, 'noteId'));
@@ -2999,8 +3058,9 @@ export function createAssistant({
           ...metadata,
         },
       };
-      chat.proposals.push(proposal);
-      persist(profileId, chat, 'attachment-proposed');
+      await publish('attachment-proposed', () => {
+        chat.proposals.push(proposal);
+      });
       result = proposal;
     } else if (params.tool === 'health_intake_package') {
       const packageId = stringArgument(args, 'id');
@@ -3717,10 +3777,11 @@ export function createAssistant({
               preparedPlan.units[0]?.kind !== 'image'
             )
               throw new Error('The host-created image plan has an unexpected shape');
-            conversionCheckpoint(chat, prepared, profileId);
-            state.checkpoint.version = prepared.version;
-            chat.reading = conversionReadingState(state.checkpoint, prepared);
-            persist(profileId, chat, 'conversion-image-plan-prepared');
+            await publish('conversion-image-plan-prepared', () => {
+              conversionCheckpoint(chat, prepared, profileId);
+              state.checkpoint!.version = prepared.version;
+              chat.reading = conversionReadingState(state.checkpoint!, prepared);
+            });
             state.diagnosticScope?.record('import.progress', {
               phase: 'image_plan_bootstrap',
               hostPreparedPlan: true,
@@ -4165,22 +4226,23 @@ export function createAssistant({
         ...result,
       };
     }
-    chat.operations.push({
-      id: params.callId,
-      tool: params.tool,
-      at: clock().toISOString(),
-      summary: [
-        'health_query',
-        'health_read',
-        'health_intake_read',
-        'health_intake_source_text',
-        'health_note_history',
-        'health_record_history',
-      ].includes(params.tool)
-        ? 'Read selected-profile records'
-        : 'Prepared a reviewable proposal',
+    await publish('tool-completed', () => {
+      chat.operations.push({
+        id: params.callId,
+        tool: params.tool,
+        at: clock().toISOString(),
+        summary: [
+          'health_query',
+          'health_read',
+          'health_intake_read',
+          'health_intake_source_text',
+          'health_note_history',
+          'health_record_history',
+        ].includes(params.tool)
+          ? 'Read selected-profile records'
+          : 'Prepared a reviewable proposal',
+      });
     });
-    persist(profileId, chat, 'tool-completed');
     return (object(result) && (result.imageContent || result.pdfContent)) ||
       params.tool === 'health_record_history'
       ? result
@@ -4277,7 +4339,16 @@ export function createAssistant({
       );
     active.set(profileId, state);
     const compactJob = Object.freeze({}) as AssistantCompactOwner;
-    compactOwners.set(compactJob, { db: dbFor(profileId), databases, profileId, active, state });
+    const requestAccountingEpoch = accountingEpoch;
+    compactOwners.set(compactJob, {
+      db: dbFor(profileId),
+      databases,
+      profileId,
+      active,
+      state,
+      chat,
+      closed: () => accountingEpoch !== requestAccountingEpoch,
+    });
     compactStateOwners.set(state, compactJob);
     const diagnosticContext = {
       profileId,
@@ -4294,6 +4365,41 @@ export function createAssistant({
       sliceId: runRecord.id,
     };
     if (checkpoint) state.diagnosticScope = diagnostics.startActive(profileId, diagnosticContext);
+    // Provider callbacks belong to this assistant lifetime, not to whichever
+    // HTTP host frame happened to deliver them. Admission never spans a model
+    // request, transport wait or source extraction.
+    const callbackHost = <T>(work: () => Promise<T>): Promise<T> =>
+      withoutClinicalOperation(() =>
+        withVaultAssistantAuthorization(compactJob, () => {
+          const db = dbFor(profileId);
+          return runExclusiveClinicalOperation(db, async () => {
+            if (dbFor(profileId) !== db) throw new Error('Profile access changed');
+            return withVaultAssistantAuthorization(compactJob, work);
+          });
+        }),
+      );
+    const requestAccounting = new Set<string>();
+    const accountRequest = (params: UnknownRecord): void =>
+      withVaultAssistantRequestAccounting(compactJob, String(params.requestId), () => {
+        const prior = chat.intakeModelAttempts || [];
+        const next = finishIntakeModelAttempt(prior, params, clock().toISOString());
+        if (next === prior) return;
+        chat.intakeModelAttempts = next;
+        try {
+          persist(profileId, chat, 'conversion-late-attempt-accounting');
+        } catch (error) {
+          // Reconcile any already-appended journal delta on the exact receipt's retry.
+          chat.intakeModelAttempts = prior;
+          throw error;
+        }
+      });
+    const accountRetiredRequest = (params: UnknownRecord): Promise<void> =>
+      withoutClinicalOperation(() =>
+        withVaultAssistantRequestAccounting(compactJob, String(params.requestId), () => {
+          const db = dbFor(profileId);
+          return runExclusiveClinicalOperation(db, async () => accountRequest(params));
+        }),
+      );
     const finish = (
       status: ChatStatus,
       error: string | null = null,
@@ -4384,6 +4490,15 @@ export function createAssistant({
         });
       }
     };
+    const finishContinuation = (
+      status: ChatStatus,
+      error: string | null = null,
+      readingReason: string | null = null,
+      generation = state.generation,
+    ): Promise<void> =>
+      callbackHost(async () => {
+        if (state.generation === generation) finish(status, error, readingReason);
+      });
     state.finish = finish;
     const readingDeadlineReached = (): boolean => {
       if (!checkpoint) return false;
@@ -4396,20 +4511,27 @@ export function createAssistant({
       return !!state.readingDeadlineReached;
     };
     state.timer = setTimeout(() => {
-      if (checkpoint) {
-        // A reading slice deadline is a soft provider-request boundary. Preserve
-        // an already-running request and its guarded tool result; the bridge's
-        // host-only request gate stops the next provider call. Stop, lock and
-        // explicit cancellation still use finish()/close() and abort immediately.
-        state.readingDeadlineReached = true;
-        if (!state.bridge) finish('idle', null, 'time_limit');
-        return;
-      }
-      finish(
-        'failed',
-        'This response exceeded 15 minutes. Its partial work is retained; retry when ready.',
-        'time_limit',
-      );
+      const generation = state.generation;
+      const pending = callbackHost(async () => {
+        if (active.get(profileId) !== state || state.generation !== generation) return;
+        if (checkpoint) {
+          // A reading slice deadline is a soft provider-request boundary. Preserve
+          // an already-running request and its guarded tool result; the bridge's
+          // host-only request gate stops the next provider call. Stop, lock and
+          // explicit cancellation still use finish()/close() and abort immediately.
+          state.readingDeadlineReached = true;
+          if (!state.bridge) finish('idle', null, 'time_limit');
+          return;
+        }
+        finish(
+          'failed',
+          'This response exceeded 15 minutes. Its partial work is retained; retry when ready.',
+          'time_limit',
+        );
+      });
+      pending.catch(() => {
+        /* Authorization loss cannot publish a terminal write. */
+      });
     }, READING_SLICE_MS);
     const runModelTurn = async (generation: number) => {
       const reconcilingCoverage = state.coverageReconciliationPending === true;
@@ -4421,7 +4543,7 @@ export function createAssistant({
       state.attributionRequests = new Map();
       try {
         if (readingDeadlineReached()) {
-          finish('idle', null, 'time_limit');
+          await finishContinuation('idle', null, 'time_limit', generation);
           return;
         }
         if (chat.context?.intakeRepair && nativeRepair(profileId, chat.context.intakeRepair)) {
@@ -4439,7 +4561,7 @@ export function createAssistant({
             { assertRunning },
           );
           assertRunning();
-          persist(profileId, chat, 'draft-repair-prepared');
+          await persistContinuation(profileId, chat, 'draft-repair-prepared', assertRunning);
         }
         const preparationDb = dbFor(profileId);
         const assertPreparationRunning = () => {
@@ -4556,7 +4678,12 @@ export function createAssistant({
           conversionCheckpoint(chat, current, profileId);
           checkpoint.turns++;
           chat.reading = conversionReadingState(checkpoint, current);
-          persist(profileId, chat, 'conversion-turn-started');
+          await persistContinuation(
+            profileId,
+            chat,
+            'conversion-turn-started',
+            assertPreparationRunning,
+          );
         }
         const readiness = await measureImportPhase(
           'model_preflight',
@@ -4575,7 +4702,7 @@ export function createAssistant({
           );
         if (active.get(profileId) !== state) return;
         if (readingDeadlineReached()) {
-          finish('idle', null, 'time_limit');
+          await finishContinuation('idle', null, 'time_limit', generation);
           return;
         }
         const bridge = bridgeFactory({
@@ -4583,654 +4710,687 @@ export function createAssistant({
           profileId,
           diagnostics,
           diagnosticContext,
-          beforeRequest: () => {
-            const guard = () => {
-              state.assertAuthorized?.('dispatch');
-              if (
-                !state.unknownSourceCoverage?.size &&
-                state.observedSourceHashes?.size &&
-                !observedSourceHashesCurrent(dbFor(profileId), state)
-              )
-                throw new ModelError(
-                  'Source text changed during this response; reread observed evidence in a fresh response before continuing.',
-                );
-              for (const [sourceId, revisionId] of new Map([
-                ...(state.sourceTextReads || []),
-                ...(state.sourceTextCapturePins || []),
-              ]))
-                if (
-                  currentIntakeSourceTextRevisionId(dbFor(profileId), profileId, sourceId) !==
-                    revisionId &&
-                  !measuredSourceCurrent(dbFor(profileId), state, sourceId)
-                )
-                  throw new ModelError(
-                    'Source text changed during this response. Completed work is retained; reread the current text in a fresh response before continuing.',
-                  );
-              if (readingDeadlineReached())
-                throw new ReadingDeadlineError(
-                  'The bounded reading slice reached its time limit before another model request. Productive work is retained.',
-                );
-              if (
-                checkpoint?.activeUnitId &&
-                chat.reading?.workUnit?.id &&
-                checkpoint.activeUnitId !== chat.reading.workUnit.id
-              )
-                throw new ReadingDeadlineError(
-                  'The current unit reached a checkpoint; continue with the next queued unit in a fresh context.',
-                );
-              if (checkpoint && state.beforeModelRequest?.(chat.reading!))
-                throw new ReadingJobLimitError(
-                  'A reading safety guard was reached before another model request. Completed work and cumulative usage are retained.',
-                );
-            };
-            if (!isNativeAssistantCheckpoint(checkpoint)) return guard();
-            return (async () => {
-              if (isNativeAssistantCheckpoint(checkpoint)) {
-                const current = conversionIntake(profileId, chat);
-                if (!isNativeAssistantConversion(current))
-                  throw Error('Native conversion source changed');
-                const mappingVersion = modelMappingRuleContext(
-                  dbFor(profileId),
-                  current.providerId,
-                ).mappingRulesVersion;
-                const ready = await prepareNativeAssistantConversion(current, {
-                  mappingVersion,
-                  currentMappingVersion: () =>
-                    modelMappingRuleContext(dbFor(profileId), current.providerId)
-                      .mappingRulesVersion,
-                  assertRunning: () => {
-                    state.assertAuthorized?.('dispatch');
-                    if (active.get(profileId) !== state || state.generation !== generation)
-                      throw Error('This response is no longer running');
-                  },
-                });
-                if (ready.state !== 'ready')
-                  throw new HttpError(
-                    409,
-                    'WORKFLOW_PREPARATION_REQUIRED',
-                    'Prepare complete selected workflow facts before another model request',
-                  );
-                chat.reading = conversionReadingState(checkpoint, current);
-              }
-              guard();
-            })();
-          },
-          onTool: (params) => {
-            let beforeIntake: ConversionIntake | null = null;
-            if (checkpoint && active.get(profileId) === state && state.generation === generation) {
-              try {
-                beforeIntake = conversionIntake(profileId, chat);
-              } catch {
-                /* The guarded tool path owns error classification. */
-              }
-            }
-            const readsBefore =
-              checkpoint && beforeIntake ? readingCount(checkpoint, beforeIntake) : 0;
-            const nativeProgressBefore =
-              isNativeAssistantConversion(beforeIntake) &&
-              isNativeAssistantCheckpoint(checkpoint) &&
-              params.tool === 'health_intake_batch'
-                ? nativeAssistantBatchProgress(
-                    beforeIntake,
-                    checkpoint,
-                    params.arguments.operationId,
-                    modelMappingRuleContext(dbFor(profileId), beforeIntake.providerId)
-                      .mappingRulesVersion,
+          beforeRequest: () =>
+            withoutClinicalOperation(() =>
+              withVaultAssistantAuthorization(compactJob, () => {
+                const guard = async () => {
+                  state.assertAuthorized?.('dispatch');
+                  if (checkpoint && (await state.beforeModelRequest?.(chat.reading!)))
+                    throw new ReadingJobLimitError(
+                      'A reading safety guard was reached before another model request. Completed work and cumulative usage are retained.',
+                    );
+                  state.assertAuthorized?.('dispatch');
+                  if (active.get(profileId) !== state || state.generation !== generation)
+                    throw Error('This response is no longer running');
+                  if (
+                    !state.unknownSourceCoverage?.size &&
+                    state.observedSourceHashes?.size &&
+                    !observedSourceHashesCurrent(dbFor(profileId), state)
                   )
-                : undefined;
-            const batchProgressBefore =
-              checkpoint &&
-              active.get(profileId) === state &&
-              state.generation === generation &&
-              params.tool === 'health_intake_batch'
-                ? isNativeAssistantConversion(beforeIntake)
-                  ? null
-                  : durableBatchProgress(beforeIntake)
-                : null;
-            return callTool(profileId, chat, params, state, generation)
-              .finally(() => {
-                // A plan command may replace the legacy checkpoint representation.
-                // Usage, progress and completion callbacks must share the new ledger.
-                checkpoint = state.checkpoint;
-              })
-              .then((result) => {
-                const batchCurrent =
-                  checkpoint &&
-                  active.get(profileId) === state &&
-                  state.generation === generation &&
-                  params.tool === 'health_intake_batch'
-                    ? conversionIntake(profileId, chat)
-                    : null;
-                const nativeProgressAfter =
-                  isNativeAssistantConversion(batchCurrent) &&
-                  isNativeAssistantCheckpoint(checkpoint)
-                    ? nativeAssistantBatchProgress(
-                        batchCurrent,
-                        checkpoint,
-                        params.arguments.operationId,
-                        modelMappingRuleContext(dbFor(profileId), batchCurrent.providerId)
+                    throw new ModelError(
+                      'Source text changed during this response; reread observed evidence in a fresh response before continuing.',
+                    );
+                  for (const [sourceId, revisionId] of new Map([
+                    ...(state.sourceTextReads || []),
+                    ...(state.sourceTextCapturePins || []),
+                  ]))
+                    if (
+                      currentIntakeSourceTextRevisionId(dbFor(profileId), profileId, sourceId) !==
+                        revisionId &&
+                      !measuredSourceCurrent(dbFor(profileId), state, sourceId)
+                    )
+                      throw new ModelError(
+                        'Source text changed during this response. Completed work is retained; reread the current text in a fresh response before continuing.',
+                      );
+                  if (readingDeadlineReached())
+                    throw new ReadingDeadlineError(
+                      'The bounded reading slice reached its time limit before another model request. Productive work is retained.',
+                    );
+                  if (
+                    checkpoint?.activeUnitId &&
+                    chat.reading?.workUnit?.id &&
+                    checkpoint.activeUnitId !== chat.reading.workUnit.id
+                  )
+                    throw new ReadingDeadlineError(
+                      'The current unit reached a checkpoint; continue with the next queued unit in a fresh context.',
+                    );
+                };
+                if (!isNativeAssistantCheckpoint(checkpoint)) return guard();
+                return (async () => {
+                  if (isNativeAssistantCheckpoint(checkpoint)) {
+                    const current = conversionIntake(profileId, chat);
+                    if (!isNativeAssistantConversion(current))
+                      throw Error('Native conversion source changed');
+                    const mappingVersion = modelMappingRuleContext(
+                      dbFor(profileId),
+                      current.providerId,
+                    ).mappingRulesVersion;
+                    const ready = await prepareNativeAssistantConversion(current, {
+                      mappingVersion,
+                      currentMappingVersion: () =>
+                        modelMappingRuleContext(dbFor(profileId), current.providerId)
                           .mappingRulesVersion,
-                      )
-                    : undefined;
-                if (batchCurrent?.durability?.pending)
-                  throw new HttpError(
-                    503,
-                    'INTAKE_DURABILITY_PENDING',
-                    'The batch receipt may already be retained, but durable publication is pending. Pause and reconcile the exact operation before continuing.',
-                  );
-                if (
-                  checkpoint &&
-                  active.get(profileId) === state &&
-                  state.generation === generation &&
-                  params.tool === 'health_intake_batch' &&
-                  ((nativeProgressBefore &&
-                    nativeProgressAfter &&
-                    !nativeProgressBefore.recorded &&
-                    nativeProgressAfter.recorded &&
-                    (nativeProgressAfter.versions > nativeProgressBefore.versions ||
-                      nativeProgressAfter.accounted > nativeProgressBefore.accounted)) ||
-                    (!isNativeAssistantConversion(batchCurrent) &&
-                      advancedDurableBatchProgress(
-                        batchProgressBefore,
-                        batchCurrent,
-                        params.arguments.operationId,
-                      )))
-                )
-                // Reads, questions, new operation IDs and no-op/inspected
-                // batches cannot replenish this consecutive-stale budget.
-                {
-                  state.recoverableStaleVersionErrors = 0;
-                  try {
-                    state.diagnosticScope?.record('import.progress', {
-                      recoveryAction: 'batch_progress',
-                      toolName: params.tool,
-                      currentVersion: batchCurrent?.version ?? null,
-                      candidates: batchCurrent ? candidateCount(batchCurrent) : 0,
-                      accountedUnits:
-                        batchCurrent && !isNativeAssistantConversion(batchCurrent)
-                          ? accountedIntakeUnitIds(batchCurrent).length
-                          : 0,
+                      assertRunning: () => {
+                        state.assertAuthorized?.('dispatch');
+                        if (active.get(profileId) !== state || state.generation !== generation)
+                          throw Error('This response is no longer running');
+                      },
                     });
-                  } catch {
-                    /* Optional recovery diagnostics cannot alter model/tool outcomes. */
+                    if (ready.state !== 'ready')
+                      throw new HttpError(
+                        409,
+                        'WORKFLOW_PREPARATION_REQUIRED',
+                        'Prepare complete selected workflow facts before another model request',
+                      );
+                    chat.reading = conversionReadingState(checkpoint, current);
                   }
-                }
-                if (
-                  checkpoint &&
-                  active.get(profileId) === state &&
-                  state.generation === generation &&
-                  params.tool === 'health_intake_plan' &&
-                  params.arguments.action === 'read'
-                )
-                  state.recoverableContextRefreshErrors = 0;
-                if (
-                  checkpoint &&
-                  state.generation === generation &&
-                  (chat.reading?.readWindows || 0) > readsBefore
-                )
-                  state.recoverableCoverageErrors = 0;
-                if (checkpoint && state.generation === generation)
-                  state.diagnosticScope?.record('import.progress', {
-                    toolName: params.tool,
-                    turns: checkpoint.turns,
-                    readyRecords: chat.reading?.readyRecords || 0,
-                    readWindows: chat.reading?.readWindows || 0,
-                    accountedUnits: chat.reading?.accountedUnits || 0,
-                    remainingUnits: chat.reading?.remainingUnits || 0,
-                    pendingReadWindows: chat.reading?.pendingReadWindows || 0,
-                  });
-                return result;
-              })
-              .catch((error) => {
+                  await guard();
+                })();
+              }),
+            ),
+          onTool: (params) =>
+            withoutClinicalOperation(() =>
+              withVaultAssistantAuthorization(compactJob, () => {
+                let beforeIntake: ConversionIntake | null = null;
                 if (
                   checkpoint &&
                   active.get(profileId) === state &&
                   state.generation === generation
                 ) {
-                  const finishAfterToolFailure = (
-                    thrown: unknown,
-                    message: string,
-                    reason: string,
-                  ): void => {
-                    // Capture the exact bounded host error while this authorized
-                    // profile/run generation is still active. A later Stop/lock
-                    // callback cannot enter this branch or create a private trace.
-                    try {
-                      diagnostics.capturePayload?.(
-                        'tool.response',
-                        {
-                          tool: params.tool,
-                          failed: true,
-                          result: privateConversionToolFailure(
-                            error,
-                            extensionTools.some((item) => item.name === params.tool),
-                          ),
-                        },
-                        diagnosticContext,
+                  try {
+                    beforeIntake = conversionIntake(profileId, chat);
+                  } catch {
+                    /* The guarded tool path owns error classification. */
+                  }
+                }
+                const readsBefore =
+                  checkpoint && beforeIntake ? readingCount(checkpoint, beforeIntake) : 0;
+                const nativeProgressBefore =
+                  isNativeAssistantConversion(beforeIntake) &&
+                  isNativeAssistantCheckpoint(checkpoint) &&
+                  params.tool === 'health_intake_batch'
+                    ? nativeAssistantBatchProgress(
+                        beforeIntake,
+                        checkpoint,
+                        params.arguments.operationId,
+                        modelMappingRuleContext(dbFor(profileId), beforeIntake.providerId)
+                          .mappingRulesVersion,
+                      )
+                    : undefined;
+                const batchProgressBefore =
+                  checkpoint &&
+                  active.get(profileId) === state &&
+                  state.generation === generation &&
+                  params.tool === 'health_intake_batch'
+                    ? isNativeAssistantConversion(beforeIntake)
+                      ? null
+                      : durableBatchProgress(beforeIntake)
+                    : null;
+                return callTool(profileId, chat, params, state, generation)
+                  .finally(() => {
+                    // A plan command may replace the legacy checkpoint representation.
+                    // Usage, progress and completion callbacks must share the new ledger.
+                    checkpoint = state.checkpoint;
+                  })
+                  .then((result) => {
+                    const batchCurrent =
+                      checkpoint &&
+                      active.get(profileId) === state &&
+                      state.generation === generation &&
+                      params.tool === 'health_intake_batch'
+                        ? conversionIntake(profileId, chat)
+                        : null;
+                    const nativeProgressAfter =
+                      isNativeAssistantConversion(batchCurrent) &&
+                      isNativeAssistantCheckpoint(checkpoint)
+                        ? nativeAssistantBatchProgress(
+                            batchCurrent,
+                            checkpoint,
+                            params.arguments.operationId,
+                            modelMappingRuleContext(dbFor(profileId), batchCurrent.providerId)
+                              .mappingRulesVersion,
+                          )
+                        : undefined;
+                    if (batchCurrent?.durability?.pending)
+                      throw new HttpError(
+                        503,
+                        'INTAKE_DURABILITY_PENDING',
+                        'The batch receipt may already be retained, but durable publication is pending. Pause and reconcile the exact operation before continuing.',
                       );
-                    } catch {
-                      // Optional diagnostics must never alter tool failure handling.
+                    if (
+                      checkpoint &&
+                      active.get(profileId) === state &&
+                      state.generation === generation &&
+                      params.tool === 'health_intake_batch' &&
+                      ((nativeProgressBefore &&
+                        nativeProgressAfter &&
+                        !nativeProgressBefore.recorded &&
+                        nativeProgressAfter.recorded &&
+                        (nativeProgressAfter.versions > nativeProgressBefore.versions ||
+                          nativeProgressAfter.accounted > nativeProgressBefore.accounted)) ||
+                        (!isNativeAssistantConversion(batchCurrent) &&
+                          advancedDurableBatchProgress(
+                            batchProgressBefore,
+                            batchCurrent,
+                            params.arguments.operationId,
+                          )))
+                    )
+                    // Reads, questions, new operation IDs and no-op/inspected
+                    // batches cannot replenish this consecutive-stale budget.
+                    {
+                      state.recoverableStaleVersionErrors = 0;
+                      try {
+                        state.diagnosticScope?.record('import.progress', {
+                          recoveryAction: 'batch_progress',
+                          toolName: params.tool,
+                          currentVersion: batchCurrent?.version ?? null,
+                          candidates: batchCurrent ? candidateCount(batchCurrent) : 0,
+                          accountedUnits:
+                            batchCurrent && !isNativeAssistantConversion(batchCurrent)
+                              ? accountedIntakeUnitIds(batchCurrent).length
+                              : 0,
+                        });
+                      } catch {
+                        /* Optional recovery diagnostics cannot alter model/tool outcomes. */
+                      }
                     }
-                    markModelToolTerminalError(thrown);
-                    const code = object(thrown) ? thrown.code : null;
-                    if (state.beforeModelRequest && reason === 'tool_error') {
-                      if (
-                        [
-                          'SOURCE_OCR_PREREQUISITE',
-                          'SOURCE_EXTRACTION_BUSY',
-                          'SOURCE_TEXT_EXTRACTION_ACTIVE',
-                        ].includes(String(code))
-                      )
-                        reason = 'source_prerequisite';
-                      else if (
-                        thrown instanceof ModelToolValidationError ||
-                        ['INTAKE_WORK_UNIT_SCOPE', 'CONVERSION_COVERAGE_PENDING'].includes(
-                          String(code),
-                        )
-                      )
-                        reason = 'model_tool_retry';
-                    }
-                    finish('idle', message, reason);
-                  };
-                  if (object(error) && error.code === 'CONVERSION_NO_PROGRESS') {
-                    finishAfterToolFailure(error, conversionToolFailure(error), 'no_progress');
-                    throw error;
-                  }
-                  const validation = conversionValidationError(params.tool, error);
-                  if (validation) {
-                    if (modelContextChanged(params.tool, error)) {
-                      // A successful revision-pinned read resolves ordinary review churn.
-                      // Consecutive changes remain finite without spending the lifetime
-                      // malformed-input repair budget.
-                      state.recoverableContextRefreshErrors =
-                        (state.recoverableContextRefreshErrors || 0) + 1;
-                      if (
-                        state.recoverableContextRefreshErrors >=
-                        MAX_RECOVERABLE_CONTEXT_REFRESH_ERRORS
-                      )
-                        finishAfterToolFailure(validation, validation.message, 'tool_error');
-                    } else {
-                      // A run gets at most two malformed-input repairs. Reads or unrelated
-                      // successes do not reset this budget and turn invalid requests into a loop.
-                      state.recoverableValidationErrors =
-                        (state.recoverableValidationErrors || 0) + 1;
-                      if (state.recoverableValidationErrors >= MAX_RECOVERABLE_VALIDATION_ERRORS)
-                        finishAfterToolFailure(validation, validation.message, 'tool_error');
-                    }
-                    throw validation;
-                  }
-                  const staleVersion = conversionStaleVersionError(params.tool, error);
-                  if (staleVersion) {
-                    // This independent consecutive budget is not reset by reads, unrelated
-                    // successes, or a new bridge slice. The third stale attempt pauses.
-                    state.recoverableStaleVersionErrors =
-                      (state.recoverableStaleVersionErrors || 0) + 1;
-                    try {
+                    if (
+                      checkpoint &&
+                      active.get(profileId) === state &&
+                      state.generation === generation &&
+                      params.tool === 'health_intake_plan' &&
+                      params.arguments.action === 'read'
+                    )
+                      state.recoverableContextRefreshErrors = 0;
+                    if (
+                      checkpoint &&
+                      state.generation === generation &&
+                      (chat.reading?.readWindows || 0) > readsBefore
+                    )
+                      state.recoverableCoverageErrors = 0;
+                    if (checkpoint && state.generation === generation)
                       state.diagnosticScope?.record('import.progress', {
-                        ...diagnosticFailureFields(staleVersion),
-                        recoveryAction:
+                        toolName: params.tool,
+                        turns: checkpoint.turns,
+                        readyRecords: chat.reading?.readyRecords || 0,
+                        readWindows: chat.reading?.readWindows || 0,
+                        accountedUnits: chat.reading?.accountedUnits || 0,
+                        remainingUnits: chat.reading?.remainingUnits || 0,
+                        pendingReadWindows: chat.reading?.pendingReadWindows || 0,
+                      });
+                    return result;
+                  })
+                  .catch(async (error) => {
+                    if (
+                      checkpoint &&
+                      active.get(profileId) === state &&
+                      state.generation === generation
+                    ) {
+                      const finishAfterToolFailure = async (
+                        thrown: unknown,
+                        message: string,
+                        reason: string,
+                      ): Promise<void> => {
+                        // Capture the exact bounded host error while this authorized
+                        // profile/run generation is still active. A later Stop/lock
+                        // callback cannot enter this branch or create a private trace.
+                        try {
+                          diagnostics.capturePayload?.(
+                            'tool.response',
+                            {
+                              tool: params.tool,
+                              failed: true,
+                              result: privateConversionToolFailure(
+                                error,
+                                extensionTools.some((item) => item.name === params.tool),
+                              ),
+                            },
+                            diagnosticContext,
+                          );
+                        } catch {
+                          // Optional diagnostics must never alter tool failure handling.
+                        }
+                        markModelToolTerminalError(thrown);
+                        const code = object(thrown) ? thrown.code : null;
+                        if (state.beforeModelRequest && reason === 'tool_error') {
+                          if (
+                            [
+                              'SOURCE_OCR_PREREQUISITE',
+                              'SOURCE_EXTRACTION_BUSY',
+                              'SOURCE_TEXT_EXTRACTION_ACTIVE',
+                            ].includes(String(code))
+                          )
+                            reason = 'source_prerequisite';
+                          else if (
+                            thrown instanceof ModelToolValidationError ||
+                            ['INTAKE_WORK_UNIT_SCOPE', 'CONVERSION_COVERAGE_PENDING'].includes(
+                              String(code),
+                            )
+                          )
+                            reason = 'model_tool_retry';
+                        }
+                        await finishContinuation('idle', message, reason, generation);
+                      };
+                      if (object(error) && error.code === 'CONVERSION_NO_PROGRESS') {
+                        await finishAfterToolFailure(
+                          error,
+                          conversionToolFailure(error),
+                          'no_progress',
+                        );
+                        throw error;
+                      }
+                      const validation = conversionValidationError(params.tool, error);
+                      if (validation) {
+                        if (modelContextChanged(params.tool, error)) {
+                          // A successful revision-pinned read resolves ordinary review churn.
+                          // Consecutive changes remain finite without spending the lifetime
+                          // malformed-input repair budget.
+                          state.recoverableContextRefreshErrors =
+                            (state.recoverableContextRefreshErrors || 0) + 1;
+                          if (
+                            state.recoverableContextRefreshErrors >=
+                            MAX_RECOVERABLE_CONTEXT_REFRESH_ERRORS
+                          )
+                            await finishAfterToolFailure(
+                              validation,
+                              validation.message,
+                              'tool_error',
+                            );
+                        } else {
+                          // A run gets at most two malformed-input repairs. Reads or unrelated
+                          // successes do not reset this budget and turn invalid requests into a loop.
+                          state.recoverableValidationErrors =
+                            (state.recoverableValidationErrors || 0) + 1;
+                          if (
+                            state.recoverableValidationErrors >= MAX_RECOVERABLE_VALIDATION_ERRORS
+                          )
+                            await finishAfterToolFailure(
+                              validation,
+                              validation.message,
+                              'tool_error',
+                            );
+                        }
+                        throw validation;
+                      }
+                      const staleVersion = conversionStaleVersionError(params.tool, error);
+                      if (staleVersion) {
+                        // This independent consecutive budget is not reset by reads, unrelated
+                        // successes, or a new bridge slice. The third stale attempt pauses.
+                        state.recoverableStaleVersionErrors =
+                          (state.recoverableStaleVersionErrors || 0) + 1;
+                        try {
+                          state.diagnosticScope?.record('import.progress', {
+                            ...diagnosticFailureFields(staleVersion),
+                            recoveryAction:
+                              state.recoverableStaleVersionErrors >=
+                              MAX_RECOVERABLE_STALE_VERSION_ERRORS
+                                ? 'pause'
+                                : 'refresh_context',
+                            toolName: params.tool,
+                            recoveryAttempt: state.recoverableStaleVersionErrors,
+                            recoveryLimit: MAX_RECOVERABLE_STALE_VERSION_ERRORS,
+                          });
+                        } catch {
+                          /* Optional recovery diagnostics cannot alter model/tool outcomes. */
+                        }
+                        if (
                           state.recoverableStaleVersionErrors >=
                           MAX_RECOVERABLE_STALE_VERSION_ERRORS
-                            ? 'pause'
-                            : 'refresh_context',
-                        toolName: params.tool,
-                        recoveryAttempt: state.recoverableStaleVersionErrors,
-                        recoveryLimit: MAX_RECOVERABLE_STALE_VERSION_ERRORS,
-                      });
-                    } catch {
-                      /* Optional recovery diagnostics cannot alter model/tool outcomes. */
+                        )
+                          await finishAfterToolFailure(
+                            staleVersion,
+                            staleVersion.message,
+                            'tool_error',
+                          );
+                        throw staleVersion;
+                      }
+                      if (object(error) && error.code === 'CONVERSION_COVERAGE_PENDING') {
+                        state.recoverableCoverageErrors =
+                          (state.recoverableCoverageErrors || 0) + 1;
+                        if (state.recoverableCoverageErrors >= MAX_RECOVERABLE_COVERAGE_ERRORS)
+                          await finishAfterToolFailure(
+                            error,
+                            conversionToolFailure(error),
+                            'tool_error',
+                          );
+                      } else
+                        await finishAfterToolFailure(
+                          error,
+                          conversionToolFailure(error),
+                          'tool_error',
+                        );
                     }
-                    if (state.recoverableStaleVersionErrors >= MAX_RECOVERABLE_STALE_VERSION_ERRORS)
-                      finishAfterToolFailure(staleVersion, staleVersion.message, 'tool_error');
-                    throw staleVersion;
-                  }
-                  if (object(error) && error.code === 'CONVERSION_COVERAGE_PENDING') {
-                    state.recoverableCoverageErrors = (state.recoverableCoverageErrors || 0) + 1;
-                    if (state.recoverableCoverageErrors >= MAX_RECOVERABLE_COVERAGE_ERRORS)
-                      finishAfterToolFailure(error, conversionToolFailure(error), 'tool_error');
-                  } else finishAfterToolFailure(error, conversionToolFailure(error), 'tool_error');
-                }
-                throw error;
-              });
-          },
-          onExit: (error) => {
-            if (state.generation === generation)
-              checkpoint && error instanceof ReadingJobLimitError
-                ? finish('idle', null, 'job_limit')
-                : checkpoint && error instanceof ReadingDeadlineError
-                  ? finish('idle', null, 'time_limit')
-                  : checkpoint && error instanceof ModelContextLimitError
-                    ? finish(
-                        'idle',
-                        error.message,
-                        error.origin === 'slice' ? 'time_limit' : 'context_limit',
-                      )
-                    : finish('failed', error.message);
-          },
-          onEvent: async (method, params) => {
-            if (active.get(profileId) !== state || state.generation !== generation) {
-              if (
-                method === 'model/requestFinished' &&
-                databases.has(profileId) &&
-                chat.intakeModelAttempts?.some((a) => a.requestId === params.requestId)
-              ) {
-                chat.intakeModelAttempts = finishIntakeModelAttempt(
-                  chat.intakeModelAttempts,
-                  params,
-                  clock().toISOString(),
-                );
-                persist(profileId, chat, 'conversion-late-attempt-accounting');
-              }
-              return;
-            }
-            try {
-              const turn = object(params.turn) ? params.turn : {};
-              const tokenUsage = object(params.tokenUsage) ? params.tokenUsage : {};
-              const item = object(params.item) ? params.item : {};
-              const eventError = object(params.error) ? params.error : {};
-              if (
-                checkpoint &&
-                method === 'model/toolResultsConsumed' &&
-                Array.isArray(params.callIds)
-              ) {
-                const beforeAcknowledgement = (currentCheckpoint: ConversionCheckpoint) => {
-                  const beforeConsumption = batchCheckpointBasis(currentCheckpoint),
-                    nativeBasis = state.nativeBatchRevalidationBasis,
-                    beforeHost = conversionIntake(profileId, chat),
-                    beforeScope =
-                      isNativeAssistantConversion(beforeHost) &&
-                      isNativeAssistantCheckpoint(currentCheckpoint)
-                        ? nativeAssistantScope(beforeHost, currentCheckpoint.activeUnitId)
-                        : undefined;
-                  return {
-                    beforeConsumption,
-                    nativeBasis,
-                    beforeLedger: beforeScope
-                      ? collectionConversionLedgerBinding(beforeScope)
-                      : undefined,
-                    basis: state.batchRevalidationBasis,
-                  };
-                };
-                let before: ReturnType<typeof beforeAcknowledgement> | undefined;
-                let changed = false;
-                for (const callId of params.callIds) {
-                  if (typeof callId !== 'string') continue;
-                  const receipt = state.unconsumedReads?.get(callId);
-                  if (!receipt) continue;
-                  // Snapshot once, before the first actual acknowledgement mutates its ledger.
-                  before ??= beforeAcknowledgement(checkpoint);
-                  if ('format' in receipt && receipt.format === 'health-intake-deferred-read-v2') {
-                    const current = conversionIntake(profileId, chat);
-                    if (
-                      !isNativeAssistantConversion(current) ||
-                      !isNativeAssistantCheckpoint(checkpoint)
-                    )
-                      throw new Error('Deferred evidence authority changed');
-                    const scope = nativeAssistantScope(current, receipt.unitId);
-                    if (!scope) throw new Error('Deferred evidence unit is unavailable');
-                    changed =
-                      (await acknowledgeCollectionConversionRead(
-                        scope,
-                        createCollectionCheckpoint(scope),
-                        receipt.key,
-                        {
-                          assertRunning() {
-                            state.assertAuthorized?.('publish');
-                            if (
-                              dbFor(profileId) !== current.db ||
-                              active.get(profileId) !== state ||
-                              state.generation !== generation
-                            )
-                              throw new Error('This response is no longer running');
-                          },
-                        },
-                      )) || changed;
-                  } else if (!isNativeAssistantCheckpoint(checkpoint) && 'tool' in receipt)
-                    changed =
-                      recordConversionRead(
-                        checkpoint,
-                        receipt.tool,
-                        receipt.args,
-                        receipt.result,
-                      ) || changed;
-                  else throw new Error('Deferred evidence checkpoint changed');
-                  state.unconsumedReads!.delete(callId);
-                }
-                if (changed) {
-                  const { beforeConsumption, nativeBasis, beforeLedger, basis } = before!;
-                  // A valid response acknowledges the exact evidence in its
-                  // request. Advance only that host cursor projection when the
-                  // frozen request basis still matches. Source/version, user
-                  // decisions and generation bindings remain untouched.
-                  if (
-                    basis &&
-                    basis.generation === generation &&
-                    basis.requestOrdinal === state.modelRequestOrdinal &&
-                    basis.checkpoint === beforeConsumption
-                  )
-                    basis.checkpoint = batchCheckpointBasis(checkpoint);
-                  const current = conversionIntake(profileId, chat);
-                  if (!current) throw new Error('The linked conversion changed');
-                  if (
-                    nativeBasis &&
-                    isNativeAssistantConversion(current) &&
-                    isNativeAssistantCheckpoint(checkpoint) &&
-                    nativeBasis.generation === generation &&
-                    nativeBasis.requestOrdinal === state.modelRequestOrdinal &&
-                    nativeBasis.checkpoint === beforeConsumption &&
-                    nativeBasis.ledger === beforeLedger
-                  ) {
-                    const scope = nativeAssistantScope(current, checkpoint.activeUnitId);
-                    if (scope) {
-                      nativeBasis.ledger = collectionConversionLedgerBinding(scope);
-                      nativeBasis.checkpoint = batchCheckpointBasis(checkpoint);
-                    }
-                  }
-                  chat.reading = conversionReadingState(checkpoint, current);
-                  state.recoverableCoverageErrors = 0;
-                  persist(profileId, chat, 'evidence-consumed');
-                }
-              }
-              if (
-                checkpoint &&
-                method === 'model/evidenceFallback' &&
-                typeof params.durationMs === 'number' &&
-                Number.isFinite(params.durationMs) &&
-                params.durationMs >= 0 &&
-                typeof params.pageCount === 'number' &&
-                Number.isSafeInteger(params.pageCount) &&
-                params.pageCount > 0
-              ) {
-                try {
-                  state.diagnosticScope?.record('import.phase.completed', {
-                    phase: 'pdf_compatibility_fallback',
-                    durationMs: params.durationMs,
-                    pageCount: params.pageCount,
+                    throw error;
                   });
-                } catch {
-                  /* Optional diagnostics cannot change compatibility recovery. */
-                }
+              }),
+            ),
+          onExit: (error) => {
+            if (active.get(profileId) !== state || state.generation !== generation)
+              return Promise.resolve();
+            return callbackHost(async () => {
+              if (state.generation === generation)
+                checkpoint && error instanceof ReadingJobLimitError
+                  ? finish('idle', null, 'job_limit')
+                  : checkpoint && error instanceof ReadingDeadlineError
+                    ? finish('idle', null, 'time_limit')
+                    : checkpoint && error instanceof ModelContextLimitError
+                      ? finish(
+                          'idle',
+                          error.message,
+                          error.origin === 'slice' ? 'time_limit' : 'context_limit',
+                        )
+                      : finish('failed', error.message);
+            }).catch((error) => {
+              // Cancellation and generation handoff already published their
+              // terminal state; a retired provider exit has nothing to save.
+              if (active.get(profileId) !== state || state.generation !== generation) return;
+              throw error;
+            });
+          },
+          onEvent: (method, params) => {
+            if (
+              method === 'model/requestFinished' &&
+              typeof params.requestId === 'string' &&
+              requestAccounting.has(params.requestId) &&
+              (active.get(profileId) !== state || state.generation !== generation)
+            )
+              return accountRetiredRequest(params);
+            if (active.get(profileId) !== state || state.generation !== generation)
+              return Promise.resolve();
+            return callbackHost(async () => {
+              if (active.get(profileId) !== state || state.generation !== generation) {
+                if (
+                  method === 'model/requestFinished' &&
+                  typeof params.requestId === 'string' &&
+                  requestAccounting.has(params.requestId)
+                )
+                  accountRequest(params);
+                return;
               }
-              if (
-                checkpoint &&
-                method === 'model/evidenceAcknowledged' &&
-                Array.isArray(params.attributionCallIds)
-              ) {
-                try {
-                  for (const id of params.attributionCallIds) {
-                    const attribution =
-                      typeof id === 'string' ? state.attributionCalls?.get(id) : null;
-                    if (attribution && !attribution.acknowledged) {
+              try {
+                const turn = object(params.turn) ? params.turn : {};
+                const tokenUsage = object(params.tokenUsage) ? params.tokenUsage : {};
+                const item = object(params.item) ? params.item : {};
+                const eventError = object(params.error) ? params.error : {};
+                if (
+                  checkpoint &&
+                  method === 'model/toolResultsConsumed' &&
+                  Array.isArray(params.callIds)
+                ) {
+                  const beforeAcknowledgement = (currentCheckpoint: ConversionCheckpoint) => {
+                    const beforeConsumption = batchCheckpointBasis(currentCheckpoint),
+                      nativeBasis = state.nativeBatchRevalidationBasis,
+                      beforeHost = conversionIntake(profileId, chat),
+                      beforeScope =
+                        isNativeAssistantConversion(beforeHost) &&
+                        isNativeAssistantCheckpoint(currentCheckpoint)
+                          ? nativeAssistantScope(beforeHost, currentCheckpoint.activeUnitId)
+                          : undefined;
+                    return {
+                      beforeConsumption,
+                      nativeBasis,
+                      beforeLedger: beforeScope
+                        ? collectionConversionLedgerBinding(beforeScope)
+                        : undefined,
+                      basis: state.batchRevalidationBasis,
+                    };
+                  };
+                  let before: ReturnType<typeof beforeAcknowledgement> | undefined;
+                  let changed = false;
+                  for (const callId of params.callIds) {
+                    if (typeof callId !== 'string') continue;
+                    const receipt = state.unconsumedReads?.get(callId);
+                    if (!receipt) continue;
+                    // Snapshot once, before the first actual acknowledgement mutates its ledger.
+                    before ??= beforeAcknowledgement(checkpoint);
+                    if (
+                      'format' in receipt &&
+                      receipt.format === 'health-intake-deferred-read-v2'
+                    ) {
+                      const current = conversionIntake(profileId, chat);
+                      if (
+                        !isNativeAssistantConversion(current) ||
+                        !isNativeAssistantCheckpoint(checkpoint)
+                      )
+                        throw new Error('Deferred evidence authority changed');
+                      const scope = nativeAssistantScope(current, receipt.unitId);
+                      if (!scope) throw new Error('Deferred evidence unit is unavailable');
+                      changed =
+                        (await acknowledgeCollectionConversionRead(
+                          scope,
+                          createCollectionCheckpoint(scope),
+                          receipt.key,
+                          {
+                            assertRunning() {
+                              state.assertAuthorized?.('publish');
+                              if (
+                                dbFor(profileId) !== current.db ||
+                                active.get(profileId) !== state ||
+                                state.generation !== generation
+                              )
+                                throw new Error('This response is no longer running');
+                            },
+                          },
+                        )) || changed;
+                    } else if (!isNativeAssistantCheckpoint(checkpoint) && 'tool' in receipt)
+                      changed =
+                        recordConversionRead(
+                          checkpoint,
+                          receipt.tool,
+                          receipt.args,
+                          receipt.result,
+                        ) || changed;
+                    else throw new Error('Deferred evidence checkpoint changed');
+                    state.unconsumedReads!.delete(callId);
+                  }
+                  if (changed) {
+                    const { beforeConsumption, nativeBasis, beforeLedger, basis } = before!;
+                    // A valid response acknowledges the exact evidence in its
+                    // request. Advance only that host cursor projection when the
+                    // frozen request basis still matches. Source/version, user
+                    // decisions and generation bindings remain untouched.
+                    if (
+                      basis &&
+                      basis.generation === generation &&
+                      basis.requestOrdinal === state.modelRequestOrdinal &&
+                      basis.checkpoint === beforeConsumption
+                    )
+                      basis.checkpoint = batchCheckpointBasis(checkpoint);
+                    const current = conversionIntake(profileId, chat);
+                    if (!current) throw new Error('The linked conversion changed');
+                    if (
+                      nativeBasis &&
+                      isNativeAssistantConversion(current) &&
+                      isNativeAssistantCheckpoint(checkpoint) &&
+                      nativeBasis.generation === generation &&
+                      nativeBasis.requestOrdinal === state.modelRequestOrdinal &&
+                      nativeBasis.checkpoint === beforeConsumption &&
+                      nativeBasis.ledger === beforeLedger
+                    ) {
+                      const scope = nativeAssistantScope(current, checkpoint.activeUnitId);
+                      if (scope) {
+                        nativeBasis.ledger = collectionConversionLedgerBinding(scope);
+                        nativeBasis.checkpoint = batchCheckpointBasis(checkpoint);
+                      }
+                    }
+                    chat.reading = conversionReadingState(checkpoint, current);
+                    state.recoverableCoverageErrors = 0;
+                    persist(profileId, chat, 'evidence-consumed');
+                  }
+                }
+                if (
+                  checkpoint &&
+                  method === 'model/evidenceFallback' &&
+                  typeof params.durationMs === 'number' &&
+                  Number.isFinite(params.durationMs) &&
+                  params.durationMs >= 0 &&
+                  typeof params.pageCount === 'number' &&
+                  Number.isSafeInteger(params.pageCount) &&
+                  params.pageCount > 0
+                ) {
+                  try {
+                    state.diagnosticScope?.record('import.phase.completed', {
+                      phase: 'pdf_compatibility_fallback',
+                      durationMs: params.durationMs,
+                      pageCount: params.pageCount,
+                    });
+                  } catch {
+                    /* Optional diagnostics cannot change compatibility recovery. */
+                  }
+                }
+                if (
+                  checkpoint &&
+                  method === 'model/evidenceAcknowledged' &&
+                  Array.isArray(params.attributionCallIds)
+                ) {
+                  try {
+                    for (const id of params.attributionCallIds) {
+                      const attribution =
+                        typeof id === 'string' ? state.attributionCalls?.get(id) : null;
+                      if (attribution && !attribution.acknowledged) {
+                        if (isNativeAssistantCheckpoint(checkpoint)) {
+                          const host = conversionIntake(profileId, chat);
+                          if (isNativeAssistantConversion(host))
+                            acknowledgeNativeAttributionRead(
+                              host,
+                              checkpoint,
+                              attribution.scopeKey,
+                            );
+                        } else acknowledgeAttributionRead(checkpoint, attribution.scopeKey);
+                        attribution.acknowledged = true;
+                      }
+                    }
+                  } catch {
+                    /* Optional attribution never gates evidence acknowledgment. */
+                  }
+                }
+                if (method === 'turn/started' && typeof turn.id === 'string')
+                  state.turnId = turn.id;
+                if (
+                  checkpoint &&
+                  method === 'model/requestFinished' &&
+                  typeof params.requestId === 'string'
+                ) {
+                  if (chat.intakeModelAttempts?.some((a) => a.requestId === params.requestId)) {
+                    chat.intakeModelAttempts = finishIntakeModelAttempt(
+                      chat.intakeModelAttempts,
+                      params,
+                      clock().toISOString(),
+                    );
+                    if (params.outcome === 'response') {
+                      checkpoint.usableModelResponses = (checkpoint.usableModelResponses || 0) + 1;
+                      checkpoint.initialContextFailures = 0;
+                    }
+                    if (chat.reading)
+                      chat.reading.usableModelResponses = checkpoint.usableModelResponses || 0;
+                    if (chat.reading)
+                      chat.reading.providerWait = intakeAttemptWait(chat.intakeModelAttempts);
+                    persist(profileId, chat, 'conversion-model-attempt-finished');
+                  }
+                  try {
+                    const scopes = state.attributionRequests?.get(params.requestId);
+                    if (scopes) {
                       if (isNativeAssistantCheckpoint(checkpoint)) {
                         const host = conversionIntake(profileId, chat);
                         if (isNativeAssistantConversion(host))
-                          acknowledgeNativeAttributionRead(host, checkpoint, attribution.scopeKey);
-                      } else acknowledgeAttributionRead(checkpoint, attribution.scopeKey);
-                      attribution.acknowledged = true;
-                    }
-                  }
-                } catch {
-                  /* Optional attribution never gates evidence acknowledgment. */
-                }
-              }
-              if (method === 'turn/started' && typeof turn.id === 'string') state.turnId = turn.id;
-              if (
-                checkpoint &&
-                method === 'model/requestFinished' &&
-                typeof params.requestId === 'string'
-              ) {
-                if (chat.intakeModelAttempts?.some((a) => a.requestId === params.requestId)) {
-                  chat.intakeModelAttempts = finishIntakeModelAttempt(
-                    chat.intakeModelAttempts,
-                    params,
-                    clock().toISOString(),
-                  );
-                  if (params.outcome === 'response') {
-                    checkpoint.usableModelResponses = (checkpoint.usableModelResponses || 0) + 1;
-                    checkpoint.initialContextFailures = 0;
-                  }
-                  if (chat.reading)
-                    chat.reading.usableModelResponses = checkpoint.usableModelResponses || 0;
-                  if (chat.reading)
-                    chat.reading.providerWait = intakeAttemptWait(chat.intakeModelAttempts);
-                  persist(profileId, chat, 'conversion-model-attempt-finished');
-                }
-                try {
-                  const scopes = state.attributionRequests?.get(params.requestId);
-                  if (scopes) {
-                    if (isNativeAssistantCheckpoint(checkpoint)) {
-                      const host = conversionIntake(profileId, chat);
-                      if (isNativeAssistantConversion(host))
-                        await finishNativeAttributionRequest(host, checkpoint, scopes, {
+                          await finishNativeAttributionRequest(host, checkpoint, scopes, {
+                            failed: params.failed === true,
+                            usage: params.usage,
+                          });
+                      } else
+                        finishAttributionRequest(checkpoint, scopes, {
                           failed: params.failed === true,
                           usage: params.usage,
                         });
-                    } else
-                      finishAttributionRequest(checkpoint, scopes, {
-                        failed: params.failed === true,
-                        usage: params.usage,
-                      });
-                    state.attributionRequests!.delete(params.requestId);
+                      state.attributionRequests!.delete(params.requestId);
+                    }
+                  } catch {
+                    /* Optional attribution never changes provider handling. */
                   }
-                } catch {
-                  /* Optional attribution never changes provider handling. */
                 }
-              }
-              if (checkpoint && method === 'model/requestStarted') {
-                const scoped = conversionIntake(profileId, chat);
-                if (!scoped) throw new Error('The conversion source is unavailable');
-                if (typeof params.requestDigest === 'string') {
-                  chat.intakeModelAttempts = startIntakeModelAttempt(
-                    chat.intakeModelAttempts || [],
-                    params,
-                    {
-                      profileId,
-                      intakeId: scoped.id,
-                      sourceHash: scoped.sha256,
-                      sourceTextRevisionId: currentIntakeSourceTextRevisionId(
-                        dbFor(profileId),
+                if (checkpoint && method === 'model/requestStarted') {
+                  const scoped = conversionIntake(profileId, chat);
+                  if (!scoped) throw new Error('The conversion source is unavailable');
+                  if (typeof params.requestDigest === 'string') {
+                    chat.intakeModelAttempts = startIntakeModelAttempt(
+                      chat.intakeModelAttempts || [],
+                      params,
+                      {
                         profileId,
-                        scoped.id,
-                      ),
-                      intakeVersion: scoped.version,
-                      runId: runRecord.id,
-                      backend: runRecord.backend || null,
-                      instructionVersion: INSTRUCTION_VERSION,
-                      workUnit: chat.reading?.workUnit || null,
-                    },
-                    clock().toISOString(),
-                  );
-                  if (chat.reading) chat.reading.providerWait = null;
-                  // Synchronous journal publication is admission to the bridge fetch.
-                  // Failure throws before any provider dispatch.
-                  persist(profileId, chat, 'conversion-model-attempt-dispatched');
-                }
-                try {
-                  const scopeKeys = (
-                    Array.isArray(params.exposedCallIds) ? params.exposedCallIds : []
-                  ).flatMap((callId) =>
-                    typeof callId === 'string' && state.attributionCalls?.has(callId)
-                      ? [state.attributionCalls.get(callId)!.scopeKey]
-                      : [],
-                  );
-                  const scopes =
-                    isNativeAssistantCheckpoint(checkpoint) && isNativeAssistantConversion(scoped)
-                      ? await startNativeAttributionRequest(scoped, checkpoint, scopeKeys)
-                      : !isNativeAssistantCheckpoint(checkpoint)
-                        ? startAttributionRequest(checkpoint, scopeKeys)
-                        : [];
+                        intakeId: scoped.id,
+                        sourceHash: scoped.sha256,
+                        sourceTextRevisionId: currentIntakeSourceTextRevisionId(
+                          dbFor(profileId),
+                          profileId,
+                          scoped.id,
+                        ),
+                        intakeVersion: scoped.version,
+                        runId: runRecord.id,
+                        backend: runRecord.backend || null,
+                        instructionVersion: INSTRUCTION_VERSION,
+                        workUnit: chat.reading?.workUnit || null,
+                      },
+                      clock().toISOString(),
+                    );
+                    if (chat.reading) chat.reading.providerWait = null;
+                    // Synchronous journal publication is admission to the bridge fetch.
+                    // Failure throws before any provider dispatch.
+                    persist(profileId, chat, 'conversion-model-attempt-dispatched');
+                    captureVaultAssistantRequestAccounting(compactJob, String(params.requestId));
+                    requestAccounting.add(String(params.requestId));
+                  }
+                  try {
+                    const scopeKeys = (
+                      Array.isArray(params.exposedCallIds) ? params.exposedCallIds : []
+                    ).flatMap((callId) =>
+                      typeof callId === 'string' && state.attributionCalls?.has(callId)
+                        ? [state.attributionCalls.get(callId)!.scopeKey]
+                        : [],
+                    );
+                    const scopes =
+                      isNativeAssistantCheckpoint(checkpoint) && isNativeAssistantConversion(scoped)
+                        ? await startNativeAttributionRequest(scoped, checkpoint, scopeKeys)
+                        : !isNativeAssistantCheckpoint(checkpoint)
+                          ? startAttributionRequest(checkpoint, scopeKeys)
+                          : [];
+                    if (active.get(profileId) !== state || state.generation !== generation) return;
+                    if (typeof params.requestId === 'string')
+                      (state.attributionRequests ||= new Map()).set(params.requestId, scopes);
+                  } catch {
+                    /* Optional attribution never changes request admission. */
+                  }
                   if (active.get(profileId) !== state || state.generation !== generation) return;
-                  if (typeof params.requestId === 'string')
-                    (state.attributionRequests ||= new Map()).set(params.requestId, scopes);
-                } catch {
-                  /* Optional attribution never changes request admission. */
-                }
-                if (active.get(profileId) !== state || state.generation !== generation) return;
-                checkpoint.modelRequests = (checkpoint.modelRequests || 0) + 1;
-                checkpoint.unmeasuredRequests = (checkpoint.unmeasuredRequests || 0) + 1;
-                const basisIntake = conversionIntake(profileId, chat);
-                const durability = personalDurabilityStatus(dbFor(profileId)) as ReturnType<
-                  typeof personalDurabilityStatus
-                > & { sequence?: number };
-                const rawIntake =
-                  basisIntake && !isNativeAssistantConversion(basisIntake)
-                    ? (readStoredIntakeDetails(dbFor(profileId), basisIntake.id) as unknown as
-                        UnknownRecord | undefined)
-                    : undefined;
-                const unitSources =
-                  basisIntake && !isNativeAssistantConversion(basisIntake)
-                    ? batchUnitSourceBasis(dbFor(profileId), root, profileId, basisIntake)
-                    : null;
-                state.modelRequestOrdinal = (state.modelRequestOrdinal || 0) + 1;
-                if (state.nativeBatchRevalidationBasis) {
-                  disposeNativeBatchRevalidationBasis(state.nativeBatchRevalidationBasis.proof);
-                  state.nativeBatchRevalidationBasis = undefined;
-                }
-                if (
-                  isNativeAssistantConversion(basisIntake) &&
-                  isNativeAssistantCheckpoint(checkpoint) &&
-                  !durability.dirty &&
-                  !durability.conflicted &&
-                  !durability.lastError &&
-                  !basisIntake.durability.pending
-                ) {
-                  const scope = nativeAssistantScope(basisIntake, checkpoint.activeUnitId);
-                  if (scope)
-                    state.nativeBatchRevalidationBasis = {
-                      profileId,
-                      chatId: chat.id,
-                      runId: state.run.id,
-                      generation,
-                      requestOrdinal: state.modelRequestOrdinal,
-                      database: dbFor(profileId),
-                      model: state.run.model || null,
-                      backend: state.run.backend || null,
-                      reasoningEffort: state.run.reasoningEffort || null,
-                      instructionVersion: INSTRUCTION_VERSION,
-                      mappingRulesVersion: modelMappingRuleContext(
-                        dbFor(profileId),
-                        basisIntake.providerId,
-                      ).mappingRulesVersion,
-                      checkpoint: batchCheckpointBasis(checkpoint),
-                      intakeId: basisIntake.id,
-                      version: basisIntake.version,
-                      sourceHash: basisIntake.sha256,
-                      ledger: collectionConversionLedgerBinding(scope),
-                      proof: captureNativeBatchRevalidationBasis(dbFor(profileId), {
-                        id: basisIntake.id,
-                      }),
-                    };
-                }
-                state.batchRevalidationBasis =
-                  basisIntake &&
-                  !isNativeAssistantConversion(basisIntake) &&
-                  unitSources &&
-                  !basisIntake.durability.pending &&
-                  rawIntake &&
-                  !durability.dirty &&
-                  !durability.conflicted &&
-                  !durability.lastError
-                    ? {
+                  checkpoint.modelRequests = (checkpoint.modelRequests || 0) + 1;
+                  checkpoint.unmeasuredRequests = (checkpoint.unmeasuredRequests || 0) + 1;
+                  const basisIntake = conversionIntake(profileId, chat);
+                  const durability = personalDurabilityStatus(dbFor(profileId)) as ReturnType<
+                    typeof personalDurabilityStatus
+                  > & { sequence?: number };
+                  const rawIntake =
+                    basisIntake && !isNativeAssistantConversion(basisIntake)
+                      ? (readStoredIntakeDetails(dbFor(profileId), basisIntake.id) as unknown as
+                          UnknownRecord | undefined)
+                      : undefined;
+                  const unitSources =
+                    basisIntake && !isNativeAssistantConversion(basisIntake)
+                      ? batchUnitSourceBasis(dbFor(profileId), root, profileId, basisIntake)
+                      : null;
+                  state.modelRequestOrdinal = (state.modelRequestOrdinal || 0) + 1;
+                  if (state.nativeBatchRevalidationBasis) {
+                    disposeNativeBatchRevalidationBasis(state.nativeBatchRevalidationBasis.proof);
+                    state.nativeBatchRevalidationBasis = undefined;
+                  }
+                  if (
+                    isNativeAssistantConversion(basisIntake) &&
+                    isNativeAssistantCheckpoint(checkpoint) &&
+                    !durability.dirty &&
+                    !durability.conflicted &&
+                    !durability.lastError &&
+                    !basisIntake.durability.pending
+                  ) {
+                    const scope = nativeAssistantScope(basisIntake, checkpoint.activeUnitId);
+                    if (scope)
+                      state.nativeBatchRevalidationBasis = {
                         profileId,
                         chatId: chat.id,
                         runId: state.run.id,
@@ -5246,268 +5406,323 @@ export function createAssistant({
                           basisIntake.providerId,
                         ).mappingRulesVersion,
                         checkpoint: batchCheckpointBasis(checkpoint),
-                        intake: structuredClone(basisIntake),
-                        rawIntake: structuredClone(rawIntake),
-                        revision: revision(dbFor(profileId)),
-                        persistedRevision: durability.persistedRevision,
-                        sequence: durability.sequence ?? null,
-                        unitSources,
-                      }
-                    : undefined;
-                if (chat.reading) {
-                  chat.reading.modelRequests = checkpoint.modelRequests;
-                  chat.reading.phase = 'waiting_for_model';
-                }
-                persist(profileId, chat, 'conversion-model-request');
-              }
-              if (checkpoint && method === 'model/requestUsage') {
-                if (params.measured === true)
-                  checkpoint.unmeasuredRequests = Math.max(
-                    0,
-                    (checkpoint.unmeasuredRequests || 0) - 1,
-                  );
-                else checkpoint.modelUsageIncomplete = true;
-                if (chat.reading)
-                  chat.reading.modelUsageIncomplete =
-                    !!checkpoint.modelUsageIncomplete || !!checkpoint.unmeasuredRequests;
-              }
-              if (
-                method === 'thread/tokenUsage/updated' &&
-                (!state.turnId || params.turnId === state.turnId)
-              ) {
-                const usage = measuredUsage(tokenUsage.total);
-                if (usage) {
-                  if (checkpoint && state.usageBeforeTurn)
-                    for (const field of Object.keys(usage))
-                      usage[field] =
-                        usage[field] !== null && state.usageBeforeTurn[field] !== null
-                          ? usage[field]! + state.usageBeforeTurn[field]!
-                          : null;
-                  const next = {
-                    ...usage,
-                    modelContextWindow:
-                      typeof tokenUsage.modelContextWindow === 'number' &&
-                      Number.isSafeInteger(tokenUsage.modelContextWindow) &&
-                      tokenUsage.modelContextWindow > 0
-                        ? tokenUsage.modelContextWindow
-                        : null,
-                    measuredAt: clock().toISOString(),
-                    source: 'thread/tokenUsage/updated',
-                  };
-                  if (checkpoint) {
-                    const currentTokens = usage.totalTokens;
-                    const previousTokens = measuredUsage(runRecord.usage)?.totalTokens || 0;
-                    if (typeof currentTokens !== 'number') checkpoint.modelUsageIncomplete = true;
-                    else
-                      checkpoint.measuredModelTokens =
-                        (checkpoint.measuredModelTokens || 0) +
-                        Math.max(0, currentTokens - previousTokens);
-                    if (chat.reading) {
-                      chat.reading.measuredModelTokens = checkpoint.measuredModelTokens || 0;
-                      chat.reading.modelUsageIncomplete =
-                        !!checkpoint.modelUsageIncomplete || !!checkpoint.unmeasuredRequests;
-                    }
+                        intakeId: basisIntake.id,
+                        version: basisIntake.version,
+                        sourceHash: basisIntake.sha256,
+                        ledger: collectionConversionLedgerBinding(scope),
+                        proof: captureNativeBatchRevalidationBasis(dbFor(profileId), {
+                          id: basisIntake.id,
+                        }),
+                      };
                   }
-                  if (JSON.stringify(runRecord.usage) !== JSON.stringify(next)) {
-                    runRecord.usage = next;
-                    persist(profileId, chat, 'token-usage');
-                  }
-                }
-              }
-              if (method === 'item/agentMessage/delta') {
-                if (typeof params.itemId !== 'string' || typeof params.delta !== 'string') return;
-                let message = chat.messages.find(
-                  (m) =>
-                    m.runId === runRecord.id &&
-                    m.generation === generation &&
-                    m.itemId === params.itemId,
-                );
-                if (!message) {
-                  message = {
-                    id: randomUUID(),
-                    itemId: params.itemId,
-                    runId: runRecord.id,
-                    generation,
-                    role: 'assistant',
-                    content: '',
-                    createdAt: clock().toISOString(),
-                    status: 'streaming',
-                  };
-                  chat.messages.push(message);
-                }
-                message.content += params.delta;
-                // Full journal snapshots are coalesced, never fsynced per token.
-                // Tool/item checkpoints and every terminal path also retain the latest text.
-                if (!state.streamPersistTimer)
-                  state.streamPersistTimer = setTimeout(() => {
-                    state.streamPersistTimer = undefined;
-                    if (active.get(profileId) !== state) return;
-                    try {
-                      persist(profileId, chat, 'assistant-stream-checkpoint');
-                    } catch (error) {
-                      finish(
-                        'failed',
-                        'The conversation could not be saved: ' + errorMessage(error),
-                      );
-                    }
-                  }, 1000);
-              }
-              if (
-                method === 'item/completed' &&
-                item.type === 'agentMessage' &&
-                typeof item.id === 'string' &&
-                typeof item.text === 'string'
-              ) {
-                let message = chat.messages.find(
-                  (m) =>
-                    m.runId === runRecord.id && m.generation === generation && m.itemId === item.id,
-                );
-                if (!message) {
-                  message = {
-                    id: randomUUID(),
-                    itemId: item.id,
-                    runId: runRecord.id,
-                    generation,
-                    role: 'assistant',
-                    createdAt: clock().toISOString(),
-                  };
-                  chat.messages.push(message);
-                }
-                message.content = item.text;
-                // A completed provider item can still precede more tools or a failed turn.
-                message.status = 'streaming';
-                persist(profileId, chat, 'assistant-message');
-              }
-              if (method === 'turn/completed') {
-                if (checkpoint && turn.status === 'completed') {
-                  const current = conversionIntake(profileId, chat);
-                  if (!current) throw new Error('The linked conversion changed');
-                  conversionCheckpoint(chat, current, profileId);
-                  const nativeProgress =
-                    isNativeAssistantConversion(current) && isNativeAssistantCheckpoint(checkpoint)
-                      ? nativeAssistantReadingProgress(
-                          current,
-                          checkpoint,
-                          modelMappingRuleContext(current.db, current.providerId)
-                            .mappingRulesVersion,
-                        )
+                  state.batchRevalidationBasis =
+                    basisIntake &&
+                    !isNativeAssistantConversion(basisIntake) &&
+                    unitSources &&
+                    !basisIntake.durability.pending &&
+                    rawIntake &&
+                    !durability.dirty &&
+                    !durability.conflicted &&
+                    !durability.lastError
+                      ? {
+                          profileId,
+                          chatId: chat.id,
+                          runId: state.run.id,
+                          generation,
+                          requestOrdinal: state.modelRequestOrdinal,
+                          database: dbFor(profileId),
+                          model: state.run.model || null,
+                          backend: state.run.backend || null,
+                          reasoningEffort: state.run.reasoningEffort || null,
+                          instructionVersion: INSTRUCTION_VERSION,
+                          mappingRulesVersion: modelMappingRuleContext(
+                            dbFor(profileId),
+                            basisIntake.providerId,
+                          ).mappingRulesVersion,
+                          checkpoint: batchCheckpointBasis(checkpoint),
+                          intake: structuredClone(basisIntake),
+                          rawIntake: structuredClone(rawIntake),
+                          revision: revision(dbFor(profileId)),
+                          persistedRevision: durability.persistedRevision,
+                          sequence: durability.sequence ?? null,
+                          unitSources,
+                        }
                       : undefined;
-                  const resume = nativeProgress
-                    ? {
-                        ...nativeProgress.resume,
-                        pendingUnits: nativeProgress.resume.reading.remainingUnits,
-                        pendingReadWindows: nativeProgress.resume.reading.pendingReadWindows,
-                      }
-                    : conversionResumeContext(checkpoint, current, !!options.beforeModelRequest);
-                  const accounted = !isNativeAssistantConversion(current)
-                    ? accountedIntakeUnitIds(current)
-                    : [];
-                  const nativeState = nativeProgress?.reading;
-                  const readWindows = nativeState
-                    ? (nativeState.readWindows ?? 0)
-                    : readingCount(checkpoint, current);
-                  const legacyAccounted = !isNativeAssistantCheckpoint(checkpoint)
-                    ? checkpoint.accountedUnits || checkpoint.completedUnits || []
-                    : [];
-                  const progress =
-                    readWindows > (state.seenBeforeTurn ?? 0) ||
-                    candidateCount(current) > (state.candidatesBeforeTurn ?? 0) ||
-                    (nativeState
-                      ? (nativeState.accountedUnits || 0) > (state.accountedBeforeTurn || 0)
-                      : !isNativeAssistantCheckpoint(checkpoint) &&
-                        accounted.some((id) => !legacyAccounted.includes(id)));
-                  if (
-                    !isNativeAssistantCheckpoint(checkpoint) &&
-                    !isNativeAssistantConversion(current)
-                  ) {
-                    checkpoint.completedUnits ||= [];
-                    checkpoint.accountedUnits ||= [...checkpoint.completedUnits];
-                    checkpoint.accountedUnits = [
-                      ...new Set([...checkpoint.accountedUnits, ...accounted]),
-                    ];
-                    checkpoint.completedUnits = [
-                      ...new Set([
-                        ...checkpoint.completedUnits,
-                        ...current.workflow.plans.flatMap((plan) =>
-                          plan.units
-                            .filter((unit) => accountedUnitKind(plan, unit) === 'extracted')
-                            .map((unit) => unit.id),
-                        ),
-                      ]),
-                    ];
+                  if (chat.reading) {
+                    chat.reading.modelRequests = checkpoint.modelRequests;
+                    chat.reading.phase = 'waiting_for_model';
                   }
-                  if (readingDeadlineReached()) {
-                    finish('idle', null, 'time_limit');
+                  persist(profileId, chat, 'conversion-model-request');
+                }
+                if (checkpoint && method === 'model/requestUsage') {
+                  if (params.measured === true)
+                    checkpoint.unmeasuredRequests = Math.max(
+                      0,
+                      (checkpoint.unmeasuredRequests || 0) - 1,
+                    );
+                  else checkpoint.modelUsageIncomplete = true;
+                  if (chat.reading)
+                    chat.reading.modelUsageIncomplete =
+                      !!checkpoint.modelUsageIncomplete || !!checkpoint.unmeasuredRequests;
+                }
+                if (
+                  method === 'thread/tokenUsage/updated' &&
+                  (!state.turnId || params.turnId === state.turnId)
+                ) {
+                  const usage = measuredUsage(tokenUsage.total);
+                  if (usage) {
+                    if (checkpoint && state.usageBeforeTurn)
+                      for (const field of Object.keys(usage))
+                        usage[field] =
+                          usage[field] !== null && state.usageBeforeTurn[field] !== null
+                            ? usage[field]! + state.usageBeforeTurn[field]!
+                            : null;
+                    const next = {
+                      ...usage,
+                      modelContextWindow:
+                        typeof tokenUsage.modelContextWindow === 'number' &&
+                        Number.isSafeInteger(tokenUsage.modelContextWindow) &&
+                        tokenUsage.modelContextWindow > 0
+                          ? tokenUsage.modelContextWindow
+                          : null,
+                      measuredAt: clock().toISOString(),
+                      source: 'thread/tokenUsage/updated',
+                    };
+                    if (checkpoint) {
+                      const currentTokens = usage.totalTokens;
+                      const previousTokens = measuredUsage(runRecord.usage)?.totalTokens || 0;
+                      if (typeof currentTokens !== 'number') checkpoint.modelUsageIncomplete = true;
+                      else
+                        checkpoint.measuredModelTokens =
+                          (checkpoint.measuredModelTokens || 0) +
+                          Math.max(0, currentTokens - previousTokens);
+                      if (chat.reading) {
+                        chat.reading.measuredModelTokens = checkpoint.measuredModelTokens || 0;
+                        chat.reading.modelUsageIncomplete =
+                          !!checkpoint.modelUsageIncomplete || !!checkpoint.unmeasuredRequests;
+                      }
+                    }
+                    if (JSON.stringify(runRecord.usage) !== JSON.stringify(next)) {
+                      runRecord.usage = next;
+                      persist(profileId, chat, 'token-usage');
+                    }
+                  }
+                }
+                if (method === 'item/agentMessage/delta') {
+                  if (typeof params.itemId !== 'string' || typeof params.delta !== 'string') return;
+                  let message = chat.messages.find(
+                    (m) =>
+                      m.runId === runRecord.id &&
+                      m.generation === generation &&
+                      m.itemId === params.itemId,
+                  );
+                  if (!message) {
+                    message = {
+                      id: randomUUID(),
+                      itemId: params.itemId,
+                      runId: runRecord.id,
+                      generation,
+                      role: 'assistant',
+                      content: '',
+                      createdAt: clock().toISOString(),
+                      status: 'streaming',
+                    };
+                    chat.messages.push(message);
+                  }
+                  message.content += params.delta;
+                  // Full journal snapshots are coalesced, never fsynced per token.
+                  // Tool/item checkpoints and every terminal path also retain the latest text.
+                  if (!state.streamPersistTimer)
+                    state.streamPersistTimer = withoutClinicalOperation(() =>
+                      setTimeout(() => {
+                        const pending = callbackHost(async () => {
+                          state.streamPersistTimer = undefined;
+                          if (active.get(profileId) !== state || state.generation !== generation)
+                            return;
+                          try {
+                            persist(profileId, chat, 'assistant-stream-checkpoint');
+                          } catch (error) {
+                            finish(
+                              'failed',
+                              'The conversation could not be saved: ' + errorMessage(error),
+                            );
+                          }
+                        });
+                        pending.catch(() => {
+                          /* Authorization loss cannot publish a stream checkpoint. */
+                        });
+                      }, 1000),
+                    );
+                }
+                if (
+                  method === 'item/completed' &&
+                  item.type === 'agentMessage' &&
+                  typeof item.id === 'string' &&
+                  typeof item.text === 'string'
+                ) {
+                  let message = chat.messages.find(
+                    (m) =>
+                      m.runId === runRecord.id &&
+                      m.generation === generation &&
+                      m.itemId === item.id,
+                  );
+                  if (!message) {
+                    message = {
+                      id: randomUUID(),
+                      itemId: item.id,
+                      runId: runRecord.id,
+                      generation,
+                      role: 'assistant',
+                      createdAt: clock().toISOString(),
+                    };
+                    chat.messages.push(message);
+                  }
+                  message.content = item.text;
+                  // A completed provider item can still precede more tools or a failed turn.
+                  message.status = 'streaming';
+                  persist(profileId, chat, 'assistant-message');
+                }
+                if (method === 'turn/completed') {
+                  if (checkpoint && turn.status === 'completed') {
+                    const current = conversionIntake(profileId, chat);
+                    if (!current) throw new Error('The linked conversion changed');
+                    conversionCheckpoint(chat, current, profileId);
+                    const nativeProgress =
+                      isNativeAssistantConversion(current) &&
+                      isNativeAssistantCheckpoint(checkpoint)
+                        ? nativeAssistantReadingProgress(
+                            current,
+                            checkpoint,
+                            modelMappingRuleContext(current.db, current.providerId)
+                              .mappingRulesVersion,
+                          )
+                        : undefined;
+                    const resume = nativeProgress
+                      ? {
+                          ...nativeProgress.resume,
+                          pendingUnits: nativeProgress.resume.reading.remainingUnits,
+                          pendingReadWindows: nativeProgress.resume.reading.pendingReadWindows,
+                        }
+                      : conversionResumeContext(checkpoint, current, !!options.beforeModelRequest);
+                    const accounted = !isNativeAssistantConversion(current)
+                      ? accountedIntakeUnitIds(current)
+                      : [];
+                    const nativeState = nativeProgress?.reading;
+                    const readWindows = nativeState
+                      ? (nativeState.readWindows ?? 0)
+                      : readingCount(checkpoint, current);
+                    const legacyAccounted = !isNativeAssistantCheckpoint(checkpoint)
+                      ? checkpoint.accountedUnits || checkpoint.completedUnits || []
+                      : [];
+                    const progress =
+                      readWindows > (state.seenBeforeTurn ?? 0) ||
+                      candidateCount(current) > (state.candidatesBeforeTurn ?? 0) ||
+                      (nativeState
+                        ? (nativeState.accountedUnits || 0) > (state.accountedBeforeTurn || 0)
+                        : !isNativeAssistantCheckpoint(checkpoint) &&
+                          accounted.some((id) => !legacyAccounted.includes(id)));
+                    if (
+                      !isNativeAssistantCheckpoint(checkpoint) &&
+                      !isNativeAssistantConversion(current)
+                    ) {
+                      checkpoint.completedUnits ||= [];
+                      checkpoint.accountedUnits ||= [...checkpoint.completedUnits];
+                      checkpoint.accountedUnits = [
+                        ...new Set([...checkpoint.accountedUnits, ...accounted]),
+                      ];
+                      checkpoint.completedUnits = [
+                        ...new Set([
+                          ...checkpoint.completedUnits,
+                          ...current.workflow.plans.flatMap((plan) =>
+                            plan.units
+                              .filter((unit) => accountedUnitKind(plan, unit) === 'extracted')
+                              .map((unit) => unit.id),
+                          ),
+                        ]),
+                      ];
+                    }
+                    if (readingDeadlineReached()) {
+                      finish('idle', null, 'time_limit');
+                      return;
+                    }
+                    const reconcileCoverage =
+                      !progress &&
+                      !state.coverageReconciliationUsed &&
+                      resume.pendingReadWindows === 0 &&
+                      resume.pendingUnits > 0 &&
+                      readWindows > 0 &&
+                      candidateCount(current) > 0;
+                    if (reconcileCoverage) {
+                      state.coverageReconciliationUsed = true;
+                      state.coverageReconciliationPending = true;
+                      state.diagnosticScope?.record('import.progress', {
+                        recoveryAction: 'reconcile_coverage',
+                        pendingReadWindows: resume.pendingReadWindows,
+                        remainingUnits: resume.pendingUnits,
+                        readyRecords: candidateCount(current),
+                      });
+                    }
+                    if (
+                      (progress || reconcileCoverage) &&
+                      (resume.pendingReadWindows || resume.pendingUnits)
+                    ) {
+                      persist(profileId, chat, 'conversion-progress-checkpoint');
+                      // The old bridge can still be unwinding its completion.
+                      // Retire its callbacks before closing and use a fresh bridge.
+                      state.generation++;
+                      state.bridge = null;
+                      bridge.close();
+                      void measureImportPhase(
+                        'continuation_dispatch',
+                        startModelTurn,
+                        {},
+                        diagnosticContext,
+                        diagnostics,
+                      );
+                    } else
+                      finish(
+                        'idle',
+                        null,
+                        !resume.pendingReadWindows &&
+                          !resume.pendingUnits &&
+                          (readWindows > 0 || (nativeState?.accountedUnits || accounted.length) > 0)
+                          ? 'reading_exhausted'
+                          : 'no_progress',
+                      );
                     return;
                   }
-                  const reconcileCoverage =
-                    !progress &&
-                    !state.coverageReconciliationUsed &&
-                    resume.pendingReadWindows === 0 &&
-                    resume.pendingUnits > 0 &&
-                    readWindows > 0 &&
-                    candidateCount(current) > 0;
-                  if (reconcileCoverage) {
-                    state.coverageReconciliationUsed = true;
-                    state.coverageReconciliationPending = true;
-                    state.diagnosticScope?.record('import.progress', {
-                      recoveryAction: 'reconcile_coverage',
-                      pendingReadWindows: resume.pendingReadWindows,
-                      remainingUnits: resume.pendingUnits,
-                      readyRecords: candidateCount(current),
-                    });
-                  }
-                  if (
-                    (progress || reconcileCoverage) &&
-                    (resume.pendingReadWindows || resume.pendingUnits)
-                  ) {
-                    persist(profileId, chat, 'conversion-progress-checkpoint');
-                    // The old bridge can still be unwinding its completion.
-                    // Retire its callbacks before closing and use a fresh bridge.
-                    state.generation++;
-                    state.bridge = null;
-                    bridge.close();
-                    void measureImportPhase(
-                      'continuation_dispatch',
-                      startModelTurn,
-                      {},
-                      diagnosticContext,
-                      diagnostics,
-                    );
-                  } else
-                    finish(
-                      'idle',
-                      null,
-                      !resume.pendingReadWindows &&
-                        !resume.pendingUnits &&
-                        (readWindows > 0 || (nativeState?.accountedUnits || accounted.length) > 0)
-                        ? 'reading_exhausted'
-                        : 'no_progress',
-                    );
-                  return;
+                  finish(
+                    turn.status === 'completed'
+                      ? 'idle'
+                      : turn.status === 'interrupted'
+                        ? 'cancelled'
+                        : 'failed',
+                    object(turn.error) && typeof turn.error.message === 'string'
+                      ? turn.error.message
+                      : null,
+                  );
                 }
-                finish(
-                  turn.status === 'completed'
-                    ? 'idle'
-                    : turn.status === 'interrupted'
-                      ? 'cancelled'
-                      : 'failed',
-                  object(turn.error) && typeof turn.error.message === 'string'
-                    ? turn.error.message
-                    : null,
-                );
+                if (method === 'error' && !params.willRetry)
+                  finish(
+                    'failed',
+                    (typeof eventError.message === 'string' && eventError.message) ||
+                      (typeof params.message === 'string' && params.message) ||
+                      'The selected model could not finish this response. Check connection and usage.',
+                  );
+              } catch (error) {
+                finish('failed', 'The conversation could not be saved: ' + errorMessage(error));
+                if (isNativeAssistantCheckpoint(checkpoint)) throw error;
               }
-              if (method === 'error' && !params.willRetry)
-                finish(
-                  'failed',
-                  (typeof eventError.message === 'string' && eventError.message) ||
-                    (typeof params.message === 'string' && params.message) ||
-                    'The selected model could not finish this response. Check connection and usage.',
-                );
-            } catch (error) {
-              finish('failed', 'The conversation could not be saved: ' + errorMessage(error));
-              if (isNativeAssistantCheckpoint(checkpoint)) throw error;
-            }
+            }).catch((error) => {
+              if (
+                method === 'model/requestFinished' &&
+                typeof params.requestId === 'string' &&
+                requestAccounting.has(params.requestId) &&
+                (active.get(profileId) !== state || state.generation !== generation)
+              )
+                return accountRetiredRequest(params);
+              throw error;
+            });
           },
         });
         state.bridge = bridge;
@@ -5640,33 +5855,36 @@ export function createAssistant({
         // handed off to the next generation. Its late failure is no longer current.
         if (active.get(profileId) === state && state.generation === generation)
           checkpoint && error instanceof ReadingJobLimitError
-            ? finish('idle', null, 'job_limit')
+            ? await finishContinuation('idle', null, 'job_limit')
             : checkpoint && error instanceof ReadingDeadlineError
-              ? finish('idle', null, 'time_limit')
+              ? await finishContinuation('idle', null, 'time_limit')
               : checkpoint && error instanceof ModelContextLimitError
-                ? finish(
+                ? await finishContinuation(
                     'idle',
                     error.message,
                     error.origin === 'slice' ? 'time_limit' : 'context_limit',
                   )
-                : finish('failed', errorMessage(error));
+                : await finishContinuation('failed', errorMessage(error));
       }
     };
     let compactAuthorizationCaptured = false;
-    const startModelTurn = async () => {
-      const generation = ++state.generation;
-      try {
-        if (!compactAuthorizationCaptured) {
-          captureVaultAssistantAuthorization(compactJob, dbFor(profileId), profileId);
-          compactAuthorizationCaptured = true;
+    const startModelTurn = () =>
+      withoutClinicalOperation(async () => {
+        const generation = ++state.generation;
+        try {
+          if (!compactAuthorizationCaptured) {
+            captureVaultAssistantAuthorization(compactJob, dbFor(profileId), profileId);
+            compactAuthorizationCaptured = true;
+          }
+          return await withVaultAssistantAuthorization(compactJob, () => runModelTurn(generation));
+        } catch (error) {
+          if (active.get(profileId) === state && state.generation === generation)
+            await finishContinuation('failed', errorMessage(error));
         }
-        return await withVaultAssistantAuthorization(compactJob, () => runModelTurn(generation));
-      } catch (error) {
-        if (active.get(profileId) === state && state.generation === generation)
-          finish('failed', errorMessage(error));
-      }
-    };
-    void diagnostics.run(diagnosticContext, startModelTurn);
+      });
+    withoutClinicalOperation(() => {
+      void diagnostics.run(diagnosticContext, startModelTurn);
+    });
     return chat;
   }
   const service: AssistantService = {
@@ -5936,12 +6154,16 @@ export function createAssistant({
           proposal.status = 'applied';
           proposal.error = null;
           proposal.durability = personalDurabilityStatus(db);
-          persist(profileId, chat, 'proposal-applied');
+          await persistContinuation(profileId, chat, 'proposal-applied', () => {
+            dbFor(profileId);
+          });
           return chat;
         } catch (error) {
           proposal.error = errorMessage(error);
           proposal.status = 'failed';
-          persist(profileId, chat, 'proposal-failed');
+          await persistContinuation(profileId, chat, 'proposal-failed', () => {
+            dbFor(profileId);
+          });
           throw error;
         }
       };
@@ -6148,6 +6370,7 @@ export function createAssistant({
       });
     },
     close() {
+      accountingEpoch++;
       for (const state of [...active.values()])
         state.finish?.('cancelled', 'The app closed during this response.');
       clearChatJournalCache(root);

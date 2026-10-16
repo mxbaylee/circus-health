@@ -1,5 +1,17 @@
 # Update an installation and recover from a failed candidate
 
+Restart into the reviewed build before adding files while an encrypted profile's
+earlier reading batch is running. Batch and conversation journal continuations,
+including public batch and chat controls, now publish through the profile's
+host-operation queue, preserving the
+upload's original bridge proof while model and extraction waits remain outside
+the queue. Prior builds can spuriously return an internal upload error when one
+of those publications overlaps proof preparation. Genuine authority changes
+still refuse; retain originals and accepted history for recovery. This changes
+no encrypted archive, cache format, provider setting or operator configuration
+and requires no migration. See the
+[encrypted upload coordination contract](../data/intake-state-storage.md#v3-bridge-and-schema-directed-envelopes).
+
 Restart into the reviewed build before correcting the person on accepted native
 report records. This build reads their retained member snapshot references and
 supports checked previews with the returned record versions. Prior builds can

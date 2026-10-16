@@ -362,6 +362,47 @@ test('two uploaded originals run sequentially into one durable review queue', as
   assert.equal(f.checks(), 2);
 });
 
+test(
+  'batch chat recovery, creation and dispatch publish inside host ownership',
+  { timeout: 30000 },
+  async (t) => {
+    const { currentClinicalOperation } = await import('../clinical-operation.ts');
+    const f = setup(t);
+    const observed: Array<{ method: string; owned: boolean }> = [];
+    for (const method of ['get', 'create', 'send', 'retry'] as const) {
+      const original = f.assistant[method];
+      t.mock.method(f.assistant, method, (...args: unknown[]) => {
+        observed.push({ method, owned: !!currentClinicalOperation(f.db) });
+        return Reflect.apply(original, f.assistant, args);
+      });
+    }
+    const intake = uploadIntake(f.db, f.root, profileId, {
+      filename: 'fictional-owned-dispatch.txt',
+      newProviderName: 'Fictional clinic',
+      bytes: Buffer.from('A fictional retained source for an interrupted reading pass.'),
+    });
+    const batch = f.manager.create(profileId, {
+      operationId: 'fictional-owned-dispatch',
+      intakeIds: [intake.id],
+    });
+    await waitFor(t, () => f.bridges[0]?.started, 'first admitted dispatch');
+    f.manager.stop(profileId, batch.id);
+    f.manager.resume(profileId, batch.id);
+    await waitFor(t, () => f.bridges[1]?.started, 'admitted retry after Stop');
+    for (const method of ['get', 'create', 'send', 'retry'])
+      assert.ok(
+        observed.some((entry) => entry.method === method),
+        `${method} was exercised`,
+      );
+    // Each call can publish a conversation journal, including recovery on get.
+    // Checking the real coordinator boundary catches unadmitted dispatch writes.
+    assert.ok(
+      observed.every((entry) => entry.owned),
+      JSON.stringify(observed),
+    );
+  },
+);
+
 test('restart does not treat cumulative capture steps as unread new work', async (t) => {
   const f = setup(t);
   const item = uploadIntake(f.db, f.root, profileId, {
@@ -1453,8 +1494,8 @@ test('append journal acknowledgement loss retains one append and retry never dup
   assert.throws(() => f.manager.create(profileId, request), /acknowledgement loss/);
   assert.equal(readIntakeBatch(f.root, profileId, batch.id).items.length, 2);
   assert.ok(requestGuard);
-  assert.throws(
-    () =>
+  await assert.rejects(
+    async () =>
       requestGuard!({
         status: 'running',
         reason: null,
@@ -1897,4 +1938,206 @@ test('automatic coordinator dispatches a selected native direct plan with explic
   assert.equal('seen' in chat.conversionCheckpoint, false);
   assert.ok('format' in getIntakeRead(f.db, f.root, profileId, source.id));
   f.manager.stop(profileId, batch.id);
+});
+
+for (const revoke of ['stop', 'close'] as const)
+  test(`a model-preflight publication queued behind host work preserves ${revoke} revocation`, async (t) => {
+    const entered = Promise.withResolvers<void>(),
+      preflight = Promise.withResolvers<{ available: boolean }>();
+    const reasons: string[] = [];
+    const f = setup(
+      t,
+      {
+        connectionCheck: async () => {
+          entered.resolve();
+          return preflight.promise;
+        },
+      },
+      {
+        journalWriter(root, id, batch, reason) {
+          reasons.push(reason);
+          writeIntakeBatch(root, id, batch, reason);
+        },
+      },
+    );
+    const item = fictionalAppendOriginal(f, 'queued-preflight-' + revoke);
+    const batch = f.manager.create(profileId, {
+      operationId: 'fictional-queued-preflight-' + revoke,
+      intakeIds: [item.id],
+    });
+    await entered.promise;
+    const { runExclusiveClinicalOperation } = await import('../clinical-operation.ts');
+    const { setImmediate } = await import('node:timers/promises');
+    const held = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>();
+    const host = runExclusiveClinicalOperation(f.db, async () => {
+      held.resolve();
+      await release.promise;
+    });
+    const hostResult = host.catch((error: unknown) => error);
+    await held.promise;
+    preflight.resolve({ available: false });
+    await setImmediate();
+    assert.equal(
+      reasons.filter((r) => r === 'model-unavailable').length,
+      0,
+      'the continuation is queued, not published',
+    );
+    if (revoke === 'stop') f.manager.stop(profileId, batch.id);
+    else {
+      f.manager.close('profile_locked');
+      f.db.close();
+    }
+    release.resolve();
+    await hostResult;
+    await setImmediate();
+    await setImmediate();
+    assert.equal(
+      reasons.filter((r) => r === 'model-unavailable').length,
+      0,
+      'revoked preflight cannot overwrite the durable revocation',
+    );
+    assert.equal(
+      readIntakeBatch(f.root, profileId, batch.id).status,
+      revoke === 'stop' ? 'stopped' : 'paused',
+    );
+    assert.equal(f.bridges.length, 0);
+  });
+
+test('a terminal model pass drains newly pending source work outside host ownership', async (t) => {
+  const { currentClinicalOperation, runExclusiveClinicalOperation } =
+    await import('../clinical-operation.ts');
+  const { getIntakeSourceText, publishIntakeSourceText } = await import('../intake-source-text.ts');
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  let armed = false,
+    drained = 0;
+  const f = setup(
+    t,
+    {},
+    {
+      extract: async (context) => {
+        assert.equal(
+          currentClinicalOperation(context.db),
+          undefined,
+          'worker extraction starts outside clinical ownership',
+        );
+        if (armed) {
+          drained++;
+          entered.resolve();
+          await release.promise;
+        }
+        return extractIntakeSourceText(context);
+      },
+    },
+  );
+  t.after(() => release.resolve());
+  const item = fictionalAppendOriginal(f, 'terminal-pending-source');
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-terminal-pending-source',
+    intakeIds: [item.id],
+  });
+  await waitFor(t, () => f.bridges.length === 1);
+  const prior = getIntakeSourceText(f.db, f.root, profileId, item.id).revision!;
+  // A fictional extractor explicitly republishes an unreviewed page as pending
+  // while the model pass is active. Original bytes and accepted versions remain.
+  await runExclusiveClinicalOperation(f.db, async () => {
+    publishIntakeSourceText(f.db, f.root, profileId, item.id, {
+      operationId: crypto.randomUUID(),
+      expectedRevisionId: prior.id,
+      sourceHash: item.sha256,
+      evidence: {
+        adapter: prior.adapter,
+        pages: [{ page: 1, disposition: 'partial', inspected: false }],
+        spans: [],
+        relations: [],
+        issues: [
+          {
+            id: 'p1-pending',
+            region: { page: 1 },
+            kind: 'coverage',
+            detail: 'Fictional pending source section.',
+            status: 'open',
+          },
+        ],
+      },
+    });
+  });
+  armed = true;
+  complete(f.bridges[0]);
+  await entered.promise;
+  let foreground = 0;
+  await runExclusiveClinicalOperation(f.db, async () => {
+    foreground++;
+  });
+  assert.equal(foreground, 1, 'foreground host work completes while the extractor is held');
+  release.resolve();
+  await waitFor(t, () => f.manager.get(profileId, batch.id).status !== 'running');
+  assert.equal(drained, 1);
+  assert.equal(
+    getIntakeSourceText(f.db, f.root, profileId, item.id).revision!.issues.some(
+      (i) => i.id === 'p1-pending',
+    ),
+    false,
+  );
+  assert.equal(f.bridges.length, 1, 'recordless draining does not start another model pass');
+});
+
+test('retry selection during an outside extraction wait cannot publish the old item continuation', async (t) => {
+  const { runExclusiveClinicalOperation } = await import('../clinical-operation.ts');
+  const { setImmediate } = await import('node:timers/promises');
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  let heldId = '',
+    heldSteps = 0;
+  const publications: { reason: string; index: number }[] = [];
+  const f = setup(
+    t,
+    {},
+    {
+      extract: async (context) => {
+        if (context.id === heldId) {
+          heldSteps++;
+          entered.resolve();
+          await release.promise;
+        }
+        return extractIntakeSourceText(context);
+      },
+      journalWriter(root, id, batch, reason) {
+        publications.push({ reason, index: batch.currentIndex });
+        writeIntakeBatch(root, id, batch, reason);
+      },
+    },
+  );
+  t.after(() => release.resolve());
+  const first = fictionalAppendOriginal(f, 'retry-first'),
+    second = fictionalAppendOriginal(f, 'retry-second');
+  heldId = second.id;
+  const batch = f.manager.create(profileId, {
+    operationId: 'fictional-outside-retry',
+    intakeIds: [first.id, second.id],
+  });
+  await waitFor(t, () => f.bridges.length === 1);
+  await propose(f.bridges[0], first);
+  complete(f.bridges[0]);
+  await entered.promise;
+  assert.equal(f.manager.get(profileId, batch.id).currentIndex, 1);
+  await runExclusiveClinicalOperation(f.db, async () => {
+    await f.manager.retryExceptions(profileId, batch.id);
+  });
+  const checkpoint = publications.length;
+  release.resolve();
+  await setImmediate();
+  await setImmediate();
+  // Stop fences any new independently scheduled attempt after the stale worker
+  // has settled. The old continuation must never account or pause index zero.
+  f.manager.stop(profileId, batch.id);
+  assert.equal(heldSteps, 1);
+  assert.ok(
+    !publications
+      .slice(checkpoint)
+      .some((p) => ['source-extraction-accounted', 'runner-paused'].includes(p.reason)),
+    JSON.stringify(publications.slice(checkpoint)),
+  );
+  assert.equal(f.manager.get(profileId, batch.id).items[0]!.status, 'review_ready');
 });

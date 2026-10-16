@@ -50,6 +50,8 @@ import {
 import { acceptedSourceReaderAttached } from './intake-accepted-source-format.ts';
 import { normalizeAssistantContext } from './assistant-context.ts';
 import { intakeIdentityRequestLifetime } from './intake-identity-request.ts';
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
+import { currentVaultCompactAuthorization } from './vault-app.ts';
 import { exportImportAttribution } from './intake-attribution.ts';
 import { prepareIntakeAttributionSources } from './intake-attribution-source.ts';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -494,6 +496,24 @@ export function createApp({
         return;
       }
       if (resource === 'assistant') {
+        const withAssistantHost = async <T>(work: () => T | Promise<T>): Promise<T> => {
+          const lifetime = intakeIdentityRequestLifetime(req, res);
+          const assertRunning = () => {
+            lifetime.signal.throwIfAborted();
+            currentVaultCompactAuthorization(db, profileId);
+          };
+          try {
+            // Journal recovery can write even on GET. Model/provider waits and
+            // request bodies remain outside this short host ownership interval.
+            return await runExclusiveClinicalOperation(db, async () => work(), {
+              operation: currentClinicalOperation(db),
+              signal: lifetime.signal,
+              assertRunning,
+            });
+          } finally {
+            lifetime.dispose();
+          }
+        };
         if (id === 'status' && parts.length === 2 && method === 'GET')
           respond(await assistant.status(profileId));
         else if (id === 'test-connection' && parts.length === 2 && method === 'POST') {
@@ -505,36 +525,38 @@ export function createApp({
             ),
           );
         } else if (id === 'chats' && parts.length === 2 && method === 'GET')
-          respond(assistant.list(profileId));
+          await withAssistantHost(() => respond(assistant.list(profileId)));
         else if (id === 'chats' && parts.length === 2 && method === 'POST') {
           const input = await jsonBody(req);
           await prepareAssistantFilenameRead(input);
-          respond(assistant.create(profileId, input));
+          await withAssistantHost(() => respond(assistant.create(profileId, input)));
         } else if (id === 'chats' && parts.length === 3 && method === 'GET')
-          respond(assistant.get(profileId, action));
+          await withAssistantHost(() => respond(assistant.get(profileId, action)));
         else if (id === 'chats' && parts.length === 4 && method === 'POST') {
           if (parts[3] === 'messages') {
             const input = await jsonBody(req);
             await prepareAssistantFilenameRead({
-              context: assistant.get(profileId, action).context,
+              context: await withAssistantHost(() =>
+                structuredClone(assistant.get(profileId, action).context),
+              ),
             });
             await prepareAssistantFilenameRead(input);
-            respond(assistant.send(profileId, action, input));
+            await withAssistantHost(() => respond(assistant.send(profileId, action, input)));
           } else if (parts[3] === 'retry') {
             await prepareAssistantFilenameRead({
-              context: assistant.get(profileId, action).context,
-            });
-            respond(assistant.retry(profileId, action));
-          } else if (parts[3] === 'cancel') respond(assistant.cancel(profileId, action));
-          else if (parts[3] === 'apply')
-            respond(
-              await assistant.applyRead(
-                profileId,
-                action,
-                (await jsonBody(req)).proposalId as string,
+              context: await withAssistantHost(() =>
+                structuredClone(assistant.get(profileId, action).context),
               ),
+            });
+            await withAssistantHost(() => respond(assistant.retry(profileId, action)));
+          } else if (parts[3] === 'cancel')
+            await withAssistantHost(() => respond(assistant.cancel(profileId, action)));
+          else if (parts[3] === 'apply') {
+            const proposalId = (await jsonBody(req)).proposalId as string;
+            await withAssistantHost(async () =>
+              respond(await assistant.applyRead(profileId, action, proposalId)),
             );
-          else throw new HttpError(404, 'NOT_FOUND', 'Assistant action not found');
+          } else throw new HttpError(404, 'NOT_FOUND', 'Assistant action not found');
         } else throw new HttpError(404, 'NOT_FOUND', 'Assistant resource not found');
         return;
       }
@@ -593,6 +615,8 @@ export function createApp({
           action,
           method,
           req,
+          res,
+          db,
           profileId,
           respond,
           jsonBody,

@@ -52,6 +52,13 @@ function check(frame: Frame, assertions = true) {
     frame.assertRunning?.();
   }
 }
+/** Schedule an independently authorized background lifetime without inheriting
+ * this short host frame. Other async-local issuers remain intact; the scheduled
+ * work must obtain its own authorization and normal lane admission. */
+export function withoutClinicalOperation<T>(schedule: () => T): T {
+  return context.exit(schedule);
+}
+
 /** Trusted nested entry points explicitly pass this token to the coordinator. */
 export function currentClinicalOperation(db: DatabaseSync): ClinicalOperation | undefined {
   const frame = context.getStore();
