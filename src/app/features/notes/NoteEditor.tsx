@@ -4,7 +4,7 @@ import { DetailHeader, EntryActions } from '../../components/DetailHeader';
 import { PersonIconPicker } from '../../components/PersonIcon';
 import { ArchiveControl } from '../../components/ArchiveControl';
 import { NoteExportDialog } from './NoteExportDialog';
-import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type Ref } from 'react';
 import { Link, useBlocker } from 'react-router-dom';
 import {
   ArrowRight,
@@ -86,7 +86,9 @@ export function NoteEditor({
   creationId,
   prelinkType,
   prelinkId,
+  headingRef,
 }: {
+  headingRef?: Ref<HTMLHeadingElement>;
   initial: Note | null;
   initialKind: NoteKind;
   initialOwnerPersonId?: string;
@@ -624,8 +626,29 @@ export function NoteEditor({
   const canPrint = kind !== 'person' || isSelf || Boolean(note?.personId);
   const canOverflow = Boolean(note);
   return (
-    <article className="panel note-detail">
+    <article
+      className="panel note-detail"
+      onFocusCapture={(event) => {
+        const target = event.target;
+        const footer = event.currentTarget.querySelector<HTMLElement>('.note-actions');
+        if (
+          !(target instanceof HTMLElement) ||
+          !event.currentTarget.contains(target) ||
+          !target.matches(':focus-visible') ||
+          !footer ||
+          footer.contains(target)
+        )
+          return;
+        const field = target.getBoundingClientRect(),
+          controls = footer.getBoundingClientRect();
+        // A browser can consider a field visible while the sticky save controls
+        // cover it. Keep the actual keyboard target above those controls.
+        if (controls.top < window.innerHeight && field.bottom + 8 > controls.top)
+          window.scrollBy({ top: field.bottom - controls.top + 16, behavior: 'instant' });
+      }}
+    >
       <DetailHeader
+        headingRef={headingRef}
         eyebrow={
           kind === 'person'
             ? isSelf

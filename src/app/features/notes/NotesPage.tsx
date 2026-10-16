@@ -89,6 +89,10 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
   const creating = params.get('new') === '1';
   const [search, setSearch] = useState(params.get('q') || '');
   const [savedInEditor, setSavedInEditor] = useState<Note | null>(null);
+  const personHeading = useRef<HTMLHeadingElement>(null);
+  const personRows = useRef(new Map<string, HTMLButtonElement>());
+  const keyboardSelection = useRef<string | null>(null);
+  const returnToPerson = useRef<string | null>(null);
   const newIdentity = useRef(`note:${crypto.randomUUID()}`);
   const wasCreatingWithoutId = useRef(false);
   if (creating && !selectedId && !wasCreatingWithoutId.current)
@@ -155,6 +159,19 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
     )
       setSavedInEditor(null);
   }, [selectedId, creating, editorId, savedInEditor]);
+  useEffect(() => {
+    if (kind !== 'person' || personScope?.pending || personScope?.error) return;
+    if (selectedId && keyboardSelection.current === selectedId && personalNote?.id === selectedId) {
+      personHeading.current?.focus();
+      if (document.activeElement === personHeading.current) keyboardSelection.current = null;
+    } else if (!selectedId && returnToPerson.current) {
+      const row = personRows.current.get(returnToPerson.current);
+      if (row) {
+        row.focus();
+        returnToPerson.current = null;
+      }
+    }
+  }, [kind, selectedId, personalNote?.id, personScope?.pending, personScope?.error, notes.data]);
   const providerNote =
     historical && currentHistorical?.origin === 'provider' ? currentHistorical : null;
   useAssistantSelection(
@@ -472,8 +489,18 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
                       type="button"
                       className="notes-row"
                       key={note.id}
+                      ref={(element) => {
+                        if (element) personRows.current.set(note.id, element);
+                        else personRows.current.delete(note.id);
+                      }}
                       aria-current={selectedId === note.id ? 'true' : undefined}
-                      onClick={() => navigate({ id: note.id, new: null })}
+                      onClick={(event) => {
+                        if (kind === 'person') {
+                          keyboardSelection.current = event.detail === 0 ? note.id : null;
+                          returnToPerson.current = note.id;
+                        }
+                        navigate({ id: note.id, new: null });
+                      }}
                     >
                       {note.kind === 'person' ? (
                         <PersonIcon value={note.person.icon} size={20} />
@@ -574,6 +601,7 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
                 creationId={personalNote?.id || editorId}
                 prelinkType={params.get('targetType')}
                 prelinkId={params.get('targetId')}
+                headingRef={kind === 'person' ? personHeading : undefined}
                 initial={personalNote}
                 initialOwnerPersonId={ownerPersonId}
                 initialKind={kind}

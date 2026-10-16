@@ -1087,3 +1087,22 @@
 .person-health-records ul {
   padding-left: 1.25rem;
 }
+
+.person-health-owner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 760px) {
+  .notes-page .detail-header.entry-header {
+    flex-wrap: wrap;
+  }
+  .notes-page .entry-header .detail-heading-copy {
+    flex-basis: 100%;
+  }
+  .notes-page .entry-header .detail-header-actions {
+    max-width: none;
+    justify-content: flex-start;
+  }
+}

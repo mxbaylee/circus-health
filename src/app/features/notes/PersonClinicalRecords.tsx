@@ -47,6 +47,14 @@ export function PersonClinicalRecords({ person }: { person: Note }) {
   return (
     <section className="person-health-records" aria-label="Health records">
       <h2>Health records</h2>
+      <p className="person-health-owner">
+        <strong>{person.title}</strong>
+        {person.person?.fullName && person.person.fullName !== person.title && (
+          <span>{String(person.person.fullName)}</span>
+        )}
+        {person.person?.birthDate && <span>Born {String(person.person.birthDate)}</span>}
+        {person.isSelf && <span>Self</span>}
+      </p>
       <nav aria-label="This person’s health records">
         {links.map(([path, label, extra]) => (
           <RecordLink key={path} path={`${path}?${scope}${extra}`} label={label} />
