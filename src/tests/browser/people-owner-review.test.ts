@@ -54,7 +54,7 @@ test(
       if (visuals)
         await page.screenshot({ path: resolve(visuals, `${name}.png`), animations: 'disabled' });
     }
-    async function tabTo(selector: string) {
+    async function tabTo(selector: string, key = 'Tab') {
       const order: unknown[] = [];
       if (
         await page
@@ -63,7 +63,7 @@ test(
       )
         return;
       for (let n = 0; n < 80; n++) {
-        await page.keyboard.press('Tab');
+        await page.keyboard.press(key);
         order.push(await focus());
         if (
           await page
@@ -72,7 +72,7 @@ test(
               elements.some((element) => element === document.activeElement),
             )
         ) {
-          steps.push({ keyboardTabOrder: order });
+          steps.push({ keyboardKey: key, keyboardTabOrder: order });
           return;
         }
       }
@@ -136,6 +136,19 @@ test(
           'Keyboard selection focuses person heading',
         );
         await capture(`04-${size}-${people[index].label}-selected-focus`);
+        if (size === 'desktop') {
+          await tabTo(selector, 'Shift+Tab');
+          const selectedUrl = page.url();
+          await page.keyboard.press('Enter');
+          assert.equal(page.url(), selectedUrl, 'Repeated selection preserves the selected route');
+          assert(
+            await page
+              .getByRole('heading', { name: people[index].title, exact: true, level: 2 })
+              .evaluate((el) => el === document.activeElement),
+            'Keyboard activation of the selected person refocuses its heading',
+          );
+          await capture(`04-desktop-${people[index].label}-reselected-focus`);
+        }
         await health.scrollIntoViewIfNeeded();
         await page.evaluate(() => {
           const health = document.querySelector('.person-health-records')!;

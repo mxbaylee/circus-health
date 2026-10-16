@@ -498,6 +498,16 @@ export function NotesPage({ initialKind = 'note' }: { initialKind?: NoteKind }) 
                         if (kind === 'person') {
                           keyboardSelection.current = event.detail === 0 ? note.id : null;
                           returnToPerson.current = note.id;
+                          if (
+                            keyboardSelection.current === selectedId &&
+                            personalNote?.id === selectedId &&
+                            !personScope?.pending &&
+                            !personScope?.error
+                          ) {
+                            personHeading.current?.focus();
+                            if (document.activeElement === personHeading.current)
+                              keyboardSelection.current = null;
+                          }
                         }
                         navigate({ id: note.id, new: null });
                       }}
