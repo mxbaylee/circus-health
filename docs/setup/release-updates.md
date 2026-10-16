@@ -1,5 +1,15 @@
 # Update an installation and recover from a failed candidate
 
+Restart into the reviewed build before correcting the person on accepted native
+report records. This build reads their retained member snapshot references and
+supports checked previews with the returned record versions. Prior builds can
+return an internal error for a valid first preview or reject versioned selections.
+Pre-save checks of changed scope or destination evidence now return a
+review-required conflict before the atomic group publishes. No archive format,
+cache migration or operator setting changes; originals and accepted history
+remain authoritative. See
+[accepted person corrections](../import/identity-review.md#correcting-accepted-person-assignments).
+
 Restart into the reviewed build to apply the internal intake-reader freshness
 checks. A retained V4 byte capability or started native field/record text stream now refuses
 after its logical generation changes, cache disposal or profile closure, including

@@ -600,7 +600,10 @@ function* ownershipPreviewSteps(
           !matches.some((m) => m.recordId === decision.targetRecordId)
         )
           blockers.push('The selected match is not a current destination record.');
-        const relationship = clinicalRelationshipProjection(db, profileId, ref);
+        const relationship = clinicalRelationshipProjection(db, profileId, {
+          kind: ref.kind,
+          recordId: ref.recordId,
+        });
         pins.push(digest(relationship));
         if (relationship.truncated)
           blockers.push('Review the complete relationship graph before correcting ownership.');
