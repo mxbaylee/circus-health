@@ -28,7 +28,7 @@ import { intakeSourcePinKey, readIntakeSourcePin } from '../intake-source-pin.ts
 import { storedIntakeDetails, registerIntakeFile } from '../intake-state-access.ts';
 import { readIntakeEnvelope, readIntakeEnvelopeText } from '../intake-authority.ts';
 import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
-import { decryptObject, recoveryEntropy, unwrapKey } from '../vault-crypto.ts';
+import { decryptObject, encryptObject, recoveryEntropy, unwrapKey } from '../vault-crypto.ts';
 import { newProfile, vaultFixture } from './helpers/vault-fixture.ts';
 import { fictionalModel } from './fictional-model.ts';
 import type { HealthRecordEnvelope, Intake } from '../../shared/intake.ts';
@@ -374,7 +374,7 @@ function selectedHead(manager: Fixture['manager'], kit: FixtureKit): string | nu
   }
 }
 type Fault = 'immutable' | 'head-before' | 'head-after' | 'activation';
-async function fault(t: TestContext, f: Fixture, kind: Fault) {
+async function fault(t: TestContext, f: Fixture, kind: Fault, afterHead?: (path: string) => void) {
   const key = kitKey(f.manager, f.setup.recoveryKit);
   const rename = fs.renameSync;
   let hit = 0;
@@ -399,7 +399,10 @@ async function fault(t: TestContext, f: Fixture, kind: Fault) {
     }
     if (matches) {
       hit++;
-      if (kind === 'head-after') rename(...args);
+      if (kind === 'head-after') {
+        rename(...args);
+        afterHead?.(destination);
+      }
       throw Error('Fictional copy fault: ' + kind);
     }
     return rename(...args);
@@ -516,7 +519,9 @@ for (const kind of ['immutable', 'head-before', 'head-after', 'activation'] as c
             },
           },
         );
-        assert.equal(authorization, 1);
+        // Admission, queued-start source sealing, then the authenticated
+        // unpublished-copy gate each require the same source authorization.
+        assert.equal(authorization, 3);
         check(f.manager.opened.get(f.setup.profileId)!, f, true, JSON.stringify(advanced));
       } else {
         const versions = archive(resolve(f.manager.pathFor(f.setup.profileId), 'vault/versions'));
@@ -800,3 +805,72 @@ test('encrypted raw initial envelope remains exact through copy and rebuild unti
     JSON.stringify(normalized),
   );
 });
+
+for (const retry of ['sync', 'async'] as const)
+  test(`an unacknowledged first manifest retains ${retry} same-session recovery without its changed or locked source`, async (t) => {
+    const f = await fixture(t);
+    await fault(t, f, 'head-after');
+    const head = selectedHead(f.manager, f.setup.recoveryKit),
+      versions = archive(resolve(f.manager.pathFor(f.setup.profileId), 'vault/versions'));
+    assert.ok(head);
+    const advanced = JSON.parse(f.expected.serialized);
+    advanced.future.a.push('fictional later source must not be recopied');
+    writeIntakeFixtureEnvelope(f.source.db, f.item.id, advanced);
+    f.manager.lock(f.sourceId);
+    await (retry === 'sync' ? f.manager.verify : f.manager.verifyAsync)(
+      f.setup.setupId,
+      { acknowledged: true, recovery: f.setup.recoveryKit },
+      {
+        authorizeCopySource() {
+          assert.fail('an accepted target must not borrow its changed or locked source');
+        },
+      },
+    );
+    assert.equal(selectedHead(f.manager, f.setup.recoveryKit), head);
+    assert.deepEqual(
+      archive(resolve(f.manager.pathFor(f.setup.profileId), 'vault/versions')),
+      versions,
+    );
+    assert.equal(f.manager.opened.has(f.sourceId), false);
+    check(f.manager.opened.get(f.setup.profileId)!, f, true);
+  });
+
+for (const replacement of ['unpublished', 'different-candidate'] as const)
+  test(`an ambiguous first-head failure cannot grant source-independent recovery from ${replacement} disk bytes`, async (t) => {
+    const f = await fixture(t),
+      path = resolve(f.manager.pathFor(f.setup.profileId), 'vault/manifest.enc'),
+      original = readFileSync(path);
+    let replacementBytes = original;
+    if (replacement === 'different-candidate') {
+      const key = kitKey(f.manager, f.setup.recoveryKit),
+        scratch = resolve(f.runtimeDirectory, 'fictional-other-candidate.enc');
+      try {
+        const candidate = JSON.parse(
+          decryptObject(path, key, f.setup.profileId, 'manifest').toString(),
+        );
+        candidate.recordsHead = Buffer.from('fictional different accepted candidate').toString(
+          'base64',
+        );
+        encryptObject(
+          scratch,
+          Buffer.from(JSON.stringify(candidate)),
+          key,
+          f.setup.profileId,
+          'manifest',
+        );
+        replacementBytes = readFileSync(scratch);
+      } finally {
+        key.fill(0);
+        rmSync(scratch, { force: true });
+      }
+    }
+    await fault(t, f, 'head-after', (selected) => writeFileSync(selected, replacementBytes));
+    f.manager.lock(f.sourceId);
+    await assert.rejects(
+      f.manager.verify(f.setup.setupId, { acknowledged: true, recovery: f.setup.recoveryKit }),
+      /Unlock the original profile/,
+    );
+    assert.deepEqual(readFileSync(path), replacementBytes);
+    assert.equal(f.manager.opened.has(f.setup.profileId), false);
+    assert.equal(f.manager.keyring(f.setup.profileId).active, false);
+  });

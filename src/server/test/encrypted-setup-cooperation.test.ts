@@ -1,4 +1,6 @@
 import test, { type TestContext } from 'node:test';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert/strict';
 import {
   mkdtempSync,
@@ -230,39 +232,42 @@ test('held setup manifest refuses a same-byte replacement before publication and
   clean(f, targetId);
 });
 
-test('accepted first head survives activation failure and resumed recovery does not recopy a later source head', async (t) => {
-  let publications = 0,
-    refuse = true;
-  const f = await fixture(t, (phase) => {
-    if (phase === 'publication' && ++publications === 2 && refuse)
-      throw Error('Fictional activation interruption');
+for (const retry of ['same-session', 'resumed-session'] as const)
+  test(`accepted first head survives activation failure and ${retry} recovery does not recopy a later source head`, async (t) => {
+    let publications = 0,
+      refuse = true;
+    const f = await fixture(t, (phase) => {
+      if (phase === 'publication' && ++publications === 2 && refuse)
+        throw Error('Fictional activation interruption');
+    });
+    const target = f.manager.begin({ name: 'Fictional Resume Copy', copyFrom: f.active.profileId }),
+      path = resolve(f.manager.pathFor(target.profileId), 'vault/manifest.enc'),
+      original = readFileSync(path);
+    await assert.rejects(
+      f.manager.verifyAsync(target.setupId, { acknowledged: true, recovery: target.recoveryKit }),
+      /Fictional activation interruption/,
+    );
+    assert.notDeepEqual(readFileSync(path), original);
+    assert.equal(f.manager.keyring(target.profileId).active, false);
+    const later = createNote(f.source.db, {
+      kind: 'note',
+      title: 'Fictional later source',
+      content: 'Must not enter the previously accepted copy.',
+    });
+    refuse = false;
+    f.manager.lock(f.active.profileId);
+    const resumed =
+      retry === 'resumed-session' ? await f.manager.resumeAsync(target.recoveryKit) : target;
+    assert.ok('setupId' in resumed);
+    await f.manager.verifyAsync(resumed.setupId!, {
+      acknowledged: true,
+      recovery: target.recoveryKit,
+    });
+    const copied = f.manager.opened.get(target.profileId)!;
+    assert.equal(getNote(copied.db, f.note.id).content, f.note.content);
+    assert.throws(() => getNote(copied.db, later.id));
+    clean(f, target.profileId);
   });
-  const target = f.manager.begin({ name: 'Fictional Resume Copy', copyFrom: f.active.profileId }),
-    path = resolve(f.manager.pathFor(target.profileId), 'vault/manifest.enc'),
-    original = readFileSync(path);
-  await assert.rejects(
-    f.manager.verifyAsync(target.setupId, { acknowledged: true, recovery: target.recoveryKit }),
-    /Fictional activation interruption/,
-  );
-  assert.notDeepEqual(readFileSync(path), original);
-  assert.equal(f.manager.keyring(target.profileId).active, false);
-  const later = createNote(f.source.db, {
-    kind: 'note',
-    title: 'Fictional later source',
-    content: 'Must not enter the previously accepted copy.',
-  });
-  refuse = false;
-  const resumed = await f.manager.resumeAsync(target.recoveryKit);
-  assert.ok('setupId' in resumed);
-  await f.manager.verifyAsync(resumed.setupId!, {
-    acknowledged: true,
-    recovery: target.recoveryKit,
-  });
-  const copied = f.manager.opened.get(target.profileId)!;
-  assert.equal(getNote(copied.db, f.note.id).content, f.note.content);
-  assert.throws(() => getNote(copied.db, later.id));
-  clean(f, target.profileId);
-});
 
 test('copy refuses equal-byte consumed source replacement before the first target head', async (t) => {
   let objectPath = '',
@@ -425,4 +430,69 @@ test('HTTP private-copy activation serves the original session and refuses anoth
   );
   assert.equal(copied.status, 200);
   assert.equal(copied.data!.content, note.content);
+});
+
+test('setup admitted before expiry finishes after its original window without renewing it', async (t) => {
+  const f = await fixture(t);
+  const now = Date.now;
+  let elapsed = 0,
+    checks = 0;
+  t.mock.method(Date, 'now', () => now() + elapsed);
+  const target = f.manager.begin({ name: 'Fictional admitted copy', copyFrom: f.active.profileId });
+  const result = await f.manager.verifyAsync(
+    target.setupId,
+    { acknowledged: true, recovery: target.recoveryKit },
+    {
+      assertAuthorized() {
+        checks++;
+        elapsed = 31 * 60 * 1000;
+      },
+    },
+  );
+  assert.equal(result.id, target.profileId);
+  assert.ok(checks > 1);
+  clean(f, target.profileId);
+  await assert.rejects(
+    f.manager.verifyAsync(target.setupId, { acknowledged: true, recovery: target.recoveryKit }),
+    { code: 'SETUP_EXPIRED' },
+  );
+});
+
+test('first target manifest publication refuses an unrelated keyring replacement without deleting its committed head', async (t) => {
+  const f = await fixture(t);
+  const target = f.manager.begin({
+    name: 'Fictional publication keyring refusal',
+    copyFrom: f.active.profileId,
+  });
+  const manifest = resolve(f.manager.pathFor(target.profileId), 'vault/manifest.enc'),
+    keyring = resolve(f.manager.pathFor(target.profileId), 'keyring.json'),
+    originalManifest = readFileSync(manifest),
+    originalKeyring = readFileSync(keyring);
+  const rename = fs.renameSync;
+  let changed = false;
+  t.mock.method(fs, 'renameSync', (...args: Parameters<typeof rename>) => {
+    rename(...args);
+    if (!changed && String(args[1]) === manifest && String(args[0]).includes('.setup-stage-')) {
+      changed = true;
+      writeFileSync(keyring, originalKeyring);
+    }
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(
+    f.manager.verifyAsync(target.setupId, { acknowledged: true, recovery: target.recoveryKit }),
+    /Setup publication changed|preparation changed/,
+  );
+  assert.equal(changed, true);
+  assert.notDeepEqual(
+    readFileSync(manifest),
+    originalManifest,
+    'the already committed first head remains recovery authority',
+  );
+  assert.equal(f.manager.opened.has(target.profileId), false);
+  assert.equal(f.manager.keyring(target.profileId).active, false);
+  clean(f, target.profileId);
 });

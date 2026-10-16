@@ -1586,6 +1586,12 @@ export function stageVaultRecordObject(
   }
 }
 
+interface InitialHeadPublication {
+  before(): void;
+  after(): void;
+  unacknowledged?(candidate: Uint8Array): void;
+}
+
 export interface Vault {
   put(input: Uint8Array | string): string;
   storeFile(name: string, input: Uint8Array | string): string;
@@ -1608,7 +1614,11 @@ export interface Vault {
     deferredBytes: number;
     databasePlanningBytes: number;
   };
-  recordStorage(beforeHead?: () => void, compactWorkspace?: string): VaultRecordStorage;
+  recordStorage(
+    beforeHead?: () => void,
+    compactWorkspace?: string,
+    initialPublication?: InitialHeadPublication,
+  ): VaultRecordStorage;
   readFile(name: string): Buffer | null;
   fileMetadata(name: string): VaultObjectMetadata | null;
   writeCache(path: string, metadata: unknown): void;
@@ -1953,10 +1963,19 @@ function* openVaultSteps({
     rememberDigest(id, manifest.objects[id]);
     return id;
   }
-  function publish(): void {
-    return measureImportPhase('vault_publish_manifest', () => publishInternal(), {}, { profileId });
+  function publish(publication?: InitialHeadPublication): void {
+    return measureImportPhase(
+      'vault_publish_manifest',
+      () => {
+        publication?.before();
+        publishInternal(publication?.unacknowledged);
+        publication?.after();
+      },
+      {},
+      { profileId },
+    );
   }
-  function publishInternal(): void {
+  function publishInternal(unacknowledgedHead?: (candidate: Uint8Array) => void): void {
     guard();
     try {
       // Verify only newly staged objects and changed binding targets, never old index history.
@@ -1972,7 +1991,12 @@ function* openVaultSteps({
         if (!meta || bytes !== meta.bytes || hash.digest('hex') !== meta.sha256)
           throw Error('Original evidence is missing or changed');
       }
-      manifest.revision = index.publish(pendingFiles, pendingObjects, manifest.recordsHead);
+      manifest.revision = index.publish(
+        pendingFiles,
+        pendingObjects,
+        manifest.recordsHead,
+        unacknowledgedHead,
+      );
       pendingFiles.clear();
       pendingObjects.clear();
       for (const [workspace, names] of stagedWorkspaceFiles) {
@@ -2100,7 +2124,11 @@ function* openVaultSteps({
     for (const name of Object.keys(manifest.files))
       if (!exclude(name)) materializeFile(name, workspace);
   }
-  function recordStorage(beforeHead?: () => void, compactWorkspace?: string): VaultRecordStorage {
+  function recordStorage(
+    beforeHead?: () => void,
+    compactWorkspace?: string,
+    initialPublication?: InitialHeadPublication,
+  ): VaultRecordStorage {
     const recordPath = (name: string): string => {
       if (!/^objects\/[0-9a-f-]{36}$/.test(name)) throw Error('Invalid record storage name');
       return resolve(directory, 'vault/versions', name.slice(8) + '.enc');
@@ -2128,7 +2156,11 @@ function* openVaultSteps({
         try {
           beforeHead?.();
           manifest.recordsHead = Buffer.from(bytes).toString('base64');
-          publish();
+          // Only this first publication belongs to setup admission. Later
+          // accepted writes must not retain its released authorization lease.
+          const publication = initialPublication;
+          initialPublication = undefined;
+          publish(publication);
         } catch (error) {
           discard();
           throw error;

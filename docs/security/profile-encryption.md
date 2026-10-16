@@ -109,6 +109,60 @@ automatic statement re-preparation rather than bypassing the installed policy.
 No caller callback, storage adapter read or database compilation follows the
 closing seal before activation.
 
+### Unlock and setup admission
+
+The five-minute authentication challenge and thirty-minute setup session gate
+admission once. A valid request claims its exact challenge or setup before
+entering the activation queue; a request already expired at that point refuses.
+Direct helper calls use the same single-claim rule. Queueing, verification and
+preparation do not renew the expiry or reject owned work merely because that
+original window has elapsed. Registration and enrollment confirmation retain
+their existing expiry checks.
+
+Queued admissions retain the original target authority and cancellation owner,
+without unwrapping a key or starting a preparation worker. A private copy also
+retains its original open source and accepted head. Disconnect, cancellation,
+lock, relevant keyring or generation changes and application closure revoke
+queued as well as active work. Recovery inspection can return a new setup
+candidate, but only its fully authorized admission replaces older setup
+identities and queued claims for that profile. A caller with the target kit but
+without current source-session access cannot invalidate an authorized copy
+setup. Replacement retains the admitted target and source proofs through
+revocation callbacks; active preparation still refuses concurrent resume.
+Cleanup releases only the exact admission it owns. An expired owned
+authentication is not removed by unrelated challenge pruning, and the challenge
+registry remains bounded.
+
+The verified authenticator's own counter publication permits only that checked
+keyring transition. Revocation callbacks run before a fresh check of the original
+authority, and unrelated directory or manifest changes cannot be adopted as a
+new baseline. Setup's first-manifest transition likewise preserves the original
+target directory and keyring. Existing source, physical-witness and passive
+closing checks remain required. A refusal after a committed first target head
+retains that accepted authority for exact-head recovery without opening the
+profile or granting a session. A failure after registry publication may retain a
+registered, locked profile. A retry with the same valid setup session,
+or a separately validated recovery session, uses the committed target head
+without requiring its old source. The attempt that first publishes the head
+still retains its original source checks through activation.
+
+The first-head receipt is captured inside publication before diagnostics can
+change the selected manifest, and its admission hooks are consumed once so
+ordinary later accepted writes do not retain the setup lease. An inactive setup
+retains that exact published manifest receipt: a changed or rolled-back manifest
+refuses the same-session retry rather than authorizing a new unpinned copy. A
+new recovery session authenticates the currently selected target before its own
+admission; it does not automatically repair altered archive files.
+
+A manifest write that commits before reporting an error still fails and cleans
+up the current attempt. Only bounded, authenticated readback equal to its exact
+intended candidate can retain a receipt for a future recovery attempt; an
+arbitrary selected disk head cannot grant that eligibility or activate a profile.
+
+This admission rule does not provide cross-process continuation of an unpublished
+partial copy or orphan-stage reclamation. Committed-head recovery below remains
+distinct from retrying unpublished work.
+
 The target preparation lease rejects concurrent target opens and is cancelled by
 target lock, removal, keyring writes or application closure. No target app, batch
 publisher or original resolver can use its prepared runtime before attachment.
@@ -170,7 +224,7 @@ Controlled fictional tests exercise recovery verification, invalid/wrong-profile
 
 On 2026-10-15 the owner reported that passkeys were ready and all their testing was complete, requested the Proton Pass compatibility change from the hosted checker in the application, and authorized closing the compatibility-testing tickets. That accepts the existing select-a-profile passkey baseline. No new raw report, detailed device matrix or browser/provider versions were supplied with that statement; it does not establish universal PRF support or retroactively fill missing fields in earlier reports.
 
-Keep the hosted checker and its publication workflow available for future testing. Its hosted credentials and fictional decryption results remain scoped to that relying party. New failures should retain the actual combination and revision rather than replacing earlier evidence. The later [username-less sign-in and salt migration](../todo/CRS-088.md) remains a separate unimplemented feature with its own post-implementation qualification; the [challenge/session expiry limitation](../todo/CRS-245.md) is also separate.
+Keep the hosted checker and its publication workflow available for future testing. Its hosted credentials and fictional decryption results remain scoped to that relying party. New failures should retain the actual combination and revision rather than replacing earlier evidence. The later [username-less sign-in and salt migration](../todo/CRS-088.md) remains a separate unimplemented feature with its own post-implementation qualification. The separate [admission contract](#unlock-and-setup-admission) now checks unlock and setup expiry before queueing, while preserving cancellation and authority checks throughout the admitted attempt.
 
 ## Physical passkey qualification
 

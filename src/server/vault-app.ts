@@ -21,7 +21,7 @@ import {
   type CreateEncryptedProfilesOptions,
 } from './encrypted-profiles.ts';
 import { importDiagnostics, type ImportDiagnostics } from './import-diagnostics.ts';
-import { createProfilePasskeys } from './profile-passkeys.ts';
+import { createProfilePasskeys, type PasskeyVerification } from './profile-passkeys.ts';
 import { writeChat, forgetChatJournal } from './assistant-journal.ts';
 import { writeIntakeBatch, forgetIntakeBatchJournal } from './intake-batch-journal.ts';
 import { HttpError } from './database.ts';
@@ -60,6 +60,7 @@ interface VaultAppOptions {
   diagnostics?: ImportDiagnostics;
   port?: number;
   unlockCheckpoint?: CreateEncryptedProfilesOptions['unlockCheckpoint'];
+  passkeyVerification?: PasskeyVerification;
 }
 interface Session {
   id: string;
@@ -229,6 +230,7 @@ export function createVaultApp({
   diagnostics = importDiagnostics,
   port = 3001,
   unlockCheckpoint,
+  passkeyVerification,
 }: VaultAppOptions) {
   const manager = createEncryptedProfiles({
       dataDirectory,
@@ -236,7 +238,7 @@ export function createVaultApp({
       diagnostics,
       unlockCheckpoint,
     }),
-    passkeys = createProfilePasskeys(manager),
+    passkeys = createProfilePasskeys(manager, passkeyVerification),
     sessions = new Map<string, Session>();
   let closed = false,
     activation: Promise<unknown> = Promise.resolve();
@@ -481,27 +483,27 @@ export function createVaultApp({
             if (!res.writableEnded) controller.abort(Error('Setup request was disconnected'));
           };
         res.once('close', abort);
+        let admission: ReturnType<typeof manager.admitSetup> | undefined;
         try {
           const input = await body(req),
-            p = await activate(
-              () =>
-                manager.verifyAsync(setup[1], input, {
-                  authorizeCopySource: (sourceId) => requireAccess(sourceId, client),
-                  signal: controller.signal,
-                  authorization: sessionUnlockAuthorization(
-                    client,
-                    'setup:' + setup[1],
-                    controller.signal,
-                  ),
-                  assertAuthorized: () => {
-                    if (closed || sessions.get(client.id) !== client)
-                      throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
-                  },
-                }),
-              client,
-            );
+            options = {
+              authorizeCopySource: (sourceId) => requireAccess(sourceId, client),
+              signal: controller.signal,
+              authorization: sessionUnlockAuthorization(
+                client,
+                'setup:' + setup[1],
+                controller.signal,
+              ),
+              assertAuthorized: () => {
+                if (closed || sessions.get(client.id) !== client)
+                  throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+              },
+            } satisfies Parameters<typeof manager.admitSetup>[2];
+          admission = manager.admitSetup(setup[1], input, options);
+          const p = await activate(() => admission!.verify(), client);
           send(res, 201, { data: publicCard(p, client, hostname) });
         } finally {
+          admission?.release();
           res.off('close', abort);
         }
         return;
@@ -547,10 +549,28 @@ export function createVaultApp({
         return;
       }
       if (action === 'passkeys/authenticate' && method === 'POST') {
-        const input = await body(req),
-          p = await activate(() => passkeys.authenticate(id, client.id, input), client);
-        passkeys.recordUse(id, (input.response as { id: string }).id);
-        send(res, 200, { data: publicCard(p, client, hostname) });
+        const controller = new AbortController(),
+          abort = () => {
+            if (!res.writableEnded) controller.abort(Error('Unlock request was disconnected'));
+          };
+        res.once('close', abort);
+        let admission: ReturnType<typeof passkeys.admitAuthentication> | undefined;
+        try {
+          const input = await body(req);
+          admission = passkeys.admitAuthentication(id, client.id, input, {
+            signal: controller.signal,
+            assertAuthorized: () => {
+              if (closed || sessions.get(client.id) !== client)
+                throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+            },
+          });
+          const p = await activate(() => admission!.authenticate(), client);
+          passkeys.recordUse(id, (input.response as { id: string }).id);
+          send(res, 200, { data: publicCard(p, client, hostname) });
+        } finally {
+          admission?.release();
+          res.off('close', abort);
+        }
         return;
       }
       if (action === 'passkeys/cancel' && method === 'POST') {
