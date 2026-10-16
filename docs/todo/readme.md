@@ -2,19 +2,19 @@
 
 This is the complete open work list. Each row links to its requirements, persona story, walkthrough, decisions and acceptance evidence. **CRS-277 is next unused**; IDs are never reused. Sizes and production marks are maintained here only. See the [workflow](workflow.md) for scoring, selection, review and retirement, [history](history.md) for earlier checkpoints and closed identifiers, and [CRS-060](CRS-060.md) for independent qualification layers. Research listings authorize no paid runs or deployment.
 
-**Grooming checkpoint:** this change resets the count to **0 of 7 only after merge**; until then the PR #85 cycle remains at **7 of 7** and grooming is due. CRS-155 completed that cycle when [PR #94](https://github.com/mxbaylee/circus-health/pull/94) merged on 2026-10-16 at 19:16 UTC (`efac2e0`). The source audit was revalidated against its identical source tree. This inspection covered 94 primary items (62 file / 32 formerly inline), plus CRS-060; it supplies no new runtime, device or paid-route qualification. [Full receipt and limits](history.md).
+**Grooming checkpoint:** [PR #99](https://github.com/mxbaylee/circus-health/pull/99) merged on 2026-10-16 at 19:53:15 UTC (`ba746af`), resetting the completed-ticket count to **0 of 7**. This People retirement advances it to **1 of 7 only when this change merges**. The current catalog has 93 primary items and 91 scored items; the historical 94-item audit and its limits remain in the [full receipt](history.md).
 
 ## <a id="top-5"></a>Next ready work
 
-Readiness applies after this grooming merges. Delegated product questions are implementation work, not a human hold. Scores below are a view of the catalog; the [selection rules](workflow.md#picking-the-next-item) govern ties.
+Readiness follows the merged grooming checkpoint. Delegated product questions are implementation work, not a human hold. Scores below are a view of the catalog; the [selection rules](workflow.md#picking-the-next-item) govern ties.
 
 | Next | Ticket | Score | Why next / remaining input |
 | --- | --- | --- | --- |
-| 1 | [CRS-124](CRS-124.md) People review completion | 8 | Human approved unchanged r5 directly in chat; final independent software checks and normal retirement remain. |
-| 2 | [CRS-141](CRS-141.md) Progressive save correctness | 7 | Unblocks CRS-086; lead resolves recorded disclosure policy. |
-| 3 | [CRS-143](CRS-143.md) Current-record policy | 7 | Supplies CRS-173/174/175; lead resolves recorded policy. |
-| 4 | [CRS-232](CRS-232.md) Complete large text / embedded files | 7 | Unblocks CRS-233; preserve storage and review safeguards. |
-| 5 | [CRS-115](CRS-115.md) Complete durable source text | 7 | Next high-impact eligible ID after external-input waits; independent complete-text oracle remains work. |
+| 1 | [CRS-141](CRS-141.md) Progressive save correctness | 7 | Unblocks CRS-086; lead resolves recorded disclosure policy. |
+| 2 | [CRS-143](CRS-143.md) Current-record policy | 7 | Supplies CRS-173/174/175; lead resolves recorded policy. |
+| 3 | [CRS-232](CRS-232.md) Complete large text / embedded files | 7 | Unblocks CRS-233; preserve storage and review safeguards. |
+| 4 | [CRS-115](CRS-115.md) Complete durable source text | 7 | Next high-impact eligible ID after external-input waits; independent complete-text oracle remains work. |
+| 5 | [CRS-139](CRS-139.md) Identity review and correction journey | 7 | Next eligible high-impact ID; preserve reviewed ownership and correction evidence. |
 
 ## Waiting: why higher scores are not next
 
@@ -118,7 +118,6 @@ Optional private-library counts remain deferred under [issue #96](https://github
 - [ ] <a id="crs-073"></a> 🧐 [CRS-073](CRS-073.md) · 🐭 S · 🟡 M · 🚀 production · score 8 — Inspect final printed output.
 - [ ] <a id="crs-037"></a><a id="crs-033"></a> 🖱️ [CRS-037](CRS-037.md) · 🐭 S · 🟢 S · 🚀 production · score 7 — Qualify OS drag-and-drop and truthful long-run progress. [Run scope #97](https://github.com/mxbaylee/circus-health/issues/97).
 - [ ] <a id="crs-154"></a> 🩺 [CRS-154](CRS-154.md) · 🐕 M · 🟡 M · 🚀 production · score 7 — Reconstruct real-provider import complaints from private-safe diagnostics. [Run scope #97](https://github.com/mxbaylee/circus-health/issues/97).
-- [ ] <a id="crs-124"></a> 👥 [CRS-124](CRS-124.md) · 🐭 S · 🟡 M · 🚀 production · score 8 — Finish software verification of owner-approved People flows.
 
 ## <a id="deferred-options"></a>💤 Deferred options
 
