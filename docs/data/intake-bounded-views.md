@@ -1418,8 +1418,19 @@ an all-file physical certificate: selected originals and retained proposals keep
 their separate current identity/hash checks.
 Uncertified native and mixed lookups finish any legacy projection preparation
 before selecting an answer, then keep that original answer witness through the
-final return. Foreign projection mutation refuses the read; explicit cache
-rebuild must restore exact answers from retained authority before retrying.
+final return. Foreign projection mutation refuses the read; a rebuilt projection
+cannot answer until checked against retained authority.
+Acceptance lookup reacquires a prepared catalog after that preparation. A
+current mixed catalog certifies its complete native subset; its token and the
+legacy answer witness both remain required through decoding and negative return.
+Without a catalog, every actual native original's full acceptance-header scope
+is independently derived for the queried operation and checked against its
+derived key before choosing a winner. Missing or redirected keys refuse rather
+than reporting an accepted operation absent. This cold compatibility work is
+not a selected-work bound; prepared native and mixed lookups avoid that scan.
+A corrupt native build that still claims completeness has no automatic repair
+here; clearing lookup caches or restarting may still refuse it. Retain the
+original exact request and accepted authority for diagnosis or recovery.
 Receipt payload hydration retains the original global selection proof as well
 as the selected source proof. A different original becoming the first matching
 receipt during hydration invalidates the answer, even when the selected source

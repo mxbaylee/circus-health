@@ -153,6 +153,197 @@ for (const mode of ['warm', 'cold', 'unprepared'] as const)
     assert.equal(answer, 7, 'A disposable completeness claim cannot supply a false negative');
   });
 
+for (const prepared of [false, true])
+  for (const later of ['none', 'native', 'legacy', 'earlier-legacy'] as const)
+    for (const damage of ['missing', 'redirected'] as const)
+      test(`a ${prepared ? 'prepared' : 'synchronous'} receipt lookup refuses a ${damage} first key with a ${later} competing original`, async (t) => {
+        const operation = 'fictional-checked-operation';
+        const raw = (marker: string) =>
+          JSON.stringify({
+            intake: {
+              version: 0,
+              workflow: {
+                format: 'health-intake-workflow-v1',
+                reportAcceptances: [
+                  { receipt: { operationId: operation }, marker },
+                  { receipt: { operationId: operation }, marker: 'later-within-source' },
+                  { receipt: { operationId: 'fictional-other-operation' }, marker: 'other' },
+                ],
+              },
+            },
+          });
+        const f = await fixture(t, raw('first'));
+        await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+        if (later !== 'none') {
+          const other = { id: 'fictional-later-original' };
+          registerRawIntakeFixture(f.db, other.id, raw('later-source'));
+          if (later === 'native') {
+            await buildIntakeCollectionEnvelope(f.db, other);
+            await buildVerifiedWorkflowSummary(f.db, other, summaryOptions);
+          }
+          if (later === 'earlier-legacy')
+            transaction(f.db, () =>
+              f.db.prepare('UPDATE source_files SET rowid=0 WHERE id=?').run(other.id),
+            );
+        }
+        await prepareIntakeLookupIndices(f.db);
+        const view = openIntakeCollectionEnvelope(f.db, f.source);
+        const workflow = view.child(view.child(view.root(), 'intake')!, 'workflow')!;
+        const collections = selectedEnvelopeStore(f.db, f.source).collections;
+        const operationId = randomUUID();
+        collections.commitMaintenance(
+          collections.prepare(collections.openView(), {
+            operationId,
+            requestDigest: createHash('sha256').update(operationId).digest('hex'),
+            domainVersion: 0,
+            changes: [
+              {
+                area: 'builds',
+                collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+                op: 'put',
+                key: 'complete',
+                value: JSON.stringify(view.logical),
+              },
+              {
+                area: 'builds',
+                collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+                op: 'put',
+                key: 'policy',
+                value: INTAKE_LOOKUP_INDEX_POLICY,
+              },
+              {
+                area: 'builds',
+                collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+                key: schemaKey(
+                  'lookup-acceptance-operation-first',
+                  Buffer.from(operation).toString('hex').toUpperCase(),
+                ),
+                ...(damage === 'missing'
+                  ? { op: 'delete' as const }
+                  : {
+                      op: 'put' as const,
+                      // A valid address to the same operation is still the wrong first occurrence.
+                      value: view.address(view.childAt(workflow, 'reportAcceptances', 1)!),
+                    }),
+              },
+            ],
+          }),
+        );
+        clearIntakeLookupCache(f.db);
+        if (prepared) await prepareIntakeLookupIndices(f.db);
+        assert.throws(
+          () => retainedIntakeAcceptance(f.db, operation),
+          /native (?:catalog target|acceptance index).*changed|acceptance index.*incomplete/,
+        );
+      });
+
+test('synchronous receipt lookup checks later native keys before returning an earlier valid receipt', async (t) => {
+  const operation = 'fictional-later-damage';
+  const raw = (marker: string) =>
+    JSON.stringify({
+      intake: {
+        version: 0,
+        workflow: {
+          format: 'health-intake-workflow-v1',
+          reportAcceptances: [{ receipt: { operationId: operation }, marker }],
+        },
+      },
+    });
+  const f = await fixture(t, raw('first'));
+  await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+  const later = { id: 'fictional-later-damaged' };
+  registerRawIntakeFixture(f.db, later.id, raw('later'));
+  await buildIntakeCollectionEnvelope(f.db, later);
+  await buildVerifiedWorkflowSummary(f.db, later, summaryOptions);
+  const view = openIntakeCollectionEnvelope(f.db, later);
+  const collections = selectedEnvelopeStore(f.db, later).collections;
+  const operationId = randomUUID();
+  collections.commitMaintenance(
+    collections.prepare(collections.openView(), {
+      operationId,
+      requestDigest: createHash('sha256').update(operationId).digest('hex'),
+      domainVersion: view.logical.domainVersion,
+      changes: [
+        {
+          area: 'builds',
+          collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+          op: 'put',
+          key: 'complete',
+          value: JSON.stringify(view.logical),
+        },
+        {
+          area: 'builds',
+          collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+          op: 'put',
+          key: 'policy',
+          value: INTAKE_LOOKUP_INDEX_POLICY,
+        },
+      ],
+    }),
+  );
+  clearIntakeLookupCache(f.db);
+  assert.throws(
+    () => retainedIntakeAcceptance(f.db, operation),
+    /native acceptance index is incomplete or changed/,
+  );
+});
+
+test('synchronous absent-operation lookup refuses a false-positive native key', async (t) => {
+  const f = await fixture(
+    t,
+    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportAcceptances":[{"receipt":{"operationId":"fictional-real-operation"}}]}}}',
+  );
+  await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+  const view = openIntakeCollectionEnvelope(f.db, f.source);
+  const workflow = view.child(view.child(view.root(), 'intake')!, 'workflow')!;
+  const collections = selectedEnvelopeStore(f.db, f.source).collections;
+  const operationId = randomUUID();
+  collections.commitMaintenance(
+    collections.prepare(collections.openView(), {
+      operationId,
+      requestDigest: createHash('sha256').update(operationId).digest('hex'),
+      domainVersion: view.logical.domainVersion,
+      changes: [
+        {
+          area: 'builds',
+          collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+          op: 'put',
+          key: 'complete',
+          value: JSON.stringify(view.logical),
+        },
+        {
+          area: 'builds',
+          collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+          op: 'put',
+          key: 'policy',
+          value: INTAKE_LOOKUP_INDEX_POLICY,
+        },
+        {
+          area: 'builds',
+          collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+          op: 'put',
+          key: schemaKey(
+            'lookup-acceptance-operation-first',
+            Buffer.from('fictional-absent').toString('hex').toUpperCase(),
+          ),
+          value: view.address(view.childAt(workflow, 'reportAcceptances', 0)!),
+        },
+      ],
+    }),
+  );
+  clearIntakeLookupCache(f.db);
+  assert.throws(
+    () => retainedIntakeAcceptance(f.db, 'fictional-absent'),
+    /native acceptance index is incomplete or changed/,
+  );
+  await prepareIntakeLookupIndices(f.db);
+  assert.equal(
+    retainedIntakeAcceptance(f.db, 'fictional-absent'),
+    null,
+    'Independently certified true absence ignores a spurious derived key',
+  );
+});
+
 for (const mode of ['direct', 'fallback'] as const)
   test(`native receipt hydration keeps its original ${mode} earliest-source selection`, async (t) => {
     const receipt = (marker: string) =>
@@ -922,38 +1113,262 @@ test('native catalog prunes a removed original without retaining its acceptance'
   });
 });
 
-test('mixed legacy and native acceptance order survives a native catalog build', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-mixed-lookup-'));
-  const db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
-  memoryRecordAuthority(db);
-  t.after(() => {
-    db.close();
-    rmSync(root, { recursive: true, force: true });
+for (const prepared of [false, true])
+  test(`mixed legacy and native acceptance order survives ${prepared ? 'prepared' : 'synchronous'} lookup`, async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-mixed-lookup-'));
+    const db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
+    memoryRecordAuthority(db);
+    t.after(() => {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    registerRawIntakeFixture(
+      db,
+      'fictional-legacy',
+      '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportGroups":[{"discoveryOrder":11}],"reportAcceptances":[{"receipt":{"operationId":"fictional-duplicate"},"marker":"legacy"}]}}}',
+    );
+    const native = { id: 'fictional-native' };
+    registerRawIntakeFixture(
+      db,
+      native.id,
+      '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportGroups":[{"discoveryOrder":13}],"reportAcceptances":[{"receipt":{"operationId":"fictional-duplicate"},"marker":"native"},{"receipt":{"operationId":"fictional-native-only"},"marker":"only"}]}}}',
+    );
+    await buildIntakeCollectionEnvelope(db, native);
+    await buildVerifiedWorkflowSummary(db, native, summaryOptions);
+    if (prepared) await prepareIntakeLookupIndices(db);
+    assert.deepEqual(retainedIntakeAcceptance(db, 'fictional-duplicate'), {
+      receipt: { operationId: 'fictional-duplicate' },
+      marker: 'legacy',
+    });
+    assert.deepEqual(retainedIntakeAcceptance(db, 'fictional-native-only'), {
+      receipt: { operationId: 'fictional-native-only' },
+      marker: 'only',
+    });
+    assert.equal(maximumIntakeDiscoveryOrder(db), 13);
+    assert.equal(retainedIntakeAcceptance(db, 'fictional-absent'), null);
   });
-  registerRawIntakeFixture(
-    db,
-    'fictional-legacy',
-    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportGroups":[{"discoveryOrder":11}],"reportAcceptances":[{"receipt":{"operationId":"fictional-duplicate"},"marker":"legacy"}]}}}',
-  );
-  const native = { id: 'fictional-native' };
-  registerRawIntakeFixture(
-    db,
-    native.id,
-    '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportGroups":[{"discoveryOrder":13}],"reportAcceptances":[{"receipt":{"operationId":"fictional-duplicate"},"marker":"native"},{"receipt":{"operationId":"fictional-native-only"},"marker":"only"}]}}}',
-  );
-  await buildIntakeCollectionEnvelope(db, native);
-  await buildVerifiedWorkflowSummary(db, native, summaryOptions);
-  await prepareIntakeLookupIndices(db);
-  assert.deepEqual(retainedIntakeAcceptance(db, 'fictional-duplicate'), {
-    receipt: { operationId: 'fictional-duplicate' },
-    marker: 'legacy',
+
+for (const count of [1, 8])
+  test(`prepared mixed receipt lookup avoids native contribution scans among ${count} native originals`, async (t) => {
+    const raw = (index: number) =>
+      JSON.stringify({
+        intake: {
+          version: 0,
+          workflow: {
+            format: 'health-intake-workflow-v1',
+            reportAcceptances: Array.from({ length: 20 }, (_, ordinal) => ({
+              receipt: { operationId: `fictional-native-${index}-${ordinal}` },
+              marker: `${index}-${ordinal}`,
+            })),
+          },
+        },
+      });
+    const f = await fixture(t, raw(0));
+    await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+    for (let index = 1; index < count; index++) {
+      const source = { id: `fictional-unrelated-${index}` };
+      registerRawIntakeFixture(f.db, source.id, raw(index));
+      await buildIntakeCollectionEnvelope(f.db, source);
+      await buildVerifiedWorkflowSummary(f.db, source, summaryOptions);
+    }
+    registerRawIntakeFixture(
+      f.db,
+      'fictional-legacy',
+      JSON.stringify({
+        intake: {
+          version: 0,
+          workflow: {
+            format: 'health-intake-workflow-v1',
+            reportAcceptances: [{ receipt: { operationId: 'fictional-legacy' }, marker: 'legacy' }],
+          },
+        },
+      }),
+    );
+    await prepareIntakeLookupIndices(f.db);
+    assert.ok(preparedIntakeLookupReadToken(f.db));
+    const before = { ...intakeLookupCounters(f.db) };
+    let headers = 0;
+    observeNativeGet = function (
+      this: StatementSync,
+      ...parameters: Parameters<StatementSync['get']>
+    ) {
+      if (this.sourceSQL.includes("typeof(json_extract(?,'$')) type,hex")) headers++;
+      return Reflect.apply(originalNativeGet, this, parameters);
+    } as typeof StatementSync.prototype.get;
+    try {
+      for (const operation of ['fictional-native-0-0', 'fictional-legacy', 'fictional-absent']) {
+        const result = await countedNativeSourceRead(f.db, () =>
+          retainedIntakeAcceptance(f.db, operation),
+        );
+        if (operation === 'fictional-absent') assert.equal(result.value, null);
+        else
+          assert.deepEqual(result.value, {
+            receipt: { operationId: operation },
+            marker: operation === 'fictional-legacy' ? 'legacy' : '0-0',
+          });
+        assert.equal(
+          result.reads.catalogRows,
+          0,
+          `${operation} must use certified native membership`,
+        );
+      }
+    } finally {
+      observeNativeGet = undefined;
+    }
+    assert.equal(headers, 0, 'Warm mixed reads do not rederive historical operation headers');
+    assert.equal(
+      intakeLookupCounters(f.db).nativeReceiptRowsWritten,
+      before.nativeReceiptRowsWritten,
+    );
+    assert.equal(intakeLookupCounters(f.db).projectionWrites, before.projectionWrites);
+    assert.ok(preparedIntakeLookupReadToken(f.db));
+    t.diagnostic(JSON.stringify({ count, receiptHeadersDerived: headers }));
   });
-  assert.deepEqual(retainedIntakeAcceptance(db, 'fictional-native-only'), {
-    receipt: { operationId: 'fictional-native-only' },
-    marker: 'only',
-  });
-  assert.equal(maximumIntakeDiscoveryOrder(db), 13);
-});
+
+for (const selected of ['native', 'legacy'] as const)
+  for (const revocation of ['order', 'registry'] as const)
+    test(`mixed ${selected} receipt hydration refuses ${revocation} revocation of its original selection witnesses`, async (t) => {
+      const raw = (marker: string) =>
+        JSON.stringify({
+          intake: {
+            version: 0,
+            workflow: {
+              format: 'health-intake-workflow-v1',
+              reportAcceptances: [
+                { receipt: { operationId: 'fictional-mixed-hydration' }, marker },
+              ],
+            },
+          },
+        });
+      const f = await fixture(t, raw(selected === 'native' ? 'first' : 'second'));
+      await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+      const legacy = 'fictional-legacy-competitor';
+      registerRawIntakeFixture(f.db, legacy, raw(selected === 'legacy' ? 'first' : 'second'));
+      if (selected === 'legacy')
+        transaction(f.db, () =>
+          f.db.prepare('UPDATE source_files SET rowid=0 WHERE id=?').run(legacy),
+        );
+      await prepareIntakeLookupIndices(f.db);
+      let changed = false;
+      const change = () => {
+        changed = true;
+        if (revocation === 'registry') {
+          clearIntakeCollectionCache(f.db);
+          return;
+        }
+        transaction(f.db, () =>
+          f.db
+            .prepare('UPDATE source_files SET rowid=-1 WHERE id=?')
+            .run(selected === 'native' ? legacy : f.source.id),
+        );
+      };
+      const originalParse = JSON.parse;
+      if (selected === 'legacy')
+        JSON.parse = function (text: string, ...rest: unknown[]) {
+          if (
+            !changed &&
+            text.includes('fictional-mixed-hydration') &&
+            text.includes('"marker":"first"')
+          )
+            change();
+          return Reflect.apply(originalParse, JSON, [text, ...rest]);
+        } as typeof JSON.parse;
+      else
+        observeNativeGet = function (
+          this: StatementSync,
+          ...parameters: Parameters<StatementSync['get']>
+        ) {
+          const row = Reflect.apply(originalNativeGet, this, parameters);
+          if (
+            !changed &&
+            this.sourceSQL === 'SELECT total_changes() AS count' &&
+            new Error().stack?.includes('recordChunks')
+          )
+            change();
+          return row;
+        } as typeof StatementSync.prototype.get;
+      try {
+        assert.throws(
+          () => retainedIntakeAcceptance(f.db, 'fictional-mixed-hydration'),
+          /native catalog frontier changed|projection answer witness changed|expired collection traversal/,
+        );
+      } finally {
+        JSON.parse = originalParse;
+        observeNativeGet = undefined;
+      }
+      assert.equal(
+        changed,
+        true,
+        'The original proof must expire inside actual selected hydration',
+      );
+      await prepareIntakeLookupIndices(f.db);
+      assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-mixed-hydration'), {
+        receipt: { operationId: 'fictional-mixed-hydration' },
+        marker: revocation === 'order' ? 'second' : 'first',
+      });
+    });
+
+for (const boundary of ['registry', 'policy', 'unchanged'] as const)
+  for (const present of [false, true])
+    test(`mixed ${present ? 'legacy result' : 'negative result'} seals ${boundary} state across both terminal proof reads`, async (t) => {
+      const f = await fixture(
+        t,
+        '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1"}}}',
+      );
+      await buildVerifiedWorkflowSummary(f.db, f.source, summaryOptions);
+      registerRawIntakeFixture(
+        f.db,
+        'fictional-terminal-legacy',
+        '{"intake":{"version":0,"workflow":{"format":"health-intake-workflow-v1","reportAcceptances":[{"receipt":{"operationId":"fictional-terminal-present"},"marker":"legacy"}]}}}',
+      );
+      await prepareIntakeLookupIndices(f.db);
+      let changed = false;
+      observeNativeGet = function (
+        this: StatementSync,
+        ...parameters: Parameters<StatementSync['get']>
+      ) {
+        const row = Reflect.apply(originalNativeGet, this, parameters);
+        const stack = new Error().stack;
+        if (
+          !changed &&
+          stack?.includes('assertAnswerCurrent') &&
+          ((boundary === 'registry' &&
+            this.sourceSQL === 'PRAGMA data_version' &&
+            stack.includes('assertProjectionAnswerWitness')) ||
+            (boundary === 'policy' &&
+              this.sourceSQL === 'PRAGMA temp.schema_version' &&
+              stack.includes('assertNativeCatalogCurrent')))
+        ) {
+          changed = true;
+          if (boundary === 'registry') clearIntakeCollectionCache(f.db);
+          else f.db.setAuthorizer(() => constants.SQLITE_OK);
+        }
+        return row;
+      } as typeof StatementSync.prototype.get;
+      const read = () =>
+        retainedIntakeAcceptance(
+          f.db,
+          present ? 'fictional-terminal-present' : 'fictional-terminal-absent',
+        );
+      try {
+        if (boundary === 'unchanged')
+          assert.deepEqual(
+            read(),
+            present
+              ? { receipt: { operationId: 'fictional-terminal-present' }, marker: 'legacy' }
+              : null,
+          );
+        else
+          assert.throws(read, /native catalog frontier changed|projection answer witness changed/);
+      } finally {
+        observeNativeGet = undefined;
+      }
+      assert.equal(
+        changed,
+        boundary !== 'unchanged',
+        'The selected terminal boundary must actually execute',
+      );
+    });
 
 const lookupProofFixture = async (t: test.TestContext) => {
   const f = await fixture(

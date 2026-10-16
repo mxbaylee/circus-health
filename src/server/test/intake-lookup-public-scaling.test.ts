@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,7 +19,16 @@ import {
   maximumIntakeDiscoveryOrder,
   retainedIntakeAcceptance,
 } from '../intake-lookup-projection.ts';
-import { prepareIntakeLookupIndices } from '../intake-lookup-state.ts';
+import {
+  INTAKE_LOOKUP_INDEX_COLLECTION,
+  INTAKE_LOOKUP_INDEX_POLICY,
+  prepareIntakeLookupIndices,
+} from '../intake-lookup-state.ts';
+import {
+  openIntakeCollectionEnvelope,
+  selectedEnvelopeStore,
+} from '../intake-collection-envelope.ts';
+import { schemaKey } from '../intake-envelope-schema.ts';
 import {
   captureIntakeFrontierAttempts,
   readIntakeFrontierCommittedChain,
@@ -276,6 +285,103 @@ async function fixture(t: TestContext, backend: 'vault' | 'contributor', unrelat
   };
   return { db, root, profileId, source, storage, vault, opened, request, measure };
 }
+
+test('mixed public receipt reads and exact retries refuse an incomplete native operation key without accepting again', async (t) => {
+  const f = await fixture(t, 'contributor', 0);
+  uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-legacy-original.txt',
+    bytes: Buffer.from('Independently fictional retained legacy original'),
+  });
+  const input = await f.request();
+  const accepted = await acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, input);
+  assert.equal(accepted.receipt.acceptedCount, 1);
+  const view = openIntakeCollectionEnvelope(f.db, f.source, { fieldSelection: 'first' });
+  const collections = selectedEnvelopeStore(f.db, f.source).collections;
+  const key = schemaKey(
+    'lookup-acceptance-operation-first',
+    Buffer.from(input.operationId).toString('hex').toUpperCase(),
+  );
+  const target = view.address(
+    view.lookup('lookup-acceptance-operation-first', [
+      Buffer.from(input.operationId).toString('hex').toUpperCase(),
+    ])!,
+  );
+  const maximum = view.lookup('lookup-discovery-maximum', []);
+  const changeKey = (value?: string) => {
+    const operationId = randomUUID();
+    collections.commitMaintenance(
+      collections.prepare(collections.openView(), {
+        operationId,
+        requestDigest: createHash('sha256').update(operationId).digest('hex'),
+        domainVersion: view.logical.domainVersion,
+        changes: [
+          {
+            area: 'builds',
+            collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+            key: schemaKey('lookup-discovery-maximum'),
+            ...(maximum
+              ? { op: 'put' as const, value: view.address(maximum) }
+              : { op: 'delete' as const }),
+          },
+          {
+            area: 'builds',
+            collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+            op: 'put',
+            key: 'complete',
+            value: JSON.stringify(view.logical),
+          },
+          {
+            area: 'builds',
+            collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+            op: 'put',
+            key: 'policy',
+            value: INTAKE_LOOKUP_INDEX_POLICY,
+          },
+          {
+            area: 'builds',
+            collection: INTAKE_LOOKUP_INDEX_COLLECTION,
+            key,
+            ...(value === undefined ? { op: 'delete' as const } : { op: 'put' as const, value }),
+          },
+        ],
+      }),
+    );
+  };
+  changeKey();
+  clearIntakeLookupCache(f.db);
+  const documents = f.db.prepare('SELECT * FROM documents ORDER BY id').all();
+  const head = f.storage.read('head');
+  const refusals: unknown[] = [];
+  for (const run of [
+    () => getIntakeReportAcceptanceRead(f.db, f.root, f.profileId, input.operationId),
+    () => acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, input),
+  ]) {
+    try {
+      await run();
+    } catch (error) {
+      refusals.push(error);
+    }
+  }
+  t.diagnostic(JSON.stringify(refusals.map((error) => String(error))));
+  assert.deepEqual(f.db.prepare('SELECT * FROM documents ORDER BY id').all(), documents);
+  assert.deepEqual(f.storage.read('head'), head);
+  assert.equal(refusals.length, 2);
+  for (const error of refusals)
+    assert.match(
+      String(error),
+      /native (?:catalog target|acceptance index).*changed|acceptance index.*incomplete/,
+    );
+  changeKey(target as string);
+  clearIntakeLookupCache(f.db);
+  assert.deepEqual(
+    (await getIntakeReportAcceptanceRead(f.db, f.root, f.profileId, input.operationId)).receipt,
+    accepted.receipt,
+  );
+  const replay = await acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, input);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.receipt, accepted.receipt);
+  assert.deepEqual(f.db.prepare('SELECT * FROM documents ORDER BY id').all(), documents);
+});
 
 for (const backend of ['vault', 'contributor'] as const)
   test(
