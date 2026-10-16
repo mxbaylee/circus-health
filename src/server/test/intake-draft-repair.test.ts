@@ -805,7 +805,7 @@ for (const native of [false, true])
               return { model: 'fictional-repair-model', backend: 'fictional' };
             },
             async turn() {
-              callbacks.onEvent?.('turn/started', { turn: { id: 'fictional-repair-turn' } });
+              await callbacks.onEvent?.('turn/started', { turn: { id: 'fictional-repair-turn' } });
             },
             async cancel() {},
             close() {},
@@ -895,17 +895,19 @@ for (const native of [false, true])
         1,
       );
 
-      bridges[0]!.callbacks.onEvent?.('error', {
+      await bridges[0]!.callbacks.onEvent?.('error', {
         willRetry: false,
         message: 'Fictional interruption before source read',
       });
+      assert.equal(chat.status, 'failed');
       assistant.retry(profileId, chat.id);
       await waitForBridge(2);
       assert.deepEqual(
         bridges[1]!.tools.map((tool) => tool.name).sort(),
         exactTools.slice().sort(),
       );
-      bridges[1]!.callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+      await bridges[1]!.callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+      assert.equal(chat.status, 'idle');
       assert.throws(
         () =>
           assistant.send(profileId, chat.id, {
@@ -973,7 +975,8 @@ for (const native of [false, true])
         },
         callId: 'preview-original-date',
       })) as { id: string };
-      bridges[2]!.callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+      await bridges[2]!.callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+      assert.equal(chat.status, 'idle');
       for (let attempt = 0; attempt < 2; attempt++) {
         if (app) {
           const address = app.server.address();

@@ -36,6 +36,8 @@ The encrypted product backup is a consistent copy of the complete durable `CRS_D
 
 Current `profiles/<id>/db/` files and top-level checkpoints may be old rebuild/recovery outputs. Normal startup builds working SQLite in a separate runtime directory. Verify the running process, committed generations and recovery coverage before declaring a particular old file disposable. Current format helpers and recovery outputs still use `db/database.sqlite`; its presence is not proof the live application reads it.
 
+The retained encrypted SQLite cache is different from the unlocked working database and disposable scratch. Those working files contain plaintext. Supported Compose mounts the runtime directory and `/tmp` on RAM-backed tmpfs; direct contributor helpers currently use the OS temporary directory, which may be a disk filesystem. An in-memory profile key does not encrypt these SQLite files, and unclean termination can leave contributor scratch behind. Working scratch is outside durable profile totals and is never recovery authority. A configurable encrypted-disk scratch mechanism is not implemented; [CRS-246](../todo/CRS-246.md) tracks that protection and capacity work.
+
 Backup retention is separate from logical record history. Removing an external backup never authorizes dropping versions from an active profile. Use the documented backup/recovery workflow and preserve the chosen recovery source before any explicitly requested archive reset.
 
 ## Capacity and curation overhead

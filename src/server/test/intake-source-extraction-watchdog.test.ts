@@ -14,7 +14,10 @@ import { uploadIntake } from '../intake.ts';
 import { createAssistant } from '../assistant.ts';
 import { createIntakeBatchManager } from '../intake-batches.ts';
 import { runExclusiveClinicalOperation } from '../clinical-operation.ts';
-import type { extractIntakeSourceText } from '../intake-source-extraction.ts';
+import {
+  locateSourceExtractionProgress,
+  type extractIntakeSourceText,
+} from '../intake-source-extraction.ts';
 
 function gate(t: TestContext) {
   let resolve!: () => void;
@@ -36,6 +39,7 @@ function fixture(
   t: TestContext,
   extract: typeof extractIntakeSourceText,
   authorized?: Parameters<typeof createIntakeBatchManager>[0]['authorized'],
+  onPublication?: Parameters<typeof createIntakeBatchManager>[0]['journalWriter'],
 ) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-extraction-watchdog-'));
   const profileId = 'fictional-watchdog';
@@ -88,6 +92,7 @@ function fixture(
         journalWriter(root, profileId, batch, reason) {
           journalReasons.push(reason);
           writeIntakeBatch(root, profileId, batch, reason);
+          onPublication?.(root, profileId, batch, reason);
         },
         clock: () => new Date(epoch + time),
         pollMs: 1,
@@ -155,9 +160,14 @@ for (const mode of ['initial admission', 'publication admission'] as const)
       try {
         if (mode === 'initial admission') {
           await entered.promise;
-          await until(t, () => !!item().sourceExtraction?.operationId);
+          // The batch's extraction prelude now needs the same host lane as the
+          // operation admission. Run its timer and let it queue before advancing
+          // the fake worker clock; it cannot publish state under another owner.
+          t.mock.timers.tick(0);
+          await setImmediate();
           f.advance(1000);
           await setImmediate();
+          assert.equal(item().sourceExtraction?.operationId, undefined);
           assert.equal(dispatched, 0);
           assert.equal(receipts().length, 0, 'Queued admission has no worker receipt yet');
           assert.equal(item().sourceExtraction?.stalls ?? 0, 0);
@@ -196,10 +206,7 @@ for (const mode of ['initial admission', 'publication admission'] as const)
         await until(t, () => item().sourceExtraction?.stalls === 1);
         assert.equal(dispatched, 1);
         assert.equal(item().reason, 'retrying_extraction');
-        assert.throws(
-          () => context!.assertRunning?.(),
-          /SOURCE_EXTRACTION_STALLED|operation changed/,
-        );
+        assert.throws(() => context!.assertRunning?.(), /SOURCE_EXTRACTION_STALLED/);
         manager.stop(f.profileId, batch.id);
       } finally {
         release.resolve();
@@ -312,3 +319,106 @@ for (const mode of ['no progress', 'revision race'] as const)
       );
     },
   );
+
+for (const change of ['operation', 'state', 'stop'] as const)
+  test(`accounted source exception refuses stale publication after ${change} changes`, async (t) => {
+    let attempts = 0,
+      injected = false;
+    let manager: ReturnType<typeof createIntakeBatchManager> | undefined;
+    const f = fixture(
+      t,
+      async () => {
+        const progress = locateSourceExtractionProgress(
+          getIntakeSourceText(f.db, f.root, f.profileId, f.source.id),
+        );
+        assert.equal(progress.page, 2, 'the retry remains scoped to the pending second page');
+        attempts++;
+        throw Error('Fictional second-page extraction failed');
+      },
+      undefined,
+      (_root, profileId, batch, reason) => {
+        if (injected || reason !== 'source-extraction-accounted' || attempts !== 3) return;
+        injected = true;
+        const item = batch.items[batch.currentIndex]!;
+        assert.ok(item.sourceExtraction);
+        if (change === 'operation') item.sourceExtraction.operationId = randomUUID();
+        else if (change === 'state') item.sourceExtraction = { ...item.sourceExtraction };
+        else manager!.stop(profileId, batch.id);
+      },
+    );
+    const initial = publishIntakeSourceText(f.db, f.root, f.profileId, f.source.id, {
+      operationId: randomUUID(),
+      expectedRevisionId: null,
+      sourceHash: f.source.sha256,
+      evidence: {
+        adapter: { name: 'fictional-three-page-capture', version: '1' },
+        pages: [1, 2, 3].map((page) => ({
+          page,
+          disposition: page === 1 ? ('extracted' as const) : ('partial' as const),
+          inspected: false,
+        })),
+        spans: [
+          {
+            id: 'fictional-completed-page-one',
+            region: { page: 1 },
+            text: 'Fictional previously captured page one.',
+            provenance: 'native',
+          },
+        ],
+        relations: [],
+        issues: [2, 3].map((page) => ({
+          id: `p${page}-pending`,
+          region: { page },
+          kind: 'coverage' as const,
+          status: 'open' as const,
+          detail: `Fictional pending page ${page}.`,
+        })),
+      },
+    });
+    manager = f.start();
+    const batchId = manager.list(f.profileId)[0]!.id;
+    const current = () => manager!.get(f.profileId, batchId);
+    const source = () => getIntakeSourceText(f.db, f.root, f.profileId, f.source.id);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      f.advance(10_000);
+      manager.wake(f.profileId);
+      if (attempt < 3)
+        await until(t, () => current().items[0]!.sourceExtraction?.stalls === attempt);
+    }
+    await until(
+      t,
+      () =>
+        injected &&
+        (['paused', 'stopped'].includes(current().status) ||
+          !!source().revision!.issues.find((issue) => issue.id === 'p2-processing-stalled')),
+    );
+    assert.equal(attempts, 3, 'stale accounting dispatches no fourth worker or later page');
+    assert.equal(current().status, change === 'stop' ? 'stopped' : 'paused');
+    assert.equal(current().items[0]!.reason, change === 'stop' ? 'stopped' : 'runner_error');
+    const retained = source().revision!;
+    assert.equal(
+      retained.id,
+      initial.revision!.id,
+      'stale accounting publishes no source revision',
+    );
+    assert.deepEqual(
+      retained.spans.filter((span) => span.region.page === 1),
+      initial.revision!.spans,
+    );
+    assert.equal(
+      retained.spans.some((span) => span.region.page === 3),
+      false,
+    );
+    assert.equal(
+      retained.issues.some((issue) => issue.id === 'p2-processing-stalled'),
+      false,
+    );
+    assert.ok(retained.issues.some((issue) => issue.id === 'p3-pending'));
+    const terminal = f.journalReasons.lastIndexOf(change === 'stop' ? 'stopped' : 'runner-paused');
+    assert.ok(terminal >= 0);
+    assert.deepEqual(
+      f.journalReasons.slice(terminal + 1),
+      [],
+      'no source checkpoint follows refusal',
+    );
+  });

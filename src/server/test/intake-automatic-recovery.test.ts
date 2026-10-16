@@ -162,7 +162,7 @@ function fixture(
               classification: 'context_limit',
               failed: true,
             });
-            callbacks.onExit?.(
+            await callbacks.onExit?.(
               new ModelContextLimitError('Fictional initial request rejected', 'initial'),
             );
             return;
@@ -174,7 +174,7 @@ function fixture(
                 outcome: 'unknown',
                 failed: true,
               });
-              callbacks.onExit?.(Error('Fictional transport loss'));
+              await callbacks.onExit?.(Error('Fictional transport loss'));
             }
             return;
           }
@@ -186,7 +186,7 @@ function fixture(
             usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
           });
           if (mode === 'slice')
-            callbacks.onExit?.(
+            await callbacks.onExit?.(
               new ModelContextLimitError('Fictional bounded slice ended', 'slice'),
             );
           else await callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
@@ -241,6 +241,7 @@ function fixture(
     db,
     profileId,
     source,
+    sourceAttempts: () => sourceAttempts,
     manager,
     assistant,
     calls,
@@ -503,13 +504,29 @@ test('three local failures isolate page two and preserve completed and later pag
   const f = fixture(t, 'source');
   await until(t, () => {
     f.tick();
+    return f.sourceAttempts() === 1;
+  });
+  const completedPageOne = getIntakeSourceText(
+    f.db,
+    f.root,
+    f.profileId,
+    f.source.id,
+  ).revision!.spans.filter((span) => span.region.page === 1);
+  assert.ok(completedPageOne.length);
+  await until(t, () => {
+    f.tick();
     const source = getIntakeSourceText(f.db, f.root, f.profileId, f.source.id);
     return source.status === 'available' && locateSourceExtractionProgress(source).page === 0;
   });
   const source = getIntakeSourceText(f.db, f.root, f.profileId, f.source.id);
+  assert.equal(f.sourceAttempts(), 3, 'only the three failed page-two attempts are dispatched');
   assert.equal(source.status, 'available');
   assert.ok(source.revision!.issues.some((issue) => issue.id === 'p2-processing-stalled'));
   assert.ok(source.revision!.spans.some((span) => span.region.page === 1));
+  assert.deepEqual(
+    source.revision!.spans.filter((span) => span.region.page === 1),
+    completedPageOne,
+  );
   assert.ok(source.revision!.spans.some((span) => span.region.page === 3));
   f.manager.close();
 });
@@ -662,7 +679,7 @@ test('automatic PDF units after page one can read their exact unit and source pa
     unitId: unit.id,
     exception: { reason: 'processing_stalled', at: new Date().toISOString() },
   });
-  f.calls[0].onExit?.(new ModelContextLimitError('Fictional bounded slice ended', 'slice'));
+  await f.calls[0].onExit?.(new ModelContextLimitError('Fictional bounded slice ended', 'slice'));
   await until(t, () => {
     f.tick();
     return f.calls.length === 2;

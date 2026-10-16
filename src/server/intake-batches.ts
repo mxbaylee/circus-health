@@ -1302,17 +1302,19 @@ export function createIntakeBatchManager({
         }, remaining);
       }
     };
-    const assertPublish = () => {
+    const assertSourceOperation = (operationId: string | null) => {
       if (
         !liveItem(profileId, batch, item, expected) ||
+        dbFor(profileId) !== db ||
         batch.status !== 'running' ||
         batch.items[batch.currentIndex] !== item ||
         item.sourceExtraction !== state ||
-        state.operationId !== prepared.operationId ||
+        state.operationId !== operationId ||
         !authorized(profileId, item.intakeId, 'publish')
       )
         throw Error('SOURCE_EXTRACTION_CANCELLED');
     };
+    const assertPublish = () => assertSourceOperation(prepared.operationId);
     let result: Awaited<ReturnType<typeof runIntakeSourceExtractionOperation>>;
     try {
       result = await runIntakeSourceExtractionOperation({
@@ -1333,8 +1335,8 @@ export function createIntakeBatchManager({
               maxPages: 1,
               onCoordinationWait: waitingForClinicalOwner,
               assertRunning() {
-                context.assertRunning?.();
                 if (expired) throw Error('SOURCE_EXTRACTION_STALLED');
+                context.assertRunning?.();
               },
             });
           } catch (error) {
@@ -1375,6 +1377,11 @@ export function createIntakeBatchManager({
         state.operationId = null;
         state.startedAt = null;
         state.initialDone = false;
+        // The worker's exact operation has been checked and accounted under
+        // this host owner. Exception retention belongs to that accounted state,
+        // not to the now-ended worker; it still pins the same item/state and
+        // requires the operation slot to remain empty.
+        const assertAccounted = () => assertSourceOperation(null);
         const after = getIntakeSourceText(db, root, profileId, item.intakeId);
         item.reason = null;
         save(profileId, batch, 'source-extraction-accounted');
@@ -1398,7 +1405,7 @@ export function createIntakeBatchManager({
           if (item.sourceRetryAttempts >= 3) {
             if (next.page) {
               await retainSourceStall(db, root, profileId, item.intakeId, next.page, {
-                assertRunning: assertPublish,
+                assertRunning: assertAccounted,
               });
               if (!liveItem(profileId, batch, item, expected) || batch.status !== 'running')
                 return 'blocked';
@@ -1466,7 +1473,7 @@ export function createIntakeBatchManager({
           state.unitPage = next.page;
           if (state.stalls >= 3 && next.page) {
             await retainSourceStall(db, root, profileId, item.intakeId, next.page, {
-              assertRunning: assertPublish,
+              assertRunning: assertAccounted,
             });
             if (!liveItem(profileId, batch, item, expected) || batch.status !== 'running')
               return 'blocked';

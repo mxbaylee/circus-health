@@ -96,7 +96,7 @@ function setup(
           },
           async turn() {
             bridge.started = true;
-            callbacks.onEvent?.('turn/started', { turn: { id: 'turn-1' } });
+            await callbacks.onEvent?.('turn/started', { turn: { id: 'turn-1' } });
           },
           async cancel() {},
           close() {
@@ -210,6 +210,7 @@ const propose = async (
   });
 };
 
+// Match the real provider: the caller waits for terminal journal publication.
 const complete = (bridge: TestBridge) =>
   bridge.callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
 
@@ -284,7 +285,7 @@ test('queued time and preflight are visible by default and exclude time while th
   release();
   await waitFor(t, () => f.bridges.length === 1);
   await propose(f.bridges[0], first);
-  complete(f.bridges[0]);
+  await complete(f.bridges[0]);
   await waitFor(t, () => f.bridges.length === 2);
   const spans = diagnostics
     .exportSnapshot(profileId)
@@ -338,11 +339,11 @@ test('two uploaded originals run sequentially into one durable review queue', as
   });
   assert.equal(f.manager.get(profileId, created.id).items[1].status, 'queued');
   await propose(f.bridges[0], first);
-  complete(f.bridges[0]);
+  await complete(f.bridges[0]);
   await waitFor(t, () => f.bridges.length === 2, 'second model pass');
   assert.equal(f.manager.get(profileId, created.id).items[0].status, 'review_ready');
   await propose(f.bridges[1], second);
-  complete(f.bridges[1]);
+  await complete(f.bridges[1]);
   const done = await waitFor(
     t,
     () => {
@@ -416,7 +417,7 @@ test('restart does not treat cumulative capture steps as unread new work', async
   });
   await waitFor(t, () => f.bridges.length === 1);
   await propose(f.bridges[0], item);
-  complete(f.bridges[0]);
+  await complete(f.bridges[0]);
   await waitFor(t, () => {
     const value = f.manager.get(profileId, batch.id);
     return value.status === 'complete' && value;
@@ -496,7 +497,7 @@ test('an active linked conversion is restarted under coordinator ownership after
   assert.equal(f.manager.get(profileId, batch.id).items[1].status, 'queued');
 
   await propose(f.bridges[1], first);
-  complete(f.bridges[1]);
+  await complete(f.bridges[1]);
   await waitFor(t, () => f.bridges.length === 3, 'next file after linked terminal pass');
   assert.equal(f.manager.get(profileId, batch.id).items[0].status, 'review_ready');
   f.manager.stop(profileId, batch.id);
@@ -601,7 +602,7 @@ test('restart resumes a batch linked immediately before a simulated process cras
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(f.bridges.length, 1, 'restart did not create or start a second chat');
   await propose(f.bridges[0], intake);
-  complete(f.bridges[0]);
+  await complete(f.bridges[0]);
   await waitFor(
     t,
     () => restarted.get(profileId, batch.id).status === 'complete',
@@ -648,10 +649,10 @@ test('Stop, reload, and explicit resume retry only the linked cancelled conversi
   await waitFor(t, () => f.bridges.length === 2, 'retried linked conversion');
   assert.equal(reloaded.get(profileId, batch.id).items[0].chatId, chatId);
   await propose(f.bridges[1], first);
-  complete(f.bridges[1]);
+  await complete(f.bridges[1]);
   await waitFor(t, () => f.bridges.length === 3, 'next queued conversion');
   await propose(f.bridges[2], second);
-  complete(f.bridges[2]);
+  await complete(f.bridges[2]);
   await waitFor(t, () => reloaded.get(profileId, batch.id).status === 'complete', 'resumed batch');
   assert.deepEqual(
     reloaded.get(profileId, batch.id).items.map((item) => item.status),
@@ -738,7 +739,7 @@ test('Stop or resume on an old batch cannot invalidate the current batch runner'
   assert.equal(f.manager.get(profileId, currentBatch.id).status, 'running');
 
   await propose(f.bridges[1], currentIntake);
-  complete(f.bridges[1]);
+  await complete(f.bridges[1]);
   await waitFor(
     t,
     () => f.manager.get(profileId, currentBatch.id).status === 'complete',
@@ -1000,7 +1001,7 @@ test('a retained partial proposal survives a failed pass and the next original s
   });
   await waitFor(t, () => f.bridges.length === 1, 'first pass');
   await propose(f.bridges[0], first);
-  f.bridges[0].callbacks.onExit?.(new Error('Synthetic file-specific conversion failure'));
+  await f.bridges[0].callbacks.onExit?.(new Error('Synthetic file-specific conversion failure'));
   await waitFor(t, () => f.bridges.length === 2, 'second pass after retained partial error');
   const retained = f.manager.get(profileId, batch.id).items[0];
   assert.equal(retained.status, 'review_ready');
@@ -1009,7 +1010,7 @@ test('a retained partial proposal survives a failed pass and the next original s
   assert.equal(retained.proposalState?.total, 1);
   assert.equal(proposalCount(getIntakeRead(f.db, f.root, profileId, first.id)), 1);
   await propose(f.bridges[1], second);
-  complete(f.bridges[1]);
+  await complete(f.bridges[1]);
   await waitFor(
     t,
     () => f.manager.get(profileId, batch.id).status === 'complete',
@@ -1037,19 +1038,19 @@ test('an unknown provider result waits while the next file can run and proposals
   });
   await waitFor(t, () => f.bridges.length === 1, 'partial provider pass');
   await propose(f.bridges[0], first);
-  f.bridges[0].callbacks.onEvent?.('model/requestStarted', {
+  await f.bridges[0].callbacks.onEvent?.('model/requestStarted', {
     requestId: 'fictional-lost',
     model: 'fictional',
     attempt: 1,
     requestDigest: 'a'.repeat(64),
     requestBytes: 1,
   });
-  f.bridges[0].callbacks.onEvent?.('model/requestFinished', {
+  await f.bridges[0].callbacks.onEvent?.('model/requestFinished', {
     requestId: 'fictional-lost',
     failed: true,
     outcome: 'unknown',
   });
-  f.bridges[0].callbacks.onExit?.(new Error('Synthetic LiteLLM proxy timeout'));
+  await f.bridges[0].callbacks.onExit?.(new Error('Synthetic LiteLLM proxy timeout'));
   const paused = await waitFor(
     t,
     () => {
@@ -1083,11 +1084,11 @@ test(
     });
     await waitFor(t, () => f.bridges.length === 1);
     await propose(f.bridges[0], original, record('fictional-first-section'), 'inspected');
-    complete(f.bridges[0]);
+    await complete(f.bridges[0]);
     await waitFor(t, () => f.bridges.length === 2, 'partial proposal continues reading');
-    complete(f.bridges[1]);
+    await complete(f.bridges[1]);
     await waitFor(t, () => f.bridges.length === 3, 'one bounded coverage reconciliation');
-    complete(f.bridges[2]);
+    await complete(f.bridges[2]);
     for (let attempt = 1; attempt <= 6; attempt++) {
       await waitFor(
         t,
@@ -1097,14 +1098,14 @@ test(
       const bridge = f.bridges[attempt + 2];
       for (let request = 0; request < DEFAULT_INTAKE_READING_LIMITS.requests!; request++) {
         const requestId = `fictional-no-progress-${attempt}-${request}`;
-        bridge.callbacks.onEvent?.('model/requestStarted', {
+        await bridge.callbacks.onEvent?.('model/requestStarted', {
           requestId,
           model: 'fictional',
           attempt: 1,
           requestDigest: 'b'.repeat(64),
           requestBytes: 1,
         });
-        bridge.callbacks.onEvent?.('model/requestFinished', {
+        await bridge.callbacks.onEvent?.('model/requestFinished', {
           requestId,
           failed: false,
           outcome: 'response',
@@ -1117,7 +1118,7 @@ test(
           attempt * DEFAULT_INTAKE_READING_LIMITS.requests!,
         'all completed no-progress responses are accounted',
       );
-      complete(bridge);
+      await complete(bridge);
     }
     await waitFor(t, () => f.manager.get(profileId, batch.id).status === 'complete');
     assert.equal(f.manager.get(profileId, batch.id).items[0].status, 'review_ready');
@@ -1173,7 +1174,7 @@ test(
     restarted.resume(profileId, batch.id);
     await waitFor(t, () => f.bridges.length === 10, 'explicit resume starts another linked pass');
     await propose(f.bridges[9], original, record('fictional-second-section'));
-    complete(f.bridges[9]);
+    await complete(f.bridges[9]);
     await waitFor(t, () => restarted.get(profileId, batch.id).status === 'complete');
     assert.deepEqual(restarted.get(profileId, batch.id).items[0]!.exceptions, unrelatedExceptions);
     assert.ok(
@@ -1212,19 +1213,19 @@ test('the last file automatically retries an unknown result and retains its part
   });
   await waitFor(t, () => f.bridges.length === 1);
   await propose(f.bridges[0], original);
-  f.bridges[0].callbacks.onEvent?.('model/requestStarted', {
+  await f.bridges[0].callbacks.onEvent?.('model/requestStarted', {
     requestId: 'fictional-lost-last',
     model: 'fictional',
     attempt: 1,
     requestDigest: 'a'.repeat(64),
     requestBytes: 1,
   });
-  f.bridges[0].callbacks.onEvent?.('model/requestFinished', {
+  await f.bridges[0].callbacks.onEvent?.('model/requestFinished', {
     requestId: 'fictional-lost-last',
     failed: true,
     outcome: 'unknown',
   });
-  f.bridges[0].callbacks.onExit?.(new Error('Synthetic LiteLLM proxy timeout'));
+  await f.bridges[0].callbacks.onExit?.(new Error('Synthetic LiteLLM proxy timeout'));
 
   await waitFor(
     t,
@@ -1445,10 +1446,10 @@ test('explicit append while preflight is in flight preserves the durable queue a
     'runner save after await retained appended work',
   );
   await propose(f.bridges[0], first);
-  complete(f.bridges[0]);
+  await complete(f.bridges[0]);
   await waitFor(t, () => f.bridges.length === 2, 'appended original starts once');
   await propose(f.bridges[1], second);
-  complete(f.bridges[1]);
+  await complete(f.bridges[1]);
   await waitFor(t, () => f.manager.get(profileId, batch.id).status === 'complete');
   assert.equal(f.bridges.length, 2);
   assert.equal(
@@ -1514,10 +1515,10 @@ test('append journal acknowledgement loss retains one append and retry never dup
   );
   assert.equal(f.manager.create(profileId, request).items.length, 2);
   await propose(f.bridges[0], first);
-  complete(f.bridges[0]);
+  await complete(f.bridges[0]);
   await waitFor(t, () => f.bridges.length === 2);
   await propose(f.bridges[1], second);
-  complete(f.bridges[1]);
+  await complete(f.bridges[1]);
   await waitFor(t, () => f.manager.get(profileId, batch.id).status === 'complete');
   assert.equal(f.bridges.length, 2);
   assert.equal(f.manager.get(profileId, batch.id).appendOperations?.length, 1);
@@ -1594,10 +1595,10 @@ test(
     reloaded.resume(profileId, batch.id);
     await waitFor(t, () => f.bridges.length === 2);
     await propose(f.bridges[1], first);
-    complete(f.bridges[1]);
+    await complete(f.bridges[1]);
     await waitFor(t, () => f.bridges.length === 3);
     await propose(f.bridges[2], second);
-    complete(f.bridges[2]);
+    await complete(f.bridges[2]);
     await waitFor(t, () => reloaded.get(profileId, batch.id).status === 'complete');
     assert.equal(reloaded.get(profileId, batch.id).items.length, 2);
     const backup = await createBackup(f.db, f.root, profileId);
@@ -2064,7 +2065,7 @@ test('a terminal model pass drains newly pending source work outside host owners
     });
   });
   armed = true;
-  complete(f.bridges[0]);
+  await complete(f.bridges[0]);
   await entered.promise;
   let foreground = 0;
   await runExclusiveClinicalOperation(f.db, async () => {
@@ -2087,7 +2088,8 @@ test('retry selection during an outside extraction wait cannot publish the old i
   const { runExclusiveClinicalOperation } = await import('../clinical-operation.ts');
   const { setImmediate } = await import('node:timers/promises');
   const entered = Promise.withResolvers<void>(),
-    release = Promise.withResolvers<void>();
+    release = Promise.withResolvers<void>(),
+    settled = Promise.withResolvers<void>();
   let heldId = '',
     heldSteps = 0;
   const publications: { reason: string; index: number }[] = [];
@@ -2101,7 +2103,11 @@ test('retry selection during an outside extraction wait cannot publish the old i
           entered.resolve();
           await release.promise;
         }
-        return extractIntakeSourceText(context);
+        try {
+          return await extractIntakeSourceText(context);
+        } finally {
+          if (context.id === heldId) settled.resolve();
+        }
       },
       journalWriter(root, id, batch, reason) {
         publications.push({ reason, index: batch.currentIndex });
@@ -2119,19 +2125,23 @@ test('retry selection during an outside extraction wait cannot publish the old i
   });
   await waitFor(t, () => f.bridges.length === 1);
   await propose(f.bridges[0], first);
-  complete(f.bridges[0]);
+  await complete(f.bridges[0]);
   await entered.promise;
   assert.equal(f.manager.get(profileId, batch.id).currentIndex, 1);
   await runExclusiveClinicalOperation(f.db, async () => {
     await f.manager.retryExceptions(profileId, batch.id);
   });
   const checkpoint = publications.length;
-  release.resolve();
+  // Hold publication while the stale worker settles, so a legitimate successor
+  // cannot account its own work and be mistaken for the retired continuation.
+  await runExclusiveClinicalOperation(f.db, async () => {
+    release.resolve();
+    await settled.promise;
+    await setImmediate();
+    f.manager.stop(profileId, batch.id);
+  });
   await setImmediate();
   await setImmediate();
-  // Stop fences any new independently scheduled attempt after the stale worker
-  // has settled. The old continuation must never account or pause index zero.
-  f.manager.stop(profileId, batch.id);
   assert.equal(heldSteps, 1);
   assert.ok(
     !publications

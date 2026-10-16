@@ -47,7 +47,7 @@ test(
               return { model: 'fictional-repair-browser', backend: 'synthetic' };
             },
             async turn(prompt: string) {
-              callbacks.onEvent?.('turn/started', { turn: { id: 'fictional-repair-turn' } });
+              await callbacks.onEvent?.('turn/started', { turn: { id: 'fictional-repair-turn' } });
               const context = JSON.parse(prompt.slice(prompt.indexOf('{'))) as {
                 mode: string;
                 intakeRepair: {
@@ -91,14 +91,14 @@ test(
                 },
                 callId: 'fictional-repair-preview',
               });
-              callbacks.onEvent?.('item/completed', {
+              await callbacks.onEvent?.('item/completed', {
                 item: {
                   id: 'fictional-repair-message',
                   type: 'agentMessage',
                   text: 'I found one source-supported date correction for review.',
                 },
               });
-              callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
+              await callbacks.onEvent?.('turn/completed', { turn: { status: 'completed' } });
             },
             async cancel() {},
             close() {},
