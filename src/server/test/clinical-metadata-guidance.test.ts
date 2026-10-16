@@ -288,3 +288,19 @@ test('clarification remains proposal-only and does not authorize acceptance', ()
   assert.match(hostInstructions, /A proposal never autoaccepts a record/);
   assert.doesNotMatch(hostInstructions, /default .*performed/i);
 });
+
+test('identity questions stay grounded and separate from independent clinical uncertainties', () => {
+  for (const text of [CLINICAL_INSTRUCTIONS, hostInstructions]) {
+    const plain = text.replaceAll('`', '').replace(/\s+/g, ' ');
+    assert.match(
+      plain,
+      /identity-only concerns in grounded reviewIssues with kind:"identity" and clinical.subject:"unknown"/,
+    );
+    assert.match(plain, /Do not duplicate an identity question in clinical.uncertainties/);
+    assert.match(plain, /independent unresolved clinical readings or assertions/);
+    assert.match(
+      plain,
+      /Identity confirmation never resolves a value, unit, date, source or other clinical ambiguity/,
+    );
+  }
+});

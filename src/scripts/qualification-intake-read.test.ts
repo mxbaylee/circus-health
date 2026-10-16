@@ -4,6 +4,8 @@ import {
   readQualificationReview,
   readQualificationIdentity,
   qualificationFeedBlocks,
+  readQualificationReading,
+  type QualificationIdentityEvidence,
 } from './qualification-intake-read.ts';
 import type { IntakeClinicalReviewPage } from '../shared/intake-clinical-review.ts';
 import type {
@@ -133,15 +135,23 @@ test('qualification identity inspects every scope collection while retaining ori
       nextCursor: null,
     } as T;
   };
+  const captures: QualificationIdentityEvidence[] = [];
   const inspected = await readQualificationIdentity(
     read,
     '/fictional/identity-review?groupId=fictional-group',
+    (evidence) => captures.push(structuredClone(evidence)),
   );
   assert.equal(paths.length, 6);
   assert.equal(inspected.confirmationScope, reference);
   assert.equal(inspected.review.scope, null);
   assert.deepEqual(inspected.inspectedScope.questions, [{ prompt: 'Confirm fictional person' }]);
   assert.equal('collection' in inspected.inspectedScope, false);
+  const raw = captures.flatMap((event) => (event.kind === 'complete' ? [] : [event.value]));
+  assert.deepEqual(raw, [review, ...inspected.pages], 'each host response is retained once');
+  const bytes = (values: unknown[]) =>
+    values.reduce<number>((sum, value) => sum + Buffer.byteLength(JSON.stringify(value)), 0);
+  assert.equal(bytes(raw), bytes([review, ...inspected.pages]));
+  assert.deepEqual(captures.at(-1), { kind: 'complete', pageCount: 5 });
   await assert.rejects(
     readQualificationIdentity(async <T>(path: string): Promise<T> => {
       const value = await read<unknown>(path);
@@ -161,4 +171,207 @@ test('qualification refuses native unloaded feed records without fabricating emp
     records: [{ detail: { kind: 'reference' } }],
   } as CollectionImportFeed;
   assert.throws(() => qualificationFeedBlocks(page), /referenced record/);
+});
+
+function readingFixture(units = 1) {
+  const intake = {
+    format: 'health-intake-summary-v2',
+    id: 'fictional-intake',
+    version: 7,
+    sha256: 'fictional-source-hash',
+    mimeType: 'application/pdf',
+    activePlan: {
+      state: 'exact',
+      plan: {
+        format: 'health-intake-plan-header-v1',
+        id: 'fictional-plan',
+        status: 'active',
+        pins: { sourceHash: 'fictional-source-hash' },
+        unitCount: units,
+      },
+    },
+  } as unknown as import('../shared/intake-summary.ts').IntakeRead;
+  const page = {
+    sourceHash: intake.sha256,
+    readerCoverage: {
+      intakeVersion: intake.version,
+      summary: { units, pending: 0, partial: 0, unreadable: 0, context: 0, stale: 0 },
+      entries: [],
+      offset: 0,
+      nextOffset: null,
+    },
+  } as unknown as import('../shared/intake-source-text.ts').SourceTextIssueList;
+  return { intake, page };
+}
+
+test('qualification inspects pinned reader observations without inventing native extraction completeness', async () => {
+  const { intake, page } = readingFixture();
+  const paths: string[] = [];
+  const captured: unknown[] = [];
+  const result = await readQualificationReading(
+    async <T>(path: string) => {
+      paths.push(path);
+      return page as T;
+    },
+    '/fictional/intake',
+    intake,
+    intake.sha256,
+    1,
+    (page) => captured.push(page),
+  );
+  assert.equal(result.passed, true);
+  assert.equal(result.unitCount, 1);
+  assert.equal(result.responsePages, 1);
+  assert.match(paths[0]!, /readerVersion=7&readerOffset=0&readerLimit=50/);
+  assert.equal('extractionComplete' in result, false);
+  assert.equal('readingAccounting' in result, false);
+  // Complete units need no exception row. Exception length is not the unit count.
+  assert.deepEqual(captured, [page]);
+  assert.equal(page.readerCoverage!.entries.length, 0);
+  assert.equal(
+    'pages' in result,
+    false,
+    'periodic qualification saves retain only the small summary',
+  );
+});
+
+test('qualification refuses absent, omitted, unread, stale, conflicting or incomplete reader evidence', async () => {
+  const { intake, page } = readingFixture();
+  for (const mutate of [
+    (p: typeof page) => {
+      delete p.readerCoverage;
+    },
+    (p: typeof page) => {
+      p.sourceHash = 'different-original';
+    },
+    (p: typeof page) => {
+      p.readerCoverage!.intakeVersion++;
+    },
+    (p: typeof page) => {
+      p.readerCoverage!.summary.units = 0;
+    },
+    ...(['pending', 'partial', 'unreadable', 'context', 'stale'] as const).map(
+      (field) => (p: typeof page) => {
+        p.readerCoverage!.summary[field] = 1;
+      },
+    ),
+    (p: typeof page) => {
+      delete p.readerCoverage!.summary.stale;
+    },
+    (p: typeof page) => {
+      p.readerCoverage!.nextOffset = 50;
+    },
+  ]) {
+    const changed = structuredClone(page);
+    mutate(changed);
+    await assert.rejects(
+      readQualificationReading(async <T>() => changed as T, '/fictional', intake, intake.sha256, 1),
+      /Qualification public evidence/,
+    );
+  }
+  await assert.rejects(
+    readQualificationReading(async <T>() => page as T, '/fictional', intake, intake.sha256, 2),
+    /active plan/,
+  );
+});
+
+test('qualification follows every pinned exception page and refuses missing or changed continuation', async () => {
+  const { intake, page } = readingFixture(105);
+  const paths: string[] = [];
+  const read = async <T>(path: string): Promise<T> => {
+    paths.push(path);
+    const offset = Number(
+      new URL(path, 'http://fictional.invalid').searchParams.get('readerOffset'),
+    );
+    const value = structuredClone(page);
+    const coverage = value.readerCoverage!;
+    coverage.offset = offset;
+    coverage.nextOffset = offset + 50 < 105 ? offset + 50 : null;
+    coverage.entries = Array.from({ length: Math.min(50, 105 - offset) }, (_, n) => ({
+      planId: 'fictional-plan',
+      unitId: 'fictional-unit-' + (offset + n),
+      status: 'completed',
+      kind: 'pdf',
+      locator: 'page 1',
+      stale: false,
+      coverageKind: 'extracted',
+      notes: 'Fictional inspected note',
+    }));
+    return value as T;
+  };
+  const captured: (typeof page)[] = [];
+  const result = await readQualificationReading(
+    read,
+    '/fictional',
+    intake,
+    intake.sha256,
+    undefined,
+    (page, ordinal) => {
+      assert.equal(ordinal, captured.length);
+      captured.push(page);
+    },
+  );
+  assert.equal(result.responsePages, 3);
+  assert.deepEqual(
+    captured.map((page) => page.readerCoverage!.offset),
+    [0, 50, 100],
+  );
+  assert.equal(
+    captured.reduce((sum, page) => sum + page.readerCoverage!.entries.length, 0),
+    105,
+  );
+  assert.equal(paths.length, 3);
+  for (const failure of ['missing', 'missing-final', 'changed', 'duplicate'] as const)
+    await assert.rejects(
+      readQualificationReading(
+        async <T>(path: string) => {
+          const value = await read<typeof page>(path);
+          if (value.readerCoverage!.offset > 0) {
+            if (failure === 'missing') value.readerCoverage!.entries = [];
+            if (failure === 'missing-final' && value.readerCoverage!.nextOffset === null)
+              value.readerCoverage!.entries = [];
+            if (failure === 'changed') value.readerCoverage!.intakeVersion++;
+            if (failure === 'duplicate')
+              value.readerCoverage!.entries[0]!.unitId = 'fictional-unit-0';
+          }
+          return value as T;
+        },
+        '/fictional',
+        intake,
+        intake.sha256,
+      ),
+      /Qualification public evidence/,
+    );
+});
+
+test('qualification retains bounded successful-HTTP identity refusal evidence before scope assertions', async () => {
+  const review = {
+    status: 'conflict',
+    scope: null,
+    message: 'Fictional original quote was not found',
+    conflicts: [],
+    evidencedIdentity: {},
+  } as unknown as IntakeIdentityReview;
+  const retained: unknown[] = [];
+  await assert.rejects(
+    readQualificationIdentity(
+      async <T>() => review as T,
+      '/fictional/identity-review',
+      (evidence) => retained.push(structuredClone(evidence)),
+    ),
+    /identity scope is unavailable/,
+  );
+  assert.deepEqual(retained, [{ kind: 'review', value: review }]);
+  retained.length = 0;
+  const oversizedRetained: unknown[] = [];
+  const oversized = { ...review, message: 'X'.repeat(8 * 1024 * 1024) };
+  await assert.rejects(
+    readQualificationIdentity(
+      async <T>() => oversized as T,
+      '/fictional/identity-review',
+      (evidence) => oversizedRetained.push(evidence),
+    ),
+    /oversized identity review/,
+  );
+  assert.deepEqual(oversizedRetained, [], 'never write an unbounded host response into evidence');
 });

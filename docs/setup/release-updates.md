@@ -1,5 +1,32 @@
 # Update an installation and recover from a failed candidate
 
+The optional [fictional deployment qualification](docker-runtime.md#fictional-deployment-qualification)
+now joins the existing provider oracle with the drive probe, fresh-container
+authentication and accepted-record/cache-loss reconstruction checks. Set
+`CRS_DEPLOYMENT_QUALIFICATION=1` and choose an external output directory on the
+intended installation drive before running `npm run qualify:deployment` with the
+adopted proxy configuration/state. The drive driver also accepts Linux with a
+nonce-proven UID 1000 scratch subtree and scoped cleanup. These tools add no
+archive format, migration or provider-setting change; each installation still
+needs its own actual receipt. They do not qualify an unavailable host or physical
+power loss, and do not replace the checked backup/update drill below.
+
+On 2026-10-16 the clean `b1ec6dada33b0879b87dd749ceda1db963dafd5c` build passed the complete fictional deployment procedure on one local macOS Docker Desktop filesystem using the supported npm → Compose → LiteLLM route with ChatGPT OAuth and alias `health-primary` configured as `chatgpt/gpt-6-astra`. Four exact observations were reviewed and explicitly accepted, with receipt replay. Both fresh-container stages retained the original bytes, exact accepted values and nonempty histories, including after disposable-cache deletion and reconstruction. Image/build, master-key bytes, provider configuration and observed model/backend matched; real authenticated tool challenges passed, and all 825 accepted-vault files remained unchanged. The protected receipt qualifies that build and small fixture, not every installation or later release. Repeat the procedure for the candidate and intended drive; [CRS-271](../todo/CRS-271.md) retains actual native Linux host qualification. Physical power loss, removable/network drives and natural OAuth refresh are outside this receipt. See the [observed deployment evidence and retained failure limits](docker-runtime.md#fictional-deployment-qualification).
+
+Restart into the reviewed build before creating or resuming an encrypted setup.
+Setup now reuses checked chunked file copying and retains its prepared manifest
+handle across worker handoff, publication and activation. This addresses observed
+copy and released-inode behavior on one UID-mapped Docker Desktop mount while
+retaining exact physical identity, digest and replacement-refusal checks. It adds
+no archive format, recovery or configuration migration. Prior builds retain the
+earlier setup copy/handoff behavior; do not treat a drive-probe receipt alone as
+proof of successful setup or provider import. See the
+[setup resource contract](../security/profile-encryption.md#encrypted-private-copy-setup).
+
+New model proposals now explicitly separate grounded identity questions from independent clinical uncertainties. Restart into the reviewed build to use that instruction; existing proposals are preserved. The qualification fixture uses separate unpunctuated patient and DOB labels. Its reading gate inspects all version/source-pinned reader exception pages and the exact active plan, while preserving the native feed’s unknown extraction status and referenced accounting. This bounded known-answer fixture proof does not implement a general clinical-completeness aggregate.
+
+Restart into the reviewed build to recheck report identity quotes that differ only in horizontal whitespace introduced by PDF text extraction. Grounding now uses whitespace-equivalent matches with original text positions, preserving line, role, report/member/page, name, punctuation and DOB conflict checks. Retained proposals, original bytes, source/identity keys and accepted history are unchanged; there is no migration. Prior builds can still refuse these otherwise literal quotes. See [original identity grounding](../import/identity-review.md).
+
 ## Updating from `main` to this candidate
 
 The owner accepted the existing passkey compatibility baseline on 2026-10-15

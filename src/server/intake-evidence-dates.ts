@@ -361,6 +361,37 @@ interface IdentityLine {
   role: 'patient' | 'relative' | 'unknown';
 }
 
+/** Comparison-only whitespace equivalence. Original offsets and column/role cues
+ * remain untouched; literals, case, punctuation and line boundaries are exact. */
+export function* originalIdentityQuoteSpans(text: string, quote: string, from = 0) {
+  if (!quote || !quote.replace(/[ \t\r\n]/g, '')) return;
+  const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const lines = quote.split(/\r?\n/).map((line) =>
+    line
+      .replace(/^[ \t]+|[ \t]+$/g, '')
+      .split(/[ \t]+/)
+      .map(escaped)
+      .join('[ \\t]+'),
+  );
+  let pattern = '';
+  for (const [index, literal] of lines.entries()) {
+    // Start with an actual literal or newline, never an unanchored whitespace
+    // quantifier. Blank lines own one padding run, without adjacent stars.
+    if (index > 0) pattern += index === 1 && !lines[0] ? '\\r?\\n' : '[ \\t]*\\r?\\n';
+    if (literal) pattern += (index > 0 ? '[ \\t]*' : '') + literal;
+  }
+  const expression = new RegExp(pattern, 'g');
+  expression.lastIndex = from;
+  for (let match = expression.exec(text); match; match = expression.exec(text))
+    yield { start: match.index, end: expression.lastIndex };
+}
+
+export function originalContainsIdentityQuote(text: string | null, quote: string | undefined) {
+  return (
+    text !== null && quote !== undefined && !originalIdentityQuoteSpans(text, quote).next().done
+  );
+}
+
 function identityLines(text: string): IdentityLine[] {
   const lines: IdentityLine[] = [];
   let role: IdentityLine['role'] = 'unknown';
@@ -384,18 +415,21 @@ function identityLines(text: string): IdentityLine[] {
 
 function reportWindow(text: string, subject: string, reportAnchor?: string) {
   if (!reportAnchor) return { start: 0, end: text.length, anchor: -1 };
-  const anchor = text.indexOf(reportAnchor);
-  if (anchor < 0 || text.indexOf(reportAnchor, anchor + reportAnchor.length) >= 0)
-    return { start: 0, end: 0, anchor: -1 };
+  const matches = originalIdentityQuoteSpans(text, reportAnchor);
+  const first = matches.next().value;
+  if (!first || !matches.next().done) return { start: 0, end: 0, anchor: -1 };
+  const anchor = first.start;
   const lines = identityLines(text);
   const anchorLine = lines.findIndex((line) => line.start <= anchor && line.end > anchor);
   const preceding = lines[anchorLine - 1];
   // A patient banner immediately above the title belongs to the same report.
   const start =
-    preceding && preceding.text.includes(subject) && anchor - preceding.start <= headerReach
+    preceding &&
+    originalContainsIdentityQuote(preceding.text, subject) &&
+    anchor - preceding.start <= headerReach
       ? preceding.start
       : anchor;
-  const nextRecord = text.indexOf('[identity record boundary]', anchor + reportAnchor.length);
+  const nextRecord = text.indexOf('[identity record boundary]', first.end);
   let end = Math.min(text.length, anchor + 600, nextRecord < 0 ? text.length : nextRecord);
   let firstPatient = false;
   for (let index = anchorLine + 1; index < lines.length; index++) {
@@ -502,9 +536,11 @@ export function originalSubjectBirthDateEvidence(
   const lines = identityLines(text);
   const referenceDate =
     boundReportDate(text, subject, reportAnchor) || new Date().toISOString().slice(0, 10);
-  const readHeader = (start: number): boolean => {
+  const readHeader = ({ start, end: subjectEnd }: { start: number; end: number }): boolean => {
+    const matchedSubject = text.slice(start, subjectEnd);
+    const subjectLength = subjectEnd - start;
     const subjectLine = lines.findIndex((line) => line.start <= start && line.end > start);
-    if (subjectLine < 0 || !patientSubjectPosition(text, lines, start, subject, window))
+    if (subjectLine < 0 || !patientSubjectPosition(text, lines, start, matchedSubject, window))
       return false;
     let evidenceStart = start;
     const structuredParent = /^\s*([\w.-]*\b(?:patient|client|subject))\.name\s*:/i.exec(
@@ -523,7 +559,7 @@ export function originalSubjectBirthDateEvidence(
         evidenceStart = previous.start;
       }
     }
-    const limit = Math.min(window.end, start + subject.length + headerReach + valueReach);
+    const limit = Math.min(window.end, subjectEnd + headerReach + valueReach);
     let end = limit;
     for (let index = subjectLine + 1; index < lines.length; index++) {
       const line = lines[index]!;
@@ -543,7 +579,7 @@ export function originalSubjectBirthDateEvidence(
     }
     const evidence = labelledBirthDateEvidence(
       text.slice(evidenceStart, end),
-      Math.min(end - evidenceStart, start - evidenceStart + subject.length + headerReach),
+      Math.min(end - evidenceStart, start - evidenceStart + subjectLength + headerReach),
       referenceDate,
     );
     for (const date of evidence.dates) dates.add(date);
@@ -551,9 +587,9 @@ export function originalSubjectBirthDateEvidence(
     for (const date of evidence.suggestions || []) suggestions.add(date);
     // An unlabelled banner reads only where no labelled birth date does.
     if (!evidence.dates.length && !evidence.unreadable) {
-      const lineEnd = text.indexOf('\n', start + subject.length);
+      const lineEnd = text.indexOf('\n', subjectEnd);
       const banner = bannerDatePattern.exec(text.slice(start, lineEnd < 0 ? text.length : lineEnd));
-      if (banner && banner.index <= subject.length) {
+      if (banner && banner.index <= subjectLength) {
         const readings = numericDateReadings(banner[1]!, true);
         banners.set(readings.join('|') || banner[1]!, readings);
       }
@@ -561,22 +597,25 @@ export function originalSubjectBirthDateEvidence(
     return evidence.dates.length > 0 || evidence.unreadable;
   };
   let foundAfterAnchor = false;
-  for (
-    let start = text.indexOf(subject, window.start);
-    start >= 0 && start < window.end;
-    start = text.indexOf(subject, start + subject.length)
-  ) {
-    const found = readHeader(start);
-    if (window.anchor >= 0 && start >= window.anchor && found) {
+  for (const span of originalIdentityQuoteSpans(text, subject, window.start)) {
+    if (span.start >= window.end) break;
+    if (span.end > window.end) continue;
+    const found = readHeader(span);
+    if (window.anchor >= 0 && span.start >= window.anchor && found) {
       foundAfterAnchor = true;
       break;
     }
   }
   if (window.anchor >= 0 && !foundAfterAnchor && window.start === window.anchor) {
-    const banner = text.lastIndexOf(subject, window.anchor - 1);
+    let bannerSpan: { start: number; end: number } | undefined;
+    for (const span of originalIdentityQuoteSpans(text, subject)) {
+      if (span.start >= window.anchor) break;
+      if (span.end <= window.anchor) bannerSpan = span;
+    }
+    const banner = bannerSpan?.start ?? -1;
     const bannerPrefix =
       banner >= 0 ? text.slice(text.lastIndexOf('\n', banner - 1) + 1, banner) : '';
-    const between = banner >= 0 ? text.slice(banner + subject.length, window.anchor) : '';
+    const between = bannerSpan ? text.slice(bannerSpan.end, window.anchor) : '';
     const interveningReportOrPatient = between
       .split(/\r?\n/)
       .some(
@@ -593,13 +632,13 @@ export function originalSubjectBirthDateEvidence(
       !interveningReportOrPatient;
     const adjacentPrintedBanner =
       banner >= 0 &&
-      window.anchor - banner <= subject.length + headerReach &&
+      window.anchor - banner <= bannerSpan!.end - banner + headerReach &&
       between
         .split(/\r?\n/)
         .every((line) =>
           /^\s*(?:(?:D\.?O\.?B\.?|date of birth|birth[ -]?date|born)\b.*)?$/i.test(line),
         );
-    if (adjacentPrintedBanner || sameStructuredRecord) readHeader(banner);
+    if (bannerSpan && (adjacentPrintedBanner || sameStructuredRecord)) readHeader(bannerSpan);
   }
   return {
     dates: [...dates],
@@ -627,12 +666,11 @@ export function originalSubjectNameGrounded(
   if (!text || !subject) return false;
   const window = reportWindow(text, subject, reportAnchor);
   const lines = identityLines(text);
-  for (
-    let start = text.indexOf(subject, window.start);
-    start >= 0 && start < window.end;
-    start = text.indexOf(subject, start + subject.length)
-  ) {
-    if (patientSubjectPosition(text, lines, start, subject, window)) return true;
+  for (const span of originalIdentityQuoteSpans(text, subject, window.start)) {
+    if (span.start >= window.end) break;
+    if (span.end > window.end) continue;
+    if (patientSubjectPosition(text, lines, span.start, text.slice(span.start, span.end), window))
+      return true;
   }
   return false;
 }

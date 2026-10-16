@@ -76,6 +76,13 @@ test('provider fixture has four independent pages and scan-only pages without hi
         for (const answer of qualificationAnswers.filter((answer) => answer.page === number))
           assert.ok(content.includes(answer.marker));
         assert.doesNotMatch(content, new RegExp(`FXP${number + 1}R`));
+        const compact = content.replace(/\s+/g, '');
+        assert.ok(compact.includes(`Patient:${qualificationPerson.replaceAll(' ', '')}`));
+        assert.equal(
+          compact.includes(`Patient:${qualificationPerson.replaceAll(' ', '')}.`),
+          false,
+        );
+        assert.ok(compact.includes(`PatientDOB:${qualificationBirthDate}`));
       } else {
         assert.equal(content, '', 'scan answers must be visible pixels only');
         assert.ok((await page.getOperatorList()).fnArray.includes(OPS.paintImageXObject));
@@ -741,6 +748,19 @@ test('qualification stages permit pending unknown identity only before review an
       [{ marker: 'FXP1R01', fields: [field] }],
     );
   }
+  const uncertain = structuredClone(pending);
+  uncertain[0].mapping.uncertainties = ['The clinical value is unreadable'];
+  assert.deepEqual(
+    gradeProviderQualification(uncertain, originalId, 'long', 'extracted').mismatches,
+    [{ marker: 'FXP1R01', fields: ['uncertainties'] }],
+  );
+  uncertain[0].mapping.uncertainties = [
+    "Printed patient identity requires explicit review; report's Self assertion is retained as evidence only.",
+  ];
+  assert.equal(
+    gradeProviderQualification(uncertain, originalId, 'long', 'extracted').passed,
+    false,
+  );
   for (const identity of [
     { fullName: 'Different Fictional Person', birthDate: qualificationBirthDate },
     { fullName: qualificationPerson, birthDate: '1990-01-01' },
@@ -754,6 +774,33 @@ test('qualification stages permit pending unknown identity only before review an
     assert.deepEqual(
       gradeProviderQualification(changed, originalId, 'long', 'extracted').mismatches,
       [{ marker: 'FXP1R01', fields: ['subjectIdentity'] }],
+    );
+  }
+  const conflict = structuredClone(pending);
+  conflict[0].identityReview = {
+    status: 'conflict',
+    conflicts: [],
+    evidencedIdentity: { fullName: qualificationPerson },
+  };
+  assert.deepEqual(
+    gradeProviderQualification(conflict, originalId, 'long', 'extracted').mismatches,
+    [{ marker: 'FXP1R01', fields: ['subjectIdentity'] }],
+  );
+  for (const fullName of ['FICTIONAL QUALIFICATION PERSON', 'Person, Fictional Qualification']) {
+    const canonical = structuredClone(pending);
+    canonical[0].identityReview = {
+      status: 'confirmation_required',
+      conflicts: [],
+      evidencedIdentity: { fullName },
+    };
+    assert.equal(
+      gradeProviderQualification(canonical, originalId, 'long', 'extracted').passed,
+      true,
+    );
+    canonical[0].identityReview.evidencedIdentity.fullName = qualificationPerson + '.';
+    assert.equal(
+      gradeProviderQualification(canonical, originalId, 'long', 'extracted').passed,
+      false,
     );
   }
   const missing = pending.slice(0, 80);

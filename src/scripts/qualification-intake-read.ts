@@ -14,6 +14,106 @@ import {
   isCollectionImportFeed,
   type CollectionImportFeed,
 } from '../shared/intake-clinical-pages.ts';
+import { isIntakeSummary, type IntakeRead } from '../shared/intake-summary.ts';
+import type { SourceTextIssueList } from '../shared/intake-source-text.ts';
+
+/** Closed-fixture reading observations, not a claim of general clinical extraction completeness.
+ * Native feeds deliberately leave that broader claim unknown even after reading ends. */
+export async function readQualificationReading(
+  request: QualificationRead,
+  path: string,
+  intake: IntakeRead,
+  sourceHash: string,
+  expectedUnits?: number,
+  onPage?: (page: SourceTextIssueList, ordinal: number) => void,
+) {
+  check(isIntakeSummary(intake), 'inspect a bounded current intake summary');
+  const plan = intake.activePlan.state === 'exact' ? intake.activePlan.plan : null;
+  check(
+    intake.sha256 === sourceHash &&
+      intake.mimeType === 'application/pdf' &&
+      plan?.status === 'active' &&
+      plan.pins.sourceHash === sourceHash &&
+      Number.isSafeInteger(plan.unitCount) &&
+      plan.unitCount > 0 &&
+      plan.unitCount <= 1000 &&
+      (expectedUnits === undefined || plan.unitCount === expectedUnits),
+    'fixture active plan or source binding is incomplete',
+  );
+  const pages: SourceTextIssueList[] = [];
+  let offset = 0;
+  let summary: string | undefined;
+  let entries = 0;
+  let capturedBytes = 0;
+  const seenUnits = new Set<string>();
+  do {
+    const params = new URLSearchParams({
+      readerVersion: String(intake.version),
+      readerOffset: String(offset),
+      readerLimit: '50',
+    });
+    const page = await request<SourceTextIssueList>(path + '/source-issues?' + params);
+    capturedBytes += Buffer.byteLength(JSON.stringify(page));
+    check(capturedBytes <= 8 * 1024 * 1024, 'reader evidence exceeded qualification byte bound');
+    pages.push(page);
+    onPage?.(page, pages.length - 1);
+    const coverage = page.readerCoverage;
+    check(
+      page.sourceHash === sourceHash &&
+        !page.extractionFailure &&
+        coverage?.intakeVersion === intake.version &&
+        coverage.offset === offset,
+      'reading observations changed or are unavailable',
+    );
+    const selected = JSON.stringify(coverage.summary);
+    if (summary !== undefined) check(selected === summary, 'reading summary changed across pages');
+    summary = selected;
+    check(
+      coverage.summary.units === plan.unitCount &&
+        coverage.summary.pending === 0 &&
+        coverage.summary.partial === 0 &&
+        coverage.summary.unreadable === 0 &&
+        coverage.summary.context === 0 &&
+        coverage.summary.stale === 0,
+      'fixture has omitted, unread, partial, stale, context-only or unreadable units',
+    );
+    check(
+      coverage.entries.length <= 50 && (offset === 0 || coverage.entries.length > 0),
+      'reader page is missing or exceeded its bound',
+    );
+    for (const entry of coverage.entries) {
+      check(
+        entry.planId === plan.id &&
+          !seenUnits.has(entry.unitId) &&
+          entry.stale === false &&
+          entry.status === 'completed' &&
+          (entry.coverageKind === 'extracted' || entry.coverageKind === 'inspected') &&
+          !entry.pagesTruncated &&
+          !entry.notesTruncated,
+        'reader exception is unresolved, duplicated or incompletely inspected',
+      );
+      seenUnits.add(entry.unitId);
+    }
+    entries += coverage.entries.length;
+    check(entries <= plan.unitCount, 'reader observations exceeded the active plan');
+    if (coverage.nextOffset === null) break;
+    check(
+      coverage.entries.length === 50 && coverage.nextOffset === offset + 50,
+      'reader continuation omitted entries or did not advance',
+    );
+    offset = coverage.nextOffset;
+  } while (pages.length < 21);
+  check(pages.at(-1)?.readerCoverage?.nextOffset === null, 'incomplete reader observations');
+  return {
+    passed: true as const,
+    scope: 'closed_fixture_reading_observations' as const,
+    intakeVersion: intake.version,
+    sourceHash,
+    planId: plan.id,
+    unitCount: plan.unitCount,
+    responsePages: pages.length,
+  };
+}
 
 export type QualificationFeedPage = IntakeImportFeed | CollectionImportFeed;
 export type QualificationFeedBlock = Pick<
@@ -216,16 +316,36 @@ export async function readQualificationReview(
   }
 }
 
+export type QualificationIdentityEvidence =
+  | { kind: 'review'; value: import('../shared/intake-identity.ts').IntakeIdentityReview }
+  | {
+      kind: 'page';
+      ordinal: number;
+      value: import('../shared/intake-identity.ts').IntakeIdentityScopePage;
+    }
+  | { kind: 'complete'; pageCount: number };
+
 /** Fully inspected scope for offline grading; commands retain the original server reference. */
-export async function readQualificationIdentity(request: QualificationRead, path: string) {
+export async function readQualificationIdentity(
+  request: QualificationRead,
+  path: string,
+  retain?: (
+    evidence: QualificationIdentityEvidence,
+    review: import('../shared/intake-identity.ts').IntakeIdentityReview,
+  ) => void,
+) {
   const review = await request<import('../shared/intake-identity.ts').IntakeIdentityReview>(path);
+  check(Buffer.byteLength(JSON.stringify(review)) <= 8 * 1024 * 1024, 'oversized identity review');
+  const pages: import('../shared/intake-identity.ts').IntakeIdentityScopePage[] = [];
+  let capturedBytes = Buffer.byteLength(JSON.stringify(review));
+  retain?.({ kind: 'review', value: review }, review);
   const reference = review.scopeReference;
   check(!review.warningsReference, 'inspect all referenced identity warnings before qualification');
   if (!reference) {
     check(review.scope, 'identity scope is unavailable');
+    retain?.({ kind: 'complete', pageCount: 0 }, review);
     return { review, inspectedScope: review.scope, confirmationScope: review.scope, pages: [] };
   }
-  const pages: import('../shared/intake-identity.ts').IntakeIdentityScopePage[] = [];
   const sections: Record<string, unknown[]> = {};
   let bytes = 0;
   for (const section of [
@@ -250,13 +370,23 @@ export async function readQualificationIdentity(request: QualificationRead, path
         path.split('?')[0]!.replace(/identity-review$/, 'identity-scope-page') + '?' + params,
       );
       check(
+        Buffer.byteLength(JSON.stringify(page)) <= 8 * 1024 * 1024,
+        'oversized identity scope page',
+      );
+      capturedBytes += Buffer.byteLength(JSON.stringify(page));
+      check(
+        capturedBytes <= 8 * 1024 * 1024 && pages.length < 100,
+        'identity capture exceeded qualification bound',
+      );
+      pages.push(page);
+      retain?.({ kind: 'page', ordinal: pages.length - 1, value: page }, review);
+      check(
         page.scopeToken === reference.scopeToken &&
           page.section === section &&
           page.total === reference.collection[section] &&
           page.total <= 1000,
         'identity scope changed or exceeded qualification bound',
       );
-      pages.push(page);
       for (const item of page.items) {
         check(
           item.kind === 'value',
@@ -294,5 +424,6 @@ export async function readQualificationIdentity(request: QualificationRead, path
     competingSubjects:
       sections.competingSubjects as import('../shared/intake-identity.ts').IntakeIdentityScope['competingSubjects'],
   };
+  retain?.({ kind: 'complete', pageCount: pages.length }, review);
   return { review, inspectedScope, confirmationScope: reference, pages };
 }

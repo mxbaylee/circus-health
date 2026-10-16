@@ -4,6 +4,7 @@ import { deflateSync } from 'node:zlib';
 import { createCanvas } from '@napi-rs/canvas';
 import type { IntakeIdentityReview } from '../shared/intake-identity.ts';
 import type { IntakeClinicalMapping, IntakeEvidenceLocator } from '../shared/intake.ts';
+import { canonicalIdentityName } from '../shared/self-identity.ts';
 
 export const qualificationPerson = 'Fictional Qualification Person';
 export const qualificationBirthDate = '1982-04-17';
@@ -121,13 +122,9 @@ export function writeProviderQualificationPdf(
     const id = 3 + (page - 1) * 3;
     const lines: Array<[string, number, number, number]> = [
       ['FICTIONAL CLINICAL QUALIFICATION REPORT', 30, 758, 14],
-      [`Original page ${page} of ${pages}. Patient: ${qualificationPerson}.`, 30, 736, 9],
-      [
-        `Patient DOB: ${qualificationBirthDate}. The named patient is the profile owner (Self).`,
-        30,
-        716,
-        9,
-      ],
+      [`Original page ${page} of ${pages}`, 30, 736, 9],
+      [`Patient: ${qualificationPerson}`, 30, 726, 9],
+      [`Patient DOB: ${qualificationBirthDate}`, 30, 716, 9],
       [
         `Issuing software/system: ${qualificationSourceSystem}. Entirely invented data.`,
         30,
@@ -498,8 +495,8 @@ export function gradeProviderQualification(
         (identity.status === 'conflict' ||
           identity.conflicts.length ||
           (identity.evidencedIdentity.fullName !== undefined &&
-            identity.evidencedIdentity.fullName.replace(/\s+/g, ' ').trim() !==
-              qualificationPerson) ||
+            canonicalIdentityName(identity.evidencedIdentity.fullName) !==
+              canonicalIdentityName(qualificationPerson)) ||
           (identity.evidencedIdentity.birthDate !== undefined &&
             identity.evidencedIdentity.birthDate !== qualificationBirthDate))
       )

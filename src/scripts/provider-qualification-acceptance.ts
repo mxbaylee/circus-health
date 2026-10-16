@@ -18,11 +18,14 @@ import {
 } from './provider-qualification-fixture.ts';
 import { readQualificationIdentity } from './qualification-intake-read.ts';
 import type { QualificationFeedBlock, QualificationFeedPage } from './qualification-intake-read.ts';
+import { canonicalIdentityName } from '../shared/self-identity.ts';
 function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw Error(message);
 }
 
-const patientName = (value: string | null | undefined) => value?.replace(/\s+/g, ' ').trim();
+const matchesPatient = (value: string | null | undefined) =>
+  typeof value === 'string' &&
+  canonicalIdentityName(value) === canonicalIdentityName(qualificationPerson);
 
 const object = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -155,6 +158,8 @@ export interface QualificationAcceptanceOptions {
   ) => Promise<{ blocks: QualificationFeedBlock[]; feed: QualificationFeedPage }>;
   originalHash: (prefix: string, originalId: string) => Promise<string>;
   afterAcceptedBeforeRecovery?: () => Promise<void>;
+  recreate?: (stage: 'accepted' | 'cache_removed') => Promise<void>;
+  retainIdentityEvidence?: Parameters<typeof readQualificationIdentity>[2];
 }
 
 /** Caller must first lock its freshly created qualification profile. Never remove
@@ -185,6 +190,47 @@ export function removeQualificationCache(
   check(!existsSync(cacheDirectory), 'Qualification cache deletion failed.');
 }
 
+/** Recovery sequencing is shared by real deployment and local-provider evidence.
+ * A recreation mismatch must fail before removing even the disposable cache. */
+export async function recoverQualificationState<T extends { histories: { entries: unknown[] }[] }>(
+  before: T,
+  options: {
+    snapshot: () => Promise<T>;
+    originalUnchanged: () => Promise<boolean>;
+    lock: () => Promise<unknown>;
+    unlock: () => Promise<unknown>;
+    removeCache: () => void;
+    recreate?: (stage: 'accepted' | 'cache_removed') => Promise<void>;
+  },
+) {
+  const verify = async () => {
+    const after = await options.snapshot();
+    if (options.recreate)
+      check(
+        before.histories.length > 0 &&
+          before.histories.every((history) => history.entries.length > 0),
+        'Accepted records require nonempty retained version histories.',
+      );
+    check(
+      JSON.stringify(after) === JSON.stringify(before),
+      'Accepted clinical projections or version history changed during recovery.',
+    );
+    check(await options.originalUnchanged(), 'Recovery changed the retained original.');
+    return after;
+  };
+  await options.lock();
+  if (options.recreate) {
+    await options.recreate('accepted');
+    await options.unlock();
+    await verify();
+    await options.lock();
+  }
+  options.removeCache();
+  await options.recreate?.('cache_removed');
+  await options.unlock();
+  return verify();
+}
+
 export async function performQualificationAcceptance({
   prefix,
   profileId,
@@ -199,6 +245,8 @@ export async function performQualificationAcceptance({
   collectFeed,
   originalHash,
   afterAcceptedBeforeRecovery,
+  recreate,
+  retainIdentityEvidence,
 }: QualificationAcceptanceOptions) {
   check(
     /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(profileId) && prefix === `/api/profiles/${profileId}`,
@@ -259,7 +307,7 @@ export async function performQualificationAcceptance({
           record.mapping.subject === 'self' &&
             (record.identityReview?.status === 'evidenced_match' ||
               record.identityReview?.status === 'prior_confirmation') &&
-            patientName(record.identityReview.evidencedIdentity.fullName) === qualificationPerson &&
+            matchesPatient(record.identityReview.evidencedIdentity.fullName) &&
             (record.identityReview.evidencedIdentity.birthDate === qualificationBirthDate ||
               (record.identityReview.evidencedIdentity.birthDate === undefined &&
                 record.reportGroups?.length === 1 &&
@@ -276,6 +324,7 @@ export async function performQualificationAcceptance({
       const inspected = await readQualificationIdentity(
         request,
         prefix + `/intakes/${originalId}/identity-review?groupId=${encodeURIComponent(groupId)}`,
+        retainIdentityEvidence,
       );
       const { review, inspectedScope: scope, confirmationScope } = inspected;
       check(
@@ -283,9 +332,9 @@ export async function performQualificationAcceptance({
           review.status !== 'conflict' &&
           !review.conflicts.length &&
           !review.selfBirthDateConflict &&
-          patientName(review.self.fullName) === qualificationPerson &&
+          matchesPatient(review.self.fullName) &&
           review.self.birthDate === qualificationBirthDate &&
-          patientName(review.evidencedIdentity.fullName) === qualificationPerson &&
+          matchesPatient(review.evidencedIdentity.fullName) &&
           (review.evidencedIdentity.birthDate === qualificationBirthDate ||
             (review.evidencedIdentity.birthDate === undefined &&
               scope.verificationMode === 'human_reviewed_original' &&
@@ -401,8 +450,23 @@ export async function performQualificationAcceptance({
         .every((record) => record.queueState === 'accepted'),
       'Qualification retains unaccepted records.',
     );
+    const histories = recreate
+      ? await Promise.all(
+          results.map(async ({ kind, record }) => {
+            const history = await request<{ entries: unknown[] }>(
+              prefix + '/record-history?' + new URLSearchParams({ kind, recordId: record.id }),
+            );
+            check(
+              history.entries.length > 0,
+              'Accepted record requires nonempty retained version history.',
+            );
+            return history;
+          }),
+        )
+      : [];
     return {
       results,
+      histories,
       grade: gradeProviderQualification(
         results.map(({ kind, record }) => acceptedQualificationRecord(kind, record)),
         originalId,
@@ -436,15 +500,18 @@ export async function performQualificationAcceptance({
     'Acceptance changed the retained original.',
   );
   await afterAcceptedBeforeRecovery?.();
-  await request(prefix + '/lock', {});
-  // Delete only this harness-owned disposable cache after lock. Originals,
-  // manifests, accepted versions and the encrypted recovery authority survive.
-  removeQualificationCache(dataDirectory, profileId, ownedProfiles);
-  await request(prefix + '/unlock', { recovery });
-  const after = await acceptedSnapshot();
+  const after = await recoverQualificationState(before, {
+    snapshot: acceptedSnapshot,
+    originalUnchanged: async () => (await originalHash(prefix, originalId)) === expectedSha256,
+    lock: () => request(prefix + '/lock', {}),
+    unlock: () => request(prefix + '/unlock', { recovery }),
+    // Only this freshly owned, locked profile's disposable cache is removed.
+    removeCache: () => removeQualificationCache(dataDirectory, profileId, ownedProfiles),
+    recreate,
+  });
   await checkClinicalCounts();
   check(
-    after.grade.passed && JSON.stringify(after.results) === JSON.stringify(before.results),
+    after.grade.passed && JSON.stringify(after) === JSON.stringify(before),
     'Accepted clinical projections or provenance changed during cache-loss recovery.',
   );
   for (let index = 0; index < requests.length; index++) {

@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto';
-import { opendirSync, lstatSync, realpathSync, openSync, readSync, closeSync } from 'node:fs';
+import {
+  opendirSync,
+  lstatSync,
+  realpathSync,
+  openSync,
+  readSync,
+  closeSync,
+  fstatSync,
+} from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { resolve, relative } from 'node:path';
 
@@ -13,6 +21,12 @@ export interface UnlockPhysicalWitness {
 }
 function refuse(): never {
   throw Error('Encrypted profile physical evidence changed');
+}
+/** A held descriptor keeps an owned file's physical identity live across workers. */
+export function unlockPhysicalFileDescriptorIdentity(fd: number): string {
+  const stat = fstatSync(fd, { bigint: true });
+  if (!stat.isFile() || stat.nlink !== 1n) refuse();
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 }
 export function unlockPhysicalIdentity(path: string): {
   kind: 'file' | 'directory';

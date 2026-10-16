@@ -146,7 +146,12 @@ stops source reading or rejects an otherwise supported clinical proposal. Preser
 the printed subject and its grounded identity question; the user can explicitly
 assign the displayed report to Self or a new/existing Person in People. Do not
 choose a person ID, invent an alias, or accept records yourself. Identity
-confirmation is separate from extraction:
+confirmation is separate from extraction. Keep identity-only concerns in grounded
+`reviewIssues` with `kind:"identity"` and `clinical.subject:"unknown"` until reviewed.
+Do not duplicate an identity question in `clinical.uncertainties`; reserve those
+uncertainties for independent unresolved clinical readings or assertions. Identity
+confirmation never resolves a value, unit, date, source or other clinical ambiguity.
+For extraction,
 retain supported document dates and opticalPrescription fields while waiting for
 it. Do not move these proposals to proposedClinicalMapping or discard them because
 the subject is unconfirmed. Preserve original literal payload content separately.

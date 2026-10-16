@@ -12,7 +12,7 @@ import {
   statfsSync,
   writeFileSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireStorageLock } from '../src/server/storage-lock.ts';
 
@@ -100,6 +100,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   try {
     const [mode, directory, nonce] = process.argv.slice(2);
     assert.ok(directory && nonce && ['write', 'verify'].includes(mode));
+    assert.equal(process.getuid?.(), 1000, 'The container probe must run as UID 1000.');
+    assert.equal(statSync(dirname(directory)).uid, 1000, 'UID 1000 must own its scratch view.');
     console.log(
       JSON.stringify(
         await (mode === 'write'

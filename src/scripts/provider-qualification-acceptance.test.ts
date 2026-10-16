@@ -7,7 +7,6 @@ import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { createVaultApp } from '../server/vault-app.ts';
 import { createImportDiagnostics } from '../server/import-diagnostics.ts';
-import { getRetainedIntakeOriginalReference } from '../server/intake.ts';
 import { intakeWorkCounters, type IntakeWorkCounters } from '../server/intake-work-accounting.ts';
 import type { IntakeIdentityReview } from '../shared/intake-identity.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
@@ -20,7 +19,6 @@ import {
   gradeProviderQualification,
   writeProviderQualificationPdf,
 } from './provider-qualification-fixture.ts';
-import { readPdfIdentityPageText } from '../server/intake-pdf-session.ts';
 import type { IntakeRead } from '../shared/intake-summary.ts';
 import { collectQualificationFeed, readQualificationReview } from './qualification-intake-read.ts';
 import { performQualificationAcceptance } from './provider-qualification-acceptance.ts';
@@ -204,40 +202,18 @@ test(
     assert.equal(owned.length, 1);
     const stopped = await request<IntakeBatch>(prefix + `/intake-batches/${owned[0]!.id}/stop`, {});
     assert.equal(stopped.status, 'stopped');
-    const state = app.manager.opened.get(profile.id)!;
     const identityByPage = new Map<
       number,
       { anchor: string; subject: string; textAnchor: string; fullName: string }
     >();
-    const reference = getRetainedIntakeOriginalReference(
-      state.db,
-      state.root,
-      profile.id,
-      uploaded.id,
-    );
+    // Independently visible fixture labels, never manufactured from the host's
+    // extracted spacing. This exercises the real PDF grounding boundary.
     for (const page of [1, 2, 3, 4]) {
-      const { text } = await readPdfIdentityPageText({ ...reference, profileId: profile.id }, page);
-      const lines = text.split('\n');
-      const anchor =
-        lines.find((line) => line.includes('FICTIONAL'))?.trim() ??
-        'FICTIONAL CLINICAL QUALIFICATION REPORT';
-      const subjectLine =
-        lines.find((line) => line.includes('Patient:'))?.trim() ??
-        `Patient: ${qualificationPerson}.`;
-      const birth =
-        lines.find((line) => line.includes('DOB:'))?.trim() ??
-        `Patient DOB: ${qualificationBirthDate}.`;
-      const patientField = /Patient:\s*(.*?)\./.exec(subjectLine)!;
-      const fullName = patientField[1]!;
-      // This independently generated proposal selects the literal patient field,
-      // not the surrounding page counter/sentence as a supposed personal name.
-      const subject = patientField[0].slice(0, -1);
-      assert.ok(subjectLine.includes(subject));
       identityByPage.set(page, {
-        anchor,
-        subject,
-        textAnchor: `${subjectLine}\n${birth}`,
-        fullName,
+        anchor: 'FICTIONAL CLINICAL QUALIFICATION REPORT',
+        subject: 'Patient: ' + qualificationPerson,
+        textAnchor: 'Patient: ' + qualificationPerson + '\nPatient DOB: ' + qualificationBirthDate,
+        fullName: qualificationPerson,
       });
     }
     const proposals: HealthRecordEnvelope[] = qualificationAnswers.map((answer) => ({

@@ -4184,3 +4184,109 @@ test('report new-Person assignment rejects canonical Self names and saved aliase
     0,
   );
 });
+
+for (const native of [false, true])
+  test(`real fragmented PDF identity quotes preserve literal boundaries (${native ? 'native' : 'legacy'})`, async (t) => {
+    const { writeProviderQualificationPdf, qualificationPerson, qualificationBirthDate } =
+      await import('../../scripts/provider-qualification-fixture.ts');
+    const directory = mkdtempSync(join(tmpdir(), 'fictional-visible-pdf-identity-'));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const path = join(directory, 'fictional.pdf');
+    writeProviderQualificationPdf(path, 'tiny');
+    const bytes = fs.readFileSync(path);
+    for (const variation of [
+      'exact',
+      'subject-punctuation',
+      'other-name',
+      'anchor-punctuation',
+      'cross-page',
+      'conflicting-dob',
+    ] as const)
+      await t.test(variation, async (sub) => {
+        const f = fixture(sub, bytes, 'fictional.pdf');
+        setSelf(f, {
+          fullName: qualificationPerson,
+          birthDate: variation === 'conflicting-dob' ? '1999-01-01' : qualificationBirthDate,
+        });
+        const title = 'FICTIONAL CLINICAL QUALIFICATION REPORT';
+        const printed = 'Patient: ' + qualificationPerson;
+        const claim =
+          variation === 'subject-punctuation'
+            ? printed + '!'
+            : variation === 'other-name'
+              ? 'Patient: Other Fictional Person'
+              : printed;
+        const value = envelope('fictional-pdf-visible-row');
+        value.payload = {
+          text: `${title}\n${claim}\nPatient DOB: ${qualificationBirthDate}\nFXP1R01 <0.01 mg/dL`,
+        };
+        value.clinical = {
+          kind: 'observation',
+          subject: 'unknown',
+          testLabel: 'FXP1R01',
+          valueText: '<0.01',
+          unit: 'mg/dL',
+          date: '2026-01-01',
+        };
+        value.report = {
+          key: 'fictional-visible-report',
+          title,
+          anchor: {
+            text: title + (variation === 'anchor-punctuation' ? '!' : ''),
+            locator: variation === 'cross-page' ? 'page 2 heading' : 'page 1 heading',
+          },
+          subject: { text: claim, locator: 'page 1 patient' },
+        };
+        value.reviewIssues = [
+          {
+            kind: 'identity',
+            field: 'subject',
+            prompt: 'Who should this printed report be assigned to?',
+            textAnchor: `${claim}\nPatient DOB: ${qualificationBirthDate}`,
+            page: 1,
+          },
+        ];
+        f.propose([value]);
+        const groupId = workflow(f).reportGroups![0]!.id;
+        if (native) {
+          const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
+          await buildIntakeCollectionEnvelope(f.db, { id: f.item.id });
+        }
+        const review = await getIntakeIdentityReview(f.db, f.root, f.profileId, f.item.id, groupId);
+        if (variation === 'exact' || variation === 'conflicting-dob') {
+          const scope = review.scopeReference || review.scope;
+          assert.ok(scope, review.message);
+          assert.equal(scope.verificationMode, 'literal_text_match');
+          assert.equal(scope.original.page, 1);
+          assert.equal(review.evidencedIdentity.fullName, qualificationPerson);
+          assert.equal(review.evidencedIdentity.birthDate, qualificationBirthDate);
+          const command = {
+            ...request(scope as IntakeIdentityScope),
+            scope,
+            attestation: 'confirmed_displayed_identity_questions' as const,
+          };
+          if (variation === 'conflicting-dob')
+            await assert.rejects(
+              confirmAnyIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, command),
+              /birth date differs from Self/,
+            );
+          else {
+            await confirmAnyIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, command);
+            const after = await getIntakeIdentityReview(
+              f.db,
+              f.root,
+              f.profileId,
+              f.item.id,
+              groupId,
+            );
+            assert.equal(after.status, 'prior_confirmation');
+            assert.equal(after.blocking, false);
+          }
+        } else {
+          assert.equal(review.status, 'conflict');
+          assert.equal(review.scope, null);
+          assert.equal(review.scopeReference, undefined);
+        }
+        assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
+      });
+  });

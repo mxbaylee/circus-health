@@ -3,9 +3,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import {
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   realpathSync,
   statSync,
@@ -14,10 +16,15 @@ import {
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { inventoryArchive, type ArchiveInventory } from './archive-restore-copy.ts';
+import { outsideGit } from '../../deploy/run.ts';
+import { qualifyDrive } from '../../deploy/qualify-drive.ts';
+import { sanitizeBuildIdentity } from '../shared/build-identity.ts';
 import type { ImportDiagnosticExport } from '../server/import-diagnostics.ts';
 import { isIntakeSummary, type IntakeRead } from '../shared/intake-summary.ts';
 import {
   collectQualificationFeed,
+  readQualificationReading,
   type QualificationFeedPage,
 } from './qualification-intake-read.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
@@ -38,6 +45,14 @@ import {
 const repository = fileURLToPath(new URL('../../', import.meta.url));
 function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw Error(message);
+}
+/** Capability checks await inference; only host work gets a harness hang guard. */
+export function qualificationRequestSignal(
+  operator: AbortSignal,
+  modelAwait: boolean,
+  hostGuard: () => AbortSignal = () => AbortSignal.timeout(90_000),
+) {
+  return modelAwait ? operator : AbortSignal.any([operator, hostGuard()]);
 }
 /** Called only with paths inside the validated external, owner-only attempt. */
 export function writeQualificationPrivateJson(path: string, value: unknown) {
@@ -93,6 +108,8 @@ interface QualificationRun {
   proposals: number;
   supersededReviewVersions: number;
   extractionComplete: boolean;
+  readingAccounting: QualificationFeedPage['activity']['readingAccounting'] | null;
+  reading: Awaited<ReturnType<typeof readQualificationReading>>;
   remainingUnits: number | null;
   coordinator: ReturnType<typeof summarizeQualificationBatch>;
   reviewEvidenceFile: string;
@@ -242,9 +259,15 @@ export function summarizeQualificationDiagnostics(
 }
 
 async function main() {
+  const deployment = process.argv.includes('--deployment');
   check(
-    process.argv.includes('--run') && process.env.CRS_PROVIDER_QUALIFICATION === '1',
-    'Explicit opt-in required: CRS_PROVIDER_QUALIFICATION=1 node scripts/qualify-provider-pdf.ts --run. This uses the configured real provider.',
+    process.argv.includes('--run') &&
+      (deployment
+        ? process.env.CRS_DEPLOYMENT_QUALIFICATION === '1'
+        : process.env.CRS_PROVIDER_QUALIFICATION === '1'),
+    deployment
+      ? 'Explicit opt-in required: CRS_DEPLOYMENT_QUALIFICATION=1 npm run qualify:deployment. This uses the configured real provider.'
+      : 'Explicit opt-in required: CRS_PROVIDER_QUALIFICATION=1 node src/scripts/qualify-provider-pdf.ts --run. This uses the configured real provider.',
   );
   const outputParent = externalDirectory(
     process.env.CRS_QUALIFICATION_OUTPUT_DIR,
@@ -258,18 +281,20 @@ async function main() {
     'Supply CRS_MODEL and absolute CRS_LITELLM_CONFIG for one operator-owned route.',
   );
   check(existsSync(process.env.CRS_LITELLM_CONFIG), 'CRS_LITELLM_CONFIG must exist.');
-  const repetitions = process.env.CRS_QUALIFICATION_REPEAT === '2' ? 2 : 1;
+  const repetitions = !deployment && process.env.CRS_QUALIFICATION_REPEAT === '2' ? 2 : 1;
   check(
     !process.env.CRS_QUALIFICATION_REPEAT ||
       ['1', '2'].includes(process.env.CRS_QUALIFICATION_REPEAT),
     'CRS_QUALIFICATION_REPEAT must be 1 or 2.',
   );
-  const scenario = process.env.CRS_QUALIFICATION_SCENARIO ?? 'quick';
+  const scenario = deployment ? 'tiny' : (process.env.CRS_QUALIFICATION_SCENARIO ?? 'quick');
   check(
     scenario === 'tiny' || scenario === 'quick' || scenario === 'long',
     'CRS_QUALIFICATION_SCENARIO must be tiny, quick or long.',
   );
-  const cacheMode = process.env.CRS_QUALIFICATION_CACHE ?? 'configured';
+  const cacheMode = deployment
+    ? 'configured'
+    : (process.env.CRS_QUALIFICATION_CACHE ?? 'configured');
   check(
     cacheMode === 'configured' || cacheMode === 'paired',
     'CRS_QUALIFICATION_CACHE must be configured or paired.',
@@ -282,13 +307,13 @@ async function main() {
     !process.env.CRS_QUALIFICATION_ACCEPT || process.env.CRS_QUALIFICATION_ACCEPT === '1',
     'CRS_QUALIFICATION_ACCEPT must be 1 when enabled.',
   );
-  const accept = process.env.CRS_QUALIFICATION_ACCEPT === '1';
+  const accept = deployment || process.env.CRS_QUALIFICATION_ACCEPT === '1';
   const diagnosticRequested = process.env.CRS_QUALIFICATION_DIAGNOSTICS === '1';
   check(
     !process.env.CRS_QUALIFICATION_DIAGNOSTICS || diagnosticRequested,
     'CRS_QUALIFICATION_DIAGNOSTICS must be 1 when enabled.',
   );
-  const format = process.env.CRS_QUALIFICATION_FORMAT ?? 'both';
+  const format = deployment ? 'auto' : (process.env.CRS_QUALIFICATION_FORMAT ?? 'both');
   if (diagnosticRequested)
     check(
       scenario === 'tiny' &&
@@ -310,6 +335,11 @@ async function main() {
   const root = mkdtempSync(join(outputParent, 'provider-qualification-'));
   chmodSync(root, 0o700);
   const data = join(root, 'data');
+  outsideGit(data);
+  check(
+    !state.startsWith(root + '/') && !root.startsWith(state + '/') && root !== state,
+    'Qualification output and provider state must be separate.',
+  );
   mkdirSync(data, { mode: 0o700 });
   const fixtureFilename = `fictional-${scenario}-qualification.pdf`;
   const fixturePath = join(root, fixtureFilename);
@@ -345,13 +375,22 @@ async function main() {
     formatPolicy: format,
     repetitions,
     acceptanceRequested: accept,
+    deploymentQualificationRequested: deployment,
+    deployment: {
+      stages: [] as unknown[],
+      drive: null as Awaited<ReturnType<typeof qualifyDrive>> | null,
+      masterKeyRetained: false,
+      providerAuthenticationRetained: false,
+      authorityUnchanged: false,
+    },
     diagnosticQualificationRequested: diagnosticRequested,
     // Status GETs also flush the encrypted workspace. Leave room in the bounded
     // event log for provider and extraction work throughout a long import.
     statusPollIntervalMs: 5_000,
-    conversionDeadlineMs: (scenario === 'long' ? 125 : 16) * 60_000,
-    conversionDeadlineInterpretation:
-      'The long harness wall bound allows the normal two-hour active-work budget plus five minutes for already-admitted work; it does not extend the application budget. Quick mode remains bounded at 16 minutes.',
+    conversionDeadlineMs: deployment ? undefined : (scenario === 'long' ? 125 : 16) * 60_000,
+    conversionDeadlineInterpretation: deployment
+      ? 'No harness model-time deadline. Follow the application coordinator and its progress/terminal outcome; operator cancellation remains available.'
+      : 'The long harness wall bound allows the normal two-hour active-work budget plus five minutes for already-admitted work; it does not extend the application budget. Quick mode remains bounded at 16 minutes.',
     manualResumeRequests: 0,
     completionCriterion:
       'One normal Import intake-batches create request, no harness convert or resume requests; the coordinator must finish without paused items or budget extensions and every extraction/delivery oracle must pass.',
@@ -418,6 +457,7 @@ async function main() {
     bytes?: Buffer,
     signal: AbortSignal = controller.signal,
     clientRequestId?: string,
+    modelAwait = false,
   ): Promise<T> {
     const response = await fetch(base + path, {
       method: input !== undefined || bytes ? 'POST' : 'GET',
@@ -438,10 +478,22 @@ async function main() {
         : input !== undefined
           ? { body: JSON.stringify(input) }
           : {}),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(90_000)]),
+      signal: qualificationRequestSignal(signal, deployment && modelAwait),
     });
     const setCookie = response.headers.get('set-cookie');
     if (setCookie) cookie = setCookie.split(';')[0] ?? '';
+    if (!response.ok && deployment) {
+      // Keep actionable local diagnostics only in this protected fictional
+      // attempt. Never include response/provider content in terminal output.
+      writeQualificationPrivateJson(
+        join(root, 'deployment-http-failure-' + randomUUID() + '.json'),
+        {
+          path,
+          status: response.status,
+          body: (await response.text()).slice(0, 32_768),
+        },
+      );
+    }
     // Never include error bodies, model content or credentials in command output.
     check(response.ok, `Qualification HTTP request failed with status ${response.status}.`);
     return ((await response.json()) as { data: T }).data;
@@ -619,84 +671,135 @@ async function main() {
       .update(Buffer.from(await response.arrayBuffer()))
       .digest('hex');
   }
+  async function runtimeIdentity() {
+    const response = await fetch(base + '/api/runtime', {
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
+    });
+    check(response.ok, 'Running build identity is unavailable.');
+    const runtime = (await response.json()) as { ready: boolean; encrypted: boolean };
+    const identity = sanitizeBuildIdentity(runtime);
+    check(
+      runtime.ready && runtime.encrypted && identity.buildId && identity.revision,
+      'Running deployment must expose an encrypted ready build identity.',
+    );
+    return identity;
+  }
   try {
     for (const { mode, cache, configurationPosition } of schedule) {
-      report.stage = `starting_${mode}_${cache}_${configurationPosition}`;
-      save();
-      const env = Object.fromEntries(
-        Object.entries(process.env).filter(
-          ([key]) =>
-            !/^(CRS_|HEALTH_|CIRCUS_|CODEX_|LITELLM_|OLLAMA_|DATA_DIR$|AI$|MODEL$|AI_URL$|KEY_FILE$|AUTH_DIR$|ENV_FILE$|STACK$|RUNTIME$|PORT$|IMAGE$|NODE$|STATE_DIR$|RESPONSE_MODEL$|IMAGES$|PDF$|PROMPT_CACHE$)/.test(
-              key,
-            ),
-        ),
-      );
-      for (const key of [
-        'CRS_MODEL',
-        'CRS_LITELLM_CONFIG',
-        'CRS_LITELLM_ENV_FILE',
-        'CRS_RESPONSE_MODEL',
-      ])
-        if (process.env[key]) env[key] = process.env[key];
-      Object.assign(env, {
-        CRS_DATA_DIR: data,
-        CRS_STATE_DIR: state,
-        CRS_PORT: String(port),
-        CRS_PUBLIC_ORIGIN: base,
-        CRS_PDF: mode === 'pdf' ? 'auto' : 'false',
-        CRS_PROMPT_CACHE: cache === 'on' ? 'true' : 'false',
-        CRS_IMAGES: 'true',
-        CRS_IMPORT_DIAGNOSTICS: 'true',
-      });
-      launcher = spawn(process.execPath, ['deploy/run.ts', 'run'], {
-        cwd: repository,
-        env,
-        detached: true,
-        stdio: 'ignore',
-      });
-      closed = new Promise<void>((done, reject) => {
-        launcher!.once('close', () => done());
-        launcher!.once('error', reject);
-      });
-      // Build readiness is bounded separately from provider and conversion deadlines.
-      const startupDeadline = Date.now() + 15 * 60_000;
-      let ready = false;
-      while (Date.now() < startupDeadline) {
-        controller.signal.throwIfAborted();
-        check(
-          launcher.exitCode === null && launcher.signalCode === null,
-          'Launcher exited before readiness. Inspect the operator configuration locally; output is withheld to avoid exposing provider secrets.',
+      const startInstallation = async () => {
+        report.stage = `starting_${mode}_${cache}_${configurationPosition}`;
+        save();
+        const env = Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([key]) =>
+              !/^(CRS_|HEALTH_|CIRCUS_|CODEX_|LITELLM_|OLLAMA_|DATA_DIR$|AI$|MODEL$|AI_URL$|KEY_FILE$|AUTH_DIR$|ENV_FILE$|STACK$|RUNTIME$|PORT$|IMAGE$|NODE$|STATE_DIR$|RESPONSE_MODEL$|IMAGES$|PDF$|PROMPT_CACHE$)/.test(
+                key,
+              ),
+          ),
         );
+        for (const key of [
+          'CRS_MODEL',
+          'CRS_LITELLM_CONFIG',
+          'CRS_LITELLM_ENV_FILE',
+          'CRS_RESPONSE_MODEL',
+        ])
+          if (process.env[key]) env[key] = process.env[key];
+        Object.assign(env, {
+          CRS_DATA_DIR: data,
+          CRS_STATE_DIR: state,
+          CRS_PORT: String(port),
+          CRS_PUBLIC_ORIGIN: base,
+          CRS_PDF: mode === 'pdf' ? 'auto' : 'false',
+          CRS_PROMPT_CACHE: cache === 'on' ? 'true' : 'false',
+          CRS_IMAGES: 'true',
+          CRS_IMPORT_DIAGNOSTICS: 'true',
+        });
+        const log = deployment
+          ? openSync(join(root, 'deployment-launcher.log'), 'a', 0o600)
+          : undefined;
         try {
-          ready = (await fetch(base + '/health/ready', { signal: AbortSignal.timeout(500) })).ok;
-        } catch {
-          /* Startup still in progress. */
+          launcher = spawn(process.execPath, ['deploy/run.ts', 'run'], {
+            cwd: repository,
+            env,
+            detached: true,
+            stdio: log === undefined ? 'ignore' : ['ignore', log, log],
+          });
+        } finally {
+          if (log !== undefined) closeSync(log);
         }
-        if (ready) break;
-        await delay(500, undefined, { signal: controller.signal });
+        closed = new Promise<void>((done, reject) => {
+          launcher!.once('close', () => done());
+          launcher!.once('error', reject);
+        });
+        // Build readiness is bounded separately from provider and conversion deadlines.
+        const startupDeadline = Date.now() + 15 * 60_000;
+        let ready = false;
+        while (Date.now() < startupDeadline) {
+          controller.signal.throwIfAborted();
+          check(
+            launcher.exitCode === null && launcher.signalCode === null,
+            'Launcher exited before readiness. Inspect the operator configuration locally; output is withheld to avoid exposing provider secrets.',
+          );
+          try {
+            ready = (await fetch(base + '/health/ready', { signal: AbortSignal.timeout(500) })).ok;
+          } catch {
+            /* Startup still in progress. */
+          }
+          if (ready) break;
+          await delay(500, undefined, { signal: controller.signal });
+        }
+        check(ready, 'Launcher did not become ready within 15 minutes.');
+        const container = execFileSync(
+          'docker',
+          [
+            'ps',
+            '-q',
+            '--filter',
+            `label=com.docker.compose.project=${project}`,
+            '--filter',
+            'label=com.docker.compose.service=health',
+          ],
+          { encoding: 'utf8' },
+        ).trim();
+        check(
+          /^[a-f0-9]+$/.test(container),
+          'Expected exactly one qualification application container.',
+        );
+        report.applicationImages[`${mode}_${cache}_${configurationPosition}`] = execFileSync(
+          'docker',
+          ['inspect', '--format', '{{.Image}}', container],
+          { encoding: 'utf8' },
+        ).trim();
+      };
+      await startInstallation();
+      const initialImage = report.applicationImages[`${mode}_${cache}_${configurationPosition}`];
+      const initialRuntime = deployment ? await runtimeIdentity() : null;
+      const masterHash = () =>
+        createHash('sha256')
+          .update(readFileSync(join(state, 'proxy-key')))
+          .digest('hex');
+      const initialMasterHash = deployment ? masterHash() : null;
+      const configHash = () =>
+        createHash('sha256').update(readFileSync(process.env.CRS_LITELLM_CONFIG!)).digest('hex');
+      const providerEnvHash = () =>
+        process.env.CRS_LITELLM_ENV_FILE
+          ? createHash('sha256')
+              .update(readFileSync(process.env.CRS_LITELLM_ENV_FILE))
+              .digest('hex')
+          : null;
+      const initialConfigHash = deployment ? configHash() : null;
+      const initialProviderEnvHash = deployment ? providerEnvHash() : null;
+      if (deployment) {
+        const receipts = join(root, 'drive-receipts');
+        mkdirSync(receipts, { mode: 0o700 });
+        report.deployment.drive = await qualifyDrive({
+          CRS_DRIVE_QUALIFICATION: '1',
+          CRS_DATA_DIR: data,
+          CRS_QUALIFICATION_OUTPUT_DIR: receipts,
+          CRS_IMAGE: initialImage,
+        });
+        save();
       }
-      check(ready, 'Launcher did not become ready within 15 minutes.');
-      const container = execFileSync(
-        'docker',
-        [
-          'ps',
-          '-q',
-          '--filter',
-          `label=com.docker.compose.project=${project}`,
-          '--filter',
-          'label=com.docker.compose.service=health',
-        ],
-        { encoding: 'utf8' },
-      ).trim();
-      check(
-        /^[a-f0-9]+$/.test(container),
-        'Expected exactly one qualification application container.',
-      );
-      report.applicationImages[`${mode}_${cache}_${configurationPosition}`] = execFileSync(
-        'docker',
-        ['inspect', '--format', '{{.Image}}', container],
-        { encoding: 'utf8' },
-      ).trim();
       for (let repetition = 1; repetition <= repetitions; repetition++) {
         const stage = (name: string) => {
           report.stage = `${mode}_${cache}_${configurationPosition}_run_${repetition}_${name}`;
@@ -754,7 +857,14 @@ async function main() {
           mode,
           (options) => {
             stage(options.pdf ? 'probing_pdf' : 'probing_tools_and_image');
-            return request<Connection>(prefix + '/assistant/test-connection', options);
+            return request<Connection>(
+              prefix + '/assistant/test-connection',
+              options,
+              undefined,
+              controller.signal,
+              undefined,
+              true,
+            );
           },
           () => {
             stage('checking_pdf_receipt');
@@ -824,6 +934,18 @@ async function main() {
         const feed = collected.feed;
         const detail = await request<IntakeRead>(prefix + `/intakes/${uploaded.id}`);
         extracted.intake = detail;
+        retainReviewFile(reviewEvidenceFile, extracted);
+        const reading = await readQualificationReading(
+          request,
+          prefix + `/intakes/${uploaded.id}`,
+          detail,
+          fixture.sha256,
+          scenario === 'tiny' ? 1 : undefined,
+          (page, ordinal) =>
+            retainReviewFile(activeReview!.stem + '-reading-page-' + (ordinal + 1) + '.json', page),
+        );
+        retainReviewFile(activeReview.stem + '-reading.json', reading);
+        extracted.intake = detail;
         extracted.supersededReviewVersions = collected.supersededReviewVersions;
         extracted.partial = false;
         retainReviewFile(reviewEvidenceFile, extracted);
@@ -860,6 +982,8 @@ async function main() {
             : detail.proposals.length,
           supersededReviewVersions: collected.supersededReviewVersions,
           extractionComplete: feed.activity.extractionComplete,
+          readingAccounting: feed.activity.readingAccounting ?? null,
+          reading,
           remainingUnits:
             typeof feed.activity.remainingUnits === 'number'
               ? feed.activity.remainingUnits
@@ -884,9 +1008,12 @@ async function main() {
           report.reviewCaptureFailures === 0 &&
           run.grade.passed &&
           run.delivery.passed &&
-          run.extractionComplete &&
+          run.reading.passed &&
           run.remainingUnits === 0
         ) {
+          let authority: ArchiveInventory | undefined;
+          const identityFiles = new WeakMap<object, string>();
+          let identitySequence = 0;
           run.acceptance = await performQualificationAcceptance({
             prefix,
             profileId: profile.id,
@@ -900,6 +1027,115 @@ async function main() {
             request,
             collectFeed,
             originalHash,
+            retainIdentityEvidence: (evidence, review) => {
+              let filename = identityFiles.get(review);
+              if (!filename) {
+                filename = activeReview!.stem + '-identity-' + ++identitySequence;
+                identityFiles.set(review, filename);
+              }
+              retainReviewFile(
+                filename +
+                  '-' +
+                  evidence.kind +
+                  (evidence.kind === 'page' ? '-' + evidence.ordinal : '') +
+                  '.json',
+                evidence,
+              );
+            },
+            ...(deployment
+              ? {
+                  recreate: async (phase: 'accepted' | 'cache_removed') => {
+                    stage('recreating_' + phase);
+                    await stop();
+                    const currentAuthority = await inventoryArchive(
+                      join(data, 'profiles', profile.id, 'vault'),
+                    );
+                    if (authority)
+                      check(
+                        JSON.stringify(currentAuthority) === JSON.stringify(authority),
+                        'Accepted authority changed before cache-loss reconstruction.',
+                      );
+                    else {
+                      check(
+                        currentAuthority.files > 0,
+                        'Retained accepted authority must be nonempty.',
+                      );
+                      authority = currentAuthority;
+                      writeQualificationPrivateJson(
+                        join(root, 'accepted-authority-inventory.json'),
+                        authority,
+                      );
+                    }
+                    check(
+                      masterHash() === initialMasterHash,
+                      'Proxy master key changed before recreation.',
+                    );
+                    cookie = '';
+                    await startInstallation();
+                    check(
+                      report.applicationImages[`${mode}_${cache}_${configurationPosition}`] ===
+                        initialImage,
+                      'Recreation used a different application image.',
+                    );
+                    check(
+                      JSON.stringify(await runtimeIdentity()) === JSON.stringify(initialRuntime),
+                      'Recreation used a different build identity.',
+                    );
+                    check(
+                      masterHash() === initialMasterHash,
+                      'Proxy master key changed during recreation.',
+                    );
+                    check(
+                      configHash() === initialConfigHash &&
+                        providerEnvHash() === initialProviderEnvHash,
+                      'Adopted provider configuration changed during qualification.',
+                    );
+                    await request(prefix + '/unlock', { recovery: setup.recoveryKit });
+                    const freshConnection = await request<Connection>(
+                      prefix + '/assistant/test-connection',
+                      { image: false, pdf: false },
+                      undefined,
+                      controller.signal,
+                      undefined,
+                      true,
+                    );
+                    check(
+                      freshConnection.available &&
+                        freshConnection.backend === connection.backend &&
+                        freshConnection.model === connection.model &&
+                        freshConnection.capabilities.tools,
+                      'Fresh containers could not authenticate the adopted provider tool route.',
+                    );
+                    const afterAuthority = await inventoryArchive(
+                      join(data, 'profiles', profile.id, 'vault'),
+                    );
+                    check(
+                      JSON.stringify(afterAuthority) === JSON.stringify(authority),
+                      'Recreation or cache reconstruction changed accepted authority.',
+                    );
+                    await request(prefix + '/lock', {});
+                    report.deployment.stages.push({
+                      phase,
+                      image: initialImage,
+                      build: initialRuntime,
+                      masterKeyRetained: true,
+                      authenticatedToolRequest: true,
+                      connection: {
+                        backend: freshConnection.backend,
+                        model: freshConnection.model,
+                      },
+                      providerConfigurationUnchanged: true,
+                      acceptedAuthorityUnchanged: true,
+                      authority: {
+                        files: authority.files,
+                        bytes: authority.bytes,
+                        treeHash: authority.treeHash,
+                      },
+                    });
+                    save();
+                  },
+                }
+              : {}),
             ...(diagnosticRequested
               ? {
                   afterAcceptedBeforeRecovery: async () => {
@@ -923,6 +1159,17 @@ async function main() {
                 }
               : {}),
           });
+          if (deployment) {
+            check(
+              report.deployment.stages.length === 2,
+              'Both recreation and cache-loss stages are required.',
+            );
+            Object.assign(report.deployment, {
+              masterKeyRetained: true,
+              providerAuthenticationRetained: true,
+              authorityUnchanged: true,
+            });
+          }
           if (!(await retainDiagnostics())) report.diagnosticCaptureFailures++;
           save();
         }
@@ -946,7 +1193,7 @@ async function main() {
           (!accept || run.acceptance?.passed === true) &&
           run.acceptedClinicalRecords === 0 &&
           !run.acceptedWrites &&
-          run.extractionComplete &&
+          run.reading.passed &&
           run.remainingUnits === 0 &&
           run.diagnostics.droppedEvents === 0 &&
           (!diagnosticRequested || run.diagnosticQualification?.passed === true) &&

@@ -4,6 +4,8 @@ Serves the [Caregiver, Self-tracker and Records assembler](../design/personas.md
 
 Identity assignment applies to each report. A name or birth-date mismatch never rejects the upload or stops reading. Pending records can be assigned to Self, an existing person or a newly created person. Records assigned to someone else remain outside Self's clinical lists and trends. Assignment leaves clinical records in review; acceptance is a separate action.
 
+Original quote grounding allows differences in ASCII spaces and tabs, horizontal padding around a retained line break, and CRLF versus LF endings. It preserves the number of line breaks, case, punctuation and every other literal character. Matching returns positions in the untouched original: patient/relative roles, report and record boundaries, and multi-space demographic column cues still use the original text. Differing names or dates, changed punctuation, cross-page/member claims and competing evidence retain their existing refusals. Repeated equivalent report anchors do not establish automatic patient-name grounding. This comparison is ephemeral; retained quotes, originals, identity/source keys, commitments and accepted versions are unchanged.
+
 ## Automatic matches and human confirmation
 
 Reusing a Self confirmation from another report requires the current printed name still to match Self, rather than a different saved person. The confirmed report's own receipt remains applicable after a later name change; a different report asks for an explicit owner.

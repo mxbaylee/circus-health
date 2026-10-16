@@ -48,7 +48,7 @@ import {
   type ImportDiagnostics,
 } from './import-diagnostics.ts';
 import { performance } from 'node:perf_hooks';
-import { rm as removeRuntime, opendir, lstat, mkdtemp } from 'node:fs/promises';
+import { rm as removeRuntime, opendir, lstat, mkdtemp, type FileHandle } from 'node:fs/promises';
 import { Worker } from 'node:worker_threads';
 import {
   prepareEncryptedUnlock,
@@ -59,7 +59,11 @@ import {
   type UnlockAuthorityWitness,
 } from './encrypted-profile-preparation.ts';
 import type { UnlockPhysicalWitness } from './encrypted-unlock-physical.ts';
-import { unlockPhysicalDigest, unlockPhysicalIdentity } from './encrypted-unlock-physical.ts';
+import {
+  unlockPhysicalDigest,
+  unlockPhysicalIdentity,
+  unlockPhysicalFileDescriptorIdentity,
+} from './encrypted-unlock-physical.ts';
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite';
 import type { Server, ServerResponse } from 'node:http';
 import {
@@ -1174,6 +1178,9 @@ export function createEncryptedProfiles({
         availableRuntimeBytes: availableRuntimeBytes(),
         witnessDirectory,
         checkpoint,
+        async discardPrepared(prepared) {
+          await (prepared as { manifestHandle?: FileHandle }).manifestHandle?.close();
+        },
       },
       (workerData, transferList) => {
         if (sourceKey) intakeCopyNativeSqlite();
@@ -1231,6 +1238,7 @@ export function createEncryptedProfiles({
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
     let stageData: string | undefined;
+    let manifestHandle: FileHandle | undefined;
     let witnessDirectory: string | undefined,
       source: OpenedProfile | undefined,
       sourceAuthority: UnlockAuthorityWitness | undefined,
@@ -1319,6 +1327,7 @@ export function createEncryptedProfiles({
           manifestDigest: string;
           originalRootIdentity: string;
           selectedHead: string;
+          manifestHandle: FileHandle;
         }>(
           id,
           key,
@@ -1337,6 +1346,7 @@ export function createEncryptedProfiles({
           check,
           source?.key,
         );
+        manifestHandle = staged.manifestHandle;
         sourcePhysicalWitness = staged.sourcePhysicalWitness;
         check();
         unlockCheckpoint?.('publication');
@@ -1375,6 +1385,7 @@ export function createEncryptedProfiles({
           unlockPhysicalIdentity(resolve(pathFor(id), 'vault')).value !==
             staged.originalRootIdentity ||
           unlockPhysicalIdentity(staged.manifestPath).value !== staged.manifestIdentity ||
+          unlockPhysicalFileDescriptorIdentity(manifestHandle.fd) !== staged.manifestIdentity ||
           unlockPhysicalDigest(staged.manifestPath) !== staged.manifestDigest
         )
           throw Error('Setup physical evidence changed');
@@ -1399,8 +1410,9 @@ export function createEncryptedProfiles({
           resolve(pathFor(id), 'vault/manifest.enc'),
         ).value;
         if (
+          unlockPhysicalFileDescriptorIdentity(manifestHandle.fd) !== publishedManifestIdentity ||
           publishedManifestIdentity.split(':').slice(0, 4).join(':') !==
-          staged.manifestIdentity.split(':').slice(0, 4).join(':')
+            staged.manifestIdentity.split(':').slice(0, 4).join(':')
         )
           throw Error('Setup publication changed');
         authority = unlockAuthorityWitness(pathFor(id));
@@ -1491,16 +1503,21 @@ export function createEncryptedProfiles({
       adopted = true;
       return result;
     } finally {
-      if (!adopted) key.fill(0);
-      if (source) {
-        const dependents = copyDependents.get(source.id);
-        dependents?.delete(controller);
-        if (!dependents?.size) copyDependents.delete(source.id);
+      try {
+        if (!adopted) key.fill(0);
+        if (source) {
+          const dependents = copyDependents.get(source.id);
+          dependents?.delete(controller);
+          if (!dependents?.size) copyDependents.delete(source.id);
+        }
+        if (preparing.get(id) === controller) preparing.delete(id);
+        signal?.removeEventListener('abort', abort);
+        if (stageData) await removeRuntime(stageData, { recursive: true, force: true });
+        if (witnessDirectory)
+          await removeRuntime(witnessDirectory, { recursive: true, force: true });
+      } finally {
+        await manifestHandle?.close();
       }
-      if (preparing.get(id) === controller) preparing.delete(id);
-      signal?.removeEventListener('abort', abort);
-      if (stageData) await removeRuntime(stageData, { recursive: true, force: true });
-      if (witnessDirectory) await removeRuntime(witnessDirectory, { recursive: true, force: true });
     }
   }
   function unlock(id: string, recovery: unknown) {

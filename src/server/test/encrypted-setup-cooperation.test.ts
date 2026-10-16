@@ -1,6 +1,16 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  lstatSync,
+  renameSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setImmediate as yieldHost } from 'node:timers/promises';
@@ -82,6 +92,20 @@ async function whileUsable(f: Awaited<ReturnType<typeof fixture>>, operation: Pr
   assert.ok(turns > 1);
 }
 
+function ciphertextFiles(root: string) {
+  return readdirSync(root, { recursive: true })
+    .map(String)
+    .filter((path) => lstatSync(resolve(root, path)).isFile())
+    .sort()
+    .map((path) => ({
+      path,
+      mode: lstatSync(resolve(root, path)).mode & 0o777,
+      sha256: createHash('sha256')
+        .update(readFileSync(resolve(root, path)))
+        .digest('hex'),
+    }));
+}
+
 test('fresh setup and private copy prepare offhost while the current accepted source remains usable', async (t) => {
   const f = await fixture(t);
   for (const copy of [false, true]) {
@@ -94,8 +118,15 @@ test('fresh setup and private copy prepare offhost while the current accepted so
             birthDate: '1991-07-18',
           },
     );
-    const sourceManifest = readFileSync(
-      resolve(f.manager.pathFor(f.active.profileId), 'vault/manifest.enc'),
+    const sourceRoot = resolve(f.manager.pathFor(f.active.profileId), 'vault'),
+      targetRoot = resolve(f.manager.pathFor(target.profileId), 'vault'),
+      sourceFiles = ciphertextFiles(sourceRoot),
+      targetIndices = ciphertextFiles(targetRoot).filter((file) =>
+        file.path.startsWith('indices/'),
+      );
+    assert.ok(
+      targetIndices.length > 0,
+      'the actual recursive setup copy contains retained indices',
     );
     await whileUsable(
       f,
@@ -122,11 +153,17 @@ test('fresh setup and private copy prepare offhost while the current accepted so
         130,
       );
     }
-    assert.deepEqual(
-      readFileSync(resolve(f.manager.pathFor(f.active.profileId), 'vault/manifest.enc')),
-      sourceManifest,
-    );
+    assert.deepEqual(ciphertextFiles(sourceRoot), sourceFiles);
+    const retained = new Map(ciphertextFiles(targetRoot).map((file) => [file.path, file]));
+    for (const file of targetIndices) assert.deepEqual(retained.get(file.path), file);
     assert.ok(opened.recoveryWork!.physicalCheckedEntries > 0);
+    clean(f, target.profileId);
+    f.manager.lock(target.profileId);
+    await f.manager.unlockAsync(target.profileId, target.recoveryKit);
+    assert.equal(
+      getNote(f.manager.opened.get(target.profileId)!.db, 'patient').person.name,
+      copy ? 'Fictional Private Copy' : 'Fictional New Profile',
+    );
     clean(f, target.profileId);
     f.manager.lock(target.profileId);
   }
@@ -155,6 +192,42 @@ test('first-head refusal leaves original setup selected and retries unreferenced
     f.note.content,
   );
   clean(f, target.profileId);
+});
+
+test('held setup manifest refuses a same-byte replacement before publication and can retry', async (t) => {
+  let targetId = '',
+    replaced = false;
+  const f = await fixture(t, (phase) => {
+    if (phase !== 'publication' || replaced || !targetId) return;
+    const profile = f.manager.pathFor(targetId),
+      stage = readdirSync(profile).find((name) => name.startsWith('.setup-stage-'))!,
+      manifest = resolve(profile, stage, 'profiles', targetId, 'vault/manifest.enc'),
+      bytes = readFileSync(manifest);
+    renameSync(manifest, manifest + '.replaced');
+    writeFileSync(manifest, bytes, { mode: 0o600 });
+    replaced = true;
+  });
+  const sourceRoot = resolve(f.manager.pathFor(f.active.profileId), 'vault'),
+    before = ciphertextFiles(sourceRoot),
+    target = f.manager.begin({
+      name: 'Fictional held manifest',
+      fullName: 'Fictional held manifest',
+      birthDate: '1991-07-18',
+    });
+  targetId = target.profileId;
+  await assert.rejects(
+    f.manager.verifyAsync(target.setupId, { acknowledged: true, recovery: target.recoveryKit }),
+    /Setup physical evidence changed/,
+  );
+  assert.equal(replaced, true);
+  assert.equal(f.manager.opened.has(targetId), false);
+  assert.equal(f.manager.keyring(targetId).active, false);
+  assert.deepEqual(ciphertextFiles(sourceRoot), before);
+  clean(f, targetId);
+  await f.manager.verifyAsync(target.setupId, { acknowledged: true, recovery: target.recoveryKit });
+  f.manager.lock(targetId);
+  await f.manager.unlockAsync(targetId, target.recoveryKit);
+  clean(f, targetId);
 });
 
 test('accepted first head survives activation failure and resumed recovery does not recopy a later source head', async (t) => {
