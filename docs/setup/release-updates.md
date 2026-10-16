@@ -11,6 +11,8 @@ archive format, migration or provider-setting change; each installation still
 needs its own actual receipt. They do not qualify an unavailable host or physical
 power loss, and do not replace the checked backup/update drill below.
 
+On 2026-10-16 the clean `b1ec6dada33b0879b87dd749ceda1db963dafd5c` build passed the complete fictional deployment procedure on one local macOS Docker Desktop filesystem using the supported npm → Compose → LiteLLM route with ChatGPT OAuth and alias `health-primary` configured as `chatgpt/gpt-6-astra`. Four exact observations were reviewed and explicitly accepted, with receipt replay. Both fresh-container stages retained the original bytes, exact accepted values and nonempty histories, including after disposable-cache deletion and reconstruction. Image/build, master-key bytes, provider configuration and observed model/backend matched; real authenticated tool challenges passed, and all 825 accepted-vault files remained unchanged. The protected receipt qualifies that build and small fixture, not every installation or later release. Repeat the procedure for the candidate and intended drive; [CRS-271](../todo/CRS-271.md) retains actual native Linux host qualification. Physical power loss, removable/network drives and natural OAuth refresh are outside this receipt. See the [observed deployment evidence and retained failure limits](docker-runtime.md#fictional-deployment-qualification).
+
 Restart into the reviewed build before creating or resuming an encrypted setup.
 Setup now reuses checked chunked file copying and retains its prepared manifest
 handle across worker handoff, publication and activation. This addresses observed
