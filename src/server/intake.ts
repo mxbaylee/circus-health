@@ -1024,7 +1024,6 @@ export function hasNativeIntakeSchema(db: DatabaseSync, profileId: string, id: s
   owner(db, profileId);
   return hasCollectionIntakeSchema(db, row(db, id));
 }
-const reportSourceIndexAttempts = new WeakMap<DatabaseSync, Set<string>>();
 /** Explicit, counted compatibility preparation before new public work. The
  * selected source and public version stay unchanged; a failed build leaves the
  * prior representation readable and a later call may retry it. */
@@ -1041,11 +1040,8 @@ export async function ensureNativeIntakeSchema(
       options.assertRunning?.();
       // Retained confirmations are indexed once; later calls are point reads.
       // Indexing is best effort: a refusal leaves report-source reads pending,
-      // as before, and is not retried until the intake's selected head changes.
+      // and a later preparation can retry without changing the selected head.
       const indexReportSources = async () => {
-        const attempt = JSON.stringify([id, intakeSourceVersion(db, id)]);
-        let attempted = reportSourceIndexAttempts.get(db);
-        if (attempted?.has(attempt)) return;
         try {
           const { prepareRetainedReportSourceIndex } =
               await import('./intake-report-source-state.ts'),
@@ -1067,8 +1063,6 @@ export async function ensureNativeIntakeSchema(
           owner(db, profileId);
           options.assertRunning?.();
           options.assertPublicationCurrent?.();
-          if (!attempted) reportSourceIndexAttempts.set(db, (attempted = new Set()));
-          attempted.add(attempt);
         }
       };
       // Check readiness only after admission. A preceding owner may have built

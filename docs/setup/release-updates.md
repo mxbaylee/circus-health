@@ -11,7 +11,8 @@ The paragraphs below describe individual changes; read this summary first.
   Builds that understand only V3 cannot open an upgraded intake, and deleting
   the disposable cache does not undo the upgrade. The same preparation indexes
   an intake's retained report-source confirmations once, at its unchanged public
-  version.
+  version. Failed index publication leaves those confirmations pending and is
+  retried by the next preparation; no intake edit or database restart is needed.
 - **Newer journal and queue formats.** Accepted commits use v2 segment manifests
   and processing queues use v3 events; older builds refuse both (see
   [format notes](#release-configuration-and-format-notes)).

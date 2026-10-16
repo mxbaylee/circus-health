@@ -382,7 +382,12 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDatabase, transaction } from '../database.ts';
+import {
+  openDatabase,
+  transaction,
+  observeTransactionBeforePublication,
+  rejectCurrentTransaction,
+} from '../database.ts';
 import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
 import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state-storage.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
@@ -892,7 +897,7 @@ test('prior occurrence authority includes every retained duplicate member', () =
   assert.ok(!entries.some((entry) => entry.occurrence.recordId === hidden.recordId));
 });
 
-test('cold native preparation indexes retained legacy confirmations once and leaves unconfirmed intakes unwritten', async (t) => {
+test('cold native preparation retries failed retained confirmation indexing and leaves unconfirmed intakes unwritten', async (t) => {
   const { ensureNativeIntakeSchema } = await import('../intake.ts');
   const { intakeSourceVersion } = await import('../intake-state-access.ts');
   const root = mkdtempSync(join(tmpdir(), 'fictional-source-cold-index-')),
@@ -967,6 +972,20 @@ test('cold native preparation indexes retained legacy confirmations once and lea
   await buildIntakeCollectionEnvelope(db, confirmed);
   assert.throws(() => resolveNativeReportSource(db, confirmed, request), /pending/);
   const before = intakeSourceVersion(db, confirmed.id);
+  let refusedPublications = 0;
+  const stopRefusing = observeTransactionBeforePublication(db, () => {
+    if (refusedPublications++) return;
+    rejectCurrentTransaction(db, new Error('Fictional one-shot index publication failure'));
+  });
+  try {
+    await ensureNativeIntakeSchema(db, profileId, confirmed.id);
+  } finally {
+    stopRefusing();
+  }
+  assert.equal(refusedPublications, 1);
+  assert.deepEqual(intakeSourceVersion(db, confirmed.id), before);
+  assert.throws(() => resolveNativeReportSource(db, confirmed, request), /pending/);
+  // Retry the same selected head in the same database after the refusal clears.
   await ensureNativeIntakeSchema(db, profileId, confirmed.id);
   const indexed = intakeSourceVersion(db, confirmed.id),
     prepared = durable();
