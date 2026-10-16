@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useResource } from '../data/api';
 import { useProfile } from '../data/profile';
@@ -15,25 +15,46 @@ import {
 export function PersonFilter({ disabled = false }: { disabled?: boolean }) {
   const scope = usePersonScope();
   const profile = useProfile();
+  const editButton = useRef<HTMLButtonElement>(null);
+  const pendingFocus = useRef<{ profileId: string | undefined; personId: string } | null>(null);
+  useEffect(() => {
+    const pending = pendingFocus.current;
+    if (!pending) return;
+    if (pending.profileId !== profile?.id) {
+      pendingFocus.current = null;
+      return;
+    }
+    if (scope?.personId === pending.personId && !scope.pending && !disabled) {
+      editButton.current?.focus();
+      if (document.activeElement === editButton.current) pendingFocus.current = null;
+    }
+  }, [profile?.id, scope?.personId, scope?.pending, disabled]);
   return scope?.filterable ? (
     <PersonFilterControl
       key={`${profile?.id}:${scope.personId}`}
       scope={scope}
       disabled={disabled}
+      editButton={editButton}
+      onApply={(personId) => {
+        pendingFocus.current = { profileId: profile?.id, personId };
+      }}
     />
   ) : null;
 }
 function PersonFilterControl({
   scope,
   disabled,
+  editButton,
+  onApply,
 }: {
   scope: NonNullable<ReturnType<typeof usePersonScope>>;
   disabled: boolean;
+  editButton: RefObject<HTMLButtonElement | null>;
+  onApply: (personId: string) => void;
 }) {
   const [params, setParams] = useSearchParams();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(scope.personId);
-  const editButton = useRef<HTMLButtonElement>(null);
   const people = useResource<ClinicalPersonOption[]>(editing ? '/clinical-people' : null);
   const canApply =
     !disabled &&
@@ -75,6 +96,7 @@ function PersonFilterControl({
             onSubmit={(event) => {
               event.preventDefault();
               if (!canApply) return;
+              onApply(draft);
               setParams(personSelectionQuery(params, draft));
               close();
             }}
