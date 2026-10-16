@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react';
+import { sameReviewValue } from '../intake/review-draft-pair-scope';
 import type { ImportReviewRecord } from './ImportReviewPresentation';
 
 /** An approval belongs to the exact displayed selection, not a later feed refresh. */
@@ -41,8 +42,9 @@ export function useReviewApprovalSelection() {
       const approved = snapshots.current.get(record.id);
       return (
         approved &&
-        JSON.stringify(approved.approval?.selections) !==
-          JSON.stringify(record.approval?.selections)
+        (JSON.stringify(approved.approval?.selections) !==
+          JSON.stringify(record.approval?.selections) ||
+          !sameReviewValue(approved.personApproval, record.personApproval))
       );
     });
     if (changed.length) reject(changed.map((record) => record.id));
@@ -57,7 +59,7 @@ export function useReviewApprovalSelection() {
       } else {
         next.add(id);
         const record = records.find((row) => row.id === id);
-        if (record) snapshots.current.set(id, record);
+        if (record) snapshots.current.set(id, structuredClone(record));
         setNeedsApproval((pending) => new Set([...pending].filter((row) => row !== id)));
       }
       return next;
@@ -66,7 +68,7 @@ export function useReviewApprovalSelection() {
   const selectShown = (records: ImportReviewRecord[], all: boolean) => {
     if (all) {
       for (const record of records)
-        if (!selected.has(record.id)) snapshots.current.set(record.id, record);
+        if (!selected.has(record.id)) snapshots.current.set(record.id, structuredClone(record));
     } else {
       for (const record of records) snapshots.current.delete(record.id);
     }
@@ -85,7 +87,13 @@ export function useReviewApprovalSelection() {
     ids.flatMap((id) =>
       snapshots.current.get(id)?.approval ? [snapshots.current.get(id)!.approval!] : [],
     );
+  const peopleApprovals = (ids: string[]) =>
+    ids.flatMap((id) => {
+      const approval = snapshots.current.get(id)?.personApproval;
+      return approval ? [structuredClone(approval)] : [];
+    });
   return {
+    peopleApprovals,
     selected,
     needsApproval,
     clearContext,

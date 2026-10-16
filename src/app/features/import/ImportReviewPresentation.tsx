@@ -24,7 +24,14 @@ import {
   UsersRound,
   X,
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  peopleReviewApproval,
+  requirePeopleApprovals,
+  samePeopleApproval,
+  peopleChangedMessage,
+  type PeopleReviewApproval,
+} from './people-review-approval';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode, RefObject } from 'react';
 import { ImportSourceSelection, useSourceSelection } from './import-source-selection';
 import type {
@@ -54,6 +61,7 @@ export type ImportReviewKind =
 
 export interface ImportReviewRecord {
   approval?: IntakeReportAcceptanceBlock;
+  personApproval?: PeopleReviewApproval;
   id: string;
   reportId: string;
   kind: ImportReviewKind;
@@ -152,6 +160,8 @@ export interface ImportReviewModel {
   /** No settled feed for the requested filters yet; absence is not an empty result. */
   loading?: boolean;
   confirmedSavedIds?: string[];
+  /** A new array is one rejected-People event, including an exact retry successor. */
+  rejectedApprovalIds?: string[];
   reports: ImportReviewReport[];
   records: ImportReviewRecord[];
   counts?: Record<ImportReviewStatus, number>;
@@ -214,14 +224,33 @@ export interface ImportReviewActions {
   onSave?: (
     recordIds: string[],
     approvals?: IntakeReportAcceptanceBlock[],
+    peopleApprovals?: PeopleReviewApproval[],
   ) =>
     | void
     | boolean
     | { savedIds: string[]; rejectedIds?: string[] }
     | Promise<void | boolean | { savedIds: string[]; rejectedIds?: string[] }>;
-  onLater?: (recordIds: string[]) => void | Promise<void>;
-  onExclude?: (recordIds: string[]) => void | Promise<void>;
-  onResume?: (recordIds: string[]) => void | Promise<void>;
+  onLater?: (
+    recordIds: string[],
+    peopleApprovals?: PeopleReviewApproval[],
+  ) =>
+    | void
+    | { savedIds: string[]; rejectedIds?: string[] }
+    | Promise<void | { savedIds: string[]; rejectedIds?: string[] }>;
+  onExclude?: (
+    recordIds: string[],
+    peopleApprovals?: PeopleReviewApproval[],
+  ) =>
+    | void
+    | { savedIds: string[]; rejectedIds?: string[] }
+    | Promise<void | { savedIds: string[]; rejectedIds?: string[] }>;
+  onResume?: (
+    recordIds: string[],
+    peopleApprovals?: PeopleReviewApproval[],
+  ) =>
+    | void
+    | { savedIds: string[]; rejectedIds?: string[] }
+    | Promise<void | { savedIds: string[]; rejectedIds?: string[] }>;
   onUseSource?: (
     reportId: string,
     source: string,
@@ -363,6 +392,22 @@ export function ImportReviewPresentation({
     approvalSelection.clearContext();
     confirmedSaved.current.clear();
   }, [model?.selectionWindowKey]);
+  const committedPeople = useRef<{ records: ImportReviewRecord[] } | null>(null);
+  useLayoutEffect(() => {
+    const owner = { records: model?.records || records };
+    committedPeople.current = owner;
+    return () => {
+      if (committedPeople.current === owner) committedPeople.current = null;
+    };
+  }, [model?.contextKey, model?.selectionWindowKey]);
+  useLayoutEffect(() => {
+    if (committedPeople.current) committedPeople.current.records = model?.records || records;
+  });
+  useEffect(() => {
+    if (!model?.rejectedApprovalIds?.length) return;
+    approvalSelection.reject(model.rejectedApprovalIds);
+    setNotice(peopleChangedMessage);
+  }, [model?.rejectedApprovalIds]);
   const reviewChangeGeneration = useRef(0);
   function closeRecordReview() {
     pinnedReview.current = null;
@@ -634,7 +679,35 @@ export function ImportReviewPresentation({
     correctableSelected.length > 0 &&
     new Set(correctableSelected.map((record) => record.reportId)).size === 1;
 
-  async function move(ids: string[], status: ImportReviewStatus) {
+  async function move(ids: string[], status: ImportReviewStatus, bulk = false) {
+    const owner = committedPeople.current;
+    const peopleIds = ids.filter((id) => records.find((row) => row.id === id)?.kind === 'People');
+    let peopleApprovals: PeopleReviewApproval[];
+    const refusePeople = () => {
+      approvalSelection.reject(peopleIds);
+      setNotice(peopleChangedMessage);
+    };
+    try {
+      peopleApprovals = requirePeopleApprovals(
+        peopleIds,
+        bulk
+          ? approvalSelection.peopleApprovals(peopleIds)
+          : records.flatMap((row) =>
+              ids.includes(row.id) && row.personApproval
+                ? [peopleReviewApproval(row.personApproval)]
+                : [],
+            ),
+      );
+    } catch {
+      refusePeople();
+      return;
+    }
+    const peopleStillCurrent = () =>
+      committedPeople.current === owner &&
+      peopleApprovals.every((approval) => {
+        const row = owner?.records.find((row) => row.id === 'person:' + approval.id);
+        return row?.personApproval && samePeopleApproval(approval, row.personApproval);
+      });
     holdoutTrace('move.enter');
     const selectedApprovals = approvalSelection.approvals(ids);
     const approvals = ids.flatMap((id) => {
@@ -661,6 +734,10 @@ export function ImportReviewPresentation({
         return;
       }
     }
+    if (peopleIds.length && !peopleStillCurrent()) {
+      refusePeople();
+      return;
+    }
     const action =
       status === 'saved'
         ? actions.onSave
@@ -675,8 +752,18 @@ export function ImportReviewPresentation({
       holdoutTrace('move.action-start');
       const succeeded =
         status === 'saved'
-          ? await (approvals.length ? actions.onSave?.(ids, approvals) : actions.onSave?.(ids))
-          : await action(ids);
+          ? await (peopleApprovals.length
+              ? actions.onSave?.(ids, approvals, peopleApprovals)
+              : approvals.length
+                ? actions.onSave?.(ids, approvals)
+                : actions.onSave?.(ids))
+          : await (peopleApprovals.length
+              ? (status === 'later'
+                  ? actions.onLater
+                  : status === 'excluded'
+                    ? actions.onExclude
+                    : actions.onResume)?.(ids, peopleApprovals)
+              : action(ids));
       holdoutTrace('move.action-done');
       const savedIds =
         succeeded && typeof succeeded === 'object'
@@ -686,7 +773,7 @@ export function ImportReviewPresentation({
             : [];
       const rejectedIds =
         succeeded && typeof succeeded === 'object' ? succeeded.rejectedIds || [] : [];
-      if (status === 'saved' && rejectedIds.length && presentedContext.current === context) {
+      if (rejectedIds.length && presentedContext.current === context) {
         approvalSelection.reject(rejectedIds);
         if (reviewedPin && rejectedIds.includes(reviewedPin.record.id)) closeRecordReview();
       }
@@ -1045,6 +1132,7 @@ export function ImportReviewPresentation({
                     move(
                       visibleSelected.map((record) => record.id),
                       view === 'later' ? 'review' : 'later',
+                      true,
                     )
                   }
                 >
@@ -1061,6 +1149,7 @@ export function ImportReviewPresentation({
                           move(
                             readyClinical.map((record) => record.id),
                             'saved',
+                            true,
                           )
                         }
                       >
@@ -1077,6 +1166,7 @@ export function ImportReviewPresentation({
                           move(
                             readyPeople.map((record) => record.id),
                             'saved',
+                            true,
                           )
                         }
                       >
@@ -1098,6 +1188,7 @@ export function ImportReviewPresentation({
                       move(
                         readySelected.map((record) => record.id),
                         'saved',
+                        true,
                       )
                     }
                   >
@@ -1524,7 +1615,7 @@ export function ImportReviewPresentation({
         exclude={(recordId) => {
           if (model && actions.onExclude) {
             setSheet(null);
-            void actions.onExclude([recordId]);
+            void move([recordId], 'excluded');
             return;
           }
           move([recordId], 'excluded');

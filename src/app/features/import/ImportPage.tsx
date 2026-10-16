@@ -1,3 +1,11 @@
+import {
+  peopleReviewApproval,
+  requirePeopleApprovals,
+  samePeopleApproval,
+  assertPeopleCurrent,
+  peopleChangedMessage,
+  type PeopleReviewApproval,
+} from './people-review-approval';
 import { hostGroundedIdentity, identityGroundingRefreshKey } from './identity-grounding';
 import { holdoutTrace } from '../../data/holdout-trace';
 import { recordLabel, recordValue, recordSaveBlockReason } from './import-feed-presentation';
@@ -18,7 +26,7 @@ import type {
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import type { ImportPersonSelection } from './ImportPersonChoice';
 import type { ManualSourceRecordResult } from '../../../shared/intake-manual-source-record';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { X } from 'lucide-react';
 import type {
@@ -222,6 +230,10 @@ export function ImportPage() {
       : 'Getting ready to upload…';
   const batch = useIntakeBatch(profile?.id || '');
   const [people, setPeople] = useState<IntakePersonProposal[]>([]);
+  const peopleRecovery = useRef<(() => Promise<unknown>) | null>(null);
+  const peopleRunning = useRef<object | null>(null);
+  const [rejectedPeople, setRejectedPeople] = useState<string[]>([]);
+  const [peopleRetry, setPeopleRetry] = useState<(() => Promise<unknown>) | null>(null);
   const [peopleNext, setPeopleNext] = useState<Map<string, string>>(new Map());
   const [identityReviews, setIdentityReviews] = useState<Map<string, IntakeIdentityReview>>(
     new Map(),
@@ -296,6 +308,22 @@ export function ImportPage() {
   }, [feed.data, feedPath, profile?.id]);
   const requestScope = `${profile?.id || ''}:${feedPath}`;
   const displayedFeed = pagedFeedScope === requestScope ? pagedFeed : null;
+  const committedPeople = useRef<{ people: IntakePersonProposal[] } | null>(null);
+  useLayoutEffect(() => {
+    const owner = { people };
+    committedPeople.current = owner;
+    return () => {
+      if (committedPeople.current === owner) committedPeople.current = null;
+    };
+  }, [requestScope, selectionQuery]);
+  useLayoutEffect(() => {
+    peopleRecovery.current = null;
+    peopleRunning.current = null;
+    setPeopleRetry(null);
+  }, [profile?.id]);
+  useLayoutEffect(() => {
+    if (committedPeople.current) committedPeople.current.people = people;
+  });
 
   useEffect(() => {
     const refreshRestoredImport = (event: PageTransitionEvent) => {
@@ -903,6 +931,7 @@ export function ImportPage() {
       const group = groups.find((item) => item.groupId === proposal.groupId);
       if (!group) continue;
       records.push({
+        personApproval: peopleReviewApproval(proposal),
         id: `person:${proposal.id}`,
         reportId: proposal.groupId,
         kind: 'People',
@@ -1010,6 +1039,7 @@ export function ImportPage() {
         ),
       ),
       contextKey: `${profile?.id || ''}:${feedPath}`,
+      rejectedApprovalIds: rejectedPeople,
       loading: !data,
       reports,
       records,
@@ -1177,6 +1207,7 @@ export function ImportPage() {
     operationStatus,
     people,
     peopleNext,
+    rejectedPeople,
     profile?.name,
     savedDestinations,
     uploadStatus,
@@ -1191,6 +1222,7 @@ export function ImportPage() {
     }) => Promise<void>,
     kind: ClientOperationSummary['kind'] = 'review_action',
     counts: ClientOperationSummary['counts'] = { actions: 1 },
+    ownsRun?: () => boolean,
   ): Promise<boolean> {
     holdoutTrace('perform.enter');
     holdoutTrace(busy ? 'perform.busy.true' : 'perform.busy.false');
@@ -1211,7 +1243,7 @@ export function ImportPage() {
     const requestedProfile = profile?.id;
     if (!requestedProfile) return false;
     const prefix = `/api/profiles/${encodeURIComponent(requestedProfile)}`;
-    const current = () => activeProfile.current === requestedProfile;
+    const current = () => activeProfile.current === requestedProfile && (!ownsRun || ownsRun());
     const operation = beginClientOperation(kind, counts);
     const started = performance.now();
     let outcome: ClientOperationSummary['outcome'] = 'completed';
@@ -1225,10 +1257,10 @@ export function ImportPage() {
       return true;
     } catch (cause) {
       outcome = current() ? 'failed' : 'cancelled';
-      if (activeProfile.current === requestedProfile) setError(errorMessage(cause));
+      if (current()) setError(errorMessage(cause));
       return false;
     } finally {
-      if (activeProfile.current === requestedProfile) {
+      if (current()) {
         setBusy(false);
         setUploadStatus(null);
         setOperationStatus(null);
@@ -1238,10 +1270,18 @@ export function ImportPage() {
     }
   }
 
-  function personFor(id: string) {
-    return id.startsWith('person:')
-      ? people.find((proposal) => proposal.id === id.slice('person:'.length))
-      : undefined;
+  function assertShownPerson(
+    approval: PeopleReviewApproval,
+    owner: typeof committedPeople.current,
+  ) {
+    const shown = owner?.people.find(
+      (person) =>
+        person.id === approval.id &&
+        person.intakeId === approval.intakeId &&
+        person.groupId === approval.groupId,
+    );
+    if (committedPeople.current !== owner || !shown || !samePeopleApproval(approval, shown))
+      throw new Error(peopleChangedMessage);
   }
 
   function exactRequest<T extends { operationId: string }>(key: string, build: () => T) {
@@ -1252,19 +1292,30 @@ export function ImportPage() {
     return request;
   }
 
-  async function exactMutation<T>(key: string, send: () => Promise<T>) {
+  async function exactMutation<T>(
+    key: string,
+    send: () => Promise<T>,
+    ownedRequest?: { operationId: string },
+  ) {
     try {
       const result = await send();
-      pendingOperations.current.delete(key);
+      if (!ownedRequest || pendingOperations.current.get(key) === ownedRequest)
+        pendingOperations.current.delete(key);
       return result;
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status >= 400 && cause.status < 500)
+      if (
+        cause instanceof ApiError &&
+        cause.status >= 400 &&
+        cause.status < 500 &&
+        (!ownedRequest || ![408, 429].includes(cause.status)) &&
+        (!ownedRequest || pendingOperations.current.get(key) === ownedRequest)
+      )
         pendingOperations.current.delete(key);
       throw cause;
     }
   }
 
-  async function freshPerson(prefix: string, proposal: IntakePersonProposal) {
+  async function freshPerson(prefix: string, proposal: PeopleReviewApproval) {
     holdoutTrace('people.fresh.start');
     let cursor: string | null = null;
     do {
@@ -1277,7 +1328,12 @@ export function ImportPage() {
       ).data;
       holdoutTrace('people.fresh.api-returned');
       const current = page.people.find((item) => item.id === proposal.id);
-      if (current) {
+      if (
+        current &&
+        page.groupId === proposal.groupId &&
+        current.intakeId === proposal.intakeId &&
+        current.groupId === proposal.groupId
+      ) {
         holdoutTrace('people.fresh.found');
         return current;
       }
@@ -1289,113 +1345,192 @@ export function ImportPage() {
   }
 
   async function setPersonState(
-    proposal: IntakePersonProposal,
+    proposal: PeopleReviewApproval,
+    owner: typeof committedPeople.current,
     state: 'pending' | 'later' | 'excluded',
     prefix: string,
   ) {
-    const fresh = await freshPerson(prefix, proposal);
-    const operationKey = `person-disposition:${fresh.id}:${state}`;
+    const operationKey = `person-disposition:${proposal.id}:${state}`;
+    let fresh: IntakePersonProposal | undefined;
+    if (!pendingOperations.current.has(operationKey)) {
+      assertShownPerson(proposal, owner);
+      fresh = await freshPerson(prefix, proposal);
+      assertShownPerson(proposal, owner);
+      assertPeopleCurrent(proposal, fresh, false);
+    }
     const request = exactRequest<IntakePersonDispositionRequest>(operationKey, () => ({
       operationId: crypto.randomUUID(),
-      intakeId: fresh.intakeId,
-      proposalId: fresh.id,
-      proposalVersion: fresh.version,
+      intakeId: fresh!.intakeId,
+      proposalId: fresh!.id,
+      proposalVersion: proposal.version,
       state,
-      intakeVersion: fresh.intakeVersion,
+      intakeVersion: fresh!.intakeVersion,
     }));
-    await exactMutation(operationKey, () =>
-      api<Intake>(`${prefix}/intakes/people-disposition`, {
-        method: 'POST',
-        body: JSON.stringify(request),
-      }),
+    await exactMutation(
+      operationKey,
+      () =>
+        api<Intake>(`${prefix}/intakes/people-disposition`, {
+          method: 'POST',
+          body: JSON.stringify(request),
+        }),
+      request,
     );
   }
 
-  async function disposition(ids: string[], next: 'pending' | 'later' | 'excluded') {
-    await perform(async ({ prefix, current: profileCurrent, request: requestApi }) => {
-      setOperationStatus(`Starting ${ids.length} selected ${ids.length === 1 ? 'item' : 'items'}…`);
-      for (const [index, id] of ids.entries()) {
-        if (!profileCurrent())
-          throw new Error('Profile changed. Remaining items were not changed.');
-        const person = personFor(id);
-        if (person) {
-          await setPersonState(person, next, prefix);
-          setOperationStatus(`Updated ${index + 1} of ${ids.length} selected items.`);
-          continue;
-        }
-        const entry = lookup.get(id);
-        if (!entry) throw new Error('This result changed. Reload and review it again.');
-        const query = entry.block.proposalId
-          ? `?proposalId=${encodeURIComponent(entry.block.proposalId)}`
-          : '';
-        const review = (
-          await requestApi<IntakeReview>(
-            `${prefix}/intakes/${encodeURIComponent(entry.block.intakeId)}/review${query}`,
-          )
-        ).data;
-        const current = review.records.find(
-          (record) =>
-            record.id === entry.record.id &&
-            record.candidateVersionId === entry.record.candidateVersionId,
+  async function disposition(
+    ids: string[],
+    next: 'pending' | 'later' | 'excluded',
+    approvals: PeopleReviewApproval[] = [],
+    retryOwner?: typeof committedPeople.current,
+  ) {
+    if (peopleRunning.current || (peopleRecovery.current && retryOwner === undefined)) {
+      setError('Finish the exact pending People action before continuing.');
+      return { savedIds: [] };
+    }
+    const owner = retryOwner === undefined ? committedPeople.current : retryOwner;
+    let pinned: PeopleReviewApproval[];
+    try {
+      pinned = requirePeopleApprovals(ids, approvals);
+    } catch {
+      setError(peopleChangedMessage);
+      return { savedIds: [], rejectedIds: ids.filter((id) => id.startsWith('person:')) };
+    }
+    const completed: string[] = [];
+    const run = {};
+    peopleRunning.current = run;
+    const succeeded = await perform(
+      async ({ prefix, current: profileCurrent, request: requestApi }) => {
+        setOperationStatus(
+          `Starting ${ids.length} selected ${ids.length === 1 ? 'item' : 'items'}…`,
         );
-        if (!current)
-          throw new Error(`${recordLabel(entry.record)} changed. Review the current version.`);
-        const draft = initialDraft(current);
-        const disposition =
-          next === 'later'
-            ? 'review_later'
-            : next === 'excluded'
-              ? 'keep_original_only'
-              : 'pending';
-        const operationKey = `draft:${entry.record.feedKey}:${next}`;
-        const request = exactRequest(operationKey, () => ({
-          version: review.version,
-          operationId: crypto.randomUUID(),
-          proposalId: review.proposalId,
-          recordId: current.id,
-          candidateVersionId: current.candidateVersionId,
-          mapping: draft.decision.mapping,
-          resolutions: draft.resolutions,
-          answers: draft.answers,
-          disposition,
-          decision: {
-            ...draft.decision,
-            action:
-              next === 'excluded' || next === 'later' ? ('skip' as const) : ('accept' as const),
-          },
-        }));
-        await exactMutation(operationKey, () =>
-          requestApi<Intake>(
-            `${prefix}/intakes/${encodeURIComponent(entry.block.intakeId)}/review-draft`,
-            {
-              method: 'POST',
-              body: JSON.stringify(request),
+        for (const [index, id] of ids.entries()) {
+          if (!profileCurrent())
+            throw new Error('Profile changed. Remaining items were not changed.');
+          const person = pinned.find((person) => id === `person:${person.id}`);
+          if (person) {
+            await setPersonState(person, owner, next, prefix);
+            if (
+              !profileCurrent() ||
+              committedPeople.current !== owner ||
+              peopleRunning.current !== run
+            )
+              throw new Error('Review scope changed. Remaining People were not changed.');
+            completed.push(id);
+            setOperationStatus(`Updated ${index + 1} of ${ids.length} selected items.`);
+            continue;
+          }
+          const entry = lookup.get(id);
+          if (!entry) throw new Error('This result changed. Reload and review it again.');
+          const query = entry.block.proposalId
+            ? `?proposalId=${encodeURIComponent(entry.block.proposalId)}`
+            : '';
+          const review = (
+            await requestApi<IntakeReview>(
+              `${prefix}/intakes/${encodeURIComponent(entry.block.intakeId)}/review${query}`,
+            )
+          ).data;
+          const current = review.records.find(
+            (record) =>
+              record.id === entry.record.id &&
+              record.candidateVersionId === entry.record.candidateVersionId,
+          );
+          if (!current)
+            throw new Error(`${recordLabel(entry.record)} changed. Review the current version.`);
+          const draft = initialDraft(current);
+          const disposition =
+            next === 'later'
+              ? 'review_later'
+              : next === 'excluded'
+                ? 'keep_original_only'
+                : 'pending';
+          const operationKey = `draft:${entry.record.feedKey}:${next}`;
+          const request = exactRequest(operationKey, () => ({
+            version: review.version,
+            operationId: crypto.randomUUID(),
+            proposalId: review.proposalId,
+            recordId: current.id,
+            candidateVersionId: current.candidateVersionId,
+            mapping: draft.decision.mapping,
+            resolutions: draft.resolutions,
+            answers: draft.answers,
+            disposition,
+            decision: {
+              ...draft.decision,
+              action:
+                next === 'excluded' || next === 'later' ? ('skip' as const) : ('accept' as const),
             },
-          ),
+          }));
+          await exactMutation(operationKey, () =>
+            requestApi<Intake>(
+              `${prefix}/intakes/${encodeURIComponent(entry.block.intakeId)}/review-draft`,
+              {
+                method: 'POST',
+                body: JSON.stringify(request),
+              },
+            ),
+          );
+          setOperationStatus(`Updated ${index + 1} of ${ids.length} selected items.`);
+        }
+        feed.reload();
+        setNotice(
+          next === 'later'
+            ? `${ids.length} ${ids.length === 1 ? 'item was' : 'items were'} moved to Review later.`
+            : next === 'excluded'
+              ? `${ids.length} ${ids.length === 1 ? 'item was' : 'items were'} excluded. Originals are kept.`
+              : `${ids.length} ${ids.length === 1 ? 'item was' : 'items were'} returned to review.`,
         );
-        setOperationStatus(`Updated ${index + 1} of ${ids.length} selected items.`);
-      }
-      feed.reload();
-      setNotice(
-        next === 'later'
-          ? `${ids.length} ${ids.length === 1 ? 'item was' : 'items were'} moved to Review later.`
-          : next === 'excluded'
-            ? `${ids.length} ${ids.length === 1 ? 'item was' : 'items were'} excluded. Originals are kept.`
-            : `${ids.length} ${ids.length === 1 ? 'item was' : 'items were'} returned to review.`,
-      );
-      setOperationStatus(null);
-    });
+        setOperationStatus(null);
+      },
+      'review_action',
+      { actions: 1 },
+      () => peopleRunning.current === run,
+    );
+    const remaining = ids.filter((id) => !completed.includes(id));
+    const uncertain = pinned.some((person) =>
+      pendingOperations.current.has(`person-disposition:${person.id}:${next}`),
+    );
+    if (peopleRunning.current === run) {
+      peopleRunning.current = null;
+      peopleRecovery.current = uncertain ? () => disposition(remaining, next, pinned, owner) : null;
+      setPeopleRetry(() => peopleRecovery.current);
+      if (!succeeded && !uncertain && committedPeople.current === owner)
+        setRejectedPeople(remaining.filter((id) => id.startsWith('person:')));
+    }
+    return {
+      savedIds: [],
+      rejectedIds:
+        !succeeded && !uncertain ? remaining.filter((id) => id.startsWith('person:')) : [],
+    };
   }
 
-  async function save(ids: string[], approvals?: IntakeReportAcceptanceRequest['blocks']) {
+  async function save(
+    ids: string[],
+    approvals?: IntakeReportAcceptanceRequest['blocks'],
+    peopleApprovals: PeopleReviewApproval[] = [],
+    retryOwner?: typeof committedPeople.current,
+  ) {
+    if (peopleRunning.current || (peopleRecovery.current && retryOwner === undefined)) {
+      setError('Finish the exact pending People action before continuing.');
+      return { savedIds: [] };
+    }
+    const owner = retryOwner === undefined ? committedPeople.current : retryOwner;
+    let pinned: PeopleReviewApproval[];
+    try {
+      pinned = requirePeopleApprovals(ids, peopleApprovals);
+    } catch {
+      setError(peopleChangedMessage);
+      return { savedIds: [], rejectedIds: ids.filter((id) => id.startsWith('person:')) };
+    }
     const savedIds: string[] = [];
     const rejectedIds: string[] = [];
-    await perform(
+    const run = {};
+    peopleRunning.current = run;
+    const succeeded = await perform(
       async ({ prefix, current, operationId, request: requestApi }) => {
         setOperationStatus(
           `Preparing ${ids.length} selected ${ids.length === 1 ? 'item' : 'items'}…`,
         );
-        const personIds = ids.filter((id) => personFor(id));
+        const personIds = ids.filter((id) => id.startsWith('person:'));
         const clinical = ids.filter((id) => !id.startsWith('person:'));
         let savedPeople = 0;
         if (personIds.length && clinical.length)
@@ -1404,10 +1539,14 @@ export function ImportPage() {
           );
         for (const [index, id] of personIds.entries()) {
           if (!current()) throw new Error('Profile changed before saving finished.');
-          const proposal = await freshPerson(prefix, personFor(id)!);
-          if (proposal.selfMatch || proposal.matches.length)
-            throw new Error(`${proposal.person.fullName} needs a People match decision.`);
+          const proposal = pinned.find((person) => id === 'person:' + person.id)!;
           const operationKey = `person-apply:${proposal.id}:add`;
+          if (!pendingOperations.current.has(operationKey)) {
+            assertShownPerson(proposal, owner);
+            const fresh = await freshPerson(prefix, proposal);
+            assertShownPerson(proposal, owner);
+            assertPeopleCurrent(proposal, fresh, true);
+          }
           const request = exactRequest<IntakePersonApplyRequest>(operationKey, () => ({
             operationId: crypto.randomUUID(),
             intakeId: proposal.intakeId,
@@ -1416,14 +1555,19 @@ export function ImportPage() {
             action: 'add',
           }));
           holdoutTrace('people.apply.start');
-          const response = await exactMutation(operationKey, () =>
-            requestApi<IntakePersonApplyResult>(`${prefix}/intakes/people-apply`, {
-              operationId,
-              method: 'POST',
-              body: JSON.stringify(request),
-            }),
+          const response = await exactMutation(
+            operationKey,
+            () =>
+              requestApi<IntakePersonApplyResult>(`${prefix}/intakes/people-apply`, {
+                operationId,
+                method: 'POST',
+                body: JSON.stringify(request),
+              }),
+            request,
           );
           if (!current()) throw new Error('Profile changed before saving finished.');
+          if (committedPeople.current !== owner)
+            throw new Error('Review scope changed. Remaining People were not changed.');
           const saved = response.data;
           setRecentSavedPeople((destinations) =>
             appendSavedPersonDestination(destinations, {
@@ -1478,8 +1622,22 @@ export function ImportPage() {
       },
       'review_save',
       { selected: ids.length, actions: 1 },
+      () => peopleRunning.current === run,
     );
-    savingChunks.current = false;
+    if (peopleRunning.current === run) savingChunks.current = false;
+    const remaining = ids.filter((id) => !savedIds.includes(id));
+    const uncertain = pinned.some((person) =>
+      pendingOperations.current.has(`person-apply:${person.id}:add`),
+    );
+    if (peopleRunning.current === run) {
+      peopleRunning.current = null;
+      peopleRecovery.current = uncertain ? () => save(remaining, approvals, pinned, owner) : null;
+      setPeopleRetry(() => peopleRecovery.current);
+      if (!succeeded && !uncertain && committedPeople.current === owner)
+        setRejectedPeople(remaining.filter((id) => id.startsWith('person:')));
+    }
+    if (!succeeded && !uncertain)
+      rejectedIds.push(...remaining.filter((id) => id.startsWith('person:')));
     return { savedIds, rejectedIds };
   }
 
@@ -2203,6 +2361,14 @@ export function ImportPage() {
         onCheck={() => void acceptance.checkReceipt()}
         onRetry={() => void acceptance.retry()}
       />
+      {peopleRetry && (
+        <div role="alert">
+          A People action is unconfirmed.{' '}
+          <button type="button" disabled={busy} onClick={() => void peopleRetry()}>
+            Retry exact People action
+          </button>
+        </div>
+      )}
       {feed.loading && !feed.data && (
         <LoadingIndicator label="Opening import review…" layout="centered" />
       )}
@@ -2308,13 +2474,17 @@ export function ImportPage() {
           model={model}
           actions={{
             busy:
-              busy || acceptance.busy || acceptance.recovering || !!acceptance.recoveryOperationId,
+              busy ||
+              !!peopleRetry ||
+              acceptance.busy ||
+              acceptance.recovering ||
+              !!acceptance.recoveryOperationId,
             uploadUnavailable,
             onFiles: upload,
             onSave: save,
-            onLater: (ids) => disposition(ids, 'later'),
-            onExclude: (ids) => disposition(ids, 'excluded'),
-            onResume: (ids) => disposition(ids, 'pending'),
+            onLater: (ids, people) => disposition(ids, 'later', people),
+            onExclude: (ids, people) => disposition(ids, 'excluded', people),
+            onResume: (ids, people) => disposition(ids, 'pending', people),
             onUseSource: source,
             onReviewSource: reviewSource,
             onConfirmIdentity: identity,

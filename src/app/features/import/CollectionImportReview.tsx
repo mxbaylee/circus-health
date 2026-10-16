@@ -1,3 +1,8 @@
+import {
+  requirePeopleApprovals,
+  peopleChangedMessage,
+  type PeopleReviewApproval,
+} from './people-review-approval';
 import { hostGroundedIdentity } from './identity-grounding';
 import { CollectionEvidenceWindow } from '../intake/CollectionEvidenceWindow';
 export { CollectionEvidenceWindow } from '../intake/CollectionEvidenceWindow';
@@ -393,9 +398,12 @@ export function CollectionImportReview({
   });
   useEffect(() => setActionRefusal(''), [activeScope]);
   const donePeople = useRef<string[]>([]);
+  const [rejectedPeople, setRejectedPeople] = useState<string[]>([]);
   const bulk = useCollectionBulkActions({
     scope: JSON.stringify([activeScope, peopleGroupKey, peopleRowCursor]),
+    people: shownPeople,
     onClinicalDone: () => {},
+    onPersonRejected: setRejectedPeople,
     onPersonDone: (id) => {
       donePeople.current.push(`person:${id}`);
     },
@@ -469,6 +477,7 @@ export function CollectionImportReview({
     filters,
     loading: !data,
     confirmedSavedIds,
+    rejectedApprovalIds: rejectedPeople,
     selectionWindowKey,
   });
   async function beforeReviewChange(intent?: 'automatic') {
@@ -588,17 +597,17 @@ export function CollectionImportReview({
       setSaving(false);
     }
   }
-  async function save(ids: string[], approvals: IntakeReportAcceptanceBlock[] = []) {
-    const people = shownPeople.filter((person) => ids.includes(`person:${person.id}`));
-    if (!people.length && ids.some((id) => id.startsWith('person:'))) {
-      holdoutTrace('collection.people.unlisted');
-      if (!data?.records.some((row) => ids.includes(row.feedKey))) {
-        if (active.current === activeScope)
-          setActionRefusal(
-            'The selected People are no longer on this page. Review the current People page, then select them again.',
-          );
-        return { savedIds: [] };
-      }
+  async function save(
+    ids: string[],
+    approvals: IntakeReportAcceptanceBlock[] = [],
+    peopleApprovals: PeopleReviewApproval[] = [],
+  ) {
+    let people: PeopleReviewApproval[];
+    try {
+      people = requirePeopleApprovals(ids, peopleApprovals);
+    } catch {
+      setActionRefusal(peopleChangedMessage);
+      return { savedIds: [], rejectedIds: ids.filter((id) => id.startsWith('person:')) };
     }
     if (people.length) {
       if (
@@ -616,7 +625,7 @@ export function CollectionImportReview({
       }
       setActionRefusal('');
       donePeople.current = [];
-      await bulk.addPeople(people, peopleGroup!.groupId);
+      await bulk.addPeople(people, peopleGroup?.groupId || '');
       return { savedIds: [...donePeople.current] };
     }
     const rows = data?.records.filter((row) => ids.includes(row.feedKey)) || [];
@@ -627,7 +636,18 @@ export function CollectionImportReview({
     }
     return saveRows(rows, approvals);
   }
-  async function disposition(ids: string[], state: CollectionDisposition) {
+  async function disposition(
+    ids: string[],
+    state: CollectionDisposition,
+    peopleApprovals: PeopleReviewApproval[] = [],
+  ) {
+    let people: PeopleReviewApproval[];
+    try {
+      people = requirePeopleApprovals(ids, peopleApprovals);
+    } catch {
+      setActionRefusal(peopleChangedMessage);
+      return { savedIds: [], rejectedIds: ids.filter((id) => id.startsWith('person:')) };
+    }
     if (mutationPending || sourcePending || authorityUnavailable) {
       refuseAction();
       return;
@@ -635,10 +655,11 @@ export function CollectionImportReview({
     setActionRefusal('');
     await bulk.disposition(
       data?.records.filter((row) => ids.includes(row.feedKey)) || [],
-      shownPeople.filter((person) => ids.includes(`person:${person.id}`)),
+      people,
       peopleGroup?.groupId || '',
       state,
     );
+    return { savedIds: [] };
   }
   async function sendRepair() {
     const request = repairRequest.current;
@@ -932,9 +953,9 @@ export function CollectionImportReview({
           uploadUnavailable,
           onFiles: onUpload,
           onSave: save,
-          onLater: (ids) => disposition(ids, 'later'),
-          onExclude: (ids) => disposition(ids, 'excluded'),
-          onResume: (ids) => disposition(ids, 'pending'),
+          onLater: (ids, people) => disposition(ids, 'later', people),
+          onExclude: (ids, people) => disposition(ids, 'excluded', people),
+          onResume: (ids, people) => disposition(ids, 'pending', people),
           onFiltersChange: setFilters,
           onCorrectDrafts: correctDrafts,
           onAskDraftRepair: (selected, request) =>
