@@ -1589,6 +1589,7 @@ export function stageVaultRecordObject(
 interface InitialHeadPublication {
   before(): void;
   after(): void;
+  unacknowledged?(candidate: Uint8Array): void;
 }
 
 export interface Vault {
@@ -1967,14 +1968,14 @@ function* openVaultSteps({
       'vault_publish_manifest',
       () => {
         publication?.before();
-        publishInternal();
+        publishInternal(publication?.unacknowledged);
         publication?.after();
       },
       {},
       { profileId },
     );
   }
-  function publishInternal(): void {
+  function publishInternal(unacknowledgedHead?: (candidate: Uint8Array) => void): void {
     guard();
     try {
       // Verify only newly staged objects and changed binding targets, never old index history.
@@ -1990,7 +1991,12 @@ function* openVaultSteps({
         if (!meta || bytes !== meta.bytes || hash.digest('hex') !== meta.sha256)
           throw Error('Original evidence is missing or changed');
       }
-      manifest.revision = index.publish(pendingFiles, pendingObjects, manifest.recordsHead);
+      manifest.revision = index.publish(
+        pendingFiles,
+        pendingObjects,
+        manifest.recordsHead,
+        unacknowledgedHead,
+      );
       pendingFiles.clear();
       pendingObjects.clear();
       for (const [workspace, names] of stagedWorkspaceFiles) {

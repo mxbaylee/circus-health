@@ -92,6 +92,7 @@ import { writeProfileRegistry } from './profile-registry.ts';
 import { seedSyntheticPlacebo } from './synthetic-placebo.ts';
 import {
   freshKey,
+  decryptObject,
   recoveryPhrase,
   recoveryEntropy,
   wrapKey,
@@ -224,7 +225,11 @@ interface OpenOptions {
   copyState?: OpenedProfile;
   pendingActivation?: boolean;
   readonlyAuthority?: boolean;
-  initialPublication?: { before(): void; after(): void };
+  initialPublication?: {
+    before(): void;
+    after(): void;
+    unacknowledged?(candidate: Uint8Array): void;
+  };
 }
 
 type RecordVersion = DurableRecordVersion;
@@ -1233,6 +1238,33 @@ export function createEncryptedProfiles({
       { once: true },
     );
     if (signal.aborted) release();
+    try {
+      signal.throwIfAborted();
+      // Recovery inspection alone does not authorize replacing a source-session
+      // setup. Only this admitted, source-authorized owner may supersede peers.
+      if (replaceSetup(setup.id, setupId, lease.signal)) {
+        options.assertAuthorized?.();
+        signal.throwIfAborted();
+        lease.assertCurrent();
+        if (setups.get(setupId) !== setup || setup.claim !== token)
+          throw Error('Setup access changed');
+        if (source) {
+          options.authorizeCopySource?.(source.id);
+          if (
+            opened.get(source.id) !== source ||
+            source.closing ||
+            source.recordStorage.read('head')?.toString('utf8') !== sourceHead
+          )
+            throw Error('Copy source changed');
+          assertUnlockAuthority(pathFor(source.id), sourceAuthority!);
+        }
+        signal.throwIfAborted();
+        lease.assertCurrent();
+      }
+    } catch (error) {
+      release();
+      throw error;
+    }
     const run = async (cooperative: boolean) => {
       if (started || released) throw Error('Setup admission already consumed');
       started = true;
@@ -1376,6 +1408,28 @@ export function createEncryptedProfiles({
                   setup.publishedManifest = authority.manifest;
                   // Future retries recover this own committed head. This attempt
                   // still carries its original source through final activation.
+                  setup.copyFrom = null;
+                },
+                unacknowledged: (candidate) => {
+                  const directory = pathFor(setup.id),
+                    selected = unlockAuthorityWitness(directory);
+                  if (
+                    selected.directory !== authority!.directory ||
+                    selected.keyring !== authority!.keyring ||
+                    !decryptObject(
+                      resolve(directory, 'vault/manifest.enc'),
+                      key,
+                      setup.id,
+                      'manifest',
+                      undefined,
+                      20 * 1024,
+                    ).equals(candidate)
+                  )
+                    throw Error('Unacknowledged setup publication changed');
+                  assertUnlockAuthority(directory, selected);
+                  // This proof permits only a future recovery claim. Never
+                  // advance the failed attempt's activation authority.
+                  setup.publishedManifest = selected.manifest;
                   setup.copyFrom = null;
                 },
               },
@@ -2272,9 +2326,19 @@ export function createEncryptedProfiles({
     rmSync(pathFor(id), { recursive: true, force: true });
     return { id, deleted: true, backupsRetained: true };
   }
-  function replaceSetup(id: string) {
-    revokeAdmissions(id);
-    for (const [setupId, setup] of setups) if (setup.id === id) setups.delete(setupId);
+  function replaceSetup(id: string, keep: string, own: AbortSignal) {
+    let replaced = false;
+    for (const admission of admissions.get(id) ?? [])
+      if (admission.signal !== own) {
+        replaced = true;
+        admission.abort(Error('Profile access changed'));
+      }
+    for (const [setupId, setup] of setups)
+      if (setup.id === id && setupId !== keep) {
+        replaced = true;
+        setups.delete(setupId);
+      }
+    return replaced;
   }
   function resume(recovery: unknown) {
     const id = (recovery as Partial<RecoveryKit> | null)?.profileId;
@@ -2307,7 +2371,6 @@ export function createEncryptedProfiles({
         throw new HttpError(400, 'SETUP_INVALID', 'This recovery file could not resume setup');
       assertUnlockAuthority(pathFor(id), authority);
       const setupId = randomBytes(32).toString('base64url');
-      replaceSetup(id);
       setups.set(setupId, {
         id,
         expires: Date.now() + 30 * 60 * 1000,
@@ -2390,7 +2453,6 @@ export function createEncryptedProfiles({
         throw new HttpError(400, 'SETUP_INVALID', 'This recovery file could not resume setup');
       const setupId = randomBytes(32).toString('base64url');
       if (!ownerCurrent()) throw Error('Setup authorization changed');
-      replaceSetup(id);
       setups.set(setupId, {
         id,
         expires: Date.now() + 30 * 60 * 1000,

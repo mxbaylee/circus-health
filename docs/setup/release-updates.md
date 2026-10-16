@@ -47,7 +47,10 @@ refuse entry, and cancellation, disconnect, lock, credential/keyring changes and
 other authority changes still stop queued or active work. Enrollment expiry is
 unchanged. This changes only in-memory admission ownership: no archive, keyring,
 recovery-file or provider configuration migration is needed. A restart needs a
-new challenge or recovered setup session. Existing committed-head setup recovery
+new challenge or recovered setup session. Recovery inspection alone does not
+replace another setup: replacement occurs at session- and source-authorized
+admission, so a target-kit holder without source access cannot cancel an
+authorized copy. Existing committed-head setup recovery
 is preserved; this update adds neither verified unpublished-stage continuation
 nor crash-leftover cleanup. See
 [unlock and setup admission](../security/profile-encryption.md#unlock-and-setup-admission).

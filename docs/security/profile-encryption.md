@@ -123,9 +123,12 @@ Queued admissions retain the original target authority and cancellation owner,
 without unwrapping a key or starting a preparation worker. A private copy also
 retains its original open source and accepted head. Disconnect, cancellation,
 lock, relevant keyring or generation changes and application closure revoke
-queued as well as active work. A successfully inspected replacement setup
-revokes older setup identities for that profile; failed recovery inspection does
-not replace them, and active preparation still refuses concurrent resume.
+queued as well as active work. Recovery inspection can return a new setup
+candidate, but only its fully authorized admission replaces older setup
+identities and queued claims for that profile. A caller with the target kit but
+without current source-session access cannot invalidate an authorized copy
+setup. Replacement retains the admitted target and source proofs through
+revocation callbacks; active preparation still refuses concurrent resume.
 Cleanup releases only the exact admission it owns. An expired owned
 authentication is not removed by unrelated challenge pruning, and the challenge
 registry remains bounded.
@@ -150,6 +153,11 @@ retains that exact published manifest receipt: a changed or rolled-back manifest
 refuses the same-session retry rather than authorizing a new unpinned copy. A
 new recovery session authenticates the currently selected target before its own
 admission; it does not automatically repair altered archive files.
+
+A manifest write that commits before reporting an error still fails and cleans
+up the current attempt. Only bounded, authenticated readback equal to its exact
+intended candidate can retain a receipt for a future recovery attempt; an
+arbitrary selected disk head cannot grant that eligibility or activate a profile.
 
 This admission rule does not provide cross-process continuation of an unpublished
 partial copy or orphan-stage reclamation. Committed-head recovery below remains

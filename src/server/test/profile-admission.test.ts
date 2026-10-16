@@ -222,7 +222,7 @@ for (const change of [
     assert.equal(manager.keyring(target.profileId).active, false);
   });
 
-test('only a successfully inspected replacement revokes an older queued setup', async (t) => {
+test('only an admitted replacement revokes an older queued setup', async (t) => {
   const { manager } = vaultFixture(t);
   const target = manager.begin({
     name: 'Fictional replaced setup',
@@ -244,6 +244,64 @@ test('only a successfully inspected replacement revokes an older queued setup', 
     code: 'PROFILE_PREPARING',
   });
   assert.equal((await current.verify()).id, target.profileId);
+});
+
+test('copy recovery inspection and denied admission preserve the original source-authorized claim', async (t) => {
+  const { manager } = vaultFixture(t),
+    source = await newProfile(manager),
+    target = manager.begin({
+      name: 'Fictional separately resumed copy',
+      copyFrom: source.profileId,
+    }),
+    input = { acknowledged: true, recovery: target.recoveryKit },
+    old = manager.admitSetup(target.setupId, input);
+  t.after(old.release);
+  const replacement = await manager.resumeAsync(target.recoveryKit);
+  assert.throws(
+    () =>
+      manager.admitSetup(replacement.setupId!, input, {
+        authorizeCopySource() {
+          throw Error('Fictional source access denied');
+        },
+      }),
+    /Fictional source access denied/,
+  );
+  assert.throws(() => manager.admitSetup(target.setupId, input), { code: 'PROFILE_PREPARING' });
+  const current = manager.admitSetup(replacement.setupId!, input);
+  t.after(current.release);
+  await assert.rejects(old.verify());
+  assert.equal((await current.verify()).id, target.profileId);
+});
+
+test('a copy replacement retains its original source pin through other admission revocation', async (t) => {
+  const { manager } = vaultFixture(t),
+    source = await newProfile(manager),
+    target = manager.begin({
+      name: 'Fictional replacement source pin',
+      copyFrom: source.profileId,
+    }),
+    input = { acknowledged: true, recovery: target.recoveryKit },
+    old = manager.admitSetup(target.setupId, input);
+  t.after(old.release);
+  const replacement = await manager.resumeAsync(target.recoveryKit);
+  let checks = 0;
+  assert.throws(
+    () =>
+      manager.admitSetup(replacement.setupId!, input, {
+        assertAuthorized() {
+          if (++checks === 2)
+            createNote(manager.opened.get(source.profileId)!.db, {
+              kind: 'note',
+              title: 'Fictional changed during replacement',
+            });
+        },
+      }),
+    /Copy source changed/,
+  );
+  assert.equal(checks, 2);
+  await assert.rejects(old.verify());
+  assert.equal(manager.opened.has(target.profileId), false);
+  assert.equal(manager.keyring(target.profileId).active, false);
 });
 
 for (const change of ['manifest', 'keyring'] as const)

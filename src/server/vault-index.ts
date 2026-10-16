@@ -282,6 +282,7 @@ export function* openVaultIndexSteps(
       changedFiles: Map<string, string>,
       newObjects: Map<string, IndexObjectMetadata>,
       recordsHead: string | null,
+      unacknowledgedHead?: (candidate: Uint8Array) => void,
     ): number {
       if (closed) throw Error('Profile is locked');
       if (
@@ -364,6 +365,7 @@ export function* openVaultIndexSteps(
       };
       const bytes = Buffer.from(JSON.stringify(candidate));
       if (bytes.length > limits.headBytes || !Number.isSafeInteger(candidate.revision)) fail();
+      let writingHead = false;
       try {
         for (const staged of proposed) {
           const target = resolve(directory, 'vault/indices', staged.ref.id + '.enc');
@@ -372,12 +374,22 @@ export function* openVaultIndexSteps(
           // Only the new generation is read; committed ancestors are never replayed here.
           readGeneration(directory, key, profileId, staged.ref, limits);
         }
+        writingHead = true;
         encryptObject(path, bytes, key, profileId, 'manifest');
         head = candidate;
         for (const id of newObjects.keys()) knownObjects.add(id);
         return head.revision;
       } catch (error) {
         closed = true;
+        if (writingHead && unacknowledgedHead) {
+          // A rename can commit before reporting failure. Only the lexical
+          // candidate may establish future recovery; this write still fails.
+          try {
+            unacknowledgedHead(bytes);
+          } catch {
+            // Missing, changed or unprovable selection grants no recovery lease.
+          }
+        }
         throw error;
       }
     },
