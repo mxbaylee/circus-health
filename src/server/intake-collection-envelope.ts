@@ -19,6 +19,7 @@ import {
   iterateSchemaRecordValue,
   createSchemaRecordCursor,
   stepSchemaRecordCursor,
+  checkedEnvelopeChunks,
 } from './intake-schema-record-stream.ts';
 import type { Database } from './database.ts';
 import {
@@ -48,6 +49,7 @@ import {
   parseIntakeCollectionDescriptor,
   parseIntakeStoredValue,
   intakeCollectionCacheGeneration,
+  retainIntakeCollectionCache,
   intakeSchemaRecordOwner,
   type SchemaChildResolution,
 } from './intake-state-collections.ts';
@@ -174,6 +176,8 @@ export interface EnvelopeCellReader {
     bytes?: number,
   ): { chunks: Buffer[]; complete: boolean; after: string | null };
   byteBinding?(value: IntakeByteValue): string;
+  /** Per-started-stream lifetime seal; check() still binds logical authority. */
+  retainRead?(): () => void;
   check(): void;
 }
 type NativeSchemaEnvelopeReader = IntakeCollectionEnvelopeReader & {
@@ -256,42 +260,51 @@ export function* intakeEnvelopeMissingScalarFactsSteps(
   const control = parseSchemaControl(
     collections.get(collections.openView(), 'logical', 'envelope.control', 'representation'),
   );
-  let work = 0;
-  for (const rootEntry of orderEntries(store, control.root)) {
-    if (++work % 64 === 0) yield;
-    if (rootEntry.name === undefined) continue;
-    if (
-      (yield* hashIntakeJsonScalarSteps(cellChunks(store, 'n:' + rootEntry.name))).hash !==
-      schemaKey('intake')
-    )
-      continue;
-    if (rootEntry.target.type !== 'record' || header(store, rootEntry.target.id).shape !== 'object')
-      continue;
-    for (const entry of orderEntries(store, rootEntry.target.id)) {
-      if (++work % 64 === 0) yield;
-      if (entry.name === undefined || entry.target.type !== 'cell') continue;
-      const name = (yield* hashIntakeJsonScalarSteps(cellChunks(store, 'n:' + entry.name))).hash;
-      if (name !== schemaKey('originalName') && name !== schemaKey('locator')) continue;
-      const cell = store.get('c:' + entry.target.id);
-      if (!cell || typeof cell === 'string' || cell.bytes <= COMPACT_SCALAR_BYTES) continue;
-      const pieces = cellChunks(store, 'c:' + entry.target.id);
-      let stringCell: boolean;
-      try {
-        stringCell = pieces.next().value?.trimStart().startsWith('"') ?? false;
-      } finally {
-        pieces.return(undefined);
+  yield* checkedEnvelopeChunks(
+    store,
+    (function* () {
+      let work = 0;
+      for (const rootEntry of orderEntries(store, control.root)) {
+        if (++work % 64 === 0) yield;
+        if (rootEntry.name === undefined) continue;
+        if (
+          (yield* hashIntakeJsonScalarSteps(cellChunks(store, 'n:' + rootEntry.name))).hash !==
+          schemaKey('intake')
+        )
+          continue;
+        if (
+          rootEntry.target.type !== 'record' ||
+          header(store, rootEntry.target.id).shape !== 'object'
+        )
+          continue;
+        for (const entry of orderEntries(store, rootEntry.target.id)) {
+          if (++work % 64 === 0) yield;
+          if (entry.name === undefined || entry.target.type !== 'cell') continue;
+          const name = (yield* hashIntakeJsonScalarSteps(cellChunks(store, 'n:' + entry.name)))
+            .hash;
+          if (name !== schemaKey('originalName') && name !== schemaKey('locator')) continue;
+          const cell = store.get('c:' + entry.target.id);
+          if (!cell || typeof cell === 'string' || cell.bytes <= COMPACT_SCALAR_BYTES) continue;
+          const pieces = cellChunks(store, 'c:' + entry.target.id);
+          let stringCell: boolean;
+          try {
+            stringCell = pieces.next().value?.trimStart().startsWith('"') ?? false;
+          } finally {
+            pieces.return(undefined);
+          }
+          if (!stringCell) continue;
+          const raw = store.get('q:' + entry.target.id);
+          if (raw === undefined) yield entry.target.id;
+          else {
+            if (typeof raw !== 'string' || !store.byteBinding) fail('scalar facts representation');
+            const facts = parseIntakeFilenameFacts(raw as string);
+            if (facts.bytes !== cell.bytes || facts.binding !== store.byteBinding!(cell))
+              fail('scalar facts binding');
+          }
+        }
       }
-      if (!stringCell) continue;
-      const raw = store.get('q:' + entry.target.id);
-      if (raw === undefined) yield entry.target.id;
-      else {
-        if (typeof raw !== 'string' || !store.byteBinding) fail('scalar facts representation');
-        const facts = parseIntakeFilenameFacts(raw as string);
-        if (facts.bytes !== cell.bytes || facts.binding !== store.byteBinding!(cell))
-          fail('scalar facts binding');
-      }
-    }
-  }
+    })(),
+  );
 }
 /** Exact compact source projection, including raw known-key duplicates and spelling.
  * The caller supplies a bounded metadata budget and publishes the source row in
@@ -336,11 +349,14 @@ export function* iterateSchemaEnvelopeText(
     }
     yield* cellChunks(store, 's:' + id);
   }
-  store.check();
-  yield* cellChunks(store, '$before');
-  yield* record(control.root, 0);
-  yield* cellChunks(store, '$after');
-  store.check();
+  yield* checkedEnvelopeChunks(
+    store,
+    (function* () {
+      yield* cellChunks(store, '$before');
+      yield* record(control.root, 0);
+      yield* cellChunks(store, '$after');
+    })(),
+  );
 }
 const schemaResolutionOwners = new WeakMap<
   EnvelopeCellReader,
@@ -723,23 +739,31 @@ export function createSchemaEnvelopeReader(
     root: () => resolve(control.root),
     *recordChunks(record) {
       const id = address(record);
+      const retained = store.retainRead?.();
       const owner = nativeOwner();
       const cursor = owner?.canAdvance() ? owner.createCursor(id) : undefined;
       if (!owner || !cursor) {
-        yield* iterateSchemaRecordValue(store, id);
+        yield* checkedEnvelopeChunks(store, iterateSchemaRecordValue(store, id));
         store.check();
+        retained?.();
         return;
       }
       try {
         let owned = true;
         while (true) {
+          retained?.();
           owned &&= nativeOwner() === owner && owner.canAdvance();
+          if (!owned) store.check();
           const next = owned ? owner.nextCursor(cursor) : stepSchemaRecordCursor(cursor, store);
+          retained?.();
+          if (!owned) store.check();
+          retained?.();
           if (owned && nativeOwner() !== owner) fail('record stream authority changed');
           if (next.done) break;
           yield next.value;
         }
         store.check();
+        retained?.();
       } finally {
         owner.closeCursor(cursor);
       }
@@ -978,7 +1002,7 @@ export function createSchemaEnvelopeReader(
       const item = fieldTarget(record, name);
       if (!item) fail('missing field');
       if (item!.type !== 'cell') fail('structured field requires child traversal');
-      yield* cellChunks(store, 'c:' + item!.id);
+      yield* checkedEnvelopeChunks(store, cellChunks(store, 'c:' + item!.id));
     },
     fieldFragment(record, name, options) {
       const item = fieldTarget(record, name);
@@ -1045,14 +1069,7 @@ export function createSchemaEnvelopeReader(
         item.type === 'record'
           ? iterateSchemaRecordValue(store, address(resolve(item.id)))
           : cellChunks(store, 'c:' + item.id);
-      return (function* () {
-        store.check();
-        for (const chunk of selected) {
-          store.check();
-          yield chunk;
-        }
-        store.check();
-      })();
+      return checkedEnvelopeChunks(store, selected);
     },
     nameBytes(record, key) {
       const value = store.get(keyedField(record, key).name);
@@ -1241,6 +1258,7 @@ function collectionCellReaderOwned(
   };
   const store: EnvelopeCellReader = {
     check,
+    retainRead: () => retainIntakeCollectionCache(db),
     get: (key) => collections.get(view, area, collection, key),
     range: (after, items, bytes, prefix) =>
       collections.range(view, area, collection, { after, items, bytes, prefix }),
@@ -1838,10 +1856,14 @@ export function* projectSchemaCompactMetadataSteps(
   return expected;
 }
 
+/** Direct lexical streams use the same started-traversal seal as field readers. */
+export function iterateSchemaCellText(store: EnvelopeCellReader, key: string): Generator<string> {
+  return checkedEnvelopeChunks(store, cellChunks(store, key));
+}
+
 export {
   header as readSchemaRecordHeader,
   order as readSchemaOrder,
   textValue as readSchemaTextValue,
-  cellChunks as iterateSchemaCellText,
   orderEntries as iterateSchemaRecordOrder,
 };

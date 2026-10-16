@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { setImmediate } from 'node:timers/promises';
 import type { DatabaseSync } from 'node:sqlite';
 import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
@@ -71,6 +72,105 @@ async function select(f: Fixture, catalog: ReportSnapshotCatalog) {
   await commit(f, await catalog.finalChanges());
 }
 const text = (reader: ReportSnapshotMapReader) => [...reader.chunks('warning')].join('');
+
+for (const mode of ['reader', 'writer'] as const)
+  for (const change of ['auxiliary', 'cache', 'logical'] as const)
+    test(`started snapshot ${mode} stream checks ${change} changes inside a prefetched page`, async (t) => {
+      const f = await fixture(t),
+        catalog = catalogFor(f),
+        writer = await catalog.fork(),
+        expected = 'f' + '🦊'.repeat(3001);
+      await writer.putText('warning', [expected]);
+      let reader: ReportSnapshotMapReader = writer;
+      if (mode === 'reader') {
+        await catalog.publish('fictional-selected', writer);
+        await select(f, catalog);
+        reader = catalogFor(f).open('fictional-selected')!;
+      }
+      const pending = reader.chunks('warning')[Symbol.iterator](),
+        first = pending.next();
+      assert.equal(first.done, false);
+      assert.ok(Buffer.byteLength(first.value!) < Buffer.byteLength(expected));
+      await setImmediate();
+      if (change === 'cache') clearIntakeCollectionCache(f.db);
+      else if (change === 'logical')
+        await updateIntakeMetadataRead(f.db, f.root, f.profileId, f.original.id, {
+          version: intakeSourceVersion(f.db, f.original.id).rawVersion,
+          operationId: 'fictional-stream-metadata-change',
+          metadata: { topics: ['Independently fictional changed topic'] },
+        });
+      else
+        await commit(f, [
+          { area: 'builds', collection: 'unrelated', op: 'put', key: 'checkpoint', value: 'ready' },
+        ]);
+      if (change === 'auxiliary')
+        assert.equal(first.value + [...{ [Symbol.iterator]: () => pending }].join(''), expected);
+      else {
+        assert.throws(() => pending.next(), /stale|expired|logical|authority/i);
+        if (change === 'cache')
+          assert.equal(text(reader), expected, 'fresh traversal remains usable after disposal');
+      }
+    });
+
+test('snapshot stream seals cache lifetime after its owner current-check callback', async (t) => {
+  const f = await fixture(t);
+  let armed = false,
+    disposed = false;
+  const catalog = createReportSnapshotCatalog(
+    f.db,
+    { id: f.original.id },
+    {
+      catalogArea: 'builds',
+      assertRunning() {
+        if (armed) {
+          armed = false;
+          disposed = true;
+          clearIntakeCollectionCache(f.db);
+        }
+      },
+    },
+  );
+  const writer = await catalog.fork();
+  await writer.putText('warning', ['f'.repeat(12000)]);
+  const pending = writer.chunks('warning')[Symbol.iterator]();
+  assert.equal(pending.next().done, false);
+  armed = true;
+  assert.throws(() => pending.next(), /expired/);
+  assert.equal(
+    disposed,
+    true,
+    'the actual catalog callback disposed the registry during its current check',
+  );
+});
+
+for (const value of ['', 'Fictional inline', '🦊'.repeat(3001)])
+  test(`snapshot stream checks terminal resume for ${value.length} characters`, async (t) => {
+    const f = await fixture(t),
+      catalog = catalogFor(f),
+      writer = await catalog.fork();
+    await writer.putText('warning', [value]);
+    const expected = [...writer.chunks('warning')],
+      pending = writer.chunks('warning')[Symbol.iterator]();
+    for (const part of expected) assert.deepEqual(pending.next(), { done: false, value: part });
+    if (expected.length) {
+      clearIntakeCollectionCache(f.db);
+      assert.throws(() => pending.next(), /expired/);
+      assert.equal(text(writer), value);
+    } else {
+      assert.deepEqual(pending.next(), { done: true, value: undefined });
+      const get = writer.get;
+      writer.get = (key) => {
+        const result = get(key);
+        clearIntakeCollectionCache(f.db);
+        return result;
+      };
+      assert.throws(
+        () => writer.chunks('warning')[Symbol.iterator]().next(),
+        /expired/,
+        'even an empty traversal seals its get before reporting completion',
+      );
+    }
+  });
 
 test('fresh singleton indexes combine construction and publication in both catalog areas', async (t) => {
   for (const catalogArea of ['logical', 'builds'] as const) {

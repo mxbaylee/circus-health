@@ -24,6 +24,7 @@ import {
 } from '../intake-state-storage.ts';
 import { intakeNamespace } from '../intake-state-evidence.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { setImmediate } from 'node:timers/promises';
 import {
   prepareInitialIntakeEnvelope,
   readIntakeEnvelopeMaterialized,
@@ -95,6 +96,229 @@ function mutate(
   });
   return transaction(db, () => store.stage(prepared));
 }
+
+test('retained byte consumption refuses a changed logical generation even when its bytes remain selected', async (t) => {
+  const { db, identity } = fixture(t),
+    store = createIntakeStateStorage(db, identity).collections,
+    expected = Buffer.alloc(3 * 4096, 'f');
+  mutate(
+    db,
+    store,
+    [
+      ...Array.from({ length: 3 }, () => ({
+        area: 'builds' as const,
+        collection: 'bytes',
+        op: 'appendBytes' as const,
+        bytes: expected.subarray(0, 4096),
+      })),
+      {
+        area: 'logical',
+        collection: 'values',
+        op: 'putBytes',
+        key: 'detail',
+        fromArea: 'builds',
+        fromCollection: 'bytes',
+      },
+    ],
+    1,
+  );
+  const value = store.get(store.openView(), 'logical', 'values', 'detail');
+  assert.ok(value && typeof value !== 'string');
+  const first = store.readBytes(value, { items: 1, bytes: 4096 });
+  assert.deepEqual(first.chunks, [expected.subarray(0, 4096)]);
+  await setImmediate();
+  mutate(
+    db,
+    store,
+    [{ area: 'logical', collection: 'summary', op: 'put', key: 'status', value: 'reviewed' }],
+    2,
+  );
+  // Test consumption before the descriptor assertion: a refusing descriptor must
+  // not invalidate the registry and accidentally conceal a successful old read.
+  const beforeRefusal = intakeWorkCounters(db).warm.collectionByteChunkReads;
+  assert.throws(
+    () => store.readBytes(value, { after: first.after!, items: 1, bytes: 4096 }),
+    /stale|expired/,
+  );
+  assert.equal(
+    intakeWorkCounters(db).warm.collectionByteChunkReads,
+    beforeRefusal,
+    'refusal precedes any old payload consumption',
+  );
+  const fresh = store.get(store.openView(), 'logical', 'values', 'detail');
+  assert.ok(fresh && typeof fresh !== 'string');
+  assert.deepEqual(
+    store.readBytes(fresh, { items: 3, bytes: expected.length }).chunks,
+    Array.from({ length: 3 }, () => expected.subarray(0, 4096)),
+  );
+});
+
+for (const change of ['auxiliary', 'cache', 'close', 'foreign', 'forged', 'reentrant'] as const)
+  test(`byte consumption preserves owner and lifetime checks: ${change}`, (t) => {
+    const { db, identity } = fixture(t),
+      storage = createIntakeStateStorage(db, identity),
+      store = storage.collections,
+      expected = Buffer.alloc(4096, 'f');
+    mutate(
+      db,
+      store,
+      [
+        { area: 'builds', collection: 'bytes', op: 'appendBytes', bytes: expected },
+        {
+          area: 'logical',
+          collection: 'values',
+          op: 'putBytes',
+          key: 'detail',
+          fromArea: 'builds',
+          fromCollection: 'bytes',
+        },
+      ],
+      1,
+    );
+    const value = store.get(store.openView(), 'logical', 'values', 'detail');
+    assert.ok(value && typeof value !== 'string');
+    if (change === 'auxiliary') {
+      const id = randomUUID();
+      store.commitMaintenance(
+        store.prepare(store.openView(), {
+          operationId: id,
+          requestDigest: digest(id),
+          domainVersion: 1,
+          changes: [
+            {
+              area: 'builds',
+              collection: 'unrelated',
+              op: 'put',
+              key: 'checkpoint',
+              value: 'ready',
+            },
+          ],
+        }),
+      );
+      assert.deepEqual(store.readBytes(value, { items: 1, bytes: 4096 }).chunks, [expected]);
+    } else if (change === 'cache') {
+      clearIntakeStateCache(db);
+      assert.throws(() => store.readBytes(value, { items: 1, bytes: 4096 }), /expired/);
+    } else if (change === 'close') {
+      storage.close();
+      assert.throws(() => store.readBytes(value, { items: 1, bytes: 4096 }), /closed/);
+    } else if (change === 'foreign') {
+      const other = fixture(t),
+        reader = createIntakeStateStorage(other.db, other.identity).collections;
+      assert.throws(() => reader.readBytes(value, { items: 1, bytes: 4096 }), /foreign/);
+    } else if (change === 'forged') {
+      assert.throws(() => store.readBytes({ ...value }, { items: 1, bytes: 4096 }), /foreign/);
+    } else {
+      let changed = false;
+      assert.throws(
+        () =>
+          store.readBytes(value, {
+            get items() {
+              if (!changed) {
+                changed = true;
+                mutate(
+                  db,
+                  store,
+                  [
+                    {
+                      area: 'logical',
+                      collection: 'summary',
+                      op: 'put',
+                      key: 'status',
+                      value: 'changed',
+                    },
+                  ],
+                  2,
+                );
+              }
+              return 1;
+            },
+            bytes: 4096,
+          }),
+        /authority changed|stale/,
+      );
+    }
+  });
+
+for (const unrelated of [0, 80])
+  test(`bounded byte consumption counts only selected chunks: ${unrelated} unrelated entries`, (t) => {
+    const { db, identity } = fixture(t),
+      store = createIntakeStateStorage(db, identity).collections;
+    mutate(
+      db,
+      store,
+      [
+        ...Array.from({ length: 3 }, () => ({
+          area: 'builds' as const,
+          collection: 'bytes',
+          op: 'appendBytes' as const,
+          bytes: Buffer.alloc(4096, 'f'),
+        })),
+        {
+          area: 'logical',
+          collection: 'values',
+          op: 'putBytes',
+          key: 'detail',
+          fromArea: 'builds',
+          fromCollection: 'bytes',
+        },
+      ],
+      1,
+    );
+    for (let offset = 0; offset < unrelated; offset += 40)
+      mutate(
+        db,
+        store,
+        Array.from({ length: Math.min(40, unrelated - offset) }, (_, n) => ({
+          area: 'logical' as const,
+          collection: 'unrelated',
+          op: 'put' as const,
+          key: String(offset + n),
+          value: 'Independently fictional unrelated evidence',
+        })),
+        2 + offset / 40,
+      );
+    const value = store.get(store.openView(), 'logical', 'values', 'detail');
+    assert.ok(value && typeof value !== 'string');
+    const binding = store.byteValueBinding(value);
+    store.readBytes(value, { items: 1, bytes: 4096 });
+    const before = structuredClone(intakeWorkCounters(db));
+    const page = store.readBytes(value, { items: 1, bytes: 4096 });
+    assert.equal(page.bytes, 4096);
+    assert.equal(page.chunks.length, 1);
+    assert.equal(page.complete, false);
+    const after = intakeWorkCounters(db),
+      delta = (key: keyof typeof after.warm) => after.warm[key] - before.warm[key];
+    assert.equal(
+      delta('collectionByteChunkReads'),
+      2,
+      'one requested chunk plus one bounded lookahead',
+    );
+    assert.equal(delta('collectionByteChunkReadBytes'), 8192);
+    assert.equal(
+      delta('collectionReadWitnessQueries'),
+      4,
+      'one entry/final certificate, not a second descriptor baseline',
+    );
+    assert.equal(delta('collectionNodeReads'), 0);
+    assert.equal(delta('collectionReadBytes'), 0);
+    assert.equal(delta('hashedBytes'), 0);
+    assert.equal(delta('collectionItemsRead'), 0);
+    assert.equal(delta('materializationReads'), 0);
+    assert.equal(delta('envelopeHydrations'), 0);
+    assert.equal(delta('collectionWrittenBytes'), 0);
+    assert.equal(after.primitive.frameBytesWritten, before.primitive.frameBytesWritten);
+    assert.equal(after.primitive.readCopyBytes, before.primitive.readCopyBytes);
+    assert.equal(store.byteValueBinding(value), binding);
+    t.diagnostic(
+      JSON.stringify({
+        unrelated,
+        returnedBytes: page.bytes,
+        chunkBytes: delta('collectionByteChunkReadBytes'),
+        witnessQueries: delta('collectionReadWitnessQueries'),
+      }),
+    );
+  });
 
 test('immutable staging makes one bounded collision read and one bounded readback per new node', (t) => {
   const { db, identity } = fixture(t);
@@ -451,7 +675,11 @@ test('unchanged collection reads authenticate selected roots once per SQLite sta
     'an exact sealed per-call certificate avoids repeated directory and value SQL reads',
   );
   assert.equal(after.collectionNodeCacheHits - before.collectionNodeCacheHits, 64);
-  assert.equal(after.collectionReadWitnessQueries - before.collectionReadWitnessQueries, 192);
+  assert.equal(
+    after.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
+    128,
+    '32 entry/final four-query seals; minting borrows that certificate instead of taking another baseline',
+  );
   t.diagnostic(
     JSON.stringify({
       nodeReads: after.collectionNodeReads - before.collectionNodeReads,

@@ -29,13 +29,26 @@ Immutable AVL nodes authenticate their exact identity, key/value, children, orde
 
 Typed nested collection values capture an existing checked map, sequence or byte descriptor. Their parent byte accounting includes the descriptor, not recursively copied content. Ordinary string/byte readers refuse such values; separate opaque reference readers traverse them. Nested references and byte descriptor binding checks bind the owner/source and selected logical root and refuse logical changes or cache disposal. Auxiliary-only checkpoints preserve their logical binding. No caller-provided hash constitutes a reference capability. Collection views are weakly held opaque handles: opening unrelated views does not expire a live reader. Selected collection reads check their logical/build root, owner and current authority; cache disposal invalidates prior handles. Cold validation follows every typed reference, and copy rebinds descendants to the target identity using disk work queues rather than a fixed nested-depth frontier.
 
-Current internal limitation: direct `readBytes` consumption and the delegating
-field stream can still read a previously registered byte value after a logical
-change, even though `byteValueBinding` refuses that value. Public selected callers
-have additional freshness checks; no stale accepted HTTP write was demonstrated.
-The shared consumption-boundary repair and consumer audit remain
-[CRS-241](../todo/CRS-241.md). Descriptor validation alone is not proof that every
-subsequent direct byte read is current.
+Direct `readBytes` consumption and byte descriptor binding share the same
+owner-issued capability, logical-generation and representation checks. Every
+bounded byte read checks the current logical binding before consuming payload;
+a reference to unchanged bytes still expires when its logical generation changes.
+Capability minting and private schema byte reads borrow their enclosing active
+certificate, without taking a second authentication baseline.
+
+Started native V4 field, record and whole-envelope streams retain their cache-registry
+lifetime and the reader's selected logical authority. Snapshot reader and writer
+text streams retain the same lifetime plus their existing catalog guards. Every
+resumed fragment and terminal advancement checks freshness, including inline or
+prefetched content that needs no further byte read. A logical change, cache
+disposal or profile closure refuses that traversal. Auxiliary-only checkpoints
+preserve unchanged logical bindings. A reusable reader can start a new traversal
+after cache disposal; an already-started iterator cannot renew its lifetime.
+Native record cursors retain their existing per-advancement sealed proof, and no
+read certificate survives a yield. Immutable recovery/graph readers continue to
+use their caller-authorized historical selection, rather than rebinding to the
+current logical head. These checks add no accepted writes, whole-value copies or
+unrelated-original scans and do not establish large-import qualification.
 
 An ordinary preparation contains at most 64 primitive changes, 4,096 changed rows and 8 MiB of encoded writes. Retained ordinary preparations are capped at eight and 16 MiB together; the page cache holds 128 pages and byte/collection reference registries are bounded. Resumable commands checkpoint private incomplete builds in smaller batches and yield to the event loop, then select a fixed number of roots. They do not publish partial domain changes. Opaque preparations are source/head bound, disposable and transaction scoped; replay is resolved before issuing a new one-use maintenance capability. Existing identical immutable rows do not enlarge the allowed changed set.
 

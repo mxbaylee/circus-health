@@ -1,5 +1,16 @@
 # Update an installation and recover from a failed candidate
 
+Restart into the reviewed build to apply the internal intake-reader freshness
+checks. A retained V4 byte capability or started native field/record text stream now refuses
+after its logical generation changes, cache disposal or profile closure, including
+when the next fragment was already buffered. Reload/reopen the detail rather than
+resuming that iterator. Auxiliary-only checkpoints preserve unchanged logical
+bindings, and a reusable reader may start a fresh traversal after cache disposal.
+Prior builds could consume an old registered byte value even when its descriptor
+binding refused it. This changes no authority format, originals, accepted history
+or provider settings and needs no migration. See the
+[reader consumption contract](../data/intake-state-storage.md#v4-collections-and-selected-publication).
+
 The optional [fictional deployment qualification](docker-runtime.md#fictional-deployment-qualification)
 now joins the existing provider oracle with the drive probe, fresh-container
 authentication and accepted-record/cache-loss reconstruction checks. Set
