@@ -1,7 +1,8 @@
+import { intakeFilenameDisplay } from '../../../shared/intake-summary';
 import { useSourceAttentionRevision } from './useSourceAttentionRevision';
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ImportSourceSelection } from './import-source-selection';
-import type { Intake } from '../../../shared/intake';
+import type { IntakeHeader, IntakeSummaryV3 } from '../../../shared/intake-summary';
 import type {
   IntakeSourceText,
   SourceTextRevision,
@@ -22,9 +23,37 @@ const pageText = (revision: SourceTextRevision, page: number) =>
     .filter((s) => s.region.page === page)
     .map((s) => s.text)
     .join('\n');
+const referencedIntake = (intake: IntakeHeader | IntakeSummaryV3): intake is IntakeSummaryV3 =>
+  'format' in intake && intake.format === 'health-intake-summary-v3';
+/** A referenced original previews from accepted predicates only. A PDF predicate
+ * is exact, so it selects the PDF viewer even when the stored type is a reference;
+ * otherwise only an exact small type is passed on. A truncated name is never
+ * assembled into the preview path or label: the content URL stands in for it. */
+function referencedOriginal(intake: IntakeSummaryV3) {
+  const { mimeType, mimePredicates, providerId } = intake.source;
+  return {
+    id: intake.id,
+    archived: intake.archived,
+    providerId: providerId?.kind === 'value' ? providerId.value : null,
+    provider: null,
+    path: intake.filename ?? intake.contentUrl,
+    sha256: intake.sha256,
+    bytes: intake.bytes,
+    mimeType: mimePredicates.pdf
+      ? 'application/pdf'
+      : mimeType.kind === 'value'
+        ? mimeType.value
+        : '',
+    kind: 'original' as const,
+    coverageStatus: 'retained_original' as const,
+    details: null,
+    contentUrl: intake.contentUrl,
+  };
+}
 /** Approval is transcription trust only. It never saves or regenerates clinical records. */
 export function SourceAttentionReview({
   intake,
+  guardNavigation = true,
   onChanged,
   onPendingChange,
   onManualCreated,
@@ -34,7 +63,8 @@ export function SourceAttentionReview({
 }: {
   onRead?: () => Promise<void>;
   readingBlocked?: string;
-  intake: Intake;
+  intake: IntakeHeader | IntakeSummaryV3;
+  guardNavigation?: boolean;
   onRemainingChange?: (count: number) => void;
   onChanged: () => void;
   onPendingChange?: (pending: boolean) => void;
@@ -285,8 +315,17 @@ export function SourceAttentionReview({
     }
   }
   return (
-    <section className="source-attention" aria-label={`Text review for ${intake.filename}`}>
-      <ReviewNavigationGuard anyLocationChange pending={() => pending} flush={async () => false} />
+    <section
+      className="source-attention"
+      aria-label={`Text review for ${intakeFilenameDisplay(intake)}`}
+    >
+      {guardNavigation && (
+        <ReviewNavigationGuard
+          anyLocationChange
+          pending={() => pending}
+          flush={async () => false}
+        />
+      )}
       {resource.loading && !data && <p role="status">Loading source sections…</p>}
       {resource.error && <p role="alert">{resource.error.message}</p>}
       {error && (
@@ -472,6 +511,7 @@ export function SourceAttentionReview({
                             <summary>Add a missing clinical record</summary>
                             <fieldset disabled={dirty || busy || advanced}>
                               <ImportManualSourceRecord
+                                guardNavigation={guardNavigation}
                                 intakeId={intake.id}
                                 page={page}
                                 onPendingChange={setManualPending}
@@ -512,6 +552,7 @@ export function SourceAttentionReview({
                             {readingBlocked && <p className="helper-text">{readingBlocked}</p>}
                             {advanced && !dirty && !busy && (
                               <SourceTextReview
+                                guardNavigation={guardNavigation}
                                 intakeId={intake.id}
                                 embedded
                                 initialPage={page}
@@ -540,6 +581,7 @@ export function SourceAttentionReview({
       )}
       {data?.status === 'unavailable' && (
         <SourceTextReview
+          guardNavigation={guardNavigation}
           intakeId={intake.id}
           onPendingChange={onPendingChange}
           onChanged={() => {
@@ -557,11 +599,13 @@ function AttentionOriginal({
   page,
   revisionId,
 }: {
-  intake: Intake;
+  intake: IntakeHeader | IntakeSummaryV3;
   page: number;
   revisionId: string;
 }) {
-  const literal = intake.mimeType !== 'application/pdf' && !intake.mimeType?.startsWith('image/');
+  const literal = referencedIntake(intake)
+    ? !intake.source.mimePredicates.pdf && !intake.source.mimePredicates.image
+    : intake.mimeType !== 'application/pdf' && !intake.mimeType?.startsWith('image/');
   const preview = useResource<{ text?: string }>(
     literal
       ? '/intakes/' +
@@ -574,7 +618,10 @@ function AttentionOriginal({
   );
   return (
     <div>
-      <SourcePreview file={intakeOriginal(intake)} initialPage={page} />
+      <SourcePreview
+        file={referencedIntake(intake) ? referencedOriginal(intake) : intakeOriginal(intake)}
+        initialPage={page}
+      />
       {literal && preview.loading && <p role="status">Loading original section…</p>}
       {literal && preview.error && (
         <p role="alert">Original preview unavailable. Open the original file to compare.</p>

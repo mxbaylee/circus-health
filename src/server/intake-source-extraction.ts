@@ -1,3 +1,4 @@
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { fork } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { HttpError } from './database.ts';
@@ -8,7 +9,11 @@ import type {
   SourceTextEvidence,
   SourceTextIssue,
 } from '../shared/intake-source-text.ts';
-import { getIntakeOriginal, getRetainedIntakeOriginalReference, readIntake } from './intake.ts';
+import {
+  getIntakeOriginal,
+  getRetainedIntakeOriginalReference,
+  readIntakeLiteralWindow,
+} from './intake.ts';
 import { pdfPageCountEvidence, readPdfEvidencePage } from './intake-pdf-session.ts';
 import { getIntakeSourceText, publishIntakeSourceText } from './intake-source-text.ts';
 import { composeSourceReadings } from './intake-source-ocr.ts';
@@ -23,10 +28,16 @@ interface ExtractionContext {
   id: string;
   assertRunning?: () => void;
   maxPages?: number;
+  /** Optional operation admission pin; direct readers choose current inside admission. */
+  expectedInitialRevisionId?: string | null;
+  /** Excludes coordinator admission wait from an adapter-owned I/O watchdog. */
+  onCoordinationWait?: (waiting: boolean) => void;
 }
 const activeSources = new WeakMap<DatabaseSync, Set<string>>();
 let activeExtractions = 0;
 export async function extractIntakeSourceText(context: ExtractionContext) {
+  if (currentClinicalOperation(context.db))
+    throw new Error('Source extraction cannot start or join inside a clinical operation');
   const key = `${context.profileId}:${context.id}`;
   const active = activeSources.get(context.db) || new Set<string>();
   if (active.has(key))
@@ -189,26 +200,61 @@ async function extractSourceStep({
   id,
   assertRunning = () => {},
   maxPages = 2,
+  onCoordinationWait,
+  expectedInitialRevisionId,
 }: ExtractionContext) {
-  assertRunning();
-  const original = getRetainedIntakeOriginalReference(db, root, profileId, id);
-  let current = getIntakeSourceText(db, root, profileId, id);
+  const phase = async <T>(work: () => T): Promise<T> => {
+    onCoordinationWait?.(true);
+    try {
+      return await runExclusiveClinicalOperation(
+        db,
+        async () => {
+          onCoordinationWait?.(false);
+          assertRunning();
+          return work();
+        },
+        { assertRunning },
+      );
+    } finally {
+      onCoordinationWait?.(false);
+    }
+  };
+  const initial = await phase(() => {
+    const original = getRetainedIntakeOriginalReference(db, root, profileId, id);
+    const current = getIntakeSourceText(db, root, profileId, id);
+    if (
+      expectedInitialRevisionId !== undefined &&
+      (current.revision?.id ?? null) !== expectedInitialRevisionId
+    )
+      throw new HttpError(
+        409,
+        'SOURCE_TEXT_CHANGED',
+        'Source text changed after extraction admission',
+      );
+    return { original, current };
+  });
+  const original = initial.original;
+  let current = initial.current;
   const limit = Math.min(10, Math.max(1, Math.trunc(maxPages) || 2));
-  const publish = (evidence: SourceTextEvidence) => {
-    assertRunning();
-    current = publishIntakeSourceText(db, root, profileId, id, {
-      operationId: randomUUID(),
-      expectedRevisionId: current.revision?.id || null,
-      sourceHash: original.sourceHash,
-      evidence,
-    });
+  const publish = async (evidence: SourceTextEvidence) => {
+    // Evidence belongs to this previously read revision. Never adopt a newer
+    // human edit as the expected revision merely because admission was queued.
+    const expectedRevisionId = current.revision?.id ?? null;
+    current = await phase(() =>
+      publishIntakeSourceText(db, root, profileId, id, {
+        operationId: randomUUID(),
+        expectedRevisionId,
+        sourceHash: original.sourceHash,
+        evidence,
+      }),
+    );
   };
   const retainedOnly = isRetainOnlyIntake(original);
   const pdf = original.mimeType === 'application/pdf',
     image = ['image/png', 'image/jpeg', 'image/webp'].includes(original.mimeType);
   if (current.status === 'unavailable') {
     if (retainedOnly || original.mimeType === 'application/zip') {
-      publish({
+      await publish({
         adapter: ADAPTER,
         pages: [{ page: 1, disposition: 'unsupported', inspected: false }],
         spans: [],
@@ -230,10 +276,10 @@ async function extractSourceStep({
     let pages = 1;
     if (pdf) pages = await pdfPageCountEvidence({ ...original, profileId }, assertRunning);
     else if (!image) {
-      const window = readIntake(db, root, profileId, id, { limit: TEXT_WINDOW });
+      const window = readIntakeLiteralWindow(db, root, profileId, id, { limit: TEXT_WINDOW });
       pages = Math.max(1, Math.ceil((window.totalCharacters || 0) / TEXT_WINDOW));
     }
-    publish({
+    await publish({
       adapter: ADAPTER,
       pages: Array.from({ length: pages }, (_, i) => ({
         page: i + 1,
@@ -278,7 +324,7 @@ async function extractSourceStep({
             pending(page),
             ...evidence.issues.filter((i) => i.id === `p${page}-failed`),
           );
-          publish(replacePage(evidence, page, partial, result.width, result.height));
+          await publish(replacePage(evidence, page, partial, result.width, result.height));
           evidence = current.revision!;
         } else bytes = getIntakeOriginal(db, root, profileId, id).bytes;
         const result = await runSourceRasterWorker(bytes, page, native, assertRunning);
@@ -286,7 +332,7 @@ async function extractSourceStep({
           ocrPrerequisitePath = process.env.PATH;
           ocrPrerequisiteUntil = Date.now() + 30000;
           result.issues.push(pending(page));
-          publish(replacePage(evidence, page, result, result.width, result.height));
+          await publish(replacePage(evidence, page, result, result.width, result.height));
           throw new HttpError(
             503,
             'SOURCE_OCR_PREREQUISITE',
@@ -294,7 +340,7 @@ async function extractSourceStep({
           );
         }
         if (result.errorCode) throw Error(result.errorCode);
-        publish(replacePage(evidence, page, result, result.width, result.height));
+        await publish(replacePage(evidence, page, result, result.width, result.height));
       } catch (error) {
         if (error instanceof HttpError && error.code === 'SOURCE_OCR_PREREQUISITE') throw error;
         assertRunning(); // Cancellation never converts pending work into a terminal exception.
@@ -321,16 +367,16 @@ async function extractSourceStep({
             error.code === 'SOURCE_EXTRACTION_BUSY')
         )
           throw error;
-        publish(replacePage(evidence, page, partial));
+        await publish(replacePage(evidence, page, partial));
       }
     } else {
-      const window = readIntake(db, root, profileId, id, {
+      const window = readIntakeLiteralWindow(db, root, profileId, id, {
         offset: (page - 1) * TEXT_WINDOW,
         limit: TEXT_WINDOW,
       });
       const structured = ['application/json', 'application/x-ndjson'].includes(original.mimeType);
       if (window.text === null) {
-        publish(
+        await publish(
           replacePage(
             evidence,
             page,
@@ -353,7 +399,7 @@ async function extractSourceStep({
           ),
         );
       } else {
-        publish(
+        await publish(
           replacePage(
             evidence,
             page,
@@ -470,4 +516,69 @@ export function retrySourceExceptions(
       ],
     },
   });
+}
+
+async function sourceExceptionPhase<T>(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  work: () => T,
+  options: { assertRunning?: () => void },
+): Promise<T> {
+  options.assertRunning?.();
+  const expected = getIntakeSourceText(db, root, profileId, id);
+  const original = getRetainedIntakeOriginalReference(db, root, profileId, id);
+  return runExclusiveClinicalOperation(
+    db,
+    async () => {
+      options.assertRunning?.();
+      const current = getIntakeSourceText(db, root, profileId, id);
+      const selected = getRetainedIntakeOriginalReference(db, root, profileId, id);
+      if (
+        selected.sourceHash !== original.sourceHash ||
+        (current.revision?.id ?? null) !== (expected.revision?.id ?? null)
+      )
+        throw new HttpError(
+          409,
+          'SOURCE_TEXT_CHANGED',
+          'Source text changed before its exception update',
+        );
+      return work();
+    },
+    { operation: currentClinicalOperation(db), assertRunning: options.assertRunning },
+  );
+}
+export function retainSourceStallAsync(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  page: number,
+  options: { assertRunning?: () => void } = {},
+) {
+  return sourceExceptionPhase(
+    db,
+    root,
+    profileId,
+    id,
+    () => retainSourceStall(db, root, profileId, id, page),
+    options,
+  );
+}
+export function retrySourceExceptionsAsync(
+  db: DatabaseSync,
+  root: string,
+  profileId: string,
+  id: string,
+  options: { assertRunning?: () => void } = {},
+) {
+  return sourceExceptionPhase(
+    db,
+    root,
+    profileId,
+    id,
+    () => retrySourceExceptions(db, root, profileId, id),
+    options,
+  );
 }

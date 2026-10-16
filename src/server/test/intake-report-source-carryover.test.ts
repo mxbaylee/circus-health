@@ -1,3 +1,4 @@
+import { selectedReportGroups } from '../intake-selected-report-groups.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -220,8 +221,12 @@ function explicitSourceReview(f: Fixture, item: Intake) {
   );
 }
 
-function confirmExplicitSource(f: Fixture, item: Intake, source = 'Fictional Body Studio') {
-  const review = explicitSourceReview(f, item);
+function confirmExplicitSource(
+  f: Fixture,
+  item: Intake,
+  source = 'Fictional Body Studio',
+  review = explicitSourceReview(f, item),
+) {
   return intake.confirmIntakeReportSource(f.db, f.root, f.profileId, item.id, {
     basis: 'explicit_current_members',
     version: review.intakeVersion,
@@ -289,7 +294,7 @@ async function accept(f: Fixture, blocks: IntakeReportAcceptanceBlock[]) {
       // Do not repeat original grounding and every proposal review for rows
       // whose current identity policy is already satisfied.
       if (record.identityReview?.blocking)
-        for (const group of record.reportGroups || [])
+        for (const group of selectedReportGroups(record.reportGroups))
           groupKeys.add(JSON.stringify([block.intakeId, group.groupId]));
     }
   }
@@ -327,6 +332,7 @@ function assertEveryReviewedResult(
   db: Fixture['db'],
   expectedCount: number,
   expectedProvider = 'Fictional Body Studio',
+  fullSourceVariantCount?: number,
 ) {
   const saved = observations(db, new URLSearchParams(), true).data;
   assert.equal(saved.length, expectedCount);
@@ -334,14 +340,42 @@ function assertEveryReviewedResult(
   assert.equal(providerIds.size, 1);
   const providerId = saved[0]!.providerId!;
   assert.ok(providerId);
+  const fullSourceIds = new Set<string>();
+  let referenceReads = 0,
+    fullSourceReads = 0;
   for (const row of saved) {
     assert.equal(row.provider, expectedProvider, `saved list source for ${row.label}`);
     const detail = getObservation(db, row.id);
     assert.ok('provider' in detail);
     assert.equal(detail.provider, expectedProvider, `saved detail source for ${row.label}`);
-    const source = getSourceRecord(db, row.sourceRecordId);
+    const source =
+      fullSourceVariantCount === undefined
+        ? getSourceRecord(db, row.sourceRecordId)
+        : getSourceRecord(db, row.sourceRecordId, { fileView: 'reference' });
     assert.equal(source.provider, expectedProvider, `source evidence for ${row.label}`);
     assert.equal(source.originalFile!.provider, 'Unknown source');
+    if (fullSourceVariantCount !== undefined) {
+      referenceReads++;
+      assert.equal(source.fileView, 'reference');
+      if (!fullSourceIds.has(source.sourceFileId)) {
+        const full = getSourceRecord(db, row.sourceRecordId);
+        fullSourceReads++;
+        fullSourceIds.add(source.sourceFileId);
+        assert.equal(full.provider, expectedProvider, `full source evidence for ${row.label}`);
+        assert.equal(full.originalFile!.provider, 'Unknown source');
+        assert.equal(full.sourceFileId, source.sourceFileId);
+        assert.equal(full.originalFile!.id, source.originalFile!.id);
+      }
+    }
+  }
+  if (fullSourceVariantCount !== undefined) {
+    assert.equal(referenceReads, expectedCount, 'every saved row uses the checked reference API');
+    assert.equal(
+      fullSourceIds.size,
+      fullSourceVariantCount,
+      'all source-file versions are checked',
+    );
+    assert.equal(fullSourceReads, fullSourceVariantCount, 'each variant also uses the full API');
   }
   const filtered = observations(db, new URLSearchParams({ providerId }), true);
   assert.equal(filtered.total, expectedCount);
@@ -843,7 +877,7 @@ test(
       { total: 190, covered: 66, uncovered: 124 },
     );
     assert.equal(new Set(before.targets.map((target) => target.sourceRef.groupVersionId)).size, 9);
-    const explicit = confirmExplicitSource(f, item);
+    const explicit = confirmExplicitSource(f, item, 'Fictional Body Studio', before);
     item = explicit.intake;
     assert.equal(explicit.confirmation.coverageEntries?.length, 190);
     assert.equal(
@@ -862,12 +896,59 @@ test(
       },
       { total: 190, covered: 190, source: 'Fictional Body Studio' },
     );
-    // accept() confirms each report once across all proposals. Repeating that
-    // report-wide operation for every version duplicates the entire review.
-    const accepted = await accept(
-      f,
-      proposalIds.map((proposalId) => block(f, item.id, proposalId)),
-    );
+    // Confirm each report once across all proposals. Repeating that report-wide
+    // operation for every version duplicates the entire review.
+    // Review each exact proposal before confirmation; identity decisions use
+    // those same reviews while no source or identity state has changed.
+    const session = () => intake.createIntakeReviewSession(f.db, f.root, f.profileId, item.id);
+    const { blocks, groupKeys } = (() => {
+      const selectionSession = session();
+      const reviewed = proposalIds.map((proposalId) => {
+        const review = selectionSession.review(proposalId);
+        const block: IntakeReportAcceptanceBlock = {
+          intakeId: item.id,
+          proposalId,
+          intakeVersion: review.version,
+          reviewToken: review.reviewToken,
+          selections: review.records.map((record) => ({
+            recordId: record.id,
+            candidateId: record.candidateId!,
+            candidateVersionId: record.candidateVersionId!,
+            mapping: {},
+          })),
+        };
+        return { block, review };
+      });
+      const groupKeys = new Set<string>();
+      for (const { block, review } of reviewed) {
+        assert.equal(review.proposalId, block.proposalId, 'review belongs to its exact proposal');
+        for (const selection of block.selections) {
+          const record = review.records.find((candidate) => candidate.id === selection.recordId);
+          assert.ok(record, 'selection belongs to its exact fictional proposal');
+          if (record.identityReview?.blocking)
+            for (const group of selectedReportGroups(record.reportGroups))
+              groupKeys.add(JSON.stringify([block.intakeId, group.groupId]));
+        }
+      }
+      return { blocks: reviewed.map(({ block }) => block), groupKeys };
+    })();
+    for (const key of groupKeys) {
+      const [intakeId, groupId] = JSON.parse(key) as [string, string];
+      await confirmFictionalIdentity(f, intakeId, groupId);
+    }
+    const refreshedSession = session();
+    const freshBlocks = blocks.map((acceptedBlock) => {
+      const review = refreshedSession.review(acceptedBlock.proposalId);
+      return {
+        ...acceptedBlock,
+        intakeVersion: review.version,
+        reviewToken: review.reviewToken,
+      };
+    });
+    const accepted = await acceptIntakeReportSelection(f.db, f.root, f.profileId, {
+      operationId: randomUUID(),
+      blocks: freshBlocks,
+    });
     assert.equal(accepted.receipt.acceptedCount, 190);
     assert.ok(
       accepted.receipt.receipts
@@ -892,14 +973,14 @@ test(
     );
     assert.equal(finished.source, 'Fictional Body Studio');
     assert.equal(finished.sourceScope, 'report');
-    assertEveryReviewedResult(f.db, 190);
+    assertEveryReviewedResult(f.db, 190, 'Fictional Body Studio', 9);
     const backup = await createBackup(f.db, f.root, f.profileId),
       target = join(f.root, 'rebuilt-explicit-sparse-source'),
       rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
       rebuiltDb = openDatabase(rebuilt.database, f.profileId);
     attachPersonalDurability(rebuiltDb, { root: target, profileId: f.profileId });
     try {
-      assertEveryReviewedResult(rebuiltDb, 190);
+      assertEveryReviewedResult(rebuiltDb, 190, 'Fictional Body Studio', 9);
       assert.deepEqual(
         observations(rebuiltDb, new URLSearchParams(), true).data.map((row) => row.provider),
         Array.from({ length: 190 }, () => 'Fictional Body Studio'),

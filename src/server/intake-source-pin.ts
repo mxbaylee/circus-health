@@ -1,5 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './database.ts';
+import { intakeSourcePinKey } from './intake-source-pin-key.ts';
+export { intakeSourcePinKey } from './intake-source-pin-key.ts';
 
 /**
  * The source-text state an intake's proposals are pinned to. It lives in its own
@@ -25,8 +27,6 @@ const FIELDS = [
   'sourceTextDependencyToken',
   'sourceTextRequiresInterpretation',
 ] as const;
-
-export const intakeSourcePinKey = (intakeId: string) => `intake_source_pin:v1:${intakeId}`;
 
 function corrupt(): never {
   throw new HttpError(

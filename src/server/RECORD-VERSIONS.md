@@ -15,6 +15,23 @@ All calls are synchronous, matching the existing SQLite transaction boundary:
 - `publishHead(bytes)` authenticates, encrypts, atomically replaces and fsyncs the
   head (`read('head')`). This is the transaction acceptance boundary. The vault
   must durably publish referenced originals before accepting this head.
+- Optional `headIdentity()` returns `{key, settled}` for the HEAD object without
+  reading its bytes, or `null` when identity is unknown. The key must change
+  whenever `read('head')` may return different bytes; `settled` means any later
+  change must also change the key. `recordDurabilityStatus` (and so the intake
+  envelope authority binding check) reuses its last parsed HEAD only while the
+  same genuine storage object, original `read`, hook and publication epoch
+  report the exact key observed settled before and after the admitting read.
+  Unknown, unsettled or changed identity reads HEAD. The contributor journal
+  keys on dev/ino/mode of the profile and authority directories plus
+  dev/ino/mode/nlink/size/mtime-ns/ctime-ns of HEAD, under the same physical
+  path checks as `read`; it settles only once the latest stamp is older than
+  twice its detected granularity (at least 50 ms), so a same-inode same-size
+  rewrite in one coarse clock tick cannot hide. The vault keys on its unlocked
+  manifest value, which is what `read('head')` returns. In-memory, copied and
+  wrapping storages return `null` or omit the hook. Every own publication
+  renews the storage's epoch. Physical read owners, publication verification
+  and terminal reads still read HEAD every time.
 
 The caller owns the profile key, unlocked lifetime and exclusive writer lock.
 No plaintext journal is written by this module. Logical JSONL streams use bounded
@@ -73,12 +90,54 @@ single primary key or an array of composite keys. Querying uses SQLite indexes
 and never reads the vault. The supplied database must be attached to its unlocked
 owning profile. Close it when locking; no history API exists for locked profiles.
 
+SQLite projection 3 derives the two creation changes for an initial, nondeleted
+`app_meta` version with exactly string `key` and `value` contents from its complete
+validated version. It stores no field-reference rows for that case and refuses
+unexpected references. Other versions retain exact stored field references.
+Older projections require fresh reconstruction, not in-place relabeling. The
+encrypted unlock owner rebuilds an incompatible cache from authenticated history;
+direct contributor attachment refuses it and explicit staged recovery creates a
+new target. This changes no accepted journal or original format.
+
 The format pins the current application schema and projection version. Unsupported
 schemas, revision/sequence gaps, broken ancestry, corrupt/missing committed bytes,
 invalid previous versions, partial transactions and wrong owners fail explicitly.
 Reconstruction applies complete rows without rerunning historical app mutations,
 then verifies SQLite, foreign keys and polymorphic targets. Domain restrictions
 such as finished-note immutability remain active on ordinary app transactions.
+
+Attachment catch-up and reconstruction are generators
+(`attachRecordDurabilitySteps`, `rebuildRecordDatabaseSteps`). Ancestry yields
+every 64 commits; catch-up yields every 256 validated versions and after each
+applied transaction. `attachRecordDurability` and `rebuildRecordDatabase` are
+synchronous drivers over the same steps, so they do the same replay.
+`rebuildRecordDatabaseAsync` and `attachRecordDurabilityAsync` run the steps in
+windows. Each window grows from 1 to `RECORD_STEP_WINDOW` steps, and the driver
+yields to the host between windows. A proof runs at the start of every window,
+at completion and on any abandoned exit. The proof checks the abort signal, the
+storage's original own `read` descriptor and the caller's `assertCurrent`. It
+also reads HEAD fresh and compares it with the starting wire. A run that is
+abandoned or refused rolls back its open transaction. Refusal during reconstruction
+removes the newly owned target and its `-wal`/`-shm` files. The direct asynchronous
+helpers currently leave the completed target behind if the terminal proof refuses
+after iterator completion; staged profile/startup callers remove their failed
+stages and do not activate it. [CRS-243](../../docs/todo/CRS-243.md) owns this direct
+cleanup exception and same-path retry coverage. Byte comparison alone accepts a
+same-byte HEAD replacement. Contributor callers therefore pass a physical HEAD
+and directory identity check (`rebuildContributorDatabaseAsync`), which refuses
+it. Replay counts match the synchronous driver exactly. The only added work is
+one HEAD read and parse for the starting binding and one for each proof.
+
+`verifyRecordHistoryInputs(storage, …)` proves every physical input of a
+history without replaying it into SQLite. Those inputs are HEAD, every commit
+and segment object by digest, every version's validation and every referenced
+original through `verifyReferences`. An existing contributor cache attachment uses
+it. When the selected HEAD reference equals the indexed head, that attachment
+reuses the reconstruction it already built for the indexed check as its
+coherence target. It still re-proves every input and reruns production intake
+validation on the reused database. The SQLite replay count drops from two to one.
+Catch-up after a newer HEAD, and any other mismatch, still takes a full second
+reconstruction.
 
 The fictional test suite covers bounded app edits amid 1,500 unrelated people,
 A → B → A birthdays, absent/null, retry replay, optimistic conflicts, interrupted

@@ -97,6 +97,11 @@ export interface PdfEvidenceSearch {
   nextOffset: number | null;
   matchedPages: number;
 }
+export interface PdfEvidencePageSearch {
+  page: number;
+  totalPages: number;
+  snippet: string | null;
+}
 
 interface PdfWorkerMemory {
   rss: number;
@@ -111,7 +116,12 @@ interface WorkerResponse {
   requestId?: number;
   pages?: number;
   verifiedBytes?: number;
-  result?: PdfWorkerPage | PdfEvidenceIndex | PdfIdentityPageText | PdfEvidenceSearch;
+  result?:
+    | PdfWorkerPage
+    | PdfEvidenceIndex
+    | PdfIdentityPageText
+    | PdfEvidenceSearch
+    | PdfEvidencePageSearch;
   diagnostics?: {
     rangeReads: number;
     rangeBytes: number;
@@ -313,7 +323,7 @@ class PdfSession {
    * onto `PdfEvidencePage`. Other actions omit it and get nothing merged.
    */
   async run<T>(
-    action: 'index' | 'page' | 'identity' | 'search',
+    action: 'index' | 'page' | 'identity' | 'search' | 'search_page',
     input: Record<string, unknown>,
     assertRunning: () => void,
     marks?: SchedulingMarks,
@@ -612,6 +622,17 @@ export function searchPdfEvidence(
 ): Promise<PdfEvidenceSearch> {
   return scheduledSource(source, assertRunning, (session, guard) =>
     session.run<PdfEvidenceSearch>('search', { query, offset }, guard),
+  );
+}
+
+export function searchPdfEvidencePage(
+  source: RetainedPdfSource,
+  page: number,
+  query: string,
+  assertRunning: () => void = () => {},
+): Promise<PdfEvidencePageSearch> {
+  return scheduledSource(source, assertRunning, (session, guard) =>
+    session.run<PdfEvidencePageSearch>('search_page', { page, query }, guard),
   );
 }
 

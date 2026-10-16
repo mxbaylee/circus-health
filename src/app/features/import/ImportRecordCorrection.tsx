@@ -1,5 +1,6 @@
+import type { IntakeHeader } from '../../../shared/intake-summary';
 import { useEffect, useId, useRef, useState } from 'react';
-import type { Intake, IntakeClinicalMapping, IntakeReviewRecord } from '../../../shared/intake';
+import type { IntakeClinicalMapping, IntakeReviewRecord } from '../../../shared/intake';
 import { SourcePreview } from '../../components/SourceDialog';
 import { intakeEvidencePage, intakeOriginal, reviewRecordTitle } from '../intake/ReviewWorkspace';
 
@@ -21,8 +22,9 @@ export function ImportRecordCorrection({
   onUpdate,
   onClose,
   onDirtyChange,
+  onDisplayedMappingChange,
 }: {
-  intake: Intake;
+  intake: IntakeHeader;
   record: IntakeReviewRecord;
   mapping: IntakeClinicalMapping;
   fields: CorrectionField[];
@@ -30,6 +32,7 @@ export function ImportRecordCorrection({
   onUpdate: (mapping: Partial<IntakeClinicalMapping>, reason?: string) => Promise<boolean>;
   onClose: () => void;
   onDirtyChange: (dirty: boolean) => void;
+  onDisplayedMappingChange?: (mapping: IntakeClinicalMapping) => void;
 }) {
   const id = useId();
   const [kindOverride, setKindOverride] = useState<IntakeClinicalMapping['kind']>();
@@ -44,6 +47,9 @@ export function ImportRecordCorrection({
   const [dirty, setDirty] = useState(false);
   const editedFields = useRef(new Set<keyof IntakeClinicalMapping>());
   const [validation, setValidation] = useState('');
+  useEffect(() => {
+    onDisplayedMappingChange?.({ ...mapping, ...values, kind });
+  }, [mapping, values, kind, onDisplayedMappingChange]);
   const listener = useRef(onDirtyChange);
   listener.current = onDirtyChange;
   useEffect(() => {

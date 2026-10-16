@@ -511,6 +511,38 @@ test('two pending unlock assertions cannot overwrite a newer published authentic
   assert.equal(manager.keyring(profile.id).passkeys[0].counter, 9);
 });
 
+test('a refusal after the vault opens leaves the opened vault key intact', async (t) => {
+  const { manager } = vaultFixture(t),
+    { profile } = await newProfile(manager);
+  const passkeys = createProfilePasskeys(manager, verified),
+    prf = randomBytes(32).toString('base64url');
+  await enroll(passkeys, profile.id, prf);
+  const head = opened(manager, profile.id).recordStorage.read('head');
+  passkeys.invalidate(profile.id);
+  manager.lock(profile.id);
+  const originalNow = Date.now,
+    unlockWithKeyAsync = manager.unlockWithKeyAsync;
+  let elapsed = 0,
+    owned: Buffer | undefined;
+  t.mock.method(Date, 'now', () => originalNow() + elapsed);
+  t.mock.method(
+    manager,
+    'unlockWithKeyAsync',
+    async (...args: Parameters<Manager['unlockWithKeyAsync']>) => {
+      owned = args[1] as Buffer;
+      const result = await unlockWithKeyAsync(...args);
+      elapsed += 6 * 60 * 1000;
+      return result;
+    },
+  );
+  const options = await passkeys.authenticationOptions(profile.id, session, origin);
+  await assert.rejects(passkeys.authenticate(profile.id, session, input(options, prf)), {
+    code: 'PASSKEY_CANCELLED',
+  });
+  assert.ok(owned && owned.some((byte) => byte !== 0));
+  assert.deepEqual(opened(manager, profile.id).recordStorage.read('head'), head);
+});
+
 test('a verified unlock assertion still needs the matching PRF', async (t) => {
   const { manager } = vaultFixture(t),
     { profile } = await newProfile(manager);

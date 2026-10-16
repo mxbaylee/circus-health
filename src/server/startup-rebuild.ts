@@ -16,18 +16,25 @@ import type { BinaryLike } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { REPO_ROOT, LATEST_SCHEMA_VERSION, openDatabase } from './database.ts';
 import { hasContributorAuthority } from './contributor-record-storage.ts';
-import { rebuildContributorDatabase, selectedContributorHead } from './contributor-durability.ts';
-import { profilePaths, profileOriginal } from './profile-storage.ts';
 import {
-  loadPortable,
+  rebuildContributorDatabase,
+  rebuildContributorDatabaseAsync,
+  selectedContributorHead,
+} from './contributor-durability.ts';
+import { profilePaths } from './profile-storage.ts';
+import {
+  openPortableRows,
+  verifyPortableOriginal,
   recoverPendingProfile,
   projectPortableDatabase,
+  projectPortableDatabaseBounded,
   durableWrite,
   syncDirectory,
-  publishedPersonalLineage,
+  publishedPersonalHeaders,
   logicalDatabaseHash,
+  type ProjectPortableResult,
 } from './portable.ts';
-import { listChats } from './assistant-journal.ts';
+import { countChats } from './assistant-journal.ts';
 
 export interface GenerationManifest {
   format: 'circus-health-generation-v1';
@@ -37,15 +44,6 @@ export interface GenerationManifest {
   file: string;
   sha256: string;
   bytes: number;
-}
-
-interface PortableGeneration {
-  manifest: GenerationManifest;
-  value: {
-    revision: number;
-    createdAt: string;
-    tables: Record<string, Array<Record<string, unknown>>>;
-  };
 }
 
 export interface MappingVersion {
@@ -58,32 +56,6 @@ export interface ProfileInputPins {
   personal: GenerationManifest;
   curation: GenerationManifest;
   mappings: MappingVersion;
-}
-
-interface OriginalMetadata {
-  path: string;
-  sha256: string;
-  bytes: number;
-}
-
-interface LoadedPortable {
-  personal: PortableGeneration;
-  curation: PortableGeneration;
-  rows: Record<string, Array<Record<string, unknown>>> & {
-    source_records: Array<Record<string, unknown>>;
-  };
-  originals: Map<string, OriginalMetadata>;
-}
-
-interface ProjectionResult {
-  database: string;
-  profileId: string;
-  revision: number;
-  schemaVersion: number;
-  files: number;
-  counts: Record<string, number>;
-  logicalSha256: string;
-  databaseBytes: number;
 }
 
 export interface StartupProgress {
@@ -151,19 +123,6 @@ export interface RebuildStartupResult {
   receipt: StartupReceipt;
   databases: Array<[string, string]>;
 }
-
-type LoadPortable = (root: string, profileId: string, pins: ProfileInputPins) => LoadedPortable;
-type PersonalLineage = (
-  root: string,
-  profileId: string,
-  options: { manifest: GenerationManifest },
-) => Iterable<PortableGeneration>;
-type ProjectPortable = (
-  database: string,
-  profileId: string,
-  portable: LoadedPortable,
-  options: { phase: (name: string) => void },
-) => ProjectionResult;
 
 const hash = (bytes: BinaryLike): string => createHash('sha256').update(bytes).digest('hex');
 const jsonBytes = (value: unknown): Buffer => Buffer.from(JSON.stringify(value, null, 2) + '\n');
@@ -305,14 +264,100 @@ export function recordStartupMetrics<T extends { id: string; startedAt: string }
 
 // The caller holds the data-directory lock for both startup and serving.
 // This function never reads a working SQLite file and never calls an AI tool.
-export function rebuildStartup({
+interface PortableProjectionStep {
+  root: string;
+  profileId: string;
+  database: string;
+  pins: ProfileInputPins;
+  phase: (name: string) => void;
+  checkpoint: () => void;
+}
+
+/** A selected contributor journal reconstructed into the staged database. */
+interface RecordRebuildStep {
+  kind: 'record';
+  database: string;
+  root: string;
+  profileId: string;
+}
+const isRecordRebuildStep = (
+  step: PortableProjectionStep | RecordRebuildStep,
+): step is RecordRebuildStep => 'kind' in step && step.kind === 'record';
+interface PortableProjectionOutcome {
+  result: ProjectPortableResult;
+  acceptedSourcesSha256: string;
+  originalBytes: number;
+  inputRecords: number;
+  sourceRecords: number;
+  originalFiles: number;
+  terminalProof?: { current(): void; close(): void };
+}
+
+function projectStartupPortableSync(step: PortableProjectionStep): PortableProjectionOutcome {
+  const { root, profileId, database, pins, phase } = step;
+  const portable = openPortableRows(root, profileId, pins);
+  try {
+    const acceptedDigest = createHash('sha256');
+    let originalBytes = 0;
+    let firstOriginal = true;
+    acceptedDigest.update('[');
+    for (const file of portable.originals()) {
+      if (!firstOriginal) acceptedDigest.update(',');
+      firstOriginal = false;
+      acceptedDigest.update(JSON.stringify([file.path, file.sha256, file.bytes]));
+      originalBytes += file.bytes;
+    }
+    acceptedDigest.update(']');
+    const result = projectPortableDatabase(database, profileId, portable, { phase });
+    for (const file of portable.originals()) verifyPortableOriginal(root, profileId, file);
+    return {
+      result,
+      acceptedSourcesSha256: acceptedDigest.digest('hex'),
+      originalBytes,
+      inputRecords: portable.tableNames().reduce((sum, table) => sum + portable.rowCount(table), 0),
+      sourceRecords: portable.rowCount('source_records'),
+      originalFiles: portable.originalCount,
+    };
+  } finally {
+    portable.close();
+  }
+}
+
+async function projectStartupPortableBounded(
+  step: PortableProjectionStep,
+): Promise<PortableProjectionOutcome> {
+  const { root, profileId, database, pins, phase } = step;
+  const result = await projectPortableDatabaseBounded(
+    root,
+    profileId,
+    database,
+    pins,
+    step.checkpoint,
+    { phase },
+  );
+  return {
+    result,
+    acceptedSourcesSha256: result.acceptedSourcesSha256,
+    originalBytes: result.originalBytes,
+    inputRecords: result.inputRecords,
+    sourceRecords: result.sourceRecords,
+    originalFiles: result.files,
+    terminalProof: result.terminalProof,
+  };
+}
+
+function* rebuildStartupSteps({
   dataDirectory,
   runtimeDirectory,
   codeRoot = REPO_ROOT,
   profileIds,
   progress = () => {},
   historyLimit = 40,
-}: RebuildStartupOptions = {}): RebuildStartupResult {
+}: RebuildStartupOptions = {}): Generator<
+  PortableProjectionStep | RecordRebuildStep,
+  RebuildStartupResult,
+  PortableProjectionOutcome | undefined
+> {
   const root = validateDataDirectory(dataDirectory, []);
   recoverProfileDeletions(root);
   profileIds ??= readProfileRegistry(root).profiles.map((p: { id: string }) => p.id);
@@ -348,6 +393,7 @@ export function rebuildStartup({
     activeMetric: StartupProfileMetric | null = null,
     activeProfileStarted = 0,
     activePhaseStarted = 0;
+  const terminalProofs: Array<{ current(): void; close(): void }> = [];
   const announce = (phase: string): void => {
     stage = phase;
     progress({
@@ -404,7 +450,8 @@ export function rebuildStartup({
       if (journal) {
         phase('record_rebuild');
         const database = resolve(staged, `${profileId}.sqlite`);
-        rebuildContributorDatabase(database, root, profileId);
+        // The driver reconstructs synchronously or step-wise (bounded startup).
+        yield { kind: 'record', database, root, profileId };
         const db = openDatabase(database, profileId);
         try {
           Object.assign(activeMetric, {
@@ -414,7 +461,7 @@ export function rebuildStartup({
             totalMs: performance.now() - profileStart,
             logicalSha256: logicalDatabaseHash(db),
             databaseBytes: statSync(database).size,
-            chats: listChats(root, profileId).length,
+            chats: countChats(root, profileId),
             peakMemoryBytes: process.resourceUsage().maxRSS * 1024,
           });
         } finally {
@@ -429,38 +476,23 @@ export function rebuildStartup({
         activeMetric = null;
         continue;
       }
-      const portable = (loadPortable as unknown as LoadPortable)(root, profileId, pins);
       let historyBytes = 0,
         historyGenerations = 0;
-      for (const generation of (publishedPersonalLineage as unknown as PersonalLineage)(
-        root,
-        profileId,
-        { manifest: pins.personal },
-      )) {
+      for (const generation of publishedPersonalHeaders(root, profileId, {
+        manifest: pins.personal,
+      })) {
         historyBytes += generation.manifest.bytes;
         historyGenerations++;
       }
       // Conversations stay in place, but corrupt current journals block startup.
-      const chats = listChats(root, profileId).length;
-      const acceptedSourcesSha256 = hash(
-        JSON.stringify(
-          [...portable.originals.values()]
-            .map((file) => [file.path, file.sha256, file.bytes])
-            .sort(),
-        ),
-      );
+      const chats = countChats(root, profileId);
       const database = resolve(staged, `${profileId}.sqlite`);
-      const result = (projectPortableDatabase as unknown as ProjectPortable)(
-        database,
-        profileId,
-        portable,
-        { phase },
-      );
-      for (const file of portable.originals.values()) {
-        const bytes = readFileSync(profileOriginal(root, file.path, profileId));
-        if (bytes.length !== file.bytes || hash(bytes) !== file.sha256)
-          throw new Error('Accepted originals changed during startup');
-      }
+      let progressChecks = 0;
+      const checkpoint = () => {
+        if (++progressChecks % 256 === 0) announce(currentPhase ?? 'read_validate');
+      };
+      const projected = (yield { root, profileId, database, pins, phase, checkpoint })!;
+      if (projected.terminalProof) terminalProofs.push(projected.terminalProof);
       if (JSON.stringify(pins) !== JSON.stringify(pinProfileInputs(root, profileId)))
         throw new Error('Pinned generations or mapping inputs changed during startup');
       phases[currentPhase!] = (phases[currentPhase!] || 0) + performance.now() - phaseStart;
@@ -470,26 +502,33 @@ export function rebuildStartup({
         personal: pins.personal,
         curation: pins.curation,
         mappings: pins.mappings,
-        acceptedSourcesSha256,
+        acceptedSourcesSha256: projected.acceptedSourcesSha256,
         inputBytes:
-          [...portable.originals.values()].reduce((sum, file) => sum + file.bytes, 0) +
-          pins.curation.bytes +
-          historyBytes +
-          pins.mappings.bytes,
-        inputRecords: Object.values(portable.rows).reduce((sum, rows) => sum + rows.length, 0),
-        sourceRecords: portable.rows.source_records.length,
-        originalFiles: portable.originals.size,
+          projected.originalBytes + pins.curation.bytes + historyBytes + pins.mappings.bytes,
+        inputRecords: projected.inputRecords,
+        sourceRecords: projected.sourceRecords,
+        originalFiles: projected.originalFiles,
         historyGenerations,
         chats,
-        counts: result.counts,
-        databaseBytes: result.databaseBytes,
-        logicalSha256: result.logicalSha256,
+        counts: projected.result.counts,
+        databaseBytes: projected.result.databaseBytes,
+        logicalSha256: projected.result.logicalSha256,
         peakMemoryBytes: process.resourceUsage().maxRSS * 1024,
       });
       activeMetric = null;
     }
     currentProfile = null;
     announce('activate');
+    for (const [profileId, pins] of pinned)
+      if (JSON.stringify(pins) !== JSON.stringify(pinProfileInputs(root, profileId)))
+        throw Error('Pinned generations or mapping inputs changed during startup');
+    for (const [profileId, journal] of journalPins)
+      if (
+        selectedContributorHead(root, profileId) !== journal.head ||
+        JSON.stringify(mappingVersion(root, profileId)) !== JSON.stringify(journal.mappings)
+      )
+        throw Error('Contributor selected inputs changed during startup');
+    for (const proof of terminalProofs) proof.current();
     renameSync(staged, active);
     syncDirectory(runtimeReal);
     receipt.outcome = 'success';
@@ -536,5 +575,51 @@ export function rebuildStartup({
       elapsedMs: receipt.totalMs,
     });
     throw error;
+  } finally {
+    for (const proof of terminalProofs) proof.close();
   }
+}
+
+export function rebuildStartup(options: RebuildStartupOptions = {}): RebuildStartupResult {
+  const steps = rebuildStartupSteps(options);
+  let step = steps.next();
+  while (!step.done) {
+    let projected: PortableProjectionOutcome | undefined;
+    try {
+      const value = step.value;
+      if (isRecordRebuildStep(value))
+        rebuildContributorDatabase(value.database, value.root, value.profileId);
+      else projected = projectStartupPortableSync(value);
+    } catch (error) {
+      step = steps.throw(error);
+      continue;
+    }
+    step = steps.next(projected);
+  }
+  return step.value;
+}
+
+/** The startup worker uses bounded source transport while preserving the
+ * same selected-input checks, metrics, and atomic staged activation. */
+export async function rebuildStartupBounded(
+  options: RebuildStartupOptions = {},
+): Promise<RebuildStartupResult> {
+  const steps = rebuildStartupSteps(options);
+  let step = steps.next();
+  while (!step.done) {
+    let projected: PortableProjectionOutcome | undefined;
+    try {
+      const value = step.value;
+      // Record replay yields between bounded steps, re-proving the selected
+      // journal's HEAD bytes and physical identity around every yield.
+      if (isRecordRebuildStep(value))
+        await rebuildContributorDatabaseAsync(value.database, value.root, value.profileId);
+      else projected = await projectStartupPortableBounded(value);
+    } catch (error) {
+      step = steps.throw(error);
+      continue;
+    }
+    step = steps.next(projected);
+  }
+  return step.value;
 }

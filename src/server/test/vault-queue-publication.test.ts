@@ -12,14 +12,18 @@ import { uploadIntake } from '../intake.ts';
 import { newProfile, vaultFixture } from './helpers/vault-fixture.ts';
 import { observeVaultQueueWork } from './helpers/vault-queue-work.ts';
 import { fictionalModel } from './fictional-model.ts';
+import { createImportDiagnostics, type ImportDiagnostics } from '../import-diagnostics.ts';
+import { diagnosticArchiveLimits } from '../import-diagnostic-archive.ts';
+import { recentPerformanceLimits } from '../import-performance.ts';
 
-async function fixture(t: test.TestContext) {
+async function fixture(t: test.TestContext, diagnostics?: ImportDiagnostics) {
   fictionalModel(t);
-  const f = vaultFixture(t);
+  const f = vaultFixture(t, { diagnostics });
   const created = await newProfile(f.manager, 'Fictional queue publication person');
   const state = f.manager.opened.get(created.profile.id)!;
   const databases = new Map([[state.id, state.db]]);
   const assistant = createAssistant({
+    diagnostics,
     root: state.root,
     databases,
     availability: () => ({ available: false, readiness: 'unavailable' }),
@@ -27,6 +31,7 @@ async function fixture(t: test.TestContext) {
   });
   let instant = 0;
   const batches = createIntakeBatchManager({
+    diagnostics,
     root: state.root,
     databases,
     assistant,
@@ -57,7 +62,9 @@ async function fixture(t: test.TestContext) {
 }
 
 test('real encrypted manager changes and response flush remain bounded at 0/100/200/300 retained transitions', async (t) => {
-  const f = await fixture(t);
+  const diagnostics = createImportDiagnostics({ enabled: true });
+  const f = await fixture(t, diagnostics);
+  t.after(() => diagnostics.close());
   const { id } = f.state;
   const directory = join(f.state.workspace, 'intake-batches', f.batch.id, 'events');
   const first = fs.readdirSync(directory).find((name) => name.endsWith('.json'))!;
@@ -69,21 +76,88 @@ test('real encrypted manager changes and response flush remain bounded at 0/100/
   const originalCiphertext = fs.readFileSync(
     join(f.manager.pathFor(id), 'vault/objects', sourceMetadata.files[originalName] + '.enc'),
   );
-  const stop = () =>
-    observeVaultQueueWork(() => {
-      const batch = f.batches.stop(id, f.batch.id);
-      // The foreground response performs this generic flush after the queue
-      // writer and accepted-record hooks. Include its complete real I/O.
-      f.manager.flush(id);
-      return batch;
-    });
-  let last = stop();
-  const samples = [{ transitions: 0, work: last.work }];
+  const diagnosticsSetupTotals = { operations: 0, writes: 0, writeBytes: 0 };
+  const allWrites = (work: ReturnType<typeof observeVaultQueueWork>['work']) => {
+    const total = { writes: 0, writeBytes: 0 };
+    for (const key of [
+      'queue',
+      'otherWorkspace',
+      'objects',
+      'indices',
+      'manifest',
+      'other',
+    ] as const) {
+      total.writes += work[key].writes;
+      total.writeBytes += work[key].writeBytes;
+    }
+    return total;
+  };
+  const stop = (transitions: number) => {
+    // A chunk flush is triggered by the diagnostic buffer, not queue history.
+    // Measure its pending work before starting every foreground sample empty.
+    const setup = observeVaultQueueWork(() => diagnostics.flushSummaries(id));
+    diagnosticsSetupTotals.operations++;
+    const setupWrites = allWrites(setup.work);
+    diagnosticsSetupTotals.writes += setupWrites.writes;
+    diagnosticsSetupTotals.writeBytes += setupWrites.writeBytes;
+    let bufferedFlush: ReturnType<typeof observeVaultQueueWork<void>> | undefined;
+    if (transitions % 100 === 0) {
+      const store = f.state.vault.diagnosticChunks();
+      const before = store.work();
+      const record = () =>
+        diagnostics.record(
+          'import.progress',
+          { phase: 'fictional_queue_sample', files: 1 },
+          { profileId: id },
+        );
+      for (let event = 1; event < diagnosticArchiveLimits.maxEventsPerChunk; event++) record();
+      bufferedFlush = observeVaultQueueWork(record);
+      const bufferedWrites = allWrites(bufferedFlush.work);
+      assert.equal(store.work().chunkWrites, before.chunkWrites + 1);
+      assert.equal(bufferedFlush.work.otherWorkspace.writes, 6);
+      assert.equal(bufferedWrites.writes, 6);
+      assert.ok(bufferedFlush.work.otherWorkspace.writeBytes > 0);
+      assert.ok(bufferedWrites.writeBytes <= diagnosticArchiveLimits.maxChunkBytes + 4096);
+      assert.ok(Object.values(bufferedFlush.work.queue).every((count) => count === 0));
+    }
+    const foreground = observeVaultQueueWork(() =>
+      diagnostics.run({ profileId: id }, () => {
+        const batch = f.batches.stop(id, f.batch.id);
+        // The foreground response performs this generic flush after the queue
+        // writer and accepted-record hooks. Include its complete real I/O.
+        f.manager.flush(id);
+        return batch;
+      }),
+    );
+    assert.ok(
+      setupWrites.writeBytes <=
+        diagnosticArchiveLimits.maxChunkBytes + recentPerformanceLimits.maxBytes + 2 * 4096,
+    );
+    assert.ok(setup.work.otherWorkspace.writes <= 12);
+    assert.ok(setupWrites.writes <= 12);
+    assert.ok(Object.values(setup.work.queue).every((count) => count === 0));
+    return { ...foreground, diagnosticsSetup: setup.work, bufferedFlush: bufferedFlush?.work };
+  };
+  let last = stop(0);
+  const samples = [
+    {
+      transitions: 0,
+      work: last.work,
+      diagnosticsSetup: last.diagnosticsSetup,
+      bufferedFlush: last.bufferedFlush,
+    },
+  ];
   for (let transition = 1; transition <= 300; transition++) {
     if (transition % 2) f.batches.resume(id, f.batch.id);
     else {
-      last = stop();
-      if (transition % 100 === 0) samples.push({ transitions: transition, work: last.work });
+      last = stop(transition);
+      if (transition % 100 === 0)
+        samples.push({
+          transitions: transition,
+          work: last.work,
+          diagnosticsSetup: last.diagnosticsSetup,
+          bufferedFlush: last.bufferedFlush,
+        });
     }
   }
   for (const sample of samples) {
@@ -135,8 +209,9 @@ test('real encrypted manager changes and response flush remain bounded at 0/100/
   t.diagnostic(
     JSON.stringify({
       samples,
+      diagnosticsSetupTotals,
       scope:
-        'Real encrypted queue manager Stop, accepted-record hooks and generic response flush. Non-queue workspace scans are measured separately and still depend on unrelated workspace contents; cold reopen is excluded.',
+        'Real encrypted queue manager Stop, accepted-record hooks and generic response flush. Enabled diagnostics pending-buffer setup and full 128-event chunk flushes are measured separately. Non-queue workspace scans still depend on unrelated workspace contents; cold reopen is excluded.',
     }),
   );
 });

@@ -4,7 +4,8 @@ import { createImportDiagnostics } from '../import-diagnostics.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import type { IncomingMessage } from 'node:http';
+import { IncomingMessage } from 'node:http';
+import { Socket } from 'node:net';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import fs from 'node:fs';
 import childProcess from 'node:child_process';
@@ -16,6 +17,7 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import {
   uploadIntake,
   getIntake,
+  getIntakeRead,
   createIntakePlan,
   getIntakeOriginal,
   saveIntakePackagePlan,
@@ -34,6 +36,7 @@ import { readJSONStructure } from '../intake-json.ts';
 import { PackageInspectionError } from '../intake-package-worker.ts';
 import { handleIntakeRoute } from '../intake-routes.ts';
 import type { IntakeWithWorkflow } from '../intake-continuation.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
 
 type PackageIndex = Parameters<typeof validatePackageRolePlan>[0];
 type PackageMember = NonNullable<PackageIndex['members']>[number];
@@ -58,6 +61,7 @@ test('package routes paginate inventory and scope selected member reads without 
     resource: 'intakes',
     method: 'GET',
     action: 'package',
+    req: new IncomingMessage(new Socket()),
     params: new URLSearchParams('offset=50&limit=10'),
     respond: (value: unknown) => {
       response = value as NonNullable<typeof response>;
@@ -83,7 +87,9 @@ test('package routes paginate inventory and scope selected member reads without 
       ...context,
       method: 'POST',
       action: 'package-member',
-      req: { headers: { 'content-type': 'application/json' } } as unknown as IncomingMessage,
+      req: Object.assign(new IncomingMessage(new Socket()), {
+        headers: { 'content-type': 'application/json' },
+      }),
       body: async () =>
         Buffer.from(
           JSON.stringify({
@@ -114,7 +120,9 @@ test('package routes paginate inventory and scope selected member reads without 
         ...context,
         method: 'POST',
         action: 'package-member',
-        req: { headers: { 'content-type': 'application/json' } } as unknown as IncomingMessage,
+        req: Object.assign(new IncomingMessage(new Socket()), {
+          headers: { 'content-type': 'application/json' },
+        }),
         body: async () => Buffer.from(JSON.stringify({ memberId: 'fictional-missing' })),
       }),
     ),
@@ -131,7 +139,9 @@ test('package routes paginate inventory and scope selected member reads without 
   assert.ok(response);
   assert.match(response.structure.literal, /fictional-A/);
   assert.equal(response.member.memberId, memberId);
-  assert.equal(getIntake(f.db, f.root, f.profileId, f.id).proposals.length, 0);
+  const current = getIntakeRead(f.db, f.root, f.profileId, f.id);
+  assert.ok(isIntakeSummary(current));
+  assert.equal(current.collections.proposals.total, 0);
   await assert.rejects(
     readIntakePackageMember({
       ...f,

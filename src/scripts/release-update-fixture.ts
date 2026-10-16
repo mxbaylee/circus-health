@@ -58,7 +58,10 @@ export function releaseArchiveFormats(data: string, kit: RecoveryKit) {
     assert.equal(keyring.format, 'circus-health-keyring-v1');
     assert.equal(manifest.format, 'circus-health-vault-head-v2');
     assert.equal(index.format, 'circus-health-vault-index-delta-v2');
-    assert.equal(history.format, 'health-record-versions-v1');
+    assert.ok(
+      history.format === 'health-record-versions-v1' ||
+        history.format === 'health-record-versions-v2',
+    );
     assert(Number.isSafeInteger(history.schemaVersion));
     assert.equal(
       readFileSync(join(directory, 'vault/manifest.enc')).subarray(0, 8).toString(),

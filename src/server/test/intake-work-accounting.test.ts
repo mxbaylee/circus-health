@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, transaction } from '../database.ts';
 import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state-storage.ts';
-import { sourceFileDetails } from '../intake-state-access.ts';
+import { intakeSourceMetadata, sourceFileDetails } from '../intake-state-access.ts';
 import { stageIntakeEnvelope } from '../intake-authority.ts';
 import { validateProductionIntakeAuthority } from '../intake-state-bootstrap.ts';
 import { intakeWorkCounters, recordIntakeWork, withIntakeWork } from '../intake-work-accounting.ts';
@@ -228,8 +228,17 @@ test('actual intake upload/retrieval counts file payloads, stream hashes, cache 
     assert.ok(counters.bufferHashBytes >= bytes.length);
     await Promise.resolve();
     const before = { ...counters };
+    clearIntakeStateCache(db);
+    const metadataBefore = intakeWorkCounters(db);
     const original = getIntakeOriginal(db, root, profileId, uploaded.id);
     assert.deepEqual(original.bytes, bytes);
+    assert.equal(original.filename, 'invented.txt');
+    const metadataAfter = intakeWorkCounters(db);
+    assert.equal(metadataAfter.warm.envelopeHydrations, metadataBefore.warm.envelopeHydrations);
+    assert.equal(
+      metadataAfter.primitive.coldReconstructions,
+      metadataBefore.primitive.coldReconstructions,
+    );
     assert.equal(counters.readBytes - before.readBytes, bytes.length);
     assert.equal(counters.reads - before.reads, 1);
     const streams = { ...counters };
@@ -253,4 +262,24 @@ test('actual intake upload/retrieval counts file payloads, stream hashes, cache 
   assert.throws(() => writeIntakeFileSync(-1, bytes));
   assert.deepEqual(counters, saved);
   assert.ok(Object.values(counters).every((value) => typeof value === 'number'));
+});
+
+test('compact original headers preserve raw duplicate semantics and reject missing selected authority', (t) => {
+  const db = openDatabase(':memory:', 'fictional-header');
+  t.after(() => db.close());
+  memoryRecordAuthority(db);
+  const id = 'fictional-raw-header';
+  registerRawIntakeFixture(
+    db,
+    id,
+    '{"unknown":{"retained":true},"intake":{"originalName":"first.txt","version":1},"intake":{"originalName":"earlier.txt","originalName":"last.txt","version":2,"workflow":{"format":"health-intake-workflow-v1"}}}',
+  );
+  clearIntakeStateCache(db);
+  const before = intakeWorkCounters(db);
+  assert.equal(intakeSourceMetadata(db, id).originalName, 'last.txt');
+  const after = intakeWorkCounters(db);
+  assert.equal(after.warm.envelopeHydrations, before.warm.envelopeHydrations);
+  assert.equal(after.primitive.coldReconstructions, before.primitive.coldReconstructions);
+  transaction(db, () => db.prepare("DELETE FROM app_meta WHERE key GLOB '*:head'").run());
+  assert.throws(() => intakeSourceMetadata(db, id), /missing selected intake head/);
 });

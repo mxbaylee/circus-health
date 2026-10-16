@@ -1,5 +1,6 @@
 import { requireStoredIntakeDetails, writeIntakeDetails } from './intake-state-access.ts';
 import { latestOwnershipDecision } from './ownership-journal.ts';
+import { ownershipDecisionQueries } from './ownership-decision-index.ts';
 import {
   intakeWorkflow,
   addWorkflowQuestion,
@@ -29,6 +30,15 @@ import type {
   IntakeEvidenceComparison,
 } from '../shared/intake.ts';
 import { HttpError, json, now, revision } from './database.ts';
+import {
+  savedDuplicateEvidenceReference,
+  selectedDuplicateEvidenceDigest,
+  savedDuplicateOriginalOverlap,
+} from './duplicate-evidence-index.ts';
+import type {
+  SavedDuplicateEvidenceReference,
+  RetainedDuplicateEvidenceReference,
+} from '../shared/saved-duplicate-evidence.ts';
 type ClinicalKind = 'observation' | 'medication' | 'procedure' | 'document';
 type DuplicateOutcome = (typeof duplicateOutcomes)[number];
 type SqlRow = Record<string, unknown>;
@@ -47,7 +57,7 @@ interface DuplicateReviewEvidence {
   contentUrl?: string;
 }
 
-interface DuplicateEvidence extends DuplicateReviewEvidence {
+export interface DuplicateEvidence extends DuplicateReviewEvidence {
   sourceRecordId: string;
   contentUrl: string;
 }
@@ -66,6 +76,35 @@ export interface DuplicateRecord extends DuplicateIdentity {
   mapping: IntakeClinicalMapping | SqlRow;
   evidence: DuplicateEvidence[];
   stateHash: string;
+}
+export type DuplicateRecordHeader = Omit<DuplicateRecord, 'evidence'>;
+export interface DuplicateEvidenceSequence extends Iterable<DuplicateEvidence> {
+  readonly length: number;
+}
+export type StreamingDuplicateRecord = DuplicateRecordHeader & {
+  evidence: DuplicateEvidenceSequence;
+};
+export type NativeDuplicateRecord = DuplicateRecordHeader & {
+  evidence: SavedDuplicateEvidenceReference;
+};
+type DuplicatePolicyRecord = DuplicateRecord | StreamingDuplicateRecord | NativeDuplicateRecord;
+export function nativeDuplicateRecord(
+  db: DatabaseSync,
+  kind: string,
+  id: string,
+): NativeDuplicateRecord {
+  return {
+    ...duplicateRecordHeader(db, kind, id),
+    evidence: savedDuplicateEvidenceReference(db, kind, id),
+  };
+}
+function evidenceValues(
+  db: DatabaseSync,
+  record: DuplicatePolicyRecord,
+): Iterable<DuplicateEvidence> {
+  return 'format' in record.evidence
+    ? duplicateEvidenceRows(db, record.kind, record.id)
+    : record.evidence;
 }
 
 export interface DuplicateReviewRecord extends DuplicateIdentity {
@@ -124,7 +163,11 @@ export interface DuplicateDecision {
   outcome: DuplicateOutcome;
   reason: string;
   occurrenceEvidence?: 'attach';
-  evidence: { left: DuplicateReviewEvidence[]; right: DuplicateReviewEvidence[] };
+  evidence: {
+    left: DuplicateReviewEvidence[];
+    right: DuplicateReviewEvidence[] | RetainedDuplicateEvidenceReference;
+  };
+  evidenceBasis?: 'reviewed-pre-projection-v1';
   previousDecisionId: string | null;
   at: string;
   sequence: number;
@@ -170,7 +213,11 @@ const parsedObject = (value: unknown): Record<string, unknown> => {
     : {};
 };
 
-export function duplicateRecord(db: DatabaseSync, kind: string, id: string): DuplicateRecord {
+export function duplicateRecordHeader(
+  db: DatabaseSync,
+  kind: string,
+  id: string,
+): DuplicateRecordHeader {
   if (!isClinicalKind(kind))
     throw new HttpError(400, 'DUPLICATE_KIND', 'Choose a supported clinical kind');
   const row = db.prepare(`SELECT * FROM ${tables[kind]} WHERE id=?`).get(id) as SqlRow | undefined;
@@ -178,11 +225,6 @@ export function duplicateRecord(db: DatabaseSync, kind: string, id: string): Dup
     throw new HttpError(404, 'RECORD_NOT_FOUND', 'Comparison record not found in this profile');
   const imported = parsedObject(parsedObject(row.extra_json).import);
   const acceptedMapping = parsedObject(imported.acceptedMapping);
-  const sources = db
-    .prepare(
-      'SELECT s.*,e.locator_json AS evidence_locator,p.name AS acquiring_source FROM evidence e JOIN source_records s ON s.id=e.source_record_id LEFT JOIN providers p ON p.id=s.provider_id WHERE e.entity_type=? AND e.entity_id=? ORDER BY e.id',
-    )
-    .all(kind, id) as SqlRow[];
   return {
     id,
     kind,
@@ -199,24 +241,72 @@ export function duplicateRecord(db: DatabaseSync, kind: string, id: string): Dup
           ? stringValue(imported.personId) || 'patient'
           : stringValue(row.person_id) || 'patient',
     },
-    evidence: sources.map((source) => ({
-      label: stringValue(source.acquiring_source) || 'Original source',
-      locator:
-        stringValue(parsedObject(source.evidence_locator).locator) ||
-        stringValue(parsedObject(source.locator_json).locator) ||
-        stringValue(source.source_key) ||
-        'Retained record',
-      sourceRecordId: stringValue(source.id) || '',
-      original: json(source.raw_json),
-      contentUrl: `/api/sources/${encodeURIComponent(
-        stringValue(parsedObject(source.evidence_locator).originalSourceFileId) ||
-          stringValue(source.source_file_id) ||
-          '',
-      )}/content`,
-    })),
   };
 }
-const reference = (record: DuplicateReviewRecord): DuplicateReference => ({
+export function* duplicateEvidenceRows(
+  db: DatabaseSync,
+  kind: ClinicalKind,
+  id: string,
+): Generator<DuplicateEvidence> {
+  for (const source of db
+    .prepare(
+      'SELECT s.*,e.locator_json AS evidence_locator,p.name AS acquiring_source FROM evidence e JOIN source_records s ON s.id=e.source_record_id LEFT JOIN providers p ON p.id=s.provider_id WHERE e.entity_type=? AND e.entity_id=? ORDER BY e.id',
+    )
+    .iterate(kind, id)) {
+    yield duplicateEvidenceValue(source);
+  }
+}
+export function duplicateEvidenceValue(source: SqlRow): DuplicateEvidence {
+  return {
+    label: stringValue(source.acquiring_source) || 'Original source',
+    locator:
+      stringValue(parsedObject(source.evidence_locator).locator) ||
+      stringValue(parsedObject(source.locator_json).locator) ||
+      stringValue(source.source_key) ||
+      'Retained record',
+    sourceRecordId: stringValue(source.id) || '',
+    original: json(source.raw_json),
+    contentUrl: `/api/sources/${encodeURIComponent(
+      stringValue(parsedObject(source.evidence_locator).originalSourceFileId) ||
+        stringValue(source.source_file_id) ||
+        '',
+    )}/content`,
+  };
+}
+/** Policy can inspect every source while retaining one evidence row at a time. */
+export function streamingDuplicateRecord(
+  db: DatabaseSync,
+  kind: string,
+  id: string,
+): StreamingDuplicateRecord {
+  const header = duplicateRecordHeader(db, kind, id);
+  return {
+    ...header,
+    evidence: {
+      get length() {
+        return Number(
+          db
+            .prepare(
+              'SELECT COUNT(*) AS n FROM evidence e JOIN source_records s ON s.id=e.source_record_id WHERE e.entity_type=? AND e.entity_id=?',
+            )
+            .get(header.kind, id)!.n,
+        );
+      },
+      [Symbol.iterator]: () => duplicateEvidenceRows(db, header.kind, id),
+    },
+  };
+}
+/** Legacy callers explicitly request the complete legacy DTO. */
+export function duplicateRecord(db: DatabaseSync, kind: string, id: string): DuplicateRecord {
+  const record = streamingDuplicateRecord(db, kind, id);
+  return {
+    ...record,
+    evidence: Array.from(record.evidence),
+  };
+}
+const reference = (
+  record: DuplicateIdentity & Pick<DuplicateReviewRecord, 'id' | 'sourceRecordId'>,
+): DuplicateReference => ({
   kind: record.kind,
   id: record.id,
   sourceRecordId: record.sourceRecordId,
@@ -274,8 +364,11 @@ export interface IntakePairIncoming extends DuplicateReviewRecord {
 }
 export const intakeEnvelopeState = (value: HealthRecordEnvelope): string =>
   'candidate-version:' + createHash('sha256').update(canonicalLiteral(value)).digest('hex');
-function scopedEvidence(db: DatabaseSync, evidence: DuplicateReviewEvidence[]): unknown[] {
-  return evidence.map((item) => {
+function* scopedEvidence(
+  db: DatabaseSync,
+  evidence: Iterable<DuplicateReviewEvidence>,
+): Generator<unknown> {
+  for (const item of evidence) {
     const match = /^\/api\/sources\/([^/?#]+)\/content(?:[?#]|$)/.exec(item.contentUrl || '');
     let source: unknown = null;
     if (match) {
@@ -298,8 +391,18 @@ function scopedEvidence(db: DatabaseSync, evidence: DuplicateReviewEvidence[]): 
           'The exact original reference is unavailable',
         );
     }
-    return { evidence: item, source };
-  });
+    yield { evidence: item, source };
+  }
+}
+function canonicalArrayHash(values: Iterable<unknown>): string {
+  const hash = createHash('sha256').update('[');
+  let first = true;
+  for (const value of values) {
+    if (!first) hash.update(',');
+    first = false;
+    hash.update(canonicalLiteral(value));
+  }
+  return hash.update(']').digest('hex');
 }
 
 const occurrenceEvidenceId = (
@@ -311,24 +414,24 @@ const occurrenceEvidenceId = (
   'evidence:reviewed-occurrence:' +
   scopeHash([transitionId, incomingSourceRecordId, targetKind, targetRecordId]);
 
-function occurrenceTransitions(
+function* occurrenceTransitions(
   db: DatabaseSync,
   incomingSourceRecordId: string,
-): OccurrenceAttachmentTransition[] {
-  return (
+): Generator<OccurrenceAttachmentTransition> {
+  const rows =
+    ownershipDecisionQueries(db)?.transitions(incomingSourceRecordId) ||
     db
       .prepare(
         "SELECT coverage_json FROM manual_batches WHERE title='Duplicate evidence decision' AND json_extract(coverage_json,'$.duplicateDecision.occurrenceAttachment.incomingSourceRecordId')=? ORDER BY json_extract(coverage_json,'$.duplicateDecision.sequence'),id",
       )
-      .all(incomingSourceRecordId) as { coverage_json: string }[]
-  ).flatMap((row) => {
+      .iterate(incomingSourceRecordId);
+  for (const row of rows) {
     const transition = parsedObject(
       parsedObject(json(row.coverage_json)).duplicateDecision,
     ).occurrenceAttachment;
-    return transition && typeof transition === 'object' && !Array.isArray(transition)
-      ? [transition as OccurrenceAttachmentTransition]
-      : [];
-  });
+    if (transition && typeof transition === 'object' && !Array.isArray(transition))
+      yield transition as OccurrenceAttachmentTransition;
+  }
 }
 
 function latestOccurrenceAttachment(
@@ -337,20 +440,21 @@ function latestOccurrenceAttachment(
   targetKind?: ClinicalKind,
   targetRecordId?: string,
 ): OccurrenceAttachmentTransition | null {
-  const matching = occurrenceTransitions(db, incomingSourceRecordId).filter(
-    (transition) =>
+  let latest: OccurrenceAttachmentTransition | null = null;
+  for (const transition of occurrenceTransitions(db, incomingSourceRecordId))
+    if (
       (!targetKind || transition.targetKind === targetKind) &&
-      (!targetRecordId || transition.targetRecordId === targetRecordId),
-  );
+      (!targetRecordId || transition.targetRecordId === targetRecordId)
+    )
+      latest = transition;
   const correction = latestOwnershipDecision<{ revision: number }>(
     db,
     'Record ownership source',
     'sourceRecordId',
     incomingSourceRecordId,
   );
-  const latest = matching.at(-1);
   if (correction && latest && correction.revision >= latest.appliedRevision) return null;
-  return matching.at(-1) || null;
+  return latest;
 }
 
 function latestOccurrenceDecision(
@@ -425,6 +529,16 @@ function rawSavedEvidenceAuthority(
   targetRecordId: string,
   active: OccurrenceAttachmentTransition | null,
 ): string {
+  return canonicalArrayHash(
+    rawSavedEvidenceValues(db, targetKind, targetRecordId, active?.evidenceId),
+  );
+}
+export function* rawSavedEvidenceValues(
+  db: DatabaseSync,
+  targetKind: ClinicalKind,
+  targetRecordId: string,
+  excludedEvidenceId?: string,
+): Generator<unknown> {
   const rows = db
     .prepare(
       `SELECT e.id,e.entity_type,e.entity_id,e.source_record_id,e.role,e.locator_json,
@@ -436,37 +550,36 @@ function rawSavedEvidenceAuthority(
       LEFT JOIN source_files o ON o.id=COALESCE(json_extract(e.locator_json,'$.originalSourceFileId'),s.source_file_id)
       WHERE e.entity_type=? AND e.entity_id=? ORDER BY e.id`,
     )
-    .all(targetKind, targetRecordId) as Record<string, unknown>[];
-  if (rows.some((row) => !row.original_source_file_id))
-    throw new HttpError(
-      409,
-      'DUPLICATE_EVIDENCE',
-      'A saved evidence row no longer has its exact retained original',
-    );
-  return scopeHash(
-    rows
-      .filter((row) => !active || row.id !== active.evidenceId)
-      .map((row) => ({
-        id: row.id,
-        entityType: row.entity_type,
-        entityId: row.entity_id,
-        sourceRecordId: row.source_record_id,
-        role: row.role,
-        locator: row.locator_json,
-        sourceFileId: row.source_file_id,
-        providerId: row.provider_id,
-        sourceKey: row.source_key,
-        kind: row.kind,
-        rawHash: scopeHash(String(row.raw_json)),
-        sourceLocatorHash: scopeHash(String(row.source_locator_json)),
-        extractionStatus: row.extraction_status,
-        sourceFileSha256: row.source_file_sha256,
-        sourceFileBytes: row.source_file_bytes,
-        originalSourceFileId: row.original_source_file_id,
-        originalSourceFileSha256: row.original_source_file_sha256,
-        originalSourceFileBytes: row.original_source_file_bytes,
-      })),
-  );
+    .iterate(targetKind, targetRecordId);
+  for (const row of rows) {
+    if (!row.original_source_file_id)
+      throw new HttpError(
+        409,
+        'DUPLICATE_EVIDENCE',
+        'A saved evidence row no longer has its exact retained original',
+      );
+    if (excludedEvidenceId && row.id === excludedEvidenceId) continue;
+    yield {
+      id: row.id,
+      entityType: row.entity_type,
+      entityId: row.entity_id,
+      sourceRecordId: row.source_record_id,
+      role: row.role,
+      locator: row.locator_json,
+      sourceFileId: row.source_file_id,
+      providerId: row.provider_id,
+      sourceKey: row.source_key,
+      kind: row.kind,
+      rawHash: scopeHash(String(row.raw_json)),
+      sourceLocatorHash: scopeHash(String(row.source_locator_json)),
+      extractionStatus: row.extraction_status,
+      sourceFileSha256: row.source_file_sha256,
+      sourceFileBytes: row.source_file_bytes,
+      originalSourceFileId: row.original_source_file_id,
+      originalSourceFileSha256: row.original_source_file_sha256,
+      originalSourceFileBytes: row.original_source_file_bytes,
+    };
+  }
 }
 
 function sourceRecordAuthority(db: DatabaseSync, sourceRecordId: string): unknown {
@@ -502,7 +615,7 @@ function sourceRecordAuthority(db: DatabaseSync, sourceRecordId: string): unknow
 function durableAttachmentAuthority(
   db: DatabaseSync,
   incoming: IntakePairIncoming,
-  saved: DuplicateRecord,
+  saved: DuplicatePolicyRecord,
   contextHash: string,
   active: OccurrenceAttachmentTransition | null,
 ): string {
@@ -530,7 +643,7 @@ function durableAttachmentAuthority(
 function occurrenceAttachmentCurrent(
   db: DatabaseSync,
   incoming: IntakePairIncoming,
-  saved: DuplicateRecord,
+  saved: DuplicatePolicyRecord,
   contextHash: string | undefined,
   transition: OccurrenceAttachmentTransition,
 ): boolean {
@@ -575,7 +688,7 @@ function sameDurablePairScope(left: unknown, right: IntakePairScope): boolean {
 export function intakePairScope(
   db: DatabaseSync,
   incoming: IntakePairIncoming,
-  saved: DuplicateRecord,
+  saved: DuplicatePolicyRecord,
   occurrence?: Pick<IntakeOccurrenceContext, 'intakeVersion' | 'contextHash'>,
 ): IntakePairScope {
   const profileId = String(
@@ -599,7 +712,10 @@ export function intakePairScope(
       incoming: intakePairReference(db, incoming),
       saved: {
         ...intakePairReference(db, saved),
-        evidenceHash: rawSavedEvidenceAuthority(db, saved.kind, saved.id, active),
+        evidenceHash:
+          !active && 'format' in saved.evidence
+            ? selectedDuplicateEvidenceDigest(db, saved.kind, saved.id).rawDigest
+            : rawSavedEvidenceAuthority(db, saved.kind, saved.id, active),
         recordId: saved.id,
       },
       activeAttachment: active
@@ -623,7 +739,7 @@ export function intakePairScope(
 }
 export function intakePairReference(
   db: DatabaseSync,
-  record: IntakePairIncoming | DuplicateRecord,
+  record: IntakePairIncoming | DuplicatePolicyRecord,
 ) {
   return {
     kind: record.kind,
@@ -631,13 +747,16 @@ export function intakePairReference(
     identity: record.identity,
     version: record.version,
     stateHash: record.stateHash,
-    evidenceHash: scopeHash(scopedEvidence(db, record.evidence)),
+    evidenceHash:
+      'format' in record.evidence
+        ? selectedDuplicateEvidenceDigest(db, record.kind, record.id).scopeDigest
+        : canonicalArrayHash(scopedEvidence(db, record.evidence)),
   };
 }
 export function requireIntakePairScope(
   db: DatabaseSync,
   incoming: IntakePairIncoming,
-  saved: DuplicateRecord,
+  saved: DuplicatePolicyRecord,
   scope: unknown,
   occurrence?: IntakeOccurrenceContext,
 ): void {
@@ -656,27 +775,35 @@ export function verifyDuplicateOriginals(
   db: DatabaseSync,
   root: string,
   profileId: string,
-  record: DuplicateRecord,
+  record: DuplicatePolicyRecord,
   verified: Set<string>,
 ): void {
-  const sourceIds = new Set<string>();
   // The evidence link can point to an uploaded original while the accepted
   // assertion itself came from a retained transcription/proposal. Both are
   // dependencies of this comparison; verify the carrier without rescanning
   // unrelated originals as the former whole-profile snapshot did.
-  for (const sourceRecordId of new Set([
-    record.sourceRecordId,
-    ...record.evidence.map((evidence) => evidence.sourceRecordId),
-  ])) {
-    if (!sourceRecordId) continue;
+  const verify = (id: string) => {
+    if (verified.has(id)) return;
+    const source = db.prepare('SELECT path,bytes,sha256 FROM source_files WHERE id=?').get(id) as
+      { path: string; bytes: number; sha256: string } | undefined;
+    if (!source)
+      throw new HttpError(409, 'DUPLICATE_EVIDENCE', 'The saved record original is unavailable');
+    verifyIntakeFileHash(profileOriginal(root, source.path, profileId), source);
+    if (verified.size >= 256) verified.delete(verified.values().next().value!);
+    verified.add(id);
+  };
+  const carrier = (sourceRecordId: string) => {
+    if (!sourceRecordId) return;
     const source = db
       .prepare('SELECT source_file_id FROM source_records WHERE id=?')
       .get(sourceRecordId);
     if (!source)
       throw new HttpError(409, 'DUPLICATE_EVIDENCE', 'The saved assertion source is unavailable');
-    sourceIds.add(String(source.source_file_id));
-  }
-  for (const evidence of record.evidence) {
+    verify(String(source.source_file_id));
+  };
+  carrier(record.sourceRecordId);
+  for (const evidence of evidenceValues(db, record)) {
+    carrier(evidence.sourceRecordId);
     const match = /^\/api\/sources\/([^/?#]+)\/content(?:[?#]|$)/.exec(evidence.contentUrl);
     if (!match)
       throw new HttpError(
@@ -684,16 +811,7 @@ export function verifyDuplicateOriginals(
         'DUPLICATE_EVIDENCE',
         'Both records need their exact retained originals',
       );
-    sourceIds.add(decodeURIComponent(match[1]!));
-  }
-  for (const id of sourceIds) {
-    if (verified.has(id)) continue;
-    const source = db.prepare('SELECT path,bytes,sha256 FROM source_files WHERE id=?').get(id) as
-      { path: string; bytes: number; sha256: string } | undefined;
-    if (!source)
-      throw new HttpError(409, 'DUPLICATE_EVIDENCE', 'The saved record original is unavailable');
-    verifyIntakeFileHash(profileOriginal(root, source.path, profileId), source);
-    verified.add(id);
+    verify(decodeURIComponent(match[1]!));
   }
 }
 export function intakePairDraftStatus(
@@ -701,14 +819,27 @@ export function intakePairDraftStatus(
   incoming: IntakePairIncoming,
   decision: { otherRecordId: string; scope?: IntakePairScope } | undefined,
   occurrence?: IntakeOccurrenceContext,
+  nativeRetained = false,
 ): IntakePairDraftScopeStatus {
   if (!decision) return 'none';
   if (!decision.scope) return 'missing';
   try {
+    if (nativeRetained)
+      return sameDurablePairScope(
+        decision.scope,
+        intakePairScope(
+          db,
+          incoming,
+          nativeDuplicateRecord(db, incoming.kind, decision.otherRecordId),
+          occurrence,
+        ),
+      )
+        ? 'current'
+        : 'stale';
     requireIntakePairScope(
       db,
       incoming,
-      duplicateRecord(db, incoming.kind, decision.otherRecordId),
+      streamingDuplicateRecord(db, incoming.kind, decision.otherRecordId),
       decision.scope,
       occurrence,
     );
@@ -720,7 +851,7 @@ export function intakePairDraftStatus(
 export function intakePairPreviousDecision(
   db: DatabaseSync,
   incoming: IntakePairIncoming,
-  candidate: DuplicateRecord,
+  candidate: DuplicatePolicyRecord,
   scope: IntakePairScope,
   contextHash?: string,
 ): IntakeEvidenceComparison['previousDecision'] {
@@ -757,12 +888,38 @@ export function buildIntakeRelatedReview(
   decisions: IntakePairDecision[] = [],
   search: RelatedRecordSearch = {},
   occurrence?: IntakeOccurrenceContext,
+  options: { native?: boolean } = {},
 ) {
-  const found = discoverDuplicateCandidates(db, incoming.kind, mapping, incoming.identity, search);
+  const found = options.native
+    ? (() => {
+        const found = relatedRecordIds(
+          db,
+          { kind: incoming.kind, mapping, identity: incoming.identity },
+          search,
+        );
+        return {
+          page: found.page,
+          records: found.matches.map((match) => ({
+            ...nativeDuplicateRecord(db, incoming.kind, match.id),
+            discoveryReasons: match.reasons,
+          })),
+        };
+      })()
+    : discoverDuplicateCandidates(db, incoming.kind, mapping, incoming.identity, search);
   const comparisons: IntakeEvidenceComparison[] = found.records.map((candidate) => {
     const scope = intakePairScope(db, incoming, candidate, occurrence);
     return {
       ...candidate,
+      ...(options.native
+        ? {
+            originalOverlap: savedDuplicateOriginalOverlap(
+              db,
+              candidate.kind,
+              candidate.id,
+              incoming.evidence,
+            ),
+          }
+        : {}),
       mapping: candidate.mapping as IntakeClinicalMapping,
       previousDecision: intakePairPreviousDecision(
         db,
@@ -777,6 +934,7 @@ export function buildIntakeRelatedReview(
         incoming,
         decisions.find((decision) => decision.otherRecordId === candidate.id),
         occurrence,
+        options.native,
       ),
     };
   });
@@ -786,14 +944,14 @@ export function buildIntakeRelatedReview(
     comparisonReference: intakePairReference(db, incoming),
     comparisonDrafts: decisions.map((decision) => ({
       otherRecordId: decision.otherRecordId,
-      status: intakePairDraftStatus(db, incoming, decision, occurrence),
+      status: intakePairDraftStatus(db, incoming, decision, occurrence, options.native),
     })),
   };
 }
 export function saveDuplicateDecision(
   db: DatabaseSync,
   left: DuplicateReviewRecord,
-  right: DuplicateReviewRecord,
+  right: DuplicateReviewRecord | StreamingDuplicateRecord,
   input: DuplicateDecisionInput,
   operationId: string,
   intakeScope?: {
@@ -801,13 +959,14 @@ export function saveDuplicateDecision(
     scope: unknown;
     occurrence?: IntakeOccurrenceContext;
     prevalidated?: boolean;
+    reviewedSavedEvidence?: RetainedDuplicateEvidenceReference;
   },
 ): DuplicateDecision {
   if (intakeScope && !intakeScope.prevalidated)
     requireIntakePairScope(
       db,
       intakeScope.incoming,
-      duplicateRecord(db, right.kind, right.id),
+      streamingDuplicateRecord(db, right.kind, right.id),
       intakeScope.scope,
       intakeScope.occurrence,
     );
@@ -826,12 +985,21 @@ export function saveDuplicateDecision(
     );
   if (
     !intakeScope &&
-    duplicateRecord(db, left.kind, left.id).mapping.personId !==
-      duplicateRecord(db, right.kind, right.id).mapping.personId
+    duplicateRecordHeader(db, left.kind, left.id).mapping.personId !==
+      duplicateRecordHeader(db, right.kind, right.id).mapping.personId
   )
     throw new HttpError(409, 'DUPLICATE_PERSON', 'Both records must belong to the same person');
   if (!left.evidence?.length || !right.evidence?.length)
     throw new HttpError(400, 'DUPLICATE_EVIDENCE', 'Both records need retained original evidence');
+  const rightEvidence =
+    intakeScope?.reviewedSavedEvidence ||
+    (Array.isArray(right.evidence) ? right.evidence : undefined);
+  if (!rightEvidence)
+    throw new HttpError(
+      409,
+      'DUPLICATE_EVIDENCE_PENDING',
+      'Prepare the complete reviewed saved evidence before recording this relationship',
+    );
   if (
     input.occurrenceEvidence !== undefined &&
     (input.occurrenceEvidence !== 'attach' || input.outcome !== 'same_event')
@@ -853,7 +1021,7 @@ export function saveDuplicateDecision(
     );
   const previous = latestDuplicateDecision(db, left, right),
     prior = previous ? parsedObject(parsedObject(json(previous)).duplicateDecision) : null;
-  const saved = intakeScope ? duplicateRecord(db, right.kind, right.id) : null;
+  const saved = intakeScope ? streamingDuplicateRecord(db, right.kind, right.id) : null;
   let active: OccurrenceAttachmentTransition | null = null;
   let priorOccurrenceTransition: OccurrenceAttachmentTransition | null = null;
   if (intakeScope?.occurrence && saved) {
@@ -893,22 +1061,22 @@ export function saveDuplicateDecision(
           : 'OCCURRENCE_ATTACHMENT_TARGET',
         'This corrected contribution already belongs to a saved record. Review another ownership correction to change that assignment.',
       );
-    const activeByTarget = new Map<string, OccurrenceAttachmentTransition>();
-    for (const transition of occurrenceTransitions(db, intakeScope!.incoming.sourceRecordId).filter(
-      (t) =>
+    let other: OccurrenceAttachmentTransition | undefined;
+    for (const transition of occurrenceTransitions(db, intakeScope!.incoming.sourceRecordId)) {
+      if (
         latestOccurrenceAttachment(
           db,
           intakeScope!.incoming.sourceRecordId,
-          t.targetKind,
-          t.targetRecordId,
-        )?.id === t.id,
-    ))
-      activeByTarget.set(`${transition.targetKind}:${transition.targetRecordId}`, transition);
-    const other = [...activeByTarget.values()].find(
-      (transition) =>
+          transition.targetKind,
+          transition.targetRecordId,
+        )?.id === transition.id &&
         transition.status === 'attached' &&
-        (transition.targetKind !== saved!.kind || transition.targetRecordId !== saved!.id),
-    );
+        (transition.targetKind !== saved!.kind || transition.targetRecordId !== saved!.id)
+      ) {
+        other = transition;
+        break;
+      }
+    }
     if (other)
       throw new HttpError(
         409,
@@ -1001,7 +1169,10 @@ export function saveDuplicateDecision(
     outcome: input.outcome,
     reason: input.reason.trim(),
     ...(input.occurrenceEvidence ? { occurrenceEvidence: input.occurrenceEvidence } : {}),
-    evidence: { left: left.evidence, right: right.evidence },
+    evidence: { left: left.evidence, right: rightEvidence },
+    ...(intakeScope?.reviewedSavedEvidence
+      ? { evidenceBasis: 'reviewed-pre-projection-v1' as const }
+      : {}),
     previousDecisionId: stringValue(prior?.id),
     at,
     sequence: Number(
@@ -1131,7 +1302,7 @@ export function refreshOccurrenceAttachmentAuthorities(
         'OCCURRENCE_ATTACHMENT_CHANGED',
         'The durable occurrence decision changed before finalization',
       );
-    const saved = duplicateRecord(db, transition.targetKind, transition.targetRecordId);
+    const saved = streamingDuplicateRecord(db, transition.targetKind, transition.targetRecordId);
     const active =
       transition.status === 'attached'
         ? verifiedActiveAttachment(

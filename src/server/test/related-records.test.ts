@@ -163,6 +163,7 @@ test('ranked discovery finds code aliases beyond exact labels, pages past twelve
   );
   assert.equal(refined.comparisons[0]!.title, 'Independent optical note');
   assert.ok(refined.comparisons[0]!.discoveryReasons!.includes('search_match'));
+  assert.ok(Array.isArray(refined.comparisons[0]!.evidence));
   assert.ok(
     refined.comparisons[0]!.evidence.every((evidence) =>
       evidence.contentUrl?.startsWith('/api/sources/'),

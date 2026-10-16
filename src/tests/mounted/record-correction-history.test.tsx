@@ -81,3 +81,21 @@ it('tolerates legacy metadata without fabricating values or mislabeling later ex
   const view = render(<RecordCorrectionHistory extra={{ import: { manuallyEdited: true } }} />);
   expect(view.container).toBeEmptyDOMElement();
 });
+
+it('treats referenced corrections as real import edits without claiming inline arrays are complete', () => {
+  const extra = {
+    import: { correctionHistorySource: { format: 'health-accepted-contribution-corrections-v1' } },
+  };
+  expect(recordCorrectionStages(extra)).toEqual({ imported: true, later: false });
+  render(
+    <>
+      <RecordCorrectionBadges extra={extra} />
+      <RecordCorrectionHistory extra={extra} open />
+    </>,
+  );
+  expect(screen.getByText('Modified during import')).toBeVisible();
+  expect(screen.getByText('Correction history')).toBeVisible();
+  expect(screen.getByRole('status')).toHaveTextContent(
+    'Open this record to load its complete import correction history',
+  );
+});

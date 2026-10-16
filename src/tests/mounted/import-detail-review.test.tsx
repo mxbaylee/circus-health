@@ -5,6 +5,7 @@ import { StrictMode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import type {
   Intake,
+  IntakeImportFeed,
   IntakeReportAcceptanceResult,
   IntakeReportQueueDetail,
   IntakeReportQueueRecord,
@@ -12,8 +13,20 @@ import type {
   IntakeReview,
 } from '../../shared/intake';
 import type { IntakeIdentityReview } from '../../shared/intake-identity';
-import { ImportDetailReview } from '../../app/features/import/ImportDetailReview';
+import type {
+  CollectionReportDetail,
+  CollectionImportFeed,
+} from '../../shared/intake-clinical-pages';
+import type {
+  ClinicalRecordAction,
+  ClinicalRecordSectionPage,
+} from '../../shared/intake-clinical-record-sections';
+import {
+  ImportDetailReview,
+  ImportRecordDetail,
+} from '../../app/features/import/ImportDetailReview';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
+import { ImportPage } from '../../app/features/import/ImportPage';
 
 vi.mock('../../app/components/SourceDialog', () => ({
   SourcePreview: () => <div>Retained original preview</div>,
@@ -165,6 +178,465 @@ const identityReview: IntakeIdentityReview = {
     scopeToken: 'fictional-scope-token',
   },
 };
+
+function nativeReportDetail(): CollectionReportDetail {
+  const coverage = {
+    total: 1,
+    covered: 0,
+    uncovered: 1,
+    status: 'uncovered' as const,
+    sourceCount: 0,
+    bySource: { items: [], total: 0, nextCursor: null },
+  };
+  return {
+    format: 'health-intake-report-detail-v2',
+    group: {
+      ...reportDetail.group,
+      format: 'health-intake-report-group-v2',
+      groupOrdinal: 0,
+      sourceScope: null,
+      report: null,
+      reportContext: null,
+      peopleCounts: { pending: 0, later: 0, excluded: 0, saved: 0 },
+      sourceCoverage: { current: coverage, saved: coverage },
+      sourceReview: null,
+      records: { intakeId: intake.id, groupId: reportDetail.group.groupId },
+      people: { intakeId: intake.id, groupId: reportDetail.group.groupId },
+    },
+    records: {
+      format: 'health-intake-report-record-page-v2',
+      intakeId: intake.id,
+      version: intake.version,
+      scope: 'clinical_records',
+      view: 'all',
+      records: [
+        {
+          kind: 'record',
+          groupId: reportDetail.group.groupId,
+          proposalId: block.proposalId,
+          reviewToken: block.reviewToken,
+          queueState: 'pending',
+          selectable: false,
+          record: {
+            ...record,
+            identityReview: {
+              status: identityReview.status,
+              blocking: identityReview.blocking,
+              message: identityReview.message,
+              evidencedIdentity: identityReview.evidencedIdentity,
+              conflicts: identityReview.conflicts,
+            },
+          },
+        },
+      ],
+      totalRecords: 2,
+      nextCursor: 'fictional-second-page',
+    },
+    people: {
+      format: 'health-intake-people-page-v2',
+      intakeId: intake.id,
+      groupId: reportDetail.group.groupId,
+      selectedPersonId: null,
+      people: [],
+      totalPeople: 0,
+      counts: { pending: 0, later: 0, excluded: 0, saved: 0 },
+      nextCursor: null,
+    },
+  };
+}
+
+it('keeps an unknown list feed unavailable and retries without exposing provisional review', async () => {
+  selectProfile({ id: 'fictional-list-error', name: 'Rowan', placebo: true });
+  let feedReads = 0;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      if (url.pathname.endsWith('/import-feed')) {
+        feedReads += 1;
+        return new Response(
+          JSON.stringify({
+            error: { code: 'UNAVAILABLE', message: 'Fictional feed unavailable.' },
+          }),
+          { status: 503, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.pathname.endsWith('/intakes/limits'))
+        return response({ uploadBytes: 1024, extractionBytes: 1024 });
+      return response([]);
+    }),
+  );
+  const view = render(
+    <MemoryRouter initialEntries={['/import']}>
+      <ImportPage />
+    </MemoryRouter>,
+  );
+  expect(await screen.findByRole('alert')).toHaveTextContent('Fictional feed unavailable.');
+  expect(view.container.querySelector('#import-review-title')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Retry import review' }));
+  await waitFor(() => expect(feedReads).toBe(2));
+  expect(view.container.querySelector('#import-review-title')).toBeNull();
+});
+
+it.each(['native', 'legacy', 'legacy-error'] as const)(
+  'mounts a direct %s report once after its initial feed settles, then refreshes once for grounding',
+  async (format) => {
+    selectProfile({ id: 'fictional-direct-feed-' + format, name: 'Rowan', placebo: true });
+    const detail = nativeReportDetail();
+    const initial = detail.records.records[0]!;
+    expect(initial.kind).toBe('record');
+    if (initial.kind !== 'record') throw Error('Expected the complete fictional selected record');
+    const feedRecord = {
+      ...initial.record,
+      feedKey: 'fictional-direct-key',
+      feedOrder: '0',
+      feedKind: 'test' as const,
+      manuallyEdited: false,
+    };
+    const nativeFeed: CollectionImportFeed = {
+      format: 'health-intake-import-feed-v2',
+      view: 'all',
+      records: [
+        {
+          intakeId: intake.id,
+          groupId: detail.group.groupId,
+          groupOrdinal: 0,
+          proposalId: block.proposalId,
+          intakeVersion: intake.version,
+          reviewToken: block.reviewToken,
+          feedKey: feedRecord.feedKey,
+          feedOrder: feedRecord.feedOrder,
+          feedKind: feedRecord.feedKind,
+          manuallyEdited: false,
+          detail: { kind: 'record', record: feedRecord },
+        },
+      ],
+      totalRecords: 1,
+      totalGroups: 1,
+      nextCursor: null,
+      counts: detail.group.counts,
+      kindCounts: {
+        test: 1,
+        procedure: 0,
+        history: 0,
+        prescription: 0,
+        vision: 0,
+        person: 0,
+        unsupported: 0,
+      },
+      groups: [],
+      people: {
+        groups: [],
+        totalGroups: 0,
+        counts: { pending: 0, later: 0, excluded: 0, saved: 0 },
+        nextCursor: null,
+      },
+      activity: {
+        format: 'activity',
+        binding: 'fictional',
+        runningFiles: 0,
+        pausedFiles: 0,
+        queuedFiles: 0,
+        filesAwaitingConversion: 0,
+        remainingUnits: { state: 'exact', value: 0 },
+        extractionUnknownFiles: 0,
+        extractionComplete: true,
+        allCurrentReportsReviewed: false,
+        readingAccounting: { state: 'referenced', scope: 'all', binding: 'fictional' },
+      },
+    };
+    const legacyFeed: IntakeImportFeed = {
+      view: 'all',
+      groups: [reportDetail.group],
+      blocks: [{ ...block, groupId: detail.group.groupId, records: [feedRecord] }],
+      totalRecords: 1,
+      totalGroups: 1,
+      nextCursor: null,
+      counts: nativeFeed.counts,
+      kindCounts: nativeFeed.kindCounts,
+      people: { groups: [], totalGroups: 0, counts: nativeFeed.people.counts, nextCursor: null },
+      activity: {
+        runningFiles: 0,
+        pausedFiles: 0,
+        queuedFiles: 0,
+        filesAwaitingConversion: 0,
+        remainingUnits: 0,
+        extractionUnknownFiles: 0,
+        extractionComplete: true,
+        allCurrentReportsReviewed: false,
+      },
+    };
+    let releaseFeed!: () => void;
+    let releaseIdentity!: () => void;
+    let feedStarted = false;
+    let grounded = false;
+    const feedReady = new Promise<void>((resolve) => {
+      releaseFeed = resolve;
+    });
+    const identityReady = new Promise<void>((resolve) => {
+      releaseIdentity = resolve;
+    });
+    const reports: URL[] = [];
+    let identityReads = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input) => {
+        const url = new URL(String(input), 'https://fictional.invalid');
+        if (url.pathname.endsWith('/import-feed')) {
+          feedStarted = true;
+          await feedReady;
+          return format === 'legacy-error'
+            ? new Response(
+                JSON.stringify({
+                  error: { code: 'UNAVAILABLE', message: 'Fictional feed unavailable.' },
+                }),
+                { status: 503, headers: { 'Content-Type': 'application/json' } },
+              )
+            : response(format === 'native' ? nativeFeed : legacyFeed);
+        }
+        if (url.pathname.includes('/report-queue/')) {
+          reports.push(url);
+          const reviewed = {
+            ...record,
+            title: grounded
+              ? 'Fictional grounded direct record'
+              : 'Fictional blocked direct record',
+            selectable: grounded,
+            identityReview: { ...identityReview, blocking: !grounded },
+          };
+          return response(
+            format === 'native'
+              ? {
+                  ...detail,
+                  records: {
+                    ...detail.records,
+                    totalRecords: 1,
+                    nextCursor: null,
+                    records: [
+                      {
+                        ...initial,
+                        record: reviewed,
+                        selectable: grounded,
+                        reviewToken: grounded ? 'grounded-direct' : block.reviewToken,
+                      },
+                    ],
+                  },
+                }
+              : { ...reportDetail, blocks: [{ ...block, records: [reviewed] }] },
+          );
+        }
+        if (url.pathname.endsWith('/identity-review')) {
+          identityReads += 1;
+          await identityReady;
+          grounded = true;
+          return response({
+            ...identityReview,
+            status: 'evidenced_match',
+            blocking: false,
+            offeredSelfFields: {},
+          });
+        }
+        if (url.pathname.endsWith('/intakes/limits'))
+          return response({ uploadBytes: 1024, extractionBytes: 1024 });
+        if (url.pathname.includes('/intakes/people/'))
+          return response({
+            groupId: detail.group.groupId,
+            people: [],
+            totalPeople: 0,
+            peopleNextCursor: null,
+          });
+        if (url.pathname.endsWith('/report-source-review'))
+          return response({
+            profileId: 'fictional-direct-feed-' + format,
+            intakeId: intake.id,
+            intakeVersion: intake.version,
+            groupId: detail.group.groupId,
+            groupVersionId: reportDetail.group.groupVersionId,
+            view: 'all',
+            scopeToken: 'fictional-source-scope',
+            targets: [],
+            sourceEvidence: [],
+            coverage: { total: 1, covered: 0, uncovered: 1, status: 'uncovered', bySource: [] },
+          } satisfies IntakeReportSourceReview);
+        return response([]);
+      }),
+    );
+    render(
+      <MemoryRouter initialEntries={['/import?group=fictional-report&intake=fictional-intake']}>
+        <ImportPage />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(feedStarted).toBe(true));
+    await act(async () => {});
+    expect(reports).toHaveLength(0);
+    expect(identityReads).toBe(0);
+    await act(async () => releaseFeed());
+    expect(
+      await screen.findByRole('link', {
+        name: /Fictional blocked direct record/,
+      }),
+    ).toBeVisible();
+    expect(reports).toHaveLength(1);
+    await waitFor(() => expect(identityReads).toBeGreaterThan(0));
+    await act(async () => releaseIdentity());
+    expect(
+      await screen.findByRole('link', {
+        name: /Fictional grounded direct record/,
+      }),
+    ).toBeVisible();
+    await act(async () => {});
+    expect(reports).toHaveLength(2);
+  },
+);
+
+it('waits for acknowledged identity grounding before refreshing readiness and retains a later referenced page', async () => {
+  selectProfile({ id: 'fictional-native-detail', name: 'Rowan', placebo: true });
+  const detail = nativeReportDetail();
+  let confirmed = false;
+  let grounded = false;
+  let finishGrounding: (() => void) | undefined;
+  let finishNextPage: (() => void) | undefined;
+  const reports: URL[] = [];
+  let identityReads = 0;
+  const changed = vi.fn();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = new URL(String(input), 'https://fictional.invalid');
+      if (url.pathname.includes('/report-queue/')) {
+        reports.push(url);
+        if (url.searchParams.has('cursor'))
+          await new Promise<void>((resolve) => {
+            finishNextPage = resolve;
+          });
+        return response(
+          url.searchParams.has('cursor')
+            ? {
+                ...detail,
+                records: {
+                  ...detail.records,
+                  records: [
+                    {
+                      kind: 'record_reference',
+                      groupId: reportDetail.group.groupId,
+                      proposalId: block.proposalId,
+                      queueState: 'pending',
+                      selectable: true,
+                      reviewToken: 'referenced-record-token',
+                      selection: {
+                        recordId: 'fictional-next-record',
+                        candidateVersionId: 'fictional-next-v1',
+                      },
+                      reference: {
+                        format: 'health-intake-clinical-review-reference-v2',
+                        section: 'records',
+                        ordinal: 1,
+                        bytes: 70000,
+                        reviewToken: 'referenced-record-token',
+                      },
+                    },
+                  ],
+                  nextCursor: null,
+                },
+              }
+            : {
+                ...detail,
+                records: {
+                  ...detail.records,
+                  records: detail.records.records.map((row) =>
+                    row.kind === 'record'
+                      ? {
+                          ...row,
+                          selectable: grounded,
+                          record: {
+                            ...row.record,
+                            title: grounded
+                              ? 'Fictional grounded ready record'
+                              : 'Fictional blocked record',
+                            selectable: grounded,
+                            identityReview: { ...row.record.identityReview!, blocking: !grounded },
+                          },
+                        }
+                      : row,
+                  ),
+                },
+              },
+        );
+      }
+      if (url.pathname.endsWith('/identity-review')) {
+        identityReads += 1;
+        if (confirmed && !grounded)
+          await new Promise<void>((resolve) => {
+            finishGrounding = () => {
+              grounded = true;
+              resolve();
+            };
+          });
+        return response({
+          ...identityReview,
+          status: confirmed ? 'prior_confirmation' : 'confirmation_required',
+          blocking: !confirmed,
+          offeredSelfFields: {},
+          scope: {
+            ...identityReview.scope,
+            scopeToken: confirmed ? 'confirmed-scope' : 'initial-scope',
+          },
+        });
+      }
+      if (url.pathname.endsWith('/identity-scope') && init?.method === 'POST') {
+        confirmed = true;
+        return response(intake);
+      }
+      if (url.pathname.endsWith('/intakes/' + intake.id)) return response([]);
+      throw new Error('Unexpected ' + url);
+    }),
+  );
+  render(
+    <MemoryRouter>
+      <ImportDetailReview
+        selection={{ groupId: reportDetail.group.groupId, intakeId: intake.id }}
+        onBack={vi.fn()}
+        onChanged={changed}
+        onUseSource={() => {}}
+      />
+    </MemoryRouter>,
+  );
+  fireEvent.click(await screen.findByRole('button', { name: 'This is me' }));
+  await waitFor(() => expect(finishGrounding).toBeDefined());
+  expect(reports).toHaveLength(1);
+  expect(changed).not.toHaveBeenCalled();
+  expect(
+    screen.getByRole('link', { name: 'Review exact record — Fictional blocked record' }),
+  ).toBeVisible();
+  await act(async () => finishGrounding!());
+  expect(await screen.findByText('This report already matches Self.')).toBeVisible();
+  expect(
+    await screen.findByRole('link', {
+      name: 'Review exact record — Fictional grounded ready record',
+    }),
+  ).toBeVisible();
+  expect(reports).toHaveLength(2);
+  expect(identityReads).toBe(2);
+  expect(changed).toHaveBeenCalledOnce();
+  expect(
+    reports.every(
+      (url) => url.searchParams.get('limit') === '40' && url.searchParams.get('bytes') === '65536',
+    ),
+  ).toBe(true);
+  fireEvent.click(screen.getByRole('button', { name: 'Next report records' }));
+  await waitFor(() => expect(finishNextPage).toBeDefined());
+  expect(screen.getByText('This report already matches Self.')).toBeVisible();
+  expect(screen.queryByRole('link', { name: /Review exact record/ })).toBeNull();
+  await act(async () => finishNextPage!());
+  await screen.findByRole('button', { name: 'First report records' });
+  expect(
+    await screen.findByRole('link', { name: 'Review exact record — Referenced clinical record' }),
+  ).toHaveAttribute('href', expect.stringContaining('fictional-next-record'));
+  await act(async () => {});
+  expect(reports).toHaveLength(3);
+  expect(identityReads).toBe(2);
+  expect(reports[2]!.searchParams.get('cursor')).toBe('fictional-second-page');
+});
 
 function response(data: unknown) {
   return new Response(JSON.stringify({ data, meta: { revision: 1 } }), {
@@ -560,7 +1032,7 @@ it.each(['review_later', 'keep_original_only'] as const)(
             totalPeople: 0,
             peopleNextCursor: null,
           });
-        if (url.includes('/intakes/fictional-intake/review?'))
+        if (url.includes('/intakes/fictional-intake/review-record?'))
           return response({ ...review, records: [savedDraft()] });
         if (url.endsWith('/intakes/fictional-intake/review-draft')) {
           currentDisposition = JSON.parse(String(init?.body)).disposition;
@@ -2839,3 +3311,569 @@ it('recovers the exact second saved sibling from a partial bulk receipt before r
   expect(screen.queryByText('This record needs review before saving.')).toBeNull();
   expect(acceptancePosts).toBe(0);
 });
+
+it('uses exact section controls for native selected-record related discovery without a legacy full-review request', async () => {
+  selectProfile({ id: 'fictional-native-related', name: 'Rowan', placebo: true });
+  const selected = { ...record, selectionReviewToken: 'selected-native-token' };
+  const nativeContext = {
+    intakeId: intake.id,
+    proposalId: block.proposalId,
+    version: intake.version,
+    reviewToken: block.reviewToken,
+    summary: review.summary,
+    sourceTextStale: false,
+  };
+  const requests: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input, init) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.includes('/review-record?'))
+        return response({
+          format: 'health-intake-clinical-record-v2',
+          context: nativeContext,
+          record: { kind: 'record', record: selected },
+        });
+      if (url.endsWith(`/intakes/${intake.id}`)) return response(intake);
+      if (url.endsWith('/review-record-section')) {
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          recordId: record.id,
+          candidateVersionId: record.candidateVersionId,
+          section: 'comparisons',
+          comparisonSearch: { query: '', limit: 20 },
+        });
+        return response({
+          format: 'health-clinical-record-section-page-v1',
+          context: nativeContext,
+          selection: {
+            proposalId: block.proposalId,
+            recordId: record.id,
+            candidateVersionId: record.candidateVersionId,
+            selectionReviewToken: selected.selectionReviewToken,
+          },
+          section: 'comparisons',
+          items: [],
+          total: 0,
+          nextCursor: null,
+          discoveryPage: {
+            query: '',
+            limit: 20,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+            truncated: false,
+            maximumResults: 200,
+          },
+        });
+      }
+      throw new Error(`Unexpected native selected request ${url}`);
+    }),
+  );
+  render(
+    <MemoryRouter>
+      <ImportRecordDetail
+        groupId="fictional-report"
+        block={block}
+        recordId={record.id}
+        identityPanel={null}
+        identityRevision={0}
+        sourcePanel={null}
+        commonIdentityIssueIds={new Set()}
+        sourceError=""
+        onBack={() => {}}
+        onChanged={() => {}}
+        onUseSource={() => {}}
+      />
+    </MemoryRouter>,
+  );
+  fireEvent.click(await screen.findByText('Find possible related saved records'));
+  expect(screen.getByRole('region', { name: 'Paired evidence review' })).toBeVisible();
+  expect(await screen.findByLabelText('Search related saved records')).toBeVisible();
+  expect(screen.getByText('0 related records in this search result window.')).toBeVisible();
+  expect(requests.some((url) => url.includes('/related-records'))).toBe(false);
+});
+
+it.each([false, true])(
+  'accepts the retained native relationship only with its displayed exact authority (foreign change=%s)',
+  async (foreignChange) => {
+    selectProfile({ id: 'fictional-native-pair-approval', name: 'Rowan', placebo: true });
+    let version = intake.version;
+    let selected = { ...record, selectionReviewToken: 'native-before-pair' };
+    let substituteForeign = false;
+    const actions: ClinicalRecordAction[] = [];
+    const acceptances: Record<string, any>[] = [];
+    const context = () => ({
+      intakeId: intake.id,
+      proposalId: block.proposalId,
+      version,
+      reviewToken: `native-review-${version}`,
+      summary: review.summary,
+      sourceTextStale: false,
+    });
+    const retainedChoice = {
+      otherRecordId: 'fictional-saved-marker',
+      outcome: 'distinct' as const,
+      reason: 'Separate fictional source identifiers; retain both literal values.',
+      scope: {
+        format: 'intake-pair-scope-v1' as const,
+        profileId: 'fictional-native-pair-approval',
+        incoming: {
+          kind: 'observation' as const,
+          sourceRecordId: record.id,
+          identity: 'fictional-incoming',
+          version: 'fictional-incoming-v1',
+          stateHash: 'fictional-incoming-state',
+          evidenceHash: 'fictional-incoming-evidence',
+        },
+        saved: {
+          kind: 'observation' as const,
+          recordId: 'fictional-saved-marker',
+          sourceRecordId: 'fictional-saved-source',
+          identity: 'fictional-saved',
+          version: 'fictional-saved-v1',
+          stateHash: 'fictional-saved-state',
+          evidenceHash: 'fictional-saved-evidence',
+        },
+        token: 'fictional-exact-pair-scope',
+      },
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input, init) => {
+        const url = String(input);
+        if (url.includes('/review-record?'))
+          return response({
+            format: 'health-intake-clinical-record-v2',
+            context: context(),
+            record: {
+              kind: 'record',
+              record: substituteForeign
+                ? { ...selected, selectionReviewToken: 'foreign-native-source-token' }
+                : selected,
+            },
+          });
+        if (url.endsWith(`/intakes/${intake.id}`)) return response({ ...intake, version });
+        if (url.endsWith('/review-record-section')) {
+          const command = JSON.parse(String(init?.body));
+          return response({
+            format: 'health-clinical-record-section-page-v1',
+            context: context(),
+            selection: {
+              proposalId: block.proposalId,
+              recordId: record.id,
+              candidateVersionId: record.candidateVersionId!,
+              selectionReviewToken: selected.selectionReviewToken,
+            },
+            section: command.section,
+            total: 1,
+            nextCursor: null,
+            items: [
+              {
+                ordinal: 0,
+                control: {
+                  kind: 'pair',
+                  otherRecordId: retainedChoice.otherRecordId,
+                  scopeToken: retainedChoice.scope.token,
+                  targetAvailable: true,
+                  reasonReferenced: false,
+                  draftScopeStatus: actions.length ? 'current' : 'none',
+                  ...(actions.length ? retainedChoice : {}),
+                },
+                detail: {
+                  kind: 'value',
+                  value: {
+                    comparison: {
+                      id: retainedChoice.otherRecordId,
+                      title: 'Fictional saved marker',
+                      kind: 'observation',
+                      mapping: { ...record.mapping, valueText: '41' },
+                      evidence: [],
+                    },
+                  },
+                },
+              },
+            ],
+          } satisfies ClinicalRecordSectionPage);
+        }
+        if (url.endsWith('/review-record-action')) {
+          const command = JSON.parse(String(init?.body)) as ClinicalRecordAction;
+          actions.push(command);
+          expect(command.pair).toMatchObject({
+            otherRecordId: retainedChoice.otherRecordId,
+            scopeToken: retainedChoice.scope.token,
+            outcome: retainedChoice.outcome,
+            reason: retainedChoice.reason,
+          });
+          version++;
+          selected = {
+            ...selected,
+            selectionReviewToken: 'native-retained-pair',
+            draft: {
+              id: command.operationId,
+              proposalId: block.proposalId,
+              recordId: record.id,
+              candidateId: record.candidateId!,
+              candidateVersionId: record.candidateVersionId!,
+              mapping: {},
+              disposition: 'pending',
+              at: '2026-10-04T00:00:00Z',
+              resolutions: [],
+              decision: {
+                recordId: record.id,
+                action: 'accept',
+                mapping: {},
+                comparisons: [retainedChoice],
+              },
+            },
+            comparisonDrafts: [{ otherRecordId: retainedChoice.otherRecordId, status: 'current' }],
+          };
+          return response({ ...intake, version });
+        }
+        if (url.endsWith('/intakes/report-acceptance')) {
+          const command = JSON.parse(String(init?.body));
+          acceptances.push(command);
+          return response(acceptedResult(command.operationId));
+        }
+        if (url.endsWith('/test-types') || url.endsWith('/rules')) return response([]);
+        if (url.includes('/accepted-records')) return response([]);
+        if (url.includes('/record-owner')) return response({ personId: 'patient' });
+        throw new Error(`Unexpected native pair request ${url}`);
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <ImportRecordDetail
+          groupId="fictional-report"
+          block={block}
+          recordId={record.id}
+          identityPanel={null}
+          identityRevision={0}
+          sourcePanel={null}
+          commonIdentityIssueIds={new Set()}
+          sourceError=""
+          onBack={() => {}}
+          onChanged={() => {}}
+          onUseSource={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const save = await screen.findByRole('button', { name: 'Confirm and save record' });
+    fireEvent.click(screen.getByText('Find possible related saved records'));
+    const relationship = await screen.findByRole('group', {
+      name: 'Relationship with this record',
+    });
+    fireEvent.change(within(relationship).getByRole('combobox'), { target: { value: 'distinct' } });
+    fireEvent.change(within(relationship).getByLabelText('Reason for this relationship'), {
+      target: { value: retainedChoice.reason },
+    });
+    expect(save).toBeDisabled();
+    fireEvent.click(within(relationship).getByRole('button', { name: 'Save this relationship' }));
+    await waitFor(() => expect(actions).toHaveLength(1));
+    await waitFor(() => expect(save).toBeEnabled());
+    substituteForeign = foreignChange;
+    await userEvent.click(save);
+    if (foreignChange) {
+      expect(
+        await screen.findByText(
+          'This exact record changed. Review the current proposal before saving.',
+        ),
+      ).toBeVisible();
+      expect(acceptances).toHaveLength(0);
+    } else {
+      expect(await screen.findByText('This exact record was saved to your profile.')).toBeVisible();
+      expect(acceptances).toHaveLength(1);
+      expect(acceptances[0]).toMatchObject({ mode: 'partial-v1' });
+      expect(acceptances[0]!.blocks[0].selections).toEqual([
+        {
+          recordId: record.id,
+          candidateId: record.candidateId,
+          candidateVersionId: record.candidateVersionId,
+          selectionReviewToken: 'native-retained-pair',
+          mapping: {},
+          useRetainedDecision: true,
+        },
+      ]);
+    }
+  },
+);
+it('keeps the selected record mounted and report retry actionable while an external report command is uncertain', async () => {
+  selectProfile({ id: 'fictional-external-pending', name: 'Fictional Reader', placebo: true });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes('/review-record?'))
+        return response({
+          format: 'health-intake-clinical-record-v2',
+          context: {
+            intakeId: intake.id,
+            proposalId: block.proposalId,
+            version: intake.version,
+            reviewToken: block.reviewToken,
+            summary: review.summary,
+            sourceTextStale: false,
+          },
+          record: { kind: 'record', record },
+        });
+      if (url.endsWith('/intakes/' + intake.id)) return response(intake);
+      if (url.includes('/test-types')) return response([]);
+      if (url.includes('/rules')) return response([]);
+      throw new Error('Unexpected ' + url);
+    }),
+  );
+  const back = vi.fn(),
+    retry = vi.fn();
+  const beforeClose = { current: null as (() => Promise<boolean>) | null };
+  const props = {
+    groupId: 'fictional-report',
+    block,
+    recordId: record.id,
+    identityPanel: <button onClick={retry}>Retry exact report command</button>,
+    identityRevision: 7,
+    sourcePanel: null,
+    commonIdentityIssueIds: new Set<string>(),
+    sourceError: '',
+    onBack: back,
+    onChanged: () => {},
+    onUseSource: () => {},
+    beforeCloseRef: beforeClose,
+  };
+  const mounted = render(
+    <MemoryRouter>
+      <ImportRecordDetail {...props} contextPending />
+    </MemoryRouter>,
+  );
+  await screen.findByRole('heading', { name: 'Ferritin' });
+  fireEvent.click(screen.getByRole('button', { name: 'Back to Import' }));
+  expect(back).not.toHaveBeenCalled();
+  expect(await beforeClose.current?.()).toBe(false);
+  const retryButton = screen.getByRole('button', { name: 'Retry exact report command' });
+  expect(retryButton).toBeEnabled();
+  fireEvent.click(retryButton);
+  expect(retry).toHaveBeenCalledOnce();
+  mounted.rerender(
+    <MemoryRouter>
+      <ImportRecordDetail {...props} contextPending={false} />
+    </MemoryRouter>,
+  );
+  await act(async () => {});
+  fireEvent.click(screen.getByRole('button', { name: 'Back to Import' }));
+  await waitFor(() => expect(back).toHaveBeenCalledOnce());
+});
+
+it.each(['saved', 'foreign revision', 'lost reply', 'scope change', 'unmount'] as const)(
+  'publishes native acceptance intent only on explicit approval after correcting an unsupported record (%s)',
+  async (outcome) => {
+    const profileId = 'fictional-corrected-acceptance';
+    selectProfile({ id: profileId, name: 'Fictional Reader', placebo: true });
+    let version = intake.version;
+    let revision = 40;
+    let selected: IntakeReportQueueRecord = {
+      ...record,
+      classification: 'unsupported',
+      selectionReviewToken: 'fictional-unsupported-token',
+    };
+    const writes: Record<string, any>[] = [];
+    const acceptances: Record<string, any>[] = [];
+    let heldReads = 0;
+    let releasedRead = false;
+    let releaseRead: () => void = () => {};
+    const readGate = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    const operations = new Map<string, { version: number; revision: number }>();
+    const context = () => ({
+      intakeId: intake.id,
+      proposalId: block.proposalId,
+      version,
+      reviewToken: `fictional-current-review-${version}`,
+      summary: review.summary,
+      sourceTextStale: false,
+    });
+    const reply = (data: unknown, at = revision) =>
+      new Response(JSON.stringify({ data, meta: { revision: at } }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input, init) => {
+        const url = String(input);
+        if (url.includes('/review-record?')) {
+          if (
+            (outcome === 'scope change' || outcome === 'unmount') &&
+            writes.some((write) => write.decision.action === 'accept') &&
+            !releasedRead
+          ) {
+            heldReads++;
+            await readGate;
+          }
+          return reply({
+            format: 'health-intake-clinical-record-v2',
+            context: context(),
+            record: { kind: 'record', record: selected },
+          });
+        }
+        if (url.endsWith('/review-draft')) {
+          const command = JSON.parse(String(init?.body));
+          writes.push(command);
+          const prior = operations.get(command.operationId);
+          if (prior) return reply({ ...intake, version: prior.version }, prior.revision);
+          const fromVersion = version;
+          const fromRevision = revision;
+          expect(command.version).toBe(version);
+          version++;
+          revision++;
+          operations.set(command.operationId, { version, revision });
+          selected = {
+            ...selected,
+            classification: 'addition',
+            selectionReviewToken: `fictional-corrected-token-${version}`,
+            mapping: { ...selected.mapping, ...command.mapping },
+            draft: {
+              id: command.operationId,
+              proposalId: block.proposalId,
+              recordId: record.id,
+              candidateId: record.candidateId!,
+              candidateVersionId: record.candidateVersionId!,
+              mapping: command.mapping,
+              disposition: command.disposition,
+              decision: command.decision,
+              resolutions: command.resolutions,
+              answers: command.answers,
+              at: '2026-10-04T00:00:00Z',
+            },
+          };
+          const certifiedRevision = revision;
+          if (command.decision.action === 'accept' && outcome === 'lost reply')
+            throw new TypeError('Fictional lost acceptance-intent acknowledgement');
+          if (command.decision.action === 'accept' && outcome === 'foreign revision') revision++;
+          return reply(
+            {
+              ...intake,
+              version,
+              reviewDraftTransition: {
+                format: 'health-intake-own-draft-transition-v1',
+                profileId,
+                intakeId: intake.id,
+                proposalId: block.proposalId,
+                recordId: record.id,
+                candidateId: record.candidateId,
+                candidateVersionId: record.candidateVersionId,
+                operationId: command.operationId,
+                fromVersion,
+                toVersion: version,
+                fromRevision,
+                toRevision: certifiedRevision,
+              },
+            },
+            certifiedRevision,
+          );
+        }
+        if (url.endsWith(`/intakes/${intake.id}`)) return reply({ ...intake, version });
+        if (url.endsWith('/review-record-section')) {
+          const command = JSON.parse(String(init?.body));
+          return reply({
+            format: 'health-clinical-record-section-page-v1',
+            context: context(),
+            selection: {
+              proposalId: block.proposalId,
+              recordId: record.id,
+              candidateVersionId: record.candidateVersionId,
+              selectionReviewToken: selected.selectionReviewToken,
+            },
+            section: command.section,
+            total: 0,
+            nextCursor: null,
+            items: [],
+          });
+        }
+        if (url.endsWith('/intakes/report-acceptance')) {
+          const command = JSON.parse(String(init?.body));
+          acceptances.push(command);
+          expect(selected.draft!.decision!.action).toBe('accept');
+          expect(command.blocks[0].selections[0]).toMatchObject({
+            selectionReviewToken: selected.selectionReviewToken,
+            useRetainedDecision: true,
+            mapping: {},
+          });
+          return reply(acceptedResult(command.operationId));
+        }
+        if (url.endsWith('/test-types') || url.endsWith('/rules')) return reply([]);
+        if (url.includes('/accepted-records')) return reply([]);
+        if (url.includes('/record-owner')) return reply({ personId: 'patient' });
+        throw new Error(`Unexpected corrected approval request ${url}`);
+      }),
+    );
+    const detail = (groupId = 'fictional-report') => (
+      <MemoryRouter>
+        <ImportRecordDetail
+          groupId={groupId}
+          block={block}
+          recordId={record.id}
+          identityPanel={null}
+          identityRevision={0}
+          sourcePanel={null}
+          commonIdentityIssueIds={new Set()}
+          sourceError=""
+          onBack={() => {}}
+          onChanged={() => {}}
+          onUseSource={() => {}}
+        />
+      </MemoryRouter>
+    );
+    const view = render(detail());
+    const save = await screen.findByRole('button', { name: 'Confirm and save record' });
+    fireEvent.change(screen.getByLabelText('Result', { exact: true }), { target: { value: '43' } });
+    await waitFor(() => expect(writes).toHaveLength(1));
+    await waitFor(() => expect(save).toBeEnabled());
+    expect(selected.classification).toBe('addition');
+    expect(selected.draft!.decision!.action).toBe('skip');
+    expect(acceptances).toHaveLength(0);
+    await userEvent.click(save);
+    await waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[1].decision).toEqual({ ...writes[0].decision, action: 'accept' });
+    expect(writes[1].mapping).toEqual(writes[0].mapping);
+    expect(writes[1].resolutions).toEqual(writes[0].resolutions);
+    expect(writes[1].answers).toEqual(writes[0].answers);
+    if (outcome === 'scope change' || outcome === 'unmount') {
+      await waitFor(() => expect(heldReads).toBeGreaterThan(0));
+      if (outcome === 'unmount') view.unmount();
+      else {
+        view.rerender(detail('fictional-other-report'));
+        view.rerender(detail());
+      }
+      await act(async () => {
+        releasedRead = true;
+        releaseRead();
+      });
+      if (outcome === 'unmount') {
+        expect(acceptances).toHaveLength(0);
+        return;
+      }
+    }
+    if (outcome === 'foreign revision' || outcome === 'scope change') {
+      expect(
+        await screen.findByText(
+          'This exact record changed. Review the current proposal before saving.',
+        ),
+      ).toBeVisible();
+      expect(acceptances).toHaveLength(0);
+      return;
+    }
+    if (outcome === 'lost reply') {
+      expect(
+        await screen.findByText('Review the saved choices before confirming this record again.'),
+      ).toBeVisible();
+      expect(acceptances).toHaveLength(0);
+      await userEvent.click(screen.getByRole('button', { name: 'Retry draft save' }));
+      await waitFor(() => expect(writes).toHaveLength(3));
+      expect(writes[2]).toEqual(writes[1]);
+      await waitFor(() => expect(save).toBeEnabled());
+      expect(acceptances).toHaveLength(0);
+      await userEvent.click(save);
+    }
+    expect(await screen.findByText('This exact record was saved to your profile.')).toBeVisible();
+    expect(acceptances).toHaveLength(1);
+  },
+);

@@ -1,4 +1,5 @@
-import type { Intake, IntakeClinicalMapping } from './intake.ts';
+import type { IntakeClinicalMapping } from './intake.ts';
+import type { IntakeRead } from './intake-summary.ts';
 import type { IntakeIdentityPerson } from './intake-identity.ts';
 import type { SourceTextRegion } from './intake-source-text.ts';
 
@@ -30,8 +31,8 @@ export interface ManualSourceRecordReceipt {
   person: IntakeIdentityPerson;
 }
 
-export interface ManualSourceRecordResult {
-  intake: Intake;
+export interface ManualSourceRecordResult<TIntake extends IntakeRead = IntakeRead> {
+  intake: TIntake;
   proposalId: string;
   recordId: string;
   groupId: string;

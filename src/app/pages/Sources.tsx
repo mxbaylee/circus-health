@@ -25,8 +25,13 @@ import { useAssistantSelection } from '../features/assistant/pageContext';
 import { RelatedNotes } from '../components/RelatedNotes';
 import { Link, Navigate, useSearchParams } from 'react-router-dom';
 import { FileText, Files, List, ChevronRight, ArrowLeft } from 'lucide-react';
-import type { SourceFile, SourceRecord, SourceRecordReference } from '../../shared/api';
-import { queryString, useResource } from '../data/api';
+import type {
+  SourceFileListItem,
+  SourceFileReference,
+  SourceRecord,
+  SourceRecordReference,
+} from '../../shared/api';
+import { apiUrl, queryString, useResource } from '../data/api';
 import { formatBytes, formatDate } from '../data/format';
 import { Pagination, ResourceState } from '../components/ResourceState';
 import { SourceDialog, SourcePreview, SourceRecordView } from '../components/SourceDialog';
@@ -64,7 +69,7 @@ export function Sources() {
       value ? next.set(key, value) : next.delete(key);
     setParams(next, { replace });
   };
-  const files = useResource<SourceFile[]>(
+  const files = useResource<SourceFileListItem[]>(
     !browsingRecords && !browsingDocuments && !importing
       ? `/sources?${queryString({ q, visibility: params.get('visibility') || 'visible', limit: 30, offset })}`
       : null,
@@ -79,8 +84,10 @@ export function Sources() {
     (!browsingRecords && !browsingDocuments && !selectedRecord && !selectedDocument
       ? files.data?.[0]?.id
       : undefined);
-  const file = useResource<SourceFile>(
-    !importing && selectedFile ? `/sources/${encodeURIComponent(selectedFile)}` : null,
+  const file = useResource<SourceFileReference>(
+    !importing && selectedFile
+      ? `/sources/${encodeURIComponent(selectedFile)}?fileView=reference`
+      : null,
   );
   const records = useResource<SourceRecord[]>(
     !importing && selectedFile
@@ -562,7 +569,9 @@ export function Sources() {
                       .
                     </p>
                     <h3>File metadata and coverage notes</h3>
-                    <pre className="raw-content">{JSON.stringify(item.details, null, 2)}</pre>
+                    <a className="button secondary" href={apiUrl(item.detailsUrl)} download>
+                      Download retained file details
+                    </a>
                   </details>
                   <h3 className="source-records-heading">Records retained from this file</h3>
                   <ResourceState

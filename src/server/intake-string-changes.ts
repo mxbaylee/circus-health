@@ -9,8 +9,12 @@ import { recordIntakeWork } from './intake-work-accounting.ts';
 // Fixed-size exact anchors and patience alignment follow the text-piece
 // reconciler's approach. UTF-16 offsets also support JSON's lone surrogates.
 const WIDTH = 32;
+// Admission limits for an optional cheaper encoding, not limits on input or
+// changed content. Larger replacements retain their original exact splices.
+const COALESCED_TEXT_UNITS = 256;
+type StringSplice = Extract<ChatChange, { op: 'splice' }>;
 export function intakeStringChanges(before: string, after: string, path: string[]): ChatChange[] {
-  const changes: ChatChange[] = [];
+  const changes: StringSplice[] = [];
   let compared = 0;
   const budget = intakeStringAlignmentBudget();
   const scan = (units: number) => {
@@ -165,8 +169,46 @@ export function intakeStringChanges(before: string, after: string, path: string[
         gap(oldEnd, nextEnd);
       }
     }
+    if (changes.length < 2) return changes.reverse();
+    // A path-bearing operation can cost more than the short unchanged gap
+    // between two edits. Bound that retained gap independently of input size,
+    // and require an actual UTF-8 JSON byte saving, including path metadata.
+    const pathBytes = Buffer.byteLength(JSON.stringify(path));
+    const encodedBytes = (change: StringSplice) =>
+      Buffer.byteLength(JSON.stringify({ ...change, path: [] })) + pathBytes - 2;
+    const compact: StringSplice[] = [];
+    let previousBytes: number | undefined;
+    for (const change of changes) {
+      const previous = compact.at(-1);
+      if (previous) {
+        const end = previous.offset + previous.remove;
+        const gap = change.offset - end;
+        if (
+          gap >= 0 &&
+          gap <= WIDTH &&
+          previous.text.length + gap + change.text.length <= COALESCED_TEXT_UNITS
+        ) {
+          const merged: StringSplice = {
+            op: 'splice',
+            path,
+            offset: previous.offset,
+            remove: change.offset + change.remove - previous.offset,
+            text: previous.text + before.slice(end, change.offset) + change.text,
+          };
+          const bytes = encodedBytes(merged);
+          previousBytes ??= encodedBytes(previous);
+          if (bytes < previousBytes + encodedBytes(change) + 1) {
+            compact[compact.length - 1] = merged;
+            previousBytes = bytes;
+            continue;
+          }
+        }
+      }
+      compact.push(change);
+      previousBytes = undefined;
+    }
     // Descending original offsets retain coordinates without a durable reference list.
-    return changes.reverse();
+    return compact.reverse();
   } finally {
     recordIntakeWork('diffStringComparedUnits', compared);
   }

@@ -20,16 +20,23 @@ export interface NameSupport {
   independentManual?: boolean;
   independentPrimary?: boolean;
 }
-export interface NameAuthority {
+interface NameAuthorityHeader {
   noteId: string;
   name: string;
   status: 'active' | 'superseded' | 'unresolved';
   operationId: string;
   revision: number;
-  supportOperations: string[];
   at: string;
   origin?: 'confirmation' | 'ownership' | 'future';
 }
+export type NameAuthority = NameAuthorityHeader &
+  (
+    | { supportOperations: string[]; supportOperationsIncluded?: true }
+    | {
+        supportOperationsIncluded: false;
+        supportOperationsReference: import('../shared/ownership-name-reference.ts').OwnershipNameSupportReference;
+      }
+  );
 const key = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export function rememberNameSupport(
   db: Database,
@@ -66,24 +73,24 @@ export function rememberNameSupport(
           }),
   };
   const at = now();
-  const added = db
-    .prepare(
-      "INSERT OR IGNORE INTO manual_batches(id,title,status,created_at,verified_at,notes,coverage_json) VALUES(?,'Remembered name support','verified',?,?,'Explicit report confirmation',?)",
-    )
-    .run(
-      'name-support:' +
-        key([
-          noteId,
-          evidence.operationId,
-          evidence.intakeId,
-          evidence.groupId,
-          evidence.sourceHash,
-          evidence.name,
-        ]),
-      at,
-      at,
-      JSON.stringify(support),
-    );
+  const added = recordMutationStatement(
+    db,
+    "INSERT OR IGNORE INTO manual_batches(id,title,status,created_at,verified_at,notes,coverage_json) VALUES(?,'Remembered name support','verified',?,?,'Explicit report confirmation',?)",
+    'changes',
+  ).run(
+    'name-support:' +
+      key([
+        noteId,
+        evidence.operationId,
+        evidence.intakeId,
+        evidence.groupId,
+        evidence.sourceHash,
+        evidence.name,
+      ]),
+    at,
+    at,
+    JSON.stringify(support),
+  );
   if (
     added.changes &&
     nameAuthorities(db, noteId).some(
@@ -316,3 +323,4 @@ export function rememberManualNameChanges(
     );
   }
 }
+import { recordMutationStatement } from './record-mutation-recipe.ts';

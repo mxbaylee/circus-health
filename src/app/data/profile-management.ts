@@ -1,24 +1,30 @@
 import { ApiError } from './api';
 import type { Profile } from './profile';
+import { separateReadGeneration } from './read-recovery';
 
 // Lifecycle requests deliberately operate on explicit IDs, independently of the
 // selected clinical profile. Keep that exception out of the clinical API helper.
 async function request<T>(path: string, method: string, body: unknown, setup = false): Promise<T> {
-  const response = await fetch(`${setup ? '/api/profile-setups' : '/api/profiles'}${path}`, {
-    method,
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok)
-    throw new ApiError(
-      payload?.error?.message ?? `Request failed (${response.status}).`,
-      payload?.error?.code,
-      response.status,
-    );
-  if (!payload || !Object.prototype.hasOwnProperty.call(payload, 'data'))
-    throw new ApiError('The server returned an unexpected response.', 'INVALID_RESPONSE');
-  return payload.data as T;
+  separateReadGeneration();
+  try {
+    const response = await fetch(`${setup ? '/api/profile-setups' : '/api/profiles'}${path}`, {
+      method,
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok)
+      throw new ApiError(
+        payload?.error?.message ?? `Request failed (${response.status}).`,
+        payload?.error?.code,
+        response.status,
+      );
+    if (!payload || !Object.prototype.hasOwnProperty.call(payload, 'data'))
+      throw new ApiError('The server returned an unexpected response.', 'INVALID_RESPONSE');
+    return payload.data as T;
+  } finally {
+    separateReadGeneration();
+  }
 }
 export type RecoveryKit = {
   format: 'circus-health-recovery-v1';

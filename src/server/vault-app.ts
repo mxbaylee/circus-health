@@ -1,5 +1,14 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
+import { authorizationSignalAborted } from './authorization-signal.ts';
+import { assistantCompactOwnerCurrent, type AssistantCompactOwner } from './assistant.ts';
+import {
+  intakeBatchOwnerCurrent,
+  type IntakeBatchOwner,
+  type IntakeBatchManager,
+} from './intake-batches.ts';
 import { createApp, type AppOptions } from './index.ts';
 import { vaultStorageTotals } from './vault-storage-totals.ts';
 import {
@@ -7,7 +16,10 @@ import {
   importStorageEstimate,
   assertImportCapacity,
 } from './archive-storage.ts';
-import { createEncryptedProfiles } from './encrypted-profiles.ts';
+import {
+  createEncryptedProfiles,
+  type CreateEncryptedProfilesOptions,
+} from './encrypted-profiles.ts';
 import { importDiagnostics, type ImportDiagnostics } from './import-diagnostics.ts';
 import { createProfilePasskeys } from './profile-passkeys.ts';
 import { writeChat, forgetChatJournal } from './assistant-journal.ts';
@@ -47,10 +59,166 @@ interface VaultAppOptions {
   assistantOptions?: AppOptions['assistantOptions'];
   diagnostics?: ImportDiagnostics;
   port?: number;
+  unlockCheckpoint?: CreateEncryptedProfilesOptions['unlockCheckpoint'];
 }
 interface Session {
   id: string;
   profiles: Set<string>;
+}
+declare const compactAuthorizationBrand: unique symbol;
+export interface VaultCompactAuthorization {
+  readonly [compactAuthorizationBrand]: true;
+}
+const compactAuthorizationContext = new AsyncLocalStorage<VaultCompactAuthorization>();
+const nativeMapGet = Map.prototype.get;
+const nativeSetHas = Set.prototype.has;
+const compactAuthorizations = new WeakMap<
+  VaultCompactAuthorization,
+  {
+    db: DatabaseSync;
+    profileId: string;
+    sessions: Map<string, Session>;
+    client: Session;
+    profiles: Set<string>;
+    opened: Map<string, unknown>;
+    state: object;
+    lifecycle: { closed: boolean };
+    signal?: AbortSignal;
+    request?: { active: boolean };
+    job?: AssistantCompactOwner;
+    batch?: IntakeBatchOwner;
+    isOpen: () => unknown;
+  }
+>();
+/** These checks retain real issuer state, not caller closures or storage reads. */
+export function vaultCompactAuthorizationCurrent(
+  authorization: VaultCompactAuthorization,
+  db: DatabaseSync,
+  profileId: string,
+): boolean {
+  const data = compactAuthorizations.get(authorization);
+  return (
+    !!data &&
+    data.db === db &&
+    data.profileId === profileId &&
+    !data.lifecycle.closed &&
+    (!data.signal || !authorizationSignalAborted(data.signal)) &&
+    (!data.request || data.request.active) &&
+    (!data.job || assistantCompactOwnerCurrent(data.job, db, profileId)) &&
+    (!data.batch || !!intakeBatchOwnerCurrent(data.batch)) &&
+    Reflect.apply(data.isOpen, db, []) === true &&
+    Reflect.apply(nativeMapGet, data.sessions, [data.client.id]) === data.client &&
+    Reflect.apply(nativeSetHas, data.profiles, [profileId]) &&
+    Reflect.apply(nativeMapGet, data.opened, [profileId]) === data.state
+  );
+}
+/** Capture only a token minted at the real authenticated HTTP dispatch. */
+export function currentVaultCompactAuthorization(
+  db: DatabaseSync,
+  profileId: string,
+): VaultCompactAuthorization | undefined {
+  const authorization = compactAuthorizationContext.getStore();
+  if (authorization && !vaultCompactAuthorizationCurrent(authorization, db, profileId))
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+  return authorization;
+}
+const assistantAuthorizations = new WeakMap<AssistantCompactOwner, VaultCompactAuthorization>();
+type CompactAuthorizationData = NonNullable<ReturnType<typeof compactAuthorizations.get>>;
+const batchIssuers = new WeakMap<
+  IntakeBatchManager,
+  Pick<
+    CompactAuthorizationData,
+    'db' | 'profileId' | 'sessions' | 'opened' | 'state' | 'lifecycle' | 'isOpen'
+  >
+>();
+/** Background dispatch has a real manager lifetime, not the expired HTTP response
+ * inherited by its timer. Only profileApp registers an encrypted manager issuer. */
+export async function withVaultIntakeBatchAuthorization<T>(
+  owner: IntakeBatchOwner,
+  run: () => Promise<T>,
+): Promise<T> {
+  const batch = intakeBatchOwnerCurrent(owner);
+  if (!batch) throw new HttpError(423, 'PROFILE_LOCKED', 'Batch owner changed');
+  const issuer = batchIssuers.get(batch.manager);
+  if (!issuer) {
+    if (compactAuthorizationContext.getStore())
+      throw new HttpError(423, 'PROFILE_LOCKED', 'Batch issuer changed');
+    return run();
+  }
+  if (issuer.db !== batch.db || issuer.profileId !== batch.profileId)
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Batch profile changed');
+  const client = [...issuer.sessions.values()].find((session) =>
+    Reflect.apply(nativeSetHas, session.profiles, [batch.profileId]),
+  );
+  if (!client) throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+  const authorization = Object.freeze({}) as VaultCompactAuthorization;
+  compactAuthorizations.set(authorization, {
+    ...issuer,
+    client,
+    profiles: client.profiles,
+    batch: owner,
+  });
+  if (!vaultCompactAuthorizationCurrent(authorization, batch.db, batch.profileId))
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+  return compactAuthorizationContext.run(authorization, run);
+}
+/** A separate background lifetime is issued before the initiating response,
+ * only for an actual assistant job already installed in its private active map. */
+export function captureVaultAssistantAuthorization(
+  owner: AssistantCompactOwner,
+  db: DatabaseSync,
+  profileId: string,
+): void {
+  if (!assistantCompactOwnerCurrent(owner, db, profileId) || assistantAuthorizations.has(owner))
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Assistant owner changed');
+  const original = currentVaultCompactAuthorization(db, profileId);
+  if (!original) return;
+  const data = compactAuthorizations.get(original)!;
+  const authorization = Object.freeze({}) as VaultCompactAuthorization;
+  compactAuthorizations.set(authorization, {
+    ...data,
+    signal: undefined,
+    request: undefined,
+    batch: undefined,
+    job: owner,
+  });
+  assistantAuthorizations.set(owner, authorization);
+}
+export function withVaultAssistantAuthorization<T>(owner: AssistantCompactOwner, run: () => T): T {
+  const authorization = assistantAuthorizations.get(owner);
+  if (!authorization) return compactAuthorizationContext.exit(run);
+  const data = compactAuthorizations.get(authorization)!;
+  if (!vaultCompactAuthorizationCurrent(authorization, data.db, data.profileId))
+    throw new HttpError(423, 'PROFILE_LOCKED', 'Assistant access changed');
+  return compactAuthorizationContext.run(authorization, run);
+}
+const sessionUnlockAuthorizations = new WeakMap<
+  object,
+  {
+    manager: object;
+    scope: string;
+    sessions: Map<string, Session>;
+    client: Session;
+    lifecycle: { closed: boolean };
+    signal: AbortSignal;
+  }
+>();
+
+/** Read-only validation of tokens issued by real HTTP session routes. */
+export function vaultSessionUnlockAuthorized(
+  authorization: object,
+  manager: object,
+  scope: string,
+): boolean {
+  const found = sessionUnlockAuthorizations.get(authorization);
+  return (
+    !!found &&
+    found.manager === manager &&
+    found.scope === scope &&
+    !found.lifecycle.closed &&
+    !authorizationSignalAborted(found.signal) &&
+    Map.prototype.get.call(found.sessions, found.client.id) === found.client
+  );
 }
 type ProfileCard = ReturnType<ReturnType<typeof createEncryptedProfiles>['card']>;
 export function createVaultApp({
@@ -60,12 +228,34 @@ export function createVaultApp({
   assistantOptions,
   diagnostics = importDiagnostics,
   port = 3001,
+  unlockCheckpoint,
 }: VaultAppOptions) {
-  const manager = createEncryptedProfiles({ dataDirectory, runtimeDirectory, diagnostics }),
+  const manager = createEncryptedProfiles({
+      dataDirectory,
+      runtimeDirectory,
+      diagnostics,
+      unlockCheckpoint,
+    }),
     passkeys = createProfilePasskeys(manager),
     sessions = new Map<string, Session>();
   let closed = false,
     activation: Promise<unknown> = Promise.resolve();
+  const lifecycle = { closed: false };
+  const openedProfiles = manager.opened;
+  const sessionUnlockAuthorization = (client: Session, scope: string, signal: AbortSignal) => {
+    if (closed || sessions.get(client.id) !== client || signal.aborted)
+      throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+    const authorization = Object.freeze({});
+    sessionUnlockAuthorizations.set(authorization, {
+      manager,
+      scope,
+      sessions,
+      client,
+      lifecycle,
+      signal,
+    });
+    return authorization;
+  };
   const origins = new Set([
     ...allowedOrigins,
     `http://127.0.0.1:${port}`,
@@ -152,8 +342,8 @@ export function createVaultApp({
   function profileApp(id: string) {
     const state = manager.opened.get(id);
     if (!state) throw new HttpError(423, 'PROFILE_LOCKED', 'Unlock this profile');
-    if (!state.app)
-      state.app = createApp({
+    if (!state.app) {
+      const app = createApp({
         root: state.root,
         databases: new Map([[id, state.db]]),
         runtimeRoot: state.root,
@@ -191,6 +381,20 @@ export function createVaultApp({
           },
         },
       });
+      const descriptor = Object.getOwnPropertyDescriptor(state.db, 'isOpen');
+      if (!descriptor?.get || descriptor.configurable)
+        throw new HttpError(423, 'PROFILE_LOCKED', 'Profile owner is unavailable');
+      state.app = app;
+      batchIssuers.set(app.intakeBatches, {
+        db: state.db,
+        profileId: id,
+        sessions,
+        opened: openedProfiles,
+        state,
+        lifecycle,
+        isOpen: descriptor.get,
+      });
+    }
     return state;
   }
   const server = createServer(async (req, res) => {
@@ -243,7 +447,25 @@ export function createVaultApp({
         return;
       }
       if (path === '/api/profile-setups/resume' && method === 'POST') {
-        send(res, 200, { data: manager.resume((await body(req)).recovery) });
+        const controller = new AbortController(),
+          abort = () => {
+            if (!res.writableEnded) controller.abort(Error('Setup request was disconnected'));
+          };
+        res.once('close', abort);
+        try {
+          send(res, 200, {
+            data: await manager.resumeAsync((await body(req)).recovery, {
+              signal: controller.signal,
+              authorization: sessionUnlockAuthorization(client, 'resume', controller.signal),
+              assertAuthorized: () => {
+                if (closed || sessions.get(client.id) !== client)
+                  throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+              },
+            }),
+          });
+        } finally {
+          res.off('close', abort);
+        }
         return;
       }
       if (path === '/api/profile-setups' && method === 'POST') {
@@ -254,24 +476,67 @@ export function createVaultApp({
       }
       const setup = path.match(/^\/api\/profile-setups\/([A-Za-z0-9_-]+)\/verify$/);
       if (setup && method === 'POST') {
-        const input = await body(req),
-          p = await activate(
-            () =>
-              manager.verify(setup[1], input, {
-                authorizeCopySource: (sourceId) => requireAccess(sourceId, client),
-              }),
-            client,
-          );
-        send(res, 201, { data: publicCard(p, client, hostname) });
+        const controller = new AbortController(),
+          abort = () => {
+            if (!res.writableEnded) controller.abort(Error('Setup request was disconnected'));
+          };
+        res.once('close', abort);
+        try {
+          const input = await body(req),
+            p = await activate(
+              () =>
+                manager.verifyAsync(setup[1], input, {
+                  authorizeCopySource: (sourceId) => requireAccess(sourceId, client),
+                  signal: controller.signal,
+                  authorization: sessionUnlockAuthorization(
+                    client,
+                    'setup:' + setup[1],
+                    controller.signal,
+                  ),
+                  assertAuthorized: () => {
+                    if (closed || sessions.get(client.id) !== client)
+                      throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+                  },
+                }),
+              client,
+            );
+          send(res, 201, { data: publicCard(p, client, hostname) });
+        } finally {
+          res.off('close', abort);
+        }
         return;
       }
       const match = path.match(/^\/api\/profiles\/(p-[0-9a-f-]+)(?:\/(.*))?$/);
       if (!match) throw new HttpError(404, 'NOT_FOUND', 'Resource not found');
       const [, id, action] = match;
       if (action === 'unlock' && method === 'POST') {
-        const input = await body(req),
-          p = await activate(() => manager.unlock(id, input.recovery), client);
-        send(res, 200, { data: publicCard(p, client, hostname) });
+        const input = await body(req);
+        const controller = new AbortController();
+        const abort = () => {
+          if (!res.writableEnded) controller.abort(Error('Unlock request was disconnected'));
+        };
+        res.once('close', abort);
+        try {
+          const p = await activate(
+            () =>
+              manager.unlockAsync(id, input.recovery, {
+                signal: controller.signal,
+                authorization: sessionUnlockAuthorization(
+                  client,
+                  'profile:' + id,
+                  controller.signal,
+                ),
+                assertAuthorized: () => {
+                  if (closed || sessions.get(client.id) !== client)
+                    throw new HttpError(423, 'PROFILE_LOCKED', 'Profile access changed');
+                },
+              }),
+            client,
+          );
+          send(res, 200, { data: publicCard(p, client, hostname) });
+        } finally {
+          res.off('close', abort);
+        }
         return;
       }
       if (action === 'passkeys/authentication-options' && method === 'POST') {
@@ -390,7 +655,41 @@ export function createVaultApp({
         }
         return Reflect.apply(writeHead, this, [status, ...args]) as typeof this;
       };
-      state.app!.server.emit('request', req, res);
+      const controller = new AbortController();
+      const requestLifetime = { active: true };
+      const abort = () =>
+        controller.abort(new HttpError(409, 'REQUEST_CANCELLED', 'The request stopped'));
+      req.once('aborted', abort);
+      const close = () => {
+        requestLifetime.active = false;
+        if (!res.writableEnded) abort();
+      };
+      res.once('close', close);
+      res.once('finish', () => {
+        requestLifetime.active = false;
+        req.off('aborted', abort);
+        res.off('close', close);
+      });
+      const descriptor = Object.getOwnPropertyDescriptor(state.db, 'isOpen');
+      if (!descriptor?.get || descriptor.configurable)
+        throw new HttpError(423, 'PROFILE_LOCKED', 'Profile owner is unavailable');
+      const authorization = Object.freeze({}) as VaultCompactAuthorization;
+      compactAuthorizations.set(authorization, {
+        db: state.db,
+        profileId: id,
+        sessions,
+        client,
+        profiles: client.profiles,
+        opened: openedProfiles,
+        state,
+        lifecycle,
+        signal: controller.signal,
+        request: requestLifetime,
+        isOpen: descriptor.get,
+      });
+      compactAuthorizationContext.run(authorization, () =>
+        state.app!.server.emit('request', req, res),
+      );
     } catch (caught) {
       const e = caught as Error & { status?: number; code?: string };
       if (res.headersSent) {
@@ -410,6 +709,7 @@ export function createVaultApp({
     manager,
     close() {
       closed = true;
+      lifecycle.closed = true;
       server.closeAllConnections();
       for (const p of manager.list()) passkeys.invalidate(p.id);
       try {

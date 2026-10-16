@@ -1,3 +1,4 @@
+import { selectedReportGroups } from '../intake-selected-report-groups.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -323,8 +324,15 @@ test('durable grouped acceptance, changed identity drafts, proposal replay and r
   await confirmFictionalGroup(db, root, profileId, item.id, groups(item)[0]!.id);
   let review = intake.reviewIntake(db, root, profileId, item.id);
   assert.equal(review.records.length, 28);
-  assert.ok(review.records.every((record) => record.reportGroups?.length === 1));
-  assert.equal(new Set(review.records.map((record) => record.reportGroups![0]!.groupId)).size, 1);
+  assert.ok(
+    review.records.every((record) => selectedReportGroups(record.reportGroups).length === 1),
+  );
+  assert.equal(
+    new Set(
+      review.records.map((record) => selectedReportGroups(record.reportGroups).at(0)!.groupId),
+    ).size,
+    1,
+  );
   item = intake.importIntake(db, root, profileId, item.id, {
     version: review.version,
     reviewToken: review.reviewToken,
@@ -650,7 +658,7 @@ test('legacy literal context links create one provisional report and one source 
 
   review = intake.reviewIntake(db, root, profileId, item.id);
   const linkedRecords = review.records.filter((record) =>
-    record.reportGroups?.some((reference) => reference.groupId === group.id),
+    selectedReportGroups(record.reportGroups).some((reference) => reference.groupId === group.id),
   );
   assert.equal(linkedRecords.length, 2);
   assert.ok(linkedRecords.every((record) => record.provider === 'Fictional Composition Studio'));
@@ -668,14 +676,22 @@ test('legacy literal context links create one provisional report and one source 
   review = intake.reviewIntake(db, root, profileId, item.id);
   assert.ok(
     review.records
-      .filter((record) => record.reportGroups?.some((reference) => reference.groupId === group.id))
+      .filter((record) =>
+        selectedReportGroups(record.reportGroups).some(
+          (reference) => reference.groupId === group.id,
+        ),
+      )
       .every((record) => record.mapping.subject === 'self'),
   );
   item = intake.importIntake(db, root, profileId, item.id, {
     version: review.version,
     reviewToken: review.reviewToken,
     decisions: review.records
-      .filter((record) => record.reportGroups?.some((reference) => reference.groupId === group.id))
+      .filter((record) =>
+        selectedReportGroups(record.reportGroups).some(
+          (reference) => reference.groupId === group.id,
+        ),
+      )
       .map((record) => ({
         recordId: record.id,
         action: 'accept',
@@ -1016,7 +1032,7 @@ test('manual report labels work without a model suggestion and stay exact-versio
   await confirmFictionalGroup(db, root, profileId, item.id, group.groupId);
   const reviewed = intake.reviewIntake(db, root, profileId, item.id);
   const selected = reviewed.records.find((r) =>
-    r.reportGroups?.some((g) => g.groupId === group.groupId),
+    selectedReportGroups(r.reportGroups).some((g) => g.groupId === group.groupId),
   )!;
   item = intake.importIntake(db, root, profileId, item.id, {
     version: reviewed.version,

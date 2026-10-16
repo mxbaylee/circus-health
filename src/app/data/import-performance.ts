@@ -3,6 +3,7 @@ import type {
   PerformanceOutcome,
 } from '../../shared/import-performance.ts';
 import { currentProfile, subscribeProfileIdentity } from './profile.ts';
+import { holdoutTrace } from './holdout-trace.ts';
 
 type Phase = NonNullable<ClientOperationSummary['phases']>[number]['phase'];
 type Counts = NonNullable<ClientOperationSummary['counts']>;
@@ -101,19 +102,29 @@ function finish(operationId: string, outcome: PerformanceOutcome) {
   // Reporting neither blocks the user action nor invokes api()/its request instrumentation recursively.
   const controller = new AbortController();
   deliveries.add(controller);
-  const timeout = setTimeout(() => controller.abort(), 5000);
+  const timeout = setTimeout(() => {
+    holdoutTrace('telemetry.abort');
+    controller.abort();
+  }, 5000);
   void Promise.resolve()
     .then(() => {
       if (controller.signal.aborted || op.profileId !== currentProfile()?.id) return;
+      holdoutTrace('telemetry.fetch-start');
       return fetch(`/api/profiles/${encodeURIComponent(op.profileId)}/import-diagnostics`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify(op.summary),
         signal: controller.signal,
+      }).then((response) => {
+        holdoutTrace('telemetry.headers');
+        return response;
       });
     })
-    .catch(() => {})
+    .catch(() => {
+      holdoutTrace('telemetry.failed');
+    })
     .finally(() => {
+      holdoutTrace('telemetry.settled');
       clearTimeout(timeout);
       deliveries.delete(controller);
     });

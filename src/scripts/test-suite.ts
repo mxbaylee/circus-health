@@ -14,6 +14,13 @@ const externalTests = new Set([
   'src/server/test/intake-source-ocr-real.test.ts',
 ]);
 const continuation = 'src/server/test/intake-pdf-controlled.integration.test.ts';
+const acceptance = 'src/scripts/provider-qualification-acceptance.test.ts';
+// These complete retained-history fixtures keep their own case guards but do
+// not compete with another test file for the same CI runner.
+const historyTests = new Set([
+  'src/server/test/intake-identity-native-artifact-history.test.ts',
+  'src/server/test/intake-identity-native-receipt-history.test.ts',
+]);
 const patterns: Record<string, string[]> = {
   server: ['src/server/test/*.test.ts'],
   browser: ['src/tests/browser/*.test.ts'],
@@ -26,14 +33,24 @@ const patterns: Record<string, string[]> = {
     'src/app/pages/*.test.ts',
   ],
   continuation: [continuation],
+  acceptance: [acceptance],
+  history: [...historyTests],
 };
 export function suiteFiles(suite: string): string[] {
   if (!patterns[suite]) throw new Error(`Unknown test suite: ${suite}`);
   return globSync(patterns[suite])
     .filter(
-      (file) => !externalTests.has(file) && (suite === 'continuation' || file !== continuation),
+      (file) =>
+        !externalTests.has(file) &&
+        (suite === 'history' || !historyTests.has(file)) &&
+        (suite === 'continuation' || file !== continuation) &&
+        (suite === 'acceptance' || file !== acceptance),
     )
     .sort();
+}
+export function suiteConcurrency(suite: string): number {
+  if (!patterns[suite]) throw new Error(`Unknown test suite: ${suite}`);
+  return suite === 'browser' || suite === 'history' ? 1 : 2;
 }
 export function testEnvironment(env: NodeJS.ProcessEnv, suite: string): NodeJS.ProcessEnv {
   const result = { ...env };
@@ -67,7 +84,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     process.execPath,
     [
       '--test',
-      `--test-concurrency=${suite === 'browser' ? 1 : 2}`,
+      `--test-concurrency=${suiteConcurrency(suite)}`,
       `--test-timeout=${suite === 'browser' ? 60000 : suite === 'continuation' ? 180000 : 30000}`,
       '--test-reporter=spec',
       '--test-reporter-destination=stdout',

@@ -101,6 +101,16 @@
   margin: 0 0 0.5rem;
 }
 
+.saved-duplicate-evidence {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.saved-duplicate-evidence pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 @container (max-width: 700px) {
   .clinical-related-search,
   .clinical-evidence-pair {

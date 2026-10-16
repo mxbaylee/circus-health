@@ -6,6 +6,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { IncomingMessage, ServerResponse } from 'node:http';
+import { Socket } from 'node:net';
 import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
@@ -532,11 +534,17 @@ test('queue routes expose exact group selection and reject invalid windows', asy
   const f = fixture(t);
   upload(f, [envelope('route')]);
   let response: unknown;
+  const req = new IncomingMessage(new Socket());
+  const res = new ServerResponse(req);
+  const initialRequestListeners = req.listenerCount('aborted');
+  const initialResponseListeners = res.listenerCount('close');
   const context = {
     ...f,
     resource: 'intakes',
     id: 'report-queue',
     method: 'GET',
+    req,
+    res,
     params: new URLSearchParams(),
     respond: (value: unknown) => {
       response = value;
@@ -551,6 +559,8 @@ test('queue routes expose exact group selection and reject invalid windows', asy
   );
   for (const input of ['limit=0', 'limit=101', 'limit=Infinity', 'view=foreign', 'cursor=invalid'])
     await assert.rejects(handleIntakeRoute({ ...context, params: new URLSearchParams(input) }));
+  assert.equal(req.listenerCount('aborted'), initialRequestListeners);
+  assert.equal(res.listenerCount('close'), initialResponseListeners);
 });
 
 test('an unversioned legacy identity answer cannot unblock changed evidence or erase accepted history', async (t) => {
@@ -597,13 +607,18 @@ test('an unversioned legacy identity answer cannot unblock changed evidence or e
     resolutions: [{ issueId: questionId, outcome: 'unknown' }],
   });
   const initialIdentity = await getIntakeIdentityReview(f.db, f.root, f.profileId, item.id, id);
-  item = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, item.id, {
+  const identityConfirmed = await confirmIntakeIdentityScope(f.db, f.root, f.profileId, item.id, {
     version: initialIdentity.scope!.intakeVersion,
     operationId: 'confirm-initial-current-identity',
     scope: initialIdentity.scope!,
     outcome: 'this_is_me',
     attestation: 'confirmed_displayed_identity_questions',
   });
+  assert.ok(
+    'validation' in identityConfirmed,
+    'The direct legacy fixture retains its full intake contract',
+  );
+  item = identityConfirmed;
   review = intake.reviewIntake(f.db, f.root, f.profileId, item.id);
   item = intake.importIntake(f.db, f.root, f.profileId, item.id, {
     version: item.version,

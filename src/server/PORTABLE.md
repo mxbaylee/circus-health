@@ -36,6 +36,27 @@ For an archive with no selected contributor journal, the retained portable-forma
 
 All construction happens in a sibling staging directory. Only a fully verified rebuild is renamed into the new or empty destination. Failed work is removed; the source tree and active database remain untouched. Replacing active storage remains a separate reviewed action with the server stopped. No wipe-live-first operation exists.
 
+The contributor startup worker uses `rebuildStartupBounded` for its portable-format branch. It stages selected rows and original inventories on disk and uses bounded native cell transfers, rather than returning complete original rows to the request host. Staging cursors retain absolute initial ordinals, including when a personal table contributes zero rows after curation rows; empty or multi-row appends cannot rewind or double-count that base. Special `updatedAt` conversion still materializes one scalar for `Date.parse`; bounded transfer does not establish bounded materialization for every field or native SQLite operation. A private reference projection supplies the expected logical hash, exact schema and row counts; the separately created target must match those results. This adds a second linear projection, not changed-only rebuild work. The synchronous `rebuildStartup` and `rebuildProfile` helpers retain their existing paths.
+
+The lower-level direct `rebuildRecordDatabaseAsync` and
+`rebuildContributorDatabaseAsync` helpers have a cleanup limitation: a terminal
+proof refusal after iterator completion can leave their newly created database
+target behind. Staged profile/startup wrappers remove their failed stages and do
+not activate that target. Direct-helper cleanup and retry coverage remain
+[CRS-243](../../docs/todo/CRS-243.md); a rejected target is never recovery authority.
+
+Before activation, the worker verifies all original bytes and retains physical pins for the original roster, selected generations and closed target. After the activation progress callback, it rechecks those pins and selected inputs immediately before the synchronous directory rename. A failed check refuses activation. The terminal original check is one metadata pass over all originals; one disposable roster handle per portable profile remains open until activation. Bounded transfer windows do not make total rebuild work, profile count or disk use constant. This internal portable projection does not make a journal-less archive eligible for normal runtime mutation, and it does not replace the supported encrypted unlock/recovery contract.
+
+Portable export is step-wise as well. `writePortableSourcesSteps` yields every 64 streamed generation rows. `writePortableSources` drives those steps synchronously. `writePortableSourcesAsync` runs them in windows that grow to `PORTABLE_STEP_WINDOW`, and the caller's checkpoint runs at the start of every window, at completion and on an abandoned exit. `createBackup` and private-copy creation in `profile-lifecycle.ts` use the async form under their existing snapshot and source proofs. `rebuildProfileAsync` is the cooperative counterpart of `rebuildProfile` for contributor profiles. It uses `rebuildContributorDatabaseAsync` and `writePortableSourcesAsync`, and it checks between windows that the source HEAD is unchanged and the target idle. Portable-only profiles still fall back to the synchronous path. The bounded startup rebuild awaits `rebuildContributorDatabaseAsync` for journal profiles. `openPortableRows`, `restoreBackup`, published-copy activation and the copy worker's own reconstruction remain synchronous.
+
+Backup file digests read at most 64 KiB before yielding. A fresh source checkpoint
+runs before every read, including the first read after each yield and the EOF
+read; no successful proof is retained across yields. The same resumed-turn check
+serves both the after-yield and before-read boundary, without an adjacent duplicate
+callback. Entry and final checkpoints, complete byte hashing, held/named file
+identity checks and descriptor cleanup remain required. Checkpoint invocation
+counts are work accounting, not a contract for arbitrary callback side effects.
+
 These functions are retained for contributor fixtures and code-level recovery tests; they are not a supported operator CLI. The npm backup/restore aliases are removed. Direct `node src/server/recovery-cli.ts` invocation fails without reading an archive or writing a destination and directs the operator to [encrypted backup and recovery](../../docs/setup/deployment.md#backup-and-recovery).
 
 Current contributor backups verify the source cache against selected journal authority, pin its head, and retain both `record-authority.json` and the complete `records/` tree alongside originals and auxiliary artifacts. Restore verifies their checksums; subsequent startup and rebuild select that journal, preserving its accepted history.

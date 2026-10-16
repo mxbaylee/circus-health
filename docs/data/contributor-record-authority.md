@@ -14,17 +14,76 @@ Each registry-free discovery repeats that full retained-state verification, incl
 
 The backend accepts only its supported head/object names, checks physical profile-contained directories and regular files, refuses symlink traversal, creates immutable objects without replacing existing evidence, and verifies writes. File and directory synchronization accompany publication. The attached database holds an exclusive writer lease for its lifetime. Original source/asset references are verified against their profile-contained files before accepted publication and during reconstruction.
 
+Fresh physical-path proofs use Node's `realpathSync.native` for each checked directory and regular file, rather than repeating the JavaScript path-component walk. Resolved paths are not memoized: every read still checks the current profile and journal directories, the selected file's parent, its physical path and regular-file status, then opens with `O_NOFOLLOW`. Replacing an ancestor or selected directory with a link, a broken link, a nonregular file or a resolver error remains a refusal. This changes neither the accepted-head format nor publication ordering, fsyncs, encryption or writer ownership. No archive migration or new operator configuration is required. The fictional storage regression counts all four physical-path proofs for each head read and verifies that an already-open backend sees new head bytes and rejects later link replacements. These checks do not add an atomic whole-path race guarantee.
+
 ## Runtime writes and reconstruction
 
 `attachPersonalDurability` without an encrypted storage callback selects contributor record durability. The previous snapshot backend is an explicit portable-format mode; it is not a fallback after journal failure. Ordinary contributor operations append versions of changed records and the [selected intake contributions](intake-envelope-authority.md), rather than writing another full personal/curation generation each time.
 
 The accepted head selects authority before acknowledgement. A published head survives a later SQL rollback or ambiguous completion; stale live state refuses further mutation until recovery. Reopening may catch up a valid earlier accepted cache from the selected head. It also compares substantive state with an independent journal reconstruction: conflicting or unacknowledged SQL changes refuse rather than being silently accepted or erased. Total SQLite cache loss reconstructs from the journal without inference. Missing or corrupt selected journal evidence is an error, even if a portable export or old SQLite file still exists.
 
+Direct attachment also refuses an incompatible history projection, including projection 2 when the current reader requires projection 3. Contributor startup reconstruction creates a fresh runtime projection; direct helper users must use the existing staged `rebuildProfile(sourceRoot, profileId, newEmptyTargetRoot)` facility to recover into a separate empty target. This retains the same selected journal and originals and leaves the source archive untouched. Keep the source stopped, retain its backup and compare complete current/history state before selecting the target. There is no operator CLI for this contributor-only facility. Do not delete a live cache, relabel its projection or erase unacknowledged edits to make attachment pass. The supported encrypted Compose runtime instead reconstructs incompatible caches during authenticated unlock.
+
 Portable personal/curation generations remain explicit export/recovery artifacts with real manifests. They omit disposable `__record_*` tables and preserve current selected intake representation. Exporting a snapshot is intentionally work proportional to retained state; it does not make that snapshot the runtime authority or authorize recurring full snapshots during mutations.
+
+### Prepared publication core
+
+The internal prepared-record API supports genuine contributor storage as well
+as vault storage. It executes business decisions once in a rolled-back
+preparation, authenticates changed predecessors against accepted storage, and
+publishes only the frozen changes through a distinct final transaction. The
+original report's complete artifact and source-lease proofs remain live through
+the combined final physical check. A temporary verification frame must belong
+to that exact report and add no expiring caller conditions; an arbitrary child
+operation or a different report cannot supply this continuation.
+
+Within the same live contributor owner, an exact committed publication can
+extend its private accepted-history certificates with its own changes. A second
+prepared write can reuse those certificates without replaying prior versions.
+The complete physical namespace still receives verification; this is not
+constant total work. Closing storage disposes retained verification resources
+without turning an already committed acknowledgement into a failure.
+
+Ordinary public ownership callers do not yet select this prepared path.
+Prerequisite catalog publications and approved multi-group continuations remain
+unqualified under [CRS-237](../todo/CRS-237.md). Helper qualification does not
+establish those public workflows or change the supported recovery procedure.
 
 ## Copy and retry
 
 The contributor copy operation retains its caller-supplied UUID, source/name binding, unpublished staging and final-directory publication contract. Source and backup must match the selected accepted head and substantive recovered state. One-time verification may reconstruct an independent source projection; it must not publish unacknowledged source changes to make a stale cache look coherent.
+
+With a backup, the private equality check serializes the selected rows once into two independent exact multisets, then consumes the source and backup rows once each. It retains row multiplicity, the original row grammar, the source and selected read intervals, full checks around each cooperative comparison step, and the later complete original and publication checks. Without a backup, the existing two-way comparison remains. This saves one selected-table traversal; full copy verification still scales with retained state.
+
+For the isolated contributor backup helper, a canonical private snapshot and
+unpublished sibling output can share the backup-row comparison traversal with
+portable JSON output. All three inventories and their ordered columns still
+match; each comparison uses the same SELECT-column row grammar. Bookkeeping
+rows remain excluded from equality but are included in the portable output.
+Bounded pieces feed the existing buffered writer without retaining a whole row
+or table. Source, selected and original-snapshot proofs remain fresh around
+cooperative windows and output yields. The existing backup caller keeps the
+separate exporter when these helper paths are not canonical.
+
+The shared output is installed without replacing an existing destination and
+read back through its final name while the original output descriptor remains
+held. Its opaque physical ownership remains part of certification through
+publication, including after the private snapshot connection closes. Failure
+cleanup removes only still-owned output names; a competing replacement is
+refused and preserved. This removes a duplicate backup-row serialization, not
+the independent reconstruction, three-way comparison, final physical scans or
+output readback. It changes no retained or archive format and does not make
+SQLite a recovery authority.
+
+Private equality and portable-export readers can return small TEXT/BLOB cells
+as raw bytes in their existing row query. The per-column allowance is 16 KiB
+divided by the selected column count, so inline raw bytes total at most 16 KiB
+per row. A direct-column byte-length check precedes materialization. Larger
+cells and every column with a declared default retain incremental native reads;
+only the existing explicitly verified historical virtual defaults are accepted.
+Strict encoding checks, storage classes, row grammar and physical/source proofs
+remain required, including when iteration ends early. This saves native cell
+opens, not complete comparison, replay or physical verification passes.
 
 Before first destination publication, the target receives its own owner/path bindings, retained verified originals and fresh target intake chains. Copied disposable journal projections are removed. The target attaches genuine durability only after staging; a selected target head cannot be treated as an unpublished destination. Initial copy artifacts and the selected accepted head are pinned for first registration.
 

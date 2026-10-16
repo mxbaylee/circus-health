@@ -7,13 +7,15 @@ import fs, { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { IncomingMessage, ServerResponse } from 'node:http';
+import { Socket } from 'node:net';
 import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
 import {
   getIntakeIdentityReview,
-  getIntakeIdentityScope,
-  confirmIntakeIdentityScope,
+  getIntakeIdentityScope as getAnyIntakeIdentityScope,
+  confirmIntakeIdentityScope as confirmAnyIntakeIdentityScope,
 } from '../intake-identity.ts';
 import {
   exactCurrentIdentityResolutionOperationId,
@@ -32,6 +34,21 @@ import type {
   IntakeIdentityScope,
   IntakeIdentityConfirmation,
 } from '../../shared/intake-identity.ts';
+
+async function getIntakeIdentityScope(...args: Parameters<typeof getAnyIntakeIdentityScope>) {
+  const scope = await getAnyIntakeIdentityScope(...args);
+  assert.equal('format' in scope, false, 'This fixture selects legacy authority');
+  if ('format' in scope) throw Error('Unexpected native fixture');
+  return scope;
+}
+async function confirmIntakeIdentityScope(
+  ...args: Parameters<typeof confirmAnyIntakeIdentityScope>
+) {
+  const result = await confirmAnyIntakeIdentityScope(...args);
+  assert.equal('workflow' in result, true, 'This fixture selects legacy authority');
+  if (!('workflow' in result)) throw Error('Unexpected native fixture');
+  return result;
+}
 
 const heading = 'Fictional report IVY-61';
 test('labelled ISO DOB sentence separates a full name while preserving terminal initials and suffixes', () => {
@@ -2889,7 +2906,18 @@ test('identity route dispatch preserves the preview contract and explicit atomic
   const f = fixture(t);
   f.propose([envelope('a')]);
   let response: unknown;
+  const http = (method: 'GET' | 'POST') => {
+    const socket = new Socket();
+    const req = new IncomingMessage(socket);
+    req.method = method;
+    req.complete = true;
+    if (method === 'POST') req.headers['content-type'] = 'application/json';
+    const res = new ServerResponse(req);
+    t.after(() => socket.destroy());
+    return { req, res };
+  };
   const context = {
+    ...http('GET'),
     db: f.db,
     root: f.root,
     profileId: f.profileId,
@@ -2913,9 +2941,7 @@ test('identity route dispatch preserves the preview contract and explicit atomic
   await handleIntakeRoute({
     ...context,
     method: 'POST',
-    req: { headers: { 'content-type': 'application/json' } } as Parameters<
-      typeof handleIntakeRoute
-    >[0]['req'],
+    ...http('POST'),
     body: async () => Buffer.from(JSON.stringify(request(scope))),
   });
   assert.equal((response as Intake).workflow!.identityConfirmations!.length, 1);

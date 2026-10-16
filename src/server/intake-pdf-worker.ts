@@ -17,7 +17,7 @@ interface WorkerSource {
 
 interface WorkerRequest {
   requestId: number;
-  action: 'index' | 'page' | 'identity' | 'search';
+  action: 'index' | 'page' | 'identity' | 'search' | 'search_page';
   sourceId?: string;
   pageStart?: number;
   pageLimit?: number;
@@ -88,6 +88,42 @@ async function searchPdf(query: string, requestedOffset: number) {
     nextOffset: results.length > 20 ? offset + 20 : null,
     matchedPages: matches,
   };
+}
+
+/** Addressed literal search; the caller owns a checked complete section cursor. */
+async function searchPdfPage(query: string, pageNumber: number) {
+  assertSameOpenFile();
+  if (!query || query.length > 200)
+    throw Object.assign(Error('Enter 1-200 search characters'), { code: 'SEARCH_INPUT' });
+  if (!Number.isSafeInteger(pageNumber) || pageNumber < 1 || pageNumber > document!.numPages)
+    throw Object.assign(Error('PDF page outside document'), { code: 'PDF_PAGE' });
+  const page = await document!.getPage(pageNumber);
+  try {
+    const content = await page.getTextContent();
+    let text = '';
+    for (const item of content.items as ({ str: string; hasEOL?: boolean } | object)[]) {
+      text += 'str' in item ? item.str + (item.hasEOL ? '\n' : ' ') : '';
+      if (text.length > INTAKE_PDF_BOUNDS.maxTextCharactersPerPage)
+        throw Object.assign(Error('PDF page text exceeds the bounded evidence limit'), {
+          code: 'PDF_TEXT_LIMIT',
+        });
+    }
+    const needle = query.toLocaleLowerCase(),
+      found = text.toLocaleLowerCase().indexOf(needle);
+    return {
+      page: pageNumber,
+      totalPages: document!.numPages,
+      snippet:
+        found < 0
+          ? null
+          : text.slice(
+              Math.max(0, found - 160),
+              Math.min(text.length, found + needle.length + 320),
+            ),
+    };
+  } finally {
+    page.cleanup();
+  }
 }
 
 interface PdfFileAnnotation {
@@ -639,11 +675,13 @@ async function handleRequest(request: WorkerRequest) {
           ? await identityPageText(Number(request.page))
           : request.action === 'search'
             ? await searchPdf(String(request.query || ''), Number(request.offset || 0))
-            : await readPage(
-                Number(request.page),
-                Number(request.offset || 0),
-                request.format === 'pdf' ? 'pdf' : 'image',
-              );
+            : request.action === 'search_page'
+              ? await searchPdfPage(String(request.query || ''), Number(request.page))
+              : await readPage(
+                  Number(request.page),
+                  Number(request.offset || 0),
+                  request.format === 'pdf' ? 'pdf' : 'image',
+                );
     send({
       type: 'result',
       requestId: request.requestId,

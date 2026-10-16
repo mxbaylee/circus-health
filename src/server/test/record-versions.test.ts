@@ -1,7 +1,8 @@
 import test, { type TestContext } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, openSync, readSync, closeSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { openDatabase, transaction, revision, type Database, type SqliteRow } from '../database.ts';
@@ -13,7 +14,10 @@ import {
   queryRecordHistory,
   recordDurabilityStatus,
   type DurableRecordVersion,
-  type RecordCommit,
+  type RecordCommitV1 as RecordCommit,
+  type RecordCommit as StoredRecordCommit,
+  type RecordCommitV2,
+  iterateRecordCommitSegments,
   type RecordObjectReference,
   type RecordStorage,
 } from '../record-versions.ts';
@@ -69,7 +73,13 @@ function head(f: Fixture): RecordObjectReference {
   return JSON.parse(stored(f, 'head').toString('utf8')) as RecordObjectReference;
 }
 function commit(f: Fixture): RecordCommit {
-  return JSON.parse(stored(f, head(f).name).toString('utf8')) as RecordCommit;
+  const selected = JSON.parse(stored(f, head(f).name).toString('utf8')) as StoredRecordCommit;
+  // Fixture-only old-format oracle also exercises retained v1 replay after re-signing mutations.
+  return {
+    ...selected,
+    format: 'health-record-versions-v1',
+    segments: [...iterateRecordCommitSegments(f.storage, selected)],
+  };
 }
 function history(db: Database, entity: string, id: string, field?: string) {
   return queryRecordHistory(db, { profileId, entity, recordId: id, field }).entries;
@@ -123,8 +133,8 @@ test('record work accounts for actual encoded payloads and independent replay on
   );
   assert.equal(
     work.operation.encodeCalls,
-    selected.records + 2,
-    'each complete version, commit and head is encoded once',
+    selected.records + work.operation.segmentIndexPagesWritten + 2,
+    'each complete version, bounded manifest page, commit and head is encoded once',
   );
   assert.equal(work.operation.indexedVersionAttempts, selected.records);
   assert.equal(work.operation.versionValidations, selected.records);
@@ -794,7 +804,11 @@ test('condition acceptance writes scale with changed occurrences at two corpus s
       { actor: 'fictional-reviewer' },
     );
     assert.equal(commit(f).records, 3, 'one occurrence and two revision scalars');
-    assert.equal(f.writes.length - before, 3, 'one bounded segment, commit and head');
+    assert.equal(
+      f.writes.length - before,
+      4,
+      'one bounded segment, manifest page, commit and head',
+    );
     assert.ok(f.writes.slice(before).reduce((sum, row) => sum + row.bytes, 0) < 6500);
     for (const [name, bytes] of old) if (name !== 'head') assert.deepEqual(stored(f, name), bytes);
     assert.equal(history(rebuild(f), 'conditions', 'condition-0').length, 2);
@@ -929,4 +943,586 @@ test('initial accepted head survives a failed cache commit and an exact empty in
   assert.deepEqual(stored(f, 'head'), accepted);
   assert.equal(f.writes.length, writes, 'recovery only indexes accepted bytes');
   assert.deepEqual(history(rebuild(f), 'people', 'patient'), history(f.db, 'people', 'patient'));
+});
+
+test('long journal ancestry replays forward from disk references and reauthenticates spooled commits', (t) => {
+  const f = fixture(t);
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  const oldest = head(f);
+  for (let ordinal = 0; ordinal < 128; ordinal++)
+    transaction(f.db, () => {
+      f.db
+        .prepare(
+          "INSERT INTO app_meta(key,value) VALUES('fictional_ancestry',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        )
+        .run(String(ordinal));
+    });
+  const selected = commit(f),
+    work = createRecordVersionWorkCounters();
+  const restored = withRecordVersionWork(work, () => rebuild(f, 'long-ancestry.sqlite'));
+  assert.equal(
+    restored.prepare("SELECT value FROM app_meta WHERE key='fictional_ancestry'").get()?.value,
+    '127',
+  );
+  assert.equal(work.reconstruction.ancestryReferencesSpooled, selected.sequence);
+  assert.equal(work.reconstruction.ancestryReferencesReplayed, selected.sequence);
+  assert.ok(work.reconstruction.commitValidations >= selected.sequence * 2);
+  assert.equal(durability(restored).sequence, selected.sequence);
+
+  const read = f.storage.read;
+  let oldestReads = 0;
+  f.storage.read = (name) =>
+    name === oldest.name && ++oldestReads === 2
+      ? Buffer.from('changed after ancestry validation')
+      : read(name);
+  assert.throws(() => rebuild(f, 'changed-spooled-commit.sqlite'), /partial or corrupt/);
+  assert.equal(oldestReads, 2);
+  assert.equal(existsSync(resolve(f.root, 'changed-spooled-commit.sqlite')), false);
+  f.storage.read = read;
+});
+
+test('journal ancestry refuses a repeated committed object name without retaining a seen set', (t) => {
+  const f = fixture(t);
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  const selected = head(f),
+    cycle = { ...commit(f), previous: selected };
+  const bytes = Buffer.from(JSON.stringify(cycle) + '\n');
+  f.objects.set(selected.name, bytes);
+  f.objects.set(
+    'head',
+    Buffer.from(
+      JSON.stringify({
+        ...selected,
+        bytes: bytes.length,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      }),
+    ),
+  );
+  assert.throws(() => rebuild(f, 'cycle.sqlite'), /cyclic commits/);
+  assert.equal(existsSync(resolve(f.root, 'cycle.sqlite')), false);
+});
+
+test('v2 transaction manifests bound segment references and preserve exact forward order and old commit compatibility', (t) => {
+  const f = fixture(t);
+  attachRecordDurability(f.db, { profileId, storage: f.storage, segmentBytes: 1024 });
+  const work = createRecordVersionWorkCounters();
+  withRecordVersionWork(work, () =>
+    transaction(f.db, () => {
+      const insert = f.db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)');
+      for (let i = 0; i < 180; i++)
+        insert.run('fictional-' + String(i).padStart(4, '0'), 'Fictional 🌿 ' + '.'.repeat(900));
+    }),
+  );
+  const raw = JSON.parse(stored(f, head(f).name).toString()) as StoredRecordCommit;
+  assert.equal(raw.format, 'health-record-versions-v2');
+  if (raw.format !== 'health-record-versions-v2') return;
+  assert.ok(raw.segments.count > 128);
+  assert.ok(head(f).bytes < 4096);
+  assert.equal(work.operation.maxSegmentReferencesBuffered, 64);
+  assert.ok(work.operation.segmentIndexPagesWritten >= 3);
+  assert.equal(work.operation.segmentReferencesSpooled, raw.segments.count);
+  const refs = [...iterateRecordCommitSegments(f.storage, raw)];
+  assert.equal(refs.length, raw.segments.count);
+  assert.ok(refs.every((ref) => ref.bytes <= 1024));
+  const rows = Buffer.concat(refs.map((ref) => stored(f, ref.name)))
+    .toString()
+    .trimEnd()
+    .split('\n')
+    .map((line) => JSON.parse(line) as DurableRecordVersion);
+  assert.deepEqual(
+    rows.filter((row) => row.entity === 'people').map((row) => row.contents.id),
+    Array.from({ length: 180 }, (_, i) => 'fictional-' + String(i).padStart(4, '0')),
+  );
+  const recovered = withRecordVersionWork(work, () => rebuild(f, 'indexed-manifest.sqlite'));
+  assert.equal(
+    recovered.prepare("SELECT count(*) n FROM people WHERE id LIKE 'fictional-%'").get()!.n,
+    180,
+  );
+  assert.equal(work.reconstruction.maxSegmentReferencesBuffered, 64);
+  // Re-sign this fixture as the old monolithic manifest to verify retained-v1 compatibility.
+  const old = { ...raw, format: 'health-record-versions-v1', segments: refs },
+    bytes = Buffer.from(JSON.stringify(old) + '\n'),
+    ref = head(f);
+  f.objects.set(ref.name, bytes);
+  f.objects.set(
+    'head',
+    Buffer.from(
+      JSON.stringify({
+        ...ref,
+        bytes: bytes.length,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      }),
+    ),
+  );
+  assert.equal(
+    rebuild(f, 'legacy-manifest.sqlite')
+      .prepare("SELECT count(*) n FROM people WHERE id LIKE 'fictional-%'")
+      .get()!.n,
+    180,
+  );
+});
+
+test('v2 segment page corruption, repeated authenticated links and oversized page claims refuse before replay', (t) => {
+  const f = fixture(t);
+  attachRecordDurability(f.db, { profileId, storage: f.storage, segmentBytes: 1024 });
+  createNote(f.db, { title: 'Fictional large manifest', content: '🌿'.repeat(45000) });
+  const original = new Map(f.objects),
+    originalHead = head(f),
+    raw = JSON.parse(stored(f, originalHead.name).toString()) as StoredRecordCommit;
+  assert.equal(raw.format, 'health-record-versions-v2');
+  if (raw.format !== 'health-record-versions-v2') return;
+  const originalPage = JSON.parse(stored(f, raw.segments.head!.name).toString());
+  const rewrite = (ref: RecordObjectReference, value: unknown) => {
+    const bytes = Buffer.from(JSON.stringify(value) + '\n');
+    f.objects.set(ref.name, bytes);
+    return {
+      ...ref,
+      bytes: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    };
+  };
+  const mutations: [string, (commit: RecordCommitV2, page: typeof originalPage) => void][] = [
+    [
+      'count',
+      (commit) => {
+        commit.segments.count++;
+      },
+    ],
+    [
+      'ordinal',
+      (_commit, page) => {
+        page.firstSegment++;
+      },
+    ],
+    [
+      'profile',
+      (_commit, page) => {
+        page.profileId = 'foreign';
+      },
+    ],
+    [
+      'operation',
+      (_commit, page) => {
+        page.operationId = randomUUID();
+      },
+    ],
+    [
+      'sequence',
+      (_commit, page) => {
+        page.sequence++;
+      },
+    ],
+    [
+      'missing previous',
+      (_commit, page) => {
+        page.previous = null;
+      },
+    ],
+    [
+      'empty page',
+      (_commit, page) => {
+        page.segments = [];
+      },
+    ],
+    [
+      'oversized reference window',
+      (_commit, page) => {
+        page.segments = Array(65).fill(page.segments[0]);
+      },
+    ],
+  ];
+  for (const [name, mutate] of mutations) {
+    const selected = structuredClone(raw),
+      page = structuredClone(originalPage);
+    mutate(selected, page);
+    selected.segments.head = rewrite(selected.segments.head!, page);
+    f.objects.set('head', Buffer.from(JSON.stringify(rewrite(originalHead, selected))));
+    assert.throws(
+      () => rebuild(f, 'bad-' + name.replaceAll(' ', '-') + '.sqlite'),
+      /segment page|segment index/,
+      name,
+    );
+    f.objects.clear();
+    for (const [key, bytes] of original) f.objects.set(key, bytes);
+  }
+  const repeated = structuredClone(raw),
+    page = structuredClone(originalPage),
+    newRef = { ...raw.segments.head!, name: 'objects/' + randomUUID() };
+  page.previous = raw.segments.head;
+  repeated.segments.head = rewrite(newRef, page);
+  f.objects.set('head', Buffer.from(JSON.stringify(rewrite(originalHead, repeated))));
+  assert.throws(() => rebuild(f, 'repeated-link.sqlite'), /segment page/);
+  f.objects.clear();
+  for (const [key, bytes] of original) f.objects.set(key, bytes);
+  const oversized = structuredClone(raw);
+  oversized.segments.head!.bytes = 32769;
+  f.objects.set('head', Buffer.from(JSON.stringify(rewrite(originalHead, oversized))));
+  let readPage = false;
+  const read = f.storage.read;
+  f.storage.read = (name) => {
+    if (name === oversized.segments.head!.name) readPage = true;
+    return read(name);
+  };
+  assert.throws(() => rebuild(f, 'oversized-page.sqlite'), /segment page reference/);
+  assert.equal(readPage, false);
+});
+
+test('failed manifest page publication and cancellation keep the prior atomic head and all old rows', (t) => {
+  for (const failure of ['page', 'cancel'] as const) {
+    const f = fixture(t);
+    let cancel = false,
+      seen = 0;
+    attachRecordDurability(f.db, {
+      profileId,
+      storage: f.storage,
+      segmentBytes: 1024,
+      verifyReferences: () => {
+        if (cancel && ++seen === 120) throw Error('fictional cancellation');
+      },
+    });
+    const previous = stored(f, 'head'),
+      write = f.storage.writeImmutable;
+    let pages = 0;
+    if (failure === 'page')
+      f.storage.writeImmutable = (name, bytes) => {
+        let format: unknown;
+        try {
+          format = JSON.parse(Buffer.from(bytes).toString()).format;
+        } catch {}
+        if (format === 'health-record-segment-page-v1' && ++pages === 2)
+          throw Error('fictional manifest failure');
+        write(name, bytes);
+      };
+    else cancel = true;
+    assert.throws(
+      () =>
+        transaction(f.db, () => {
+          const insert = f.db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)');
+          for (let i = 0; i < 180; i++)
+            insert.run('cancelled-' + i, 'Fictional ' + '.'.repeat(900));
+        }),
+      /fictional/,
+    );
+    assert.deepEqual(stored(f, 'head'), previous);
+    assert.equal(
+      f.db.prepare("SELECT count(*) n FROM people WHERE id LIKE 'cancelled-%'").get()!.n,
+      0,
+    );
+    assert.equal(
+      rebuild(f, 'failed-' + failure + '.sqlite')
+        .prepare("SELECT count(*) n FROM people WHERE id LIKE 'cancelled-%'")
+        .get()!.n,
+      0,
+    );
+  }
+});
+
+test('only a successfully attached accepted journal selects normal-synchronous WAL projection', (t) => {
+  const f = fixture(t);
+  f.db.exec('PRAGMA main.synchronous=FULL');
+  const synchronous = (db: Database) =>
+    Number(db.prepare('PRAGMA main.synchronous').get()?.synchronous);
+  const checkpointPages = (db: Database) =>
+    Number(db.prepare('PRAGMA main.wal_autocheckpoint').get()?.wal_autocheckpoint);
+  assert.equal(synchronous(f.db), 2);
+  assert.equal(checkpointPages(f.db), 1000);
+  assert.throws(() =>
+    attachRecordDurability(f.db, { profileId: 'wrong-profile', storage: f.storage }),
+  );
+  assert.equal(synchronous(f.db), 2, 'failed attachment cannot alter cache policy');
+  assert.equal(checkpointPages(f.db), 1000, 'failed attachment keeps the default WAL threshold');
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  assert.equal(f.db.prepare('PRAGMA main.journal_mode').get()?.journal_mode, 'wal');
+  assert.equal(synchronous(f.db), 1);
+  assert.equal(checkpointPages(f.db), 32768);
+  const unattached = f.open('unattached-policy.sqlite');
+  assert.equal(synchronous(unattached), 2, 'opening alone does not relax SQLite durability');
+  assert.equal(checkpointPages(unattached), 1000);
+  const rollback = f.open('rollback-policy.sqlite');
+  rollback.exec('PRAGMA main.journal_mode=DELETE; PRAGMA main.synchronous=FULL');
+  attachRecordDurability(rollback, { profileId, storage: f.storage });
+  assert.equal(rollback.prepare('PRAGMA main.journal_mode').get()?.journal_mode, 'delete');
+  assert.equal(synchronous(rollback), 2, 'non-WAL modes keep their existing durability');
+  assert.equal(checkpointPages(rollback), 1000, 'non-WAL modes keep their checkpoint setting');
+});
+
+test('attached WAL policy reduces actual checkpoint restarts while preserving accepted recovery', (t) => {
+  const walSalt = (path: string) => {
+    // SQLite WAL header: salts at bytes 16..23 change on reset after a completed checkpoint.
+    // https://www.sqlite.org/fileformat2.html#the_write_ahead_log
+    const file = openSync(path, 'r');
+    try {
+      const header = Buffer.alloc(24);
+      assert.equal(readSync(file, header, 0, header.length, 0), header.length);
+      assert.ok([0x377f0682, 0x377f0683].includes(header.readUInt32BE(0)));
+      return header.subarray(16, 24).toString('hex');
+    } finally {
+      closeSync(file);
+    }
+  };
+  const run = (threshold: 1000 | 8192) => {
+    const f = fixture(t),
+      path = resolve(f.root, 'current.sqlite'),
+      wal = path + '-wal';
+    attachRecordDurability(f.db, { profileId, storage: f.storage });
+    f.db.exec(`PRAGMA main.wal_autocheckpoint=${threshold}`);
+    assert.equal(
+      f.db.prepare('PRAGMA main.wal_autocheckpoint').get()?.wal_autocheckpoint,
+      threshold,
+    );
+    const pageSize = Number(f.db.prepare('PRAGMA main.page_size').get()?.page_size);
+    assert.equal(f.db.prepare('PRAGMA main.wal_checkpoint(TRUNCATE)').get()?.busy, 0);
+    transaction(f.db, () => {
+      f.db
+        .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+        .run('fictional-wal-large', 'Fictional ' + 'x'.repeat(5 * 1024 * 1024));
+    });
+    const firstSalt = walSalt(wal),
+      firstWalBytes = statSync(wal).size;
+    assert.ok(firstWalBytes >= 32 + 1000 * (pageSize + 24));
+    assert.ok(firstWalBytes < 32 + 8192 * (pageSize + 24));
+    transaction(f.db, () => {
+      f.db
+        .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+        .run('fictional-wal-small', 'Fictional small');
+    });
+    const restarts = Number(walSalt(wal) !== firstSalt);
+    const beforeDrain = statSync(path).size;
+    assert.equal(f.db.prepare('PRAGMA main.wal_checkpoint(TRUNCATE)').get()?.busy, 0);
+    assert.equal(statSync(wal).size, 0);
+    assert.ok(statSync(path).size >= beforeDrain);
+    const recovered = rebuild(f, `recovered-wal-${threshold}.sqlite`);
+    const currentLarge = f.db
+      .prepare('SELECT display_name FROM people WHERE id=?')
+      .get('fictional-wal-large')?.display_name;
+    const currentSmall = f.db
+      .prepare('SELECT display_name FROM people WHERE id=?')
+      .get('fictional-wal-small')?.display_name;
+    assert.equal(
+      recovered.prepare('SELECT display_name FROM people WHERE id=?').get('fictional-wal-large')
+        ?.display_name,
+      currentLarge,
+    );
+    assert.equal(
+      recovered.prepare('SELECT display_name FROM people WHERE id=?').get('fictional-wal-small')
+        ?.display_name,
+      currentSmall,
+    );
+    assert.equal(currentLarge, 'Fictional ' + 'x'.repeat(5 * 1024 * 1024));
+    assert.equal(currentSmall, 'Fictional small');
+    assert.equal(history(recovered, 'people', 'fictional-wal-large').length, 1);
+    return restarts;
+  };
+  assert.equal(run(1000), 1, 'default threshold restarts the WAL after the large commit');
+  assert.equal(run(8192), 0, 'attached threshold avoids that checkpoint restart');
+});
+
+test('larger attached WAL window avoids repeated resets without deferring accepted recovery', (t) => {
+  const walSalt = (path: string) => {
+    const file = openSync(path, 'r');
+    try {
+      const header = Buffer.alloc(24);
+      assert.equal(readSync(file, header, 0, header.length, 0), header.length);
+      assert.ok([0x377f0682, 0x377f0683].includes(header.readUInt32BE(0)));
+      return header.subarray(16, 24).toString('hex');
+    } finally {
+      closeSync(file);
+    }
+  };
+  const run = (threshold: 8192 | 32768) => {
+    const f = fixture(t),
+      path = resolve(f.root, 'current.sqlite'),
+      wal = path + '-wal';
+    attachRecordDurability(f.db, { profileId, storage: f.storage });
+    if (threshold === 8192) f.db.exec('PRAGMA main.wal_autocheckpoint=8192');
+    const configured = Number(
+      f.db.prepare('PRAGMA main.wal_autocheckpoint').get()?.wal_autocheckpoint,
+    );
+    assert.equal(f.db.prepare('PRAGMA main.wal_checkpoint(TRUNCATE)').get()?.busy, 0);
+    let priorSalt: string | undefined;
+    let resets = 0;
+    let maxWalBytes = 0;
+    const observe = () => {
+      const salt = walSalt(wal);
+      if (priorSalt && salt !== priorSalt) resets++;
+      priorSalt = salt;
+      maxWalBytes = Math.max(maxWalBytes, statSync(wal).size);
+    };
+    for (let index = 0; index < 7; index++) {
+      transaction(f.db, () => {
+        f.db
+          .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+          .run('fictional-checkpoint-' + index, 'Fictional ' + 'x'.repeat(5 * 1024 * 1024));
+      });
+      observe();
+    }
+    transaction(f.db, () => {
+      f.db
+        .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+        .run('fictional-checkpoint-last', 'Fictional small');
+    });
+    observe();
+    const contentDigests = (db: Database) => {
+      const selected: Array<{ id: string; bytes: number; sha256: string }> = [];
+      for (const row of db
+        .prepare(
+          "SELECT id,display_name FROM people WHERE id LIKE 'fictional-checkpoint-%' ORDER BY id",
+        )
+        .iterate()) {
+        const value = String(row.display_name);
+        const hash = createHash('sha256');
+        for (let offset = 0; offset < value.length; offset += 64 * 1024)
+          hash.update(value.slice(offset, offset + 64 * 1024));
+        selected.push({
+          id: String(row.id),
+          bytes: Buffer.byteLength(value),
+          sha256: hash.digest('hex'),
+        });
+      }
+      return selected;
+    };
+    const current = contentDigests(f.db);
+    assert.equal(current.length, 8);
+    const beforeDrain = statSync(path).size;
+    const drain = f.db.prepare('PRAGMA main.wal_checkpoint(TRUNCATE)').get();
+    assert.equal(drain?.busy, 0);
+    assert.equal(statSync(wal).size, 0);
+    assert.ok(statSync(path).size >= beforeDrain);
+    const recovered = rebuild(f, `recovered-wal-window-${threshold}.sqlite`);
+    assert.deepEqual(contentDigests(recovered), current);
+    assert.equal(history(recovered, 'people', 'fictional-checkpoint-0').length, 1);
+    assert.equal(history(recovered, 'people', 'fictional-checkpoint-6').length, 1);
+    return { configured, resets, maxWalBytes };
+  };
+  const baseline = run(8192),
+    candidate = run(32768);
+  t.diagnostic(JSON.stringify({ baseline, candidate }));
+  assert.equal(baseline.configured, 8192);
+  assert.ok(baseline.resets >= 1, '8192-page window must actually restart this WAL');
+  assert.equal(candidate.resets, 0, 'attached candidate keeps this bounded WAL cycle open');
+  assert.equal(candidate.configured, 32768);
+});
+
+test('journal-backed WAL refuses failed HEAD publication and recovers durable acceptance before cache COMMIT', (t) => {
+  const f = fixture(t);
+  attachRecordDurability(f.db, { profileId, storage: f.storage });
+  assert.equal(f.db.prepare('PRAGMA main.synchronous').get()?.synchronous, 1);
+  const initialHead = stored(f, 'head');
+  const publish = f.storage.publishHead;
+  f.storage.publishHead = () => {
+    throw Error('fictional failure before accepted HEAD');
+  };
+  try {
+    assert.throws(
+      () =>
+        transaction(f.db, () => {
+          f.db
+            .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+            .run('unaccepted-cache-policy', 'Fictional unaccepted');
+        }),
+      /fictional failure before accepted HEAD/,
+    );
+  } finally {
+    f.storage.publishHead = publish;
+  }
+  assert.deepEqual(stored(f, 'head'), initialHead);
+  assert.equal(
+    f.db.prepare('SELECT 1 FROM people WHERE id=?').get('unaccepted-cache-policy'),
+    undefined,
+  );
+  assert.equal(durability(f.db).dirty, false);
+  const operation = { operationId: randomUUID(), fingerprint: 'fictional-cache-policy-recovery' };
+  const exec = f.db.exec;
+  let interrupted = false;
+  let expected: ReturnType<typeof logical> | undefined;
+  f.db.exec = function (sql: string) {
+    if (sql === 'COMMIT' && !interrupted) {
+      interrupted = true;
+      assert.notDeepEqual(
+        stored(f, 'head'),
+        initialHead,
+        'durable acceptance precedes cache commit',
+      );
+      expected = logical(f.db);
+      throw Error('fictional interruption before cache COMMIT');
+    }
+    return exec.call(this, sql);
+  };
+  try {
+    assert.throws(
+      () =>
+        transaction(
+          f.db,
+          () => {
+            f.db
+              .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+              .run('accepted-cache-policy', 'Fictional accepted');
+            return { saved: 'accepted-cache-policy' };
+          },
+          operation,
+        ),
+      /fictional interruption before cache COMMIT/,
+    );
+  } finally {
+    f.db.exec = exec;
+  }
+  assert.equal(interrupted, true);
+  assert.ok(expected);
+  assert.equal(
+    f.db.prepare('SELECT 1 FROM people WHERE id=?').get('accepted-cache-policy'),
+    undefined,
+  );
+  assert.equal(durability(f.db).dirty, true);
+  const recovered = rebuild(f, 'cache-policy-recovered.sqlite');
+  assert.deepEqual(
+    logical(recovered),
+    expected,
+    'every current and historical projection row is recovered',
+  );
+  const writes = f.writes.length;
+  assert.deepEqual(
+    transaction(
+      recovered,
+      () => {
+        throw Error('replay must not run a second mutation');
+      },
+      operation,
+    ),
+    { saved: 'accepted-cache-policy' },
+  );
+  assert.equal(f.writes.length, writes, 'exact replay publishes no duplicate accepted version');
+});
+
+test('record identity validation batches private scratch transactions without replacing its complete replay checks', (t) => {
+  const f = fixture(t);
+  const prepare = DatabaseSync.prototype.prepare;
+  let identityScopes = 0;
+  DatabaseSync.prototype.prepare = function (sql: string) {
+    if (sql === 'INSERT INTO identities VALUES(?)') {
+      assert.equal(
+        this.isTransaction,
+        true,
+        'all identities share the one disposable-index transaction',
+      );
+      identityScopes++;
+    }
+    return prepare.call(this, sql);
+  };
+  try {
+    attachRecordDurability(f.db, { profileId, storage: f.storage });
+    transaction(f.db, () => {
+      const insert = f.db.prepare('INSERT INTO people(id,display_name) VALUES(?,?)');
+      for (let index = 0; index < 160; index++)
+        insert.run('scratch-policy-' + index, 'Fictional person ' + index);
+    });
+    const expected = logical(f.db);
+    const recovered = rebuild(f, 'scratch-policy-recovered.sqlite');
+    assert.deepEqual(logical(recovered), expected);
+    assert.ok(
+      identityScopes >= 4,
+      'the actual writer and complete recovery both use checked scratch scopes',
+    );
+  } finally {
+    DatabaseSync.prototype.prepare = prepare;
+  }
 });

@@ -19,6 +19,8 @@ import { createIntakeBatchManager } from '../intake-batches.ts';
 import { readIntakeEvidence } from '../intake-evidence.ts';
 import { rebuildProfile } from '../portable.ts';
 import { createBackup } from '../recovery.ts';
+import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { isIntakeSummary } from '../../shared/intake-summary.ts';
 type UploadRequest = IncomingMessage;
 const hash = (bytes: string | Buffer) => createHash('sha256').update(bytes).digest('hex');
 function request(
@@ -67,6 +69,33 @@ test('streamed originals adopt the completed staging inode without a second plai
   assert.deepEqual(readFileSync(retained.path), original);
   assert.deepEqual(readdirSync(join(f.root, '.upload-staging')), []);
   assert.equal(item.sha256, hash(original));
+  assert.ok(isIntakeSummary(item));
+  assert.equal('workflow' in item, false);
+});
+
+test('repeated streamed upload returns a native summary without hydrating retained history', async (t) => {
+  const f = fixture(t),
+    bytes = Buffer.from('%PDF-1.4\nFictional native repeat');
+  const first = await intake.uploadIntakeStream(f.db, f.root, f.profileId, input, request([bytes]));
+  assert.ok(isIntakeSummary(first));
+  const before = intakeWorkCounters(f.db).warm;
+  const repeated = await intake.uploadIntakeStream(
+    f.db,
+    f.root,
+    f.profileId,
+    input,
+    request([bytes]),
+  );
+  assert.ok(isIntakeSummary(repeated));
+  assert.equal(repeated.id, first.id);
+  assert.equal(repeated.version, first.version);
+  assert.equal(repeated.repeatedUpload, true);
+  assert.equal(
+    f.db.prepare("SELECT COUNT(*) n FROM source_files WHERE kind='intake_original'").get()?.n,
+    1,
+  );
+  assert.equal(intakeWorkCounters(f.db).warm.envelopeHydrations, before.envelopeHydrations);
+  assert.equal(intakeWorkCounters(f.db).warm.sourceDTOHydrations, before.sourceDTOHydrations);
 });
 
 test('a coordinator wake fault after retention still acknowledges upload for later reconciliation', async (t) => {
@@ -272,17 +301,18 @@ test('original above JSONL cap survives streaming upload, conversion, backup and
       })(),
       { 'x-content-sha256': sha256 },
     );
-  let item = await intake.uploadIntakeStream(f.db, f.root, f.profileId, input, chunks());
+  const item = await intake.uploadIntakeStream(f.db, f.root, f.profileId, input, chunks());
   assert.equal(item.sha256, sha256);
   assert.equal(item.bytes, 26 * chunk.length + prefix.length);
   assert.equal(item.state, 'pending_conversion');
-  assert.equal(item.validation.previewComplete, false);
+  assert.ok(isIntakeSummary(item));
+  assert.equal(item.collections.proposals.total, 0);
   assert.equal(
     (await intake.uploadIntakeStream(f.db, f.root, f.profileId, input, chunks())).repeatedUpload,
     true,
   );
-  assert.throws(
-    () => intake.reviewIntake(f.db, f.root, f.profileId, item.id),
+  await assert.rejects(
+    intake.reviewIntakeRead(f.db, f.root, f.profileId, item.id),
     (e: unknown) => e instanceof HttpError && e.code === 'CONVERSION_REQUIRED',
   );
   const original = intake.verifyIntakeOriginal(f.db, f.root, f.profileId, item.id);
@@ -301,12 +331,13 @@ test('original above JSONL cap survives streaming upload, conversion, backup and
     },
     coverage: { status: 'partial', notes: ['Remaining pages pending'] },
   };
-  const proposed = intake.proposeConversion(f.db, f.root, f.profileId, item.id, {
+  const proposed = await intake.proposeConversionRead(f.db, f.root, f.profileId, item.id, {
     version: item.version,
     jsonlText: JSON.stringify(value),
     summary: 'Only page 1 inspected',
   });
-  assert.equal(proposed.proposals.length, 1);
+  assert.ok(isIntakeSummary(proposed));
+  assert.equal(proposed.collections.proposals.total, 1);
   const backup = await createBackup(f.db, f.root, f.profileId),
     target = join(f.root, 'rebuilt'),
     rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
@@ -315,7 +346,9 @@ test('original above JSONL cap survives streaming upload, conversion, backup and
   try {
     const restored = intake.verifyIntakeOriginal(db, target, f.profileId, proposed.id);
     assert.equal(inspectIntakeFile(restored.path).sha256, sha256);
-    assert.equal(intake.getIntake(db, target, f.profileId, proposed.id).proposals.length, 1);
+    const restoredIntake = intake.getIntakeRead(db, target, f.profileId, proposed.id);
+    assert.ok(isIntakeSummary(restoredIntake));
+    assert.equal(restoredIntake.collections.proposals.total, 1);
   } finally {
     db.close();
   }
@@ -410,6 +443,8 @@ test('HTTP uploads expose configured limits, stream chunked originals and reject
   } as RequestInit);
   assert.equal(response.status, 201);
   const item = (await response.json()).data;
+  assert.equal(item.format, 'health-intake-summary-v2');
+  assert.equal('workflow' in item, false);
   assert.equal(item.sha256, hash(bytes));
   assert.deepEqual(intake.getIntakeOriginal(f.db, f.root, f.profileId, item.id).bytes, bytes);
 });

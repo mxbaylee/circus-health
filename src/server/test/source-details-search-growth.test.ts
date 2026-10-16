@@ -100,7 +100,10 @@ test('100/200/300 actual source-list requests and mutations separately measure l
     })();
     assert.equal(actual.total, count);
     assert.deepEqual(
-      actual.data.map((row) => ({ id: row.id, details: row.details })),
+      actual.data.map((row) => {
+        assert.ok('details' in row, 'legacy source fixture retains its complete DTO');
+        return { id: row.id, details: row.details };
+      }),
       oracle.map((row) => ({ id: row.id, details: JSON.parse(String(row.details_json)) })),
     );
     assert.equal(sourceDetailsSearchCounters(db).activeRequests, 0);

@@ -6,6 +6,24 @@ import type {
   IntakeExtractionUnit,
   IntakeQuestion,
 } from '../shared/intake.ts';
+import type { Database } from './database.ts';
+import type { IntakeEnvelopeSource } from './intake-authority.ts';
+import { openCollectionModelIntakeBackend } from './intake-model-collection-backend.ts';
+import {
+  modelIntakeContextV2,
+  modelIntakeEvidenceContextV2,
+  type ModelCurrentUnitScopeV2,
+  type ModelIntakeContextRequestV2,
+} from './intake-model-context-v4.ts';
+
+/** Explicit selected source capability; it cannot be passed off as a partial legacy Intake. */
+export interface SelectedModelIntakeSourceV2 {
+  format: 'health-intake-selected-model-source-v2';
+  db: Database;
+  source: IntakeEnvelopeSource;
+  options: Parameters<typeof openCollectionModelIntakeBackend>[2];
+  currentUnits?: (page?: number) => ModelCurrentUnitScopeV2;
+}
 
 // Leave room for the fixed plan/pin/count summary so the complete tool result
 // stays below the assistant's 64k structured-result envelope.
@@ -614,7 +632,7 @@ function summary(source: ModelIntakeSource) {
   };
 }
 
-export function modelIntakeContext(
+function legacyModelIntakeContext(
   source: ModelIntakeSource,
   { section = 'units', offset = 0 }: ModelIntakeContextOptions = {},
 ) {
@@ -635,7 +653,7 @@ export function modelIntakeContext(
   };
 }
 
-export function modelIntakeEvidenceContext(
+function legacyModelIntakeEvidenceContext(
   intake: Intake,
   {
     page: pageNumber,
@@ -691,4 +709,47 @@ export function modelIntakeEvidenceContext(
     paging: context.paging,
     identitySafety: context.identitySafety,
   };
+}
+
+export function modelIntakeContext(
+  source: ModelIntakeSource,
+  options?: ModelIntakeContextOptions,
+): ReturnType<typeof legacyModelIntakeContext>;
+export function modelIntakeContext(
+  source: SelectedModelIntakeSourceV2,
+  options: ModelIntakeContextRequestV2,
+): ReturnType<typeof modelIntakeContextV2>;
+export function modelIntakeContext(
+  source: ModelIntakeSource | SelectedModelIntakeSourceV2,
+  options: ModelIntakeContextOptions | ModelIntakeContextRequestV2 = {},
+) {
+  if ('format' in source && source.format === 'health-intake-selected-model-source-v2')
+    return modelIntakeContextV2(
+      openCollectionModelIntakeBackend(source.db, source.source, source.options),
+      options as ModelIntakeContextRequestV2,
+    );
+  return legacyModelIntakeContext(
+    source as ModelIntakeSource,
+    options as ModelIntakeContextOptions,
+  );
+}
+
+export function modelIntakeEvidenceContext(
+  source: Intake,
+  options?: Parameters<typeof legacyModelIntakeEvidenceContext>[1],
+): ReturnType<typeof legacyModelIntakeEvidenceContext>;
+export function modelIntakeEvidenceContext(
+  source: SelectedModelIntakeSourceV2,
+  options?: { page?: number },
+): ReturnType<typeof modelIntakeEvidenceContextV2>;
+export function modelIntakeEvidenceContext(
+  source: Intake | SelectedModelIntakeSourceV2,
+  options: Parameters<typeof legacyModelIntakeEvidenceContext>[1] = {},
+) {
+  if ('format' in source && source.format === 'health-intake-selected-model-source-v2')
+    return modelIntakeEvidenceContextV2(
+      openCollectionModelIntakeBackend(source.db, source.source, source.options),
+      source.currentUnits?.(options.page),
+    );
+  return legacyModelIntakeEvidenceContext(source as Intake, options);
 }

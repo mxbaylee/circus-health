@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createServer } from 'node:http';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { observeRecoveryChoiceClick } from './recovery-choice-click-diagnostic.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import {
   lockOwnedPasskeyProfile,
@@ -39,6 +40,7 @@ for (const failFinalLock of [false, true])
         rmSync(runtimeDirectory, { recursive: true, force: true });
       });
       const page = await newTestPage(browser);
+      const recoveryChoiceDiagnostic = observeRecoveryChoiceClick(page);
       const origin = `http://localhost:${(runtime.server.address() as AddressInfo).port}`;
       const config = physicalPasskeyConfiguration({
         CRS_PHYSICAL_PASSKEY_QUALIFICATION: '1',
@@ -67,6 +69,7 @@ for (const failFinalLock of [false, true])
       };
       let recoverySaved = false;
       let ownedName = '';
+      let finalLockRefused = false;
       const journey = physicalPasskeyJourney(
         page,
         config.origin,
@@ -77,13 +80,14 @@ for (const failFinalLock of [false, true])
         progress,
         async (observed) => {
           if (failFinalLock && observed.recoveryFallback)
-            await page.route('**/lock', (route) =>
-              route.fulfill({
+            await page.route('**/lock', (route) => {
+              finalLockRefused = true;
+              return route.fulfill({
                 status: 500,
                 contentType: 'application/json',
                 body: JSON.stringify({ data: null }),
-              }),
-            );
+              });
+            });
           if (observed.successfulUnlocks === 3)
             await cdp.send('WebAuthn.setAutomaticPresenceSimulation', {
               authenticatorId,
@@ -95,8 +99,29 @@ for (const failFinalLock of [false, true])
           ownedName = name;
         },
       );
+      const observedJourney = journey.catch(async (error) => {
+        if (!failFinalLock || !finalLockRefused) {
+          let diagnostic = 'Profile handoff actionability: unavailable:diagnostic-failed';
+          try {
+            diagnostic =
+              'Profile handoff actionability: ' +
+              JSON.stringify(await recoveryChoiceDiagnostic('Add passkey'));
+          } catch {}
+          try {
+            t.diagnostic(diagnostic);
+          } catch {}
+        }
+        throw error;
+      });
       if (failFinalLock) {
-        await assert.rejects(journey);
+        await assert.rejects(observedJourney, (error) => {
+          if (!finalLockRefused) throw error;
+          return (
+            error instanceof assert.AssertionError &&
+            error.actual === false &&
+            error.expected === true
+          );
+        });
         assert.equal(progress.recoveryFallback, true);
         assert.equal(physicalPasskeyPassed(progress, false), false);
         assert.equal(
@@ -110,7 +135,7 @@ for (const failFinalLock of [false, true])
         assert.equal(cards[0]?.locked, true);
         return;
       }
-      await journey;
+      await observedJourney;
       assert.equal(recoverySaved, true);
       assert.equal(physicalPasskeyPassed(progress, true), true);
       assert.equal(

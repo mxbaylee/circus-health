@@ -1,3 +1,4 @@
+import { selectedReportGroups } from '../intake-selected-report-groups.ts';
 import { fixtureTransaction } from './helpers/accepted-record-fixture.ts';
 import { writeIntakeFixtureEnvelope } from './helpers/intake-authority-fixture.ts';
 import { readIntakeEnvelopeText } from '../intake-authority.ts';
@@ -92,7 +93,9 @@ async function accept(f: Fixture, id: string, mapping: Record<string, string> = 
 }
 async function prepare(f: Fixture, id: string) {
   let review = reviewIntake(f.db, f.root, f.profile, id);
-  for (const group of review.records.flatMap((record) => record.reportGroups || [])) {
+  for (const group of review.records.flatMap((record) => [
+    ...selectedReportGroups(record.reportGroups),
+  ])) {
     const state = await getIntakeIdentityReview(f.db, f.root, f.profile, id, group.groupId);
     if (state.blocking && state.scope) {
       await confirmIntakeIdentityScope(f.db, f.root, f.profile, id, {
@@ -714,3 +717,166 @@ for (const family of [false, true])
       db.close();
     }
   });
+
+test('selected clinical dependency work checkpoints unrelated exception history without adding authority', async (t) => {
+  const { clinicalSourceScopeRecordIds, clinicalSourceScopeRecordIdsWork } =
+    await import('../clinical-source-scope.ts');
+  const { runClinicalReviewWork } = await import('../clinical-review-work.ts');
+  const { reviewReadStamp } = await import('../intake-clinical-review-read-cache.ts');
+  const { db } = fixture(t);
+  const put = db.prepare(
+    "INSERT INTO manual_batches(id,title,status,created_at,coverage_json) VALUES(?,'Import record exception','verified','2026-01-01',?)",
+  );
+  for (let i = 0; i < 97; i++)
+    put.run(
+      'fictional-unrelated-' + i,
+      JSON.stringify({
+        recordException: { identityKey: 'unrelated-' + i, recordId: 'unrelated-record-' + i },
+      }),
+    );
+  const work = function* (): Generator<void, string[], void> {
+    const selected: string[] = [];
+    for (const id of clinicalSourceScopeRecordIdsWork(db, 'absent-fictional-identity')) {
+      yield;
+      if (id !== undefined) selected.push(id);
+    }
+    return selected;
+  };
+  const capture = () => {
+    const stamp = reviewReadStamp(db);
+    return () => assert.equal(reviewReadStamp(db), stamp, 'dependency proof changed');
+  };
+  let done = false,
+    turns = 0;
+  const pulse = () => {
+    if (!done) {
+      turns++;
+      setImmediate(pulse);
+    }
+  };
+  setImmediate(pulse);
+  try {
+    assert.deepEqual(await runClinicalReviewWork(work(), { capture }), [
+      ...clinicalSourceScopeRecordIds(db, 'absent-fictional-identity'),
+    ]);
+  } finally {
+    done = true;
+  }
+  assert.ok(turns >= 6, 'unrelated retained rows cooperate even when no dependency is emitted');
+  const controller = new AbortController();
+  setImmediate(() => controller.abort());
+  await assert.rejects(runClinicalReviewWork(work(), { capture, signal: controller.signal }), {
+    name: 'AbortError',
+  });
+  setImmediate(() => {
+    db.exec('BEGIN');
+    db.prepare("UPDATE app_meta SET value=value WHERE key='owner_profile_id'").run();
+    db.exec('ROLLBACK');
+  });
+  await assert.rejects(runClinicalReviewWork(work(), { capture }), /dependency proof changed/);
+  assert.equal(
+    db
+      .prepare("SELECT count(*) AS n FROM manual_batches WHERE title='Import record exception'")
+      .get()!.n,
+    97,
+  );
+});
+
+test('prepared clinical source exception lookups do not reread unrelated history per identity', async (t) => {
+  const { clinicalSourceScopeRecordIdsWork } = await import('../clinical-source-scope.ts');
+  const { prepareOwnershipDecisionIndex, ownershipDecisionIndexWork, ownershipExceptionIndexWork } =
+    await import('../ownership-decision-index.ts');
+  const { db } = fixture(t);
+  const insert = db.prepare(
+    "INSERT INTO manual_batches(id,title,status,created_at,coverage_json) VALUES(?,'Import record exception','verified','2026-01-01',?)",
+  );
+  for (let index = 0; index < 97; index++)
+    insert.run(
+      'fictional-unrelated-' + index,
+      JSON.stringify({
+        recordException: { identityKey: 'unrelated-' + index, recordId: 'old-' + index },
+      }),
+    );
+  for (const [id, recordId] of [
+    ['fictional-match-a', 'first-occurrence'],
+    ['fictional-match-b', 'second-occurrence'],
+    ['fictional-malformed', 17],
+  ] as const)
+    insert.run(id, JSON.stringify({ recordException: { identityKey: 'selected-39', recordId } }));
+  insert.run(
+    'fictional-missing-record',
+    JSON.stringify({ recordException: { identityKey: 'selected-39' } }),
+  );
+  insert.run(
+    'fictional-numeric-identity',
+    JSON.stringify({ recordException: { identityKey: 39, recordId: 'wrong-type' } }),
+  );
+  insert.run(
+    'fictional-object-record',
+    JSON.stringify({
+      recordException: { identityKey: 'selected-39', recordId: { route: 'fictional' } },
+    }),
+  );
+  insert.run(
+    'fictional-array-record',
+    JSON.stringify({ recordException: { identityKey: 'selected-39', recordId: ['fictional'] } }),
+  );
+  insert.run(
+    'fictional-object-identity',
+    JSON.stringify({
+      recordException: { identityKey: { route: 'fictional' }, recordId: 'wrong-object' },
+    }),
+  );
+  insert.run(
+    'fictional-array-identity',
+    JSON.stringify({ recordException: { identityKey: ['fictional'], recordId: 'wrong-array' } }),
+  );
+  const legacy = [...clinicalSourceScopeRecordIdsWork(db, 'selected-39')];
+  assert.equal(legacy.filter((item) => item === undefined).length, 106);
+  assert.deepEqual(legacy.filter((item): item is string => typeof item === 'string').sort(), [
+    '',
+    '',
+    '',
+    '',
+    'first-occurrence',
+    'second-occurrence',
+  ]);
+  assert.equal(
+    [...clinicalSourceScopeRecordIdsWork(db, '{"route":"fictional"}')].filter(
+      (item) => typeof item === 'string',
+    ).length,
+    0,
+  );
+  assert.equal(
+    [...clinicalSourceScopeRecordIdsWork(db, '["fictional"]')].filter(
+      (item) => typeof item === 'string',
+    ).length,
+    0,
+  );
+  await prepareOwnershipDecisionIndex(db);
+  assert.equal(ownershipDecisionIndexWork(db).coldRows, 106);
+  const plan = db
+    .prepare(
+      "EXPLAIN QUERY PLAN SELECT exception_target_record_id FROM __ownership_decision_index INDEXED BY __ownership_decision_index_exception_identity WHERE title='Import record exception' AND exception_scope_identity=? ORDER BY id",
+    )
+    .all('selected-39');
+  assert.ok(
+    plan.some((row) =>
+      String(row.detail).includes('__ownership_decision_index_exception_identity'),
+    ),
+  );
+  assert.ok(plan.every((row) => !String(row.detail).startsWith('SCAN')));
+  let inspected = 0;
+  const selected: string[] = [];
+  for (let index = 0; index < 40; index++)
+    for (const item of clinicalSourceScopeRecordIdsWork(db, 'selected-' + index)) {
+      if (item === undefined) inspected++;
+      else selected.push(item);
+    }
+  assert.equal(inspected, 6);
+  assert.deepEqual(selected.sort(), ['', '', '', '', 'first-occurrence', 'second-occurrence']);
+  assert.deepEqual([...clinicalSourceScopeRecordIdsWork(db, '39')], []);
+  assert.deepEqual([...clinicalSourceScopeRecordIdsWork(db, '{"route":"fictional"}')], []);
+  assert.deepEqual([...clinicalSourceScopeRecordIdsWork(db, '["fictional"]')], []);
+  assert.deepEqual(ownershipExceptionIndexWork(db), { queries: 43, rows: 6 });
+});

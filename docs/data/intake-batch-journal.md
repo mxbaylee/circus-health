@@ -10,6 +10,12 @@ The manager uses tracked state to record exact mutations. Assigned values are de
 
 Warm publication checks the selected marker and remembered file identities under a kernel writer lock. It validates and serializes the changed evidence. The remembered state is disposable acceleration: it is not recovery authority and is invalidated on publication failure, closure and profile lock. Warm updates do not rehash every older event; cold reopening, copying and recovery verify the complete retained selected chain. Corrupt, missing or unsupported selected evidence fails visibly rather than falling back to SQLite or an earlier snapshot.
 
+Each journal path check first uses the native filesystem resolver. An exact
+literal-path result needs no JavaScript path traversal; a differing result or
+native error delegates to the existing resolver, preserving alias, filename-case
+and error behavior. No path result is cached. Selected-path, file identity,
+hardlink, descriptor, writer-lock and durability checks remain unchanged.
+
 ## Publication, interruption and retry
 
 An event is staged and flushed before the selected marker is published. The staging directory is flushed after removing the temporary event link and before selecting it; both directories are flushed after the marker moves. Immutable event publication does not replace an earlier event. Staging material and unselected events cannot become current merely because they exist on disk. Temporary files and writer locks are excluded from encrypted publication and portable copies.

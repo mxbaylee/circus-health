@@ -514,3 +514,51 @@ test('current assertions check stale and corrupt authority without publishing pe
   fs.writeFileSync(tail, fs.readFileSync(tail));
   assert.throws(() => assertCurrentIntakeBatch(f.root, f.profileId, current), /Invalid/);
 });
+
+test('archive copy streams batches once to its sink and preserves per-journal publication notifications', (t) => {
+  const f = fixture(t),
+    target = join(f.root, 'streamed-batches');
+  const expected = new Map<string, IntakeBatch>();
+  for (let ordinal = 0; ordinal < 4; ordinal++) {
+    const batch = trackIntakeBatch({
+      ...f.batch,
+      id: randomUUID(),
+      operationId: 'fictional-' + ordinal,
+      items: [],
+    });
+    writeIntakeBatch(f.root, f.profileId, batch, 'initial');
+    batch.reason = 'Fictional progress ' + ordinal;
+    writeIntakeBatch(f.root, f.profileId, batch, 'progress');
+    expected.set(batch.id, batch);
+  }
+  const notifications: string[][] = [];
+  const stop = registerIntakeBatchPublication(target, f.profileId, (names) =>
+    notifications.push(names),
+  );
+  const work = createIntakeBatchJournalWorkCounters();
+  let files = 0;
+  try {
+    const collected = withIntakeBatchJournalWork(work, () =>
+      copyIntakeBatchJournals(f.root, f.profileId, target, {
+        onFile(path) {
+          files++;
+          assert.equal(fs.existsSync(join(target, path)), true);
+        },
+      }),
+    );
+    assert.equal(collected.length, 0);
+    assert.equal(files, 12);
+    assert.equal(work.replayedEvents, 8);
+    assert.equal(work.copiedEvents, 8);
+    assert.equal(notifications.length, 4);
+    for (const names of notifications) {
+      assert.equal(names.length, 3);
+      assert.ok(names.at(-1)?.endsWith('/current'));
+    }
+    for (const [id, batch] of expected)
+      assert.deepEqual(readIntakeBatch(target, f.profileId, id), batch);
+  } finally {
+    stop();
+    clearIntakeBatchJournalCache(target);
+  }
+});

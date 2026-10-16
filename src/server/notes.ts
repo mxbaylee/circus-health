@@ -738,16 +738,21 @@ function requireDistinctPerson(
       'Another person already has this display name and icon. Choose a different display name or icon.',
     );
 }
-function createInner(db: Database, input: NoteValues): string {
+function createInner(
+  db: Database,
+  input: NoteValues,
+  preparedPerson?: { personId: string; icon?: string },
+): string {
   const kind = input.kind ?? 'note';
   if (typeof kind !== 'string' || !['note', 'historical', 'person'].includes(kind))
     throw new HttpError(400, 'INVALID_INPUT', 'Unknown note kind');
   const v = validateInput(db, input, { profile_json: '{}' }),
     id = input.id === undefined ? newId('note') : safeText(input.id, 'id'),
-    personId = kind === 'person' ? newId('person') : null,
+    personId = kind === 'person' ? preparedPerson?.personId || newId('person') : null,
     t = now();
   if (personId) {
     const name = v.title;
+    if (preparedPerson?.icon) v.person.icon = preparedPerson.icon;
     if (!v.person.icon) {
       const used = personDisplayIdentities(db);
       const choices = personIconCatalog.icons
@@ -764,12 +769,12 @@ function createInner(db: Database, input: NoteValues): string {
     requireDistinctPerson(db, name, v.person.icon);
   }
   if (personId)
-    db.prepare('INSERT INTO people(id,display_name,relationship) VALUES(?,?,?)').run(
-      personId,
-      v.person.name || v.title,
-      v.person.relationship || null,
-    );
-  db.prepare(
+    recordMutationStatement(
+      db,
+      'INSERT INTO people(id,display_name,relationship) VALUES(?,?,?)',
+    ).run(personId, v.person.name || v.title, v.person.relationship || null);
+  recordMutationStatement(
+    db,
     'INSERT INTO notes(id,kind,status,title,content,note_type,event_date,topics,raw_thoughts,person_id,profile_json,text_formats_json,pinned,archived,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
   ).run(
     id,
@@ -924,7 +929,8 @@ function saveInner(db: Database, row: NoteRow, input: NoteValues, manualNames = 
   }
   v.archived = row.archived;
   replaceLinks(db, row.id, input.links);
-  db.prepare(
+  recordMutationStatement(
+    db,
     'UPDATE notes SET title=?,content=?,note_type=?,event_date=?,topics=?,raw_thoughts=?,profile_json=?,text_formats_json=?,pinned=?,archived=?,updated_at=?,version=version+1 WHERE id=?',
   ).run(
     v.title,
@@ -941,7 +947,7 @@ function saveInner(db: Database, row: NoteRow, input: NoteValues, manualNames = 
     row.id,
   );
   if (row.person_id)
-    db.prepare('UPDATE people SET display_name=?,relationship=? WHERE id=?').run(
+    recordMutationStatement(db, 'UPDATE people SET display_name=?,relationship=? WHERE id=?').run(
       v.person.name || v.title,
       v.person.relationship || null,
       row.person_id,
@@ -953,18 +959,36 @@ export function createIntakeFamilyPersonInTransaction(
   db: Database,
   fullName: string,
   relationship?: string,
+  preparedPerson?: { noteId: string; personId: string; icon?: string },
 ) {
-  const id = createInner(db, {
-    kind: 'person',
-    title: fullName,
-    content: '',
-    person: {
-      fullName,
-      name: fullName,
-      tags: ['Family'],
-      ...(relationship ? { relationship } : {}),
+  if (
+    preparedPerson &&
+    (!/^note:[0-9a-f-]{36}$/i.test(preparedPerson.noteId) ||
+      !/^person:[0-9a-f-]{36}$/i.test(preparedPerson.personId) ||
+      db.prepare('SELECT 1 FROM notes WHERE id=?').get(preparedPerson.noteId) ||
+      db.prepare('SELECT 1 FROM people WHERE id=?').get(preparedPerson.personId))
+  )
+    throw new HttpError(
+      409,
+      'IDENTITY_SELECTION',
+      'The prepared family person destination changed',
+    );
+  const id = createInner(
+    db,
+    {
+      ...(preparedPerson ? { id: preparedPerson.noteId } : {}),
+      kind: 'person',
+      title: fullName,
+      content: '',
+      person: {
+        fullName,
+        name: fullName,
+        tags: ['Family'],
+        ...(relationship ? { relationship } : {}),
+      },
     },
-  });
+    preparedPerson,
+  );
   return getNote(db, id);
 }
 
@@ -992,7 +1016,7 @@ export function rememberSourceNameInTransaction(
   const next = already ? names : [...names, evidence.name];
   // Install the authority inside the caller's existing journal transaction,
   // then use ordinary save validation/versioning for the mirrored name list.
-  db.prepare('UPDATE notes SET profile_json=? WHERE id=?').run(
+  recordMutationStatement(db, 'UPDATE notes SET profile_json=? WHERE id=?').run(
     JSON.stringify({ ...current.person, sourceKnownNames: [...sources, evidence] }),
     row.id,
   );
@@ -1337,3 +1361,4 @@ function validatePerson(person: Record<string, unknown>, previous: Record<string
       throw new HttpError(400, 'INVALID_INPUT', `${key} is not a valid calendar date`);
   }
 }
+import { recordMutationStatement } from './record-mutation-recipe.ts';

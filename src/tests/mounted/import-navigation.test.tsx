@@ -12,8 +12,19 @@ import { ImportPage } from '../../app/features/import/ImportPage';
 import { selectProfile } from '../../app/data/profile';
 
 vi.mock('../../app/features/import/ImportDetailReview', () => ({
-  ImportDetailReview: ({ onBack }: { onBack: () => void }) => (
-    <section aria-label="Exact selected report">
+  ImportDetailReview: ({
+    onBack,
+    selection,
+  }: {
+    onBack: () => void;
+    selection: { groupId: string; recordId?: string; proposalId?: string | null };
+  }) => (
+    <section
+      aria-label="Exact selected report"
+      data-group-id={selection.groupId}
+      data-record-id={selection.recordId}
+      data-proposal-id={selection.proposalId ?? 'original'}
+    >
       <button onClick={onBack}>Back to overview</button>
     </section>
   ),
@@ -156,7 +167,10 @@ it.each([true, false])(
             manuallyEdited: false,
             issues: [],
             identityReview: {
-              ...identity,
+              message: identity.message,
+              evidencedIdentity: identity.evidencedIdentity,
+              conflicts: identity.conflicts,
+              warnings: identity.warnings,
               status: ready ? 'prior_confirmation' : 'confirmation_required',
               blocking: !ready,
             },
@@ -302,7 +316,16 @@ it('saves good selections through ImportPage, then requires a fresh approval for
           offeredSelfFields: {},
           conflicts: [],
         });
-      if (url.endsWith('/people')) return response([]);
+      if (url.endsWith('/record-ownership/people'))
+        return response([
+          {
+            noteId: 'person-note:fictional-parent',
+            personId: 'person:fictional-parent',
+            version: 1,
+            fullName: 'Fictional Parent',
+            relationship: 'Parent',
+          },
+        ]);
       if (url.includes('/record-owner?')) return response({ personId: 'patient' });
       if (url.endsWith('/intakes/report-acceptance') && init?.method === 'POST') {
         posts++;
@@ -332,7 +355,7 @@ it('saves good selections through ImportPage, then requires a fresh approval for
           operationId: `fictional-child-${posts}-${selection.recordId}`,
           label: selection.recordId.replace('record', 'marker'),
           kind: 'observation',
-          personId: 'patient',
+          personId: selection.recordId.endsWith('-1') ? 'person:fictional-parent' : 'patient',
           status: posts === 1 && selection.recordId.endsWith('-1') ? 'needs_review' : 'saved',
           message: 'Review the current record, then approve again.',
           ...(posts === 1 && selection.recordId.endsWith('-1')
@@ -391,6 +414,9 @@ it('saves good selections through ImportPage, then requires a fresh approval for
   await waitFor(() => expect(posts).toBe(1));
   expect(await screen.findByText('1 saved, 1 needs review')).toBeVisible();
   expect(
+    await screen.findByRole('link', { name: /Fictional Parent · Parent · needs review/ }),
+  ).toBeVisible();
+  expect(
     screen
       .getAllByRole('status')
       .filter((region) => region.textContent?.includes('1 saved, 1 needs review')),
@@ -416,7 +442,7 @@ it.each(['/import', '/import?q=fictional'])(
   },
 );
 
-it('retries only an unchanged source scope and stops for changed scope or queue view', async () => {
+it('retries only an unchanged source scope and stops for changed scope or report navigation', async () => {
   const profileId = 'fictional-source-path-guard';
   selectProfile({ id: profileId, name: 'Rowan', placebo: true });
   const sourceGroup: IntakeReportQueueGroup = {
@@ -582,13 +608,10 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
     }),
   );
   const user = userEvent.setup();
-  render(
-    <RouterProvider
-      router={createMemoryRouter([{ path: '/import', element: <ImportPage /> }], {
-        initialEntries: ['/import'],
-      })}
-    />,
-  );
+  const router = createMemoryRouter([{ path: '/import', element: <ImportPage /> }], {
+    initialEntries: ['/import'],
+  });
+  render(<RouterProvider router={router} />);
 
   await user.click(
     await screen.findByRole('button', { name: 'Change source: Fictional BodySpec' }),
@@ -601,6 +624,7 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
   expect(sourcePosts[0]!.version).toBe(1);
   expect(sourcePosts[1]!.version).toBe(2);
   expect(sourcePosts[1]!.scopeToken).toBe(sameScopeRefresh.scopeToken);
+  expect(sourceReviewReads, 'after unchanged-scope retry').toBe(2);
 
   await user.click(
     await screen.findByRole('button', { name: 'Change source: Fictional BodySpec' }),
@@ -612,10 +636,12 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
     await screen.findByRole('button', { name: 'Use Fictional BodySpec for 2 records' }),
   ).toBeEnabled();
   expect(sourcePosts).toHaveLength(3);
+  expect(sourceReviewReads, 'after changed scope disclosure').toBe(5);
   await user.click(screen.getByRole('button', { name: 'Use Fictional BodySpec for 2 records' }));
   await waitFor(() => expect(sourcePosts).toHaveLength(4));
   expect(sourcePosts[3]!.operationId).not.toBe(sourcePosts[2]!.operationId);
   expect(sourcePosts[3]!.scopeToken).toBe(changedScopeRefresh.scopeToken);
+  expect(sourceReviewReads, 'after deliberate changed-scope save').toBe(5);
 
   await user.click(
     await screen.findByRole('button', { name: 'Change source: Fictional BodySpec' }),
@@ -624,8 +650,14 @@ it('retries only an unchanged source scope and stops for changed scope or queue 
     await screen.findByRole('button', { name: 'Use Fictional BodySpec for 1 record' }),
   );
   await waitFor(() => expect(sourcePosts).toHaveLength(5));
+  expect(sourceReviewReads, 'before abandoning the pending scope').toBe(6);
   await user.click(screen.getByRole('button', { name: 'Close' }));
-  await user.selectOptions(screen.getByRole('combobox', { name: 'Review status' }), 'later');
+  expect(screen.getByRole('combobox', { name: 'Review status' })).toBeDisabled();
+  await act(async () => {
+    await router.navigate('/import?intake=fictional-intake&group=fictional-report&review=full');
+  });
+  expect(await screen.findByRole('region', { name: 'Exact selected report' })).toBeVisible();
+  expect(sourceReviewReads, 'after closing and navigating to the exact report').toBe(6);
   releasePost(
     new Response(
       JSON.stringify({
@@ -1385,7 +1417,7 @@ it('clears a retained identity action before refreshing a back-forward cached Im
     expect(screen.getByRole('button', { name: /Review person for/ })).toBeEnabled(),
   );
   fireEvent.click(screen.getByRole('button', { name: /Review person for/ }));
-  expect(screen.getByRole('button', { name: 'This is me' })).toBeEnabled();
+  expect(await screen.findByRole('button', { name: 'This is me' })).toBeEnabled();
 
   const restored = new Event('pageshow');
   Object.defineProperty(restored, 'persisted', { value: true });
@@ -2146,7 +2178,14 @@ it('keeps report B banner review visible and saving blocked beside confirmed rep
     selectable: !identity(id).blocking,
     manuallyEdited: false,
     issues: [],
-    identityReview: identity(id),
+    identityReview: {
+      status: identity(id).status,
+      blocking: identity(id).blocking,
+      message: identity(id).message,
+      evidencedIdentity: identity(id).evidencedIdentity,
+      conflicts: identity(id).conflicts,
+      warnings: identity(id).warnings,
+    },
   });
   vi.stubGlobal(
     'fetch',
@@ -2203,4 +2242,102 @@ it('keeps report B banner review visible and saving blocked beside confirmed rep
   expect(
     within(refreshedB.closest('article')!).getByRole('button', { name: 'Confirm & save' }),
   ).toBeEnabled();
+});
+
+it('resolves a native historical record link through exact authority and forwards its first retained report', async () => {
+  selectProfile({ id: 'fictional-native-deep-link', name: 'Fictional Reader', placebo: true });
+  const nativeFeed = {
+    format: 'health-intake-import-feed-v2',
+    view: 'active',
+    records: [],
+    totalRecords: 0,
+    totalGroups: 0,
+    nextCursor: null,
+    counts,
+    kindCounts: feed.kindCounts,
+    groups: [],
+    people: feed.people,
+    activity: {
+      ...feed.activity,
+      format: 'activity',
+      binding: 'pinned',
+      remainingUnits: { state: 'exact', value: 0 },
+      readingAccounting: { state: 'referenced', scope: 'full', binding: 'pinned' },
+    },
+  };
+  const requests: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.includes('/intakes/import-feed?')) return response(nativeFeed);
+      if (url.endsWith('/intakes/limits'))
+        return response({ uploadBytes: 1024, extractionBytes: 1024 });
+      if (url.endsWith('/intake-batches')) return response([]);
+      if (url.endsWith('/intakes/fictional-intake'))
+        return response({
+          format: 'health-intake-summary-v2',
+          id: 'fictional-intake',
+          links: { reports: '/intakes/import-feed?intakeId=fictional-intake' },
+        });
+      if (url.includes('/review-record?'))
+        return response({
+          format: 'health-intake-clinical-record-v2',
+          context: {
+            intakeId: 'fictional-intake',
+            proposalId: 'fictional-proposal',
+            version: 7,
+            reviewToken: 'review-7',
+            summary: { additions: 1, duplicates: 0, unsupported: 0, uncertain: 0 },
+            sourceTextStale: false,
+          },
+          record: {
+            kind: 'reference',
+            reference: {
+              format: 'health-intake-clinical-review-reference-v2',
+              reviewToken: 'review-7',
+              section: 'records',
+              ordinal: 0,
+              bytes: 90000,
+            },
+            selection: { recordId: 'fictional-record', candidateVersionId: 'version-1' },
+            policy: {
+              canAcceptUnchanged: true,
+              blockingIssueCount: 0,
+              unreviewedPairChoices: false,
+              classification: 'addition',
+              kind: 'document',
+            },
+            reportGroups: {
+              format: 'health-intake-report-group-links-v1',
+              count: 200,
+              first: { groupId: 'fictional-exact-group', groupVersionId: 'group-1' },
+              selection: {
+                recordId: 'fictional-record',
+                candidateId: 'candidate-1',
+                candidateVersionId: 'version-1',
+                proposalId: 'fictional-proposal',
+              },
+            },
+          },
+        });
+      throw new Error(`Unexpected request ${url}`);
+    }),
+  );
+  render(
+    <RouterProvider
+      router={createMemoryRouter([{ path: '/import', element: <ImportPage /> }], {
+        initialEntries: [
+          '/import?intake=fictional-intake&proposal=fictional-proposal&record=fictional-record',
+        ],
+      })}
+    />,
+  );
+  const selected = await screen.findByRole('region', { name: 'Exact selected report' });
+  expect(selected).toHaveAttribute('data-group-id', 'fictional-exact-group');
+  expect(selected).toHaveAttribute('data-record-id', 'fictional-record');
+  expect(selected).toHaveAttribute('data-proposal-id', 'fictional-proposal');
+  expect(requests.filter((url) => url.includes('/review-record?'))).toHaveLength(1);
+  expect(requests.some((url) => url.includes('/review?'))).toBe(false);
 });

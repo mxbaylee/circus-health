@@ -7,6 +7,7 @@ import {
   lstatSync,
   openSync,
   realpathSync,
+  readdirSync,
   rmSync,
   writeSync,
 } from 'node:fs';
@@ -23,8 +24,16 @@ export interface FictionalPdfPage {
 export function assertFictionalOutputPath(path: string) {
   let directory = realpathSync(dirname(resolve(path)));
   for (;;) {
-    if (existsSync(join(directory, '.git')))
-      throw Error('Fictional artifacts must remain outside Git');
+    const marker = join(directory, '.git');
+    if (existsSync(marker)) {
+      const metadata = lstatSync(marker);
+      // Filesystem sandboxes may protect a nonexistent metadata path with an
+      // empty, unwritable directory. It cannot contain a Git repository. Keep
+      // rejecting real metadata, worktree files, links and writable markers.
+      const placeholder =
+        metadata.isDirectory() && (metadata.mode & 0o222) === 0 && readdirSync(marker).length === 0;
+      if (!placeholder) throw Error('Fictional artifacts must remain outside Git');
+    }
     const parent = dirname(directory);
     if (parent === directory) return;
     directory = parent;

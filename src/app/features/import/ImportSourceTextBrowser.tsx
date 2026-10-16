@@ -1,5 +1,7 @@
+import { intakeFilenameDisplay } from '../../../shared/intake-summary';
+import { IntakeFilenameDetails } from '../intake/IntakeFilenameDetails';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Intake } from '../../../shared/intake';
+import type { IntakeHeader, IntakeSummaryV3 } from '../../../shared/intake-summary';
 import type { ManualSourceRecordResult } from '../../../shared/intake-manual-source-record';
 import type { SourceTextIssueList } from '../../../shared/intake-source-text';
 import { isRetainOnlyIntake } from '../../../shared/intake-source-policy';
@@ -11,8 +13,22 @@ import { SourceReaderObservations } from './SourceReaderObservations';
 import './import-source-issues.css';
 import { ImportSourceAttentionQueue } from './ImportSourceAttentionQueue';
 
+type SourceBrowserIntake = IntakeHeader | IntakeSummaryV3;
+
+function referencedIntake(source: SourceBrowserIntake): source is IntakeSummaryV3 {
+  return 'format' in source && source.format === 'health-intake-summary-v3';
+}
+
+function retainOnlySource(source: SourceBrowserIntake): boolean | null {
+  if (referencedIntake(source)) {
+    return typeof source.retainOnly === 'boolean' ? source.retainOnly : null;
+  }
+  return isRetainOnlyIntake(source);
+}
+
 export interface SourceBrowserProps {
   onChanged: () => void;
+  guardNavigation?: boolean;
   attentionRows?: boolean;
   onAttentionCount?: (count: number) => void;
   attentionRefreshKey?: unknown;
@@ -41,6 +57,7 @@ function ImportedSourceSections({
   onManualCreated,
   intakeId,
   onPendingChange,
+  guardNavigation = true,
 }: SourceBrowserProps) {
   const profile = useProfile();
   const alive = useRef(true);
@@ -50,7 +67,7 @@ function ImportedSourceSections({
   const [readingError, setReadingError] = useState('');
   const [offset, setOffset] = useState(0);
   const [members, setMembers] = useState(false);
-  const [selected, setSelected] = useState<Intake | null>(null);
+  const [selected, setSelected] = useState<SourceBrowserIntake | null>(null);
   const [pendingSources, setPendingSources] = useState<Set<string>>(() => new Set());
   const pending = pendingSources.size > 0;
   const setSourcePending = useCallback((id: string, value: boolean) => {
@@ -74,7 +91,7 @@ function ImportedSourceSections({
     },
     [],
   );
-  const resource = useResource<Intake[] | Intake>(
+  const resource = useResource<SourceBrowserIntake[] | SourceBrowserIntake>(
     intakeId
       ? `/intakes/${encodeURIComponent(intakeId)}`
       : `/intakes?rootOnly=${!members}&limit=30&offset=${offset}`,
@@ -84,7 +101,7 @@ function ImportedSourceSections({
       ? resource.data
       : [resource.data]
     : [];
-  const retainOnly = !!selected && isRetainOnlyIntake(selected);
+  const retainOnly = !!selected && retainOnlySource(selected);
   const guards = useRef({ pending, readingBlocked });
   guards.current = { pending, readingBlocked };
   useEffect(() => {
@@ -96,7 +113,7 @@ function ImportedSourceSections({
   async function readSource(source = selected) {
     if (
       !source ||
-      isRetainOnlyIntake(source) ||
+      retainOnlySource(source) !== false ||
       !profile ||
       !onRead ||
       pending ||
@@ -113,14 +130,14 @@ function ImportedSourceSections({
       // belong to their original delivery and must not start a second, competing job.
       let id = source.id;
       const seen = new Set<string>();
-      let root: Intake;
+      let root: SourceBrowserIntake;
       while (true) {
         if (seen.has(id) || seen.size >= 100)
           throw new Error(
             'The source package ancestry could not be resolved. Refresh imported files.',
           );
         seen.add(id);
-        const result = await api<Intake>(
+        const result = await api<SourceBrowserIntake>(
           '/api/profiles/' + encodeURIComponent(profile.id) + '/intakes/' + encodeURIComponent(id),
         );
         if (!alive.current) return;
@@ -139,7 +156,7 @@ function ImportedSourceSections({
       if (alive.current) {
         setReadingNotice(
           'Clinical reading queued for ' +
-            root.filename +
+            intakeFilenameDisplay(root) +
             '. Review the resulting proposals before saving records.',
         );
         onChanged();
@@ -156,7 +173,7 @@ function ImportedSourceSections({
       if (alive.current) setReading(false);
     }
   }
-  const change = (next: Intake | null) => {
+  const change = (next: SourceBrowserIntake | null) => {
     if (readingLock.current) return;
     if (pending) {
       setNotice('Save or discard the current source review draft before opening another file.');
@@ -224,6 +241,7 @@ function ImportedSourceSections({
         <SourceReportSection
           key={intake.id}
           intake={intake}
+          guardNavigation={guardNavigation}
           compact={!!intakeId}
           expanded={selected?.id === intake.id}
           pending={pending}
@@ -244,18 +262,20 @@ function ImportedSourceSections({
               <button
                 type="button"
                 className="button secondary"
-                disabled={retainOnly || pending || reading || !!readingBlocked}
+                disabled={retainOnly !== false || pending || reading || !!readingBlocked}
                 onClick={() => void readSource()}
               >
                 {reading ? 'Starting clinical reading…' : 'Read source for clinical review'}
               </button>
-              {(retainOnly || pending || readingBlocked) && (
+              {(retainOnly !== false || pending || readingBlocked) && (
                 <p className="helper-text">
-                  {retainOnly
-                    ? 'This format is kept as an original only. Clinical reading is unavailable; select a readable report instead.'
-                    : pending
-                      ? 'Save or discard your source review draft before starting clinical reading.'
-                      : readingBlocked}
+                  {retainOnly === null
+                    ? 'Checked source eligibility is unavailable. Refresh imported files.'
+                    : retainOnly
+                      ? 'This format is kept as an original only. Clinical reading is unavailable; select a readable report instead.'
+                      : pending
+                        ? 'Save or discard your source review draft before starting clinical reading.'
+                        : readingBlocked}
                 </p>
               )}
               {readingNotice && <p role="status">{readingNotice}</p>}
@@ -307,6 +327,7 @@ function issueState(issue: Issue): string {
 
 function SourceReportSection({
   intake,
+  guardNavigation,
   compact,
   expanded,
   pending,
@@ -318,7 +339,8 @@ function SourceReportSection({
   onManualCreated,
   children,
 }: {
-  intake: Intake;
+  intake: SourceBrowserIntake;
+  guardNavigation?: boolean;
   compact?: boolean;
   expanded: boolean;
   pending: boolean;
@@ -380,6 +402,7 @@ function SourceReportSection({
       ) : (
         <fieldset className="import-source-manual" disabled={textPending || reading}>
           <ImportManualSourceRecord
+            guardNavigation={guardNavigation}
             intakeId={intake.id}
             page={editorPage}
             onPendingChange={setManualPending}
@@ -392,6 +415,7 @@ function SourceReportSection({
         </fieldset>
       )}
       <SourceTextReview
+        guardNavigation={guardNavigation}
         key={`${intake.id}:${selection.issueId || selection.readerId || 'original'}:${selection.page}`}
         intakeId={intake.id}
         embedded
@@ -486,18 +510,21 @@ function SourceReportSection({
   return (
     <article
       className={`import-report import-source-report${compact ? ' is-embedded' : ''}`}
-      aria-label={`Original ${intake.filename}`}
+      aria-label={`Original ${intakeFilenameDisplay(intake)}`}
     >
       {!compact && (
         <header className="import-report-title">
-          <h3>{intake.filename}</h3>
+          <h3>{intakeFilenameDisplay(intake)}</h3>
+          {intake.filenameReference && (
+            <IntakeFilenameDetails reference={intake.filenameReference} />
+          )}
         </header>
       )}
       <div className="import-source-report-summary">
         <button
           type="button"
           className="text-link"
-          aria-label={intake.filename}
+          aria-label={intakeFilenameDisplay(intake)}
           aria-expanded={expanded}
           disabled={reading}
           onClick={onToggle}

@@ -2,13 +2,34 @@ import { clearSourceContextClassificationCache } from './intake-source-context-c
 import { clearSourceDetailsSearchCache } from './source-details-search.ts';
 import { clearSourceTextProjectionCache } from './source-text-projection.ts';
 import { clearIntakeLookupCache } from './intake-lookup-projection.ts';
+import { clearNativeOwnershipPlans } from './record-ownership-native.ts';
+import { clearPreparedClinicalProjections } from './intake-clinical-projection-plan.ts';
+import { clearIntakeLiteralSessions } from './intake-literal-session.ts';
+import { clearIntakeMappingSections } from './intake-model-mapping.ts';
+import { clearJournalActivityIndex } from './journal-activity-index.ts';
+import { clearIntakeCollectionEvidenceFragments } from './intake-evidence-fragment.ts';
+import { clearPreparedCollectionQueues } from './intake-queue-native.ts';
+import { clearCollectionReportQueues } from './intake-report-group-collection.ts';
+import { clearCollectionImportFeeds } from './intake-import-feed-collection.ts';
+import {
+  REPORT_QUEUE_GUARD_HEADER,
+  reportQueueGuardLocation,
+} from './report-queue-guard-diagnostic.ts';
 import { clearIntakeStateCache } from './intake-state-storage.ts';
+import { clearIdentityGrounding } from './intake-identity-grounding.ts';
+import { clearPackageSourceSession } from './intake-package-session.ts';
+import { clearIntakeSourceFieldSessions } from './intake-source-field-session.ts';
 import { sourceAssertionOwnership } from './source-assertion-ownership.ts';
 import { handleRecordOwnershipRoute } from './record-ownership-routes.ts';
 import { recordOwner } from './record-owner.ts';
+import { clinicalImportCorrectionHistory } from './clinical-import-corrections.ts';
 import { readProfileRegistry, recoverProfileDeletions } from './profile-registry.ts';
 import { diagnosticRoute } from '../shared/import-diagnostic-route.ts';
-import { createProfileLifecycle } from './profile-lifecycle.ts';
+import {
+  createProfileLifecycle,
+  profileLifecycleAvailable,
+  type ProfileLifecycle,
+} from './profile-lifecycle.ts';
 import { disposePdfEvidenceSessions } from './intake-pdf-session.ts';
 import { visibilityState, setVisibility } from './visibility.ts';
 import { clinicalRedirect } from './clinical-references.ts';
@@ -17,12 +38,28 @@ import { createNoteExports } from './note-exports.ts';
 import { personFilterOptions } from './collection-filters.ts';
 import { personSourceEvidence } from './person-source-evidence.ts';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { listIntakes } from './intake.ts';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { iterateIntakeEnvelopeText } from './intake-collection-envelope.ts';
+import {
+  listIntakeReads,
+  intakeConversionChatId,
+  prepareIntakeReadFilenames,
+  withAcceptedSourceFileContent,
+} from './intake.ts';
+import { acceptedSourceReaderAttached } from './intake-accepted-source-format.ts';
+import { normalizeAssistantContext } from './assistant-context.ts';
+import { intakeIdentityRequestLifetime } from './intake-identity-request.ts';
 import { exportImportAttribution } from './intake-attribution.ts';
+import { prepareIntakeAttributionSources } from './intake-attribution-source.ts';
 import { randomBytes, randomUUID } from 'node:crypto';
 import type { Database } from './database.ts';
+import {
+  assertAuthorizationSignalRunning,
+  authorizationSignalAborted,
+} from './authorization-signal.ts';
 import type { LinkTargetType } from '../shared/api.ts';
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, readSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { openDatabase, REPO_ROOT, HttpError, revision, required, json } from './database.ts';
@@ -121,12 +158,7 @@ async function jsonBody(req: IncomingMessage, max?: number): Promise<Record<stri
     throw new HttpError(400, 'INVALID_JSON', 'Request must contain a JSON object');
   }
 }
-function serveOriginal(
-  res: ServerResponse,
-  path: string,
-  mime: string | null,
-  name: string | undefined,
-) {
+function safeOriginalMime(mime: string | null): string {
   const allowed = new Set([
     'application/pdf',
     'image/png',
@@ -137,7 +169,15 @@ function serveOriginal(
     'application/json',
     'application/x-ndjson',
   ]);
-  const safeMime = allowed.has(mime!) ? mime! : 'application/octet-stream';
+  return mime && allowed.has(mime) ? mime : 'application/octet-stream';
+}
+function serveOriginal(
+  res: ServerResponse,
+  path: string,
+  mime: string | null,
+  name: string | undefined,
+) {
+  const safeMime = safeOriginalMime(mime);
   responseBodySizes.set(res, statSync(path).size);
   res.writeHead(200, {
     'Content-Type': safeMime,
@@ -148,6 +188,28 @@ function serveOriginal(
     'Cache-Control': 'no-store',
   });
   createReadStream(path).pipe(res);
+}
+const requestFilenameAssertions = new WeakMap<
+  () => void,
+  {
+    db: Database;
+    databases: Map<string, Database>;
+    profileId: string;
+    signal: AbortSignal;
+    lifecycle: ProfileLifecycle;
+  }
+>();
+const nativeDatabaseMapGet = Map.prototype.get;
+/** Only actual filename-read request closures are registered by this module. */
+export function requestFilenameAssertionCurrent(assertion: () => void, db: Database): boolean {
+  const owner = requestFilenameAssertions.get(assertion);
+  return (
+    !!owner &&
+    owner.db === db &&
+    !authorizationSignalAborted(owner.signal) &&
+    Reflect.apply(nativeDatabaseMapGet, owner.databases, [owner.profileId]) === db &&
+    profileLifecycleAvailable(owner.lifecycle, owner.profileId)
+  );
 }
 export interface AppOptions {
   root?: string;
@@ -217,6 +279,11 @@ export function createApp({
       apply(proposal, context) {
         return proposal.kind === 'intake_draft_repair'
           ? draftRepairActions.apply(proposal, context)
+          : mappingActions.apply(proposal, context);
+      },
+      async applyAsync(proposal, context) {
+        return proposal.kind === 'intake_draft_repair'
+          ? draftRepairActions.applyAsync(proposal, context)
           : mappingActions.apply(proposal, context);
       },
       reconcile(proposal, context) {
@@ -326,6 +393,49 @@ export function createApp({
         const { data, ...meta } = result;
         respond(data, meta);
       };
+      const prepareFilenameRead = async (
+        input: Parameters<typeof prepareIntakeReadFilenames>[2],
+      ) => {
+        const lifetime = intakeIdentityRequestLifetime(req, res);
+        const assertRunning = () => {
+          lifetime.signal.throwIfAborted();
+          if (dbs.get(profileId) !== db || lifecycle.isLocked(profileId))
+            throw new HttpError(409, 'PROFILE_BUSY', 'The selected profile changed');
+        };
+        requestFilenameAssertions.set(assertRunning, {
+          db,
+          databases: dbs,
+          profileId,
+          signal: lifetime.signal,
+          lifecycle,
+        });
+        try {
+          await prepareIntakeReadFilenames(db, profileId, input, {
+            assertRunning,
+          });
+          lifetime.signal.throwIfAborted();
+        } finally {
+          requestFilenameAssertions.delete(assertRunning);
+          lifetime.dispose();
+        }
+      };
+      const prepareAssistantFilenameRead = async (input: unknown) => {
+        const context = normalizeAssistantContext(input);
+        const repair = context.intakeRepair;
+        const repairId =
+          repair && typeof repair === 'object' && 'intakeId' in repair
+            ? repair.intakeId
+            : undefined;
+        for (const sourceId of new Set([context.intakeId, repairId])) {
+          if (
+            typeof sourceId === 'string' &&
+            db
+              .prepare("SELECT 1 FROM source_files WHERE id=? AND kind='intake_original'")
+              .get(sourceId)
+          )
+            await prepareFilenameRead({ id: sourceId });
+        }
+      };
       if (resource === 'import-diagnostics' && id === 'status' && method === 'GET') {
         send(res, 200, { data: { enabled: diagnostics.enabled } });
         return;
@@ -347,11 +457,17 @@ export function createApp({
         const eventArchive = await diagnostics.exportArchive(profileId, salt);
         let attribution: unknown;
         try {
-          const intakes = listIntakes(db, profileId, { visibility: 'all', limit: 100 }, root);
-          const metadata = assistant.attributionMetadata(profileId, intakes.data);
+          await prepareFilenameRead({ list: { visibility: 'all', limit: 100 } });
+          const intakes = listIntakeReads(db, profileId, { visibility: 'all', limit: 100 }, root);
+          const metadata = assistant.attributionMetadata(
+            profileId,
+            intakes.data.map((intake) => ({
+              conversionChatId: intakeConversionChatId(db, profileId, intake.id),
+            })),
+          );
           attribution = {
             ...exportImportAttribution({
-              intakes: intakes.data,
+              intakes: prepareIntakeAttributionSources(db, root, profileId, intakes.data),
               chats: metadata.chats,
               selectionIncomplete: intakes.total > intakes.data.length,
               historyIncomplete: metadata.omittedChats > 0 || metadata.unavailableChats > 0,
@@ -390,17 +506,34 @@ export function createApp({
           );
         } else if (id === 'chats' && parts.length === 2 && method === 'GET')
           respond(assistant.list(profileId));
-        else if (id === 'chats' && parts.length === 2 && method === 'POST')
-          respond(assistant.create(profileId, await jsonBody(req)));
-        else if (id === 'chats' && parts.length === 3 && method === 'GET')
+        else if (id === 'chats' && parts.length === 2 && method === 'POST') {
+          const input = await jsonBody(req);
+          await prepareAssistantFilenameRead(input);
+          respond(assistant.create(profileId, input));
+        } else if (id === 'chats' && parts.length === 3 && method === 'GET')
           respond(assistant.get(profileId, action));
         else if (id === 'chats' && parts.length === 4 && method === 'POST') {
-          if (parts[3] === 'messages')
-            respond(assistant.send(profileId, action, await jsonBody(req)));
-          else if (parts[3] === 'retry') respond(assistant.retry(profileId, action));
-          else if (parts[3] === 'cancel') respond(assistant.cancel(profileId, action));
+          if (parts[3] === 'messages') {
+            const input = await jsonBody(req);
+            await prepareAssistantFilenameRead({
+              context: assistant.get(profileId, action).context,
+            });
+            await prepareAssistantFilenameRead(input);
+            respond(assistant.send(profileId, action, input));
+          } else if (parts[3] === 'retry') {
+            await prepareAssistantFilenameRead({
+              context: assistant.get(profileId, action).context,
+            });
+            respond(assistant.retry(profileId, action));
+          } else if (parts[3] === 'cancel') respond(assistant.cancel(profileId, action));
           else if (parts[3] === 'apply')
-            respond(assistant.apply(profileId, action, (await jsonBody(req)).proposalId as string));
+            respond(
+              await assistant.applyRead(
+                profileId,
+                action,
+                (await jsonBody(req)).proposalId as string,
+              ),
+            );
           else throw new HttpError(404, 'NOT_FOUND', 'Assistant action not found');
         } else throw new HttpError(404, 'NOT_FOUND', 'Assistant resource not found');
         return;
@@ -492,6 +625,7 @@ export function createApp({
           method,
           params,
           req,
+          res,
           db,
           root,
           profileId,
@@ -674,12 +808,96 @@ export function createApp({
           return;
         }
         if (resource === 'sources') {
-          if (id && action === 'content') {
-            const f = q.getSourceFile(db, id),
+          if (id && action === 'content' && !acceptedSourceReaderAttached(db)) {
+            // No incremental accepted proof attached; see acceptedSourceReaderAttached.
+            const f = q.sourceFileContentHeader(db, id),
               path = a.profileFile(root, f.path, profileId);
             serveOriginal(res, path, f.mimeType, f.path.split('/').pop());
-          } else if (id) respond(q.getSourceFile(db, id));
-          else list(q.sourceFiles(db, params));
+          } else if (id && action === 'content') {
+            // Streams under the accepted source proof. A refused proof is
+            // retried only before the first header is written.
+            const lifetime = intakeIdentityRequestLifetime(req, res);
+            try {
+              await withAcceptedSourceFileContent(
+                db,
+                root,
+                profileId,
+                id,
+                () => lifetime.signal.throwIfAborted(),
+                async (lease, header) => {
+                  const safeMime = safeOriginalMime(header.mimeType);
+                  responseBodySizes.set(res, header.bytes);
+                  res.writeHead(200, {
+                    'Content-Type': safeMime,
+                    'Content-Disposition': `${safeMime === 'application/octet-stream' ? 'attachment' : 'inline'}; filename*=UTF-8''${encodeURIComponent(header.filename)}`,
+                    'X-Content-Type-Options': 'nosniff',
+                    'Content-Security-Policy': "sandbox; default-src 'none'",
+                    'Cache-Control': 'no-store',
+                  });
+                  async function* chunks() {
+                    const buffer = Buffer.allocUnsafe(64 * 1024);
+                    let offset = 0;
+                    for (;;) {
+                      lease.assertCurrent();
+                      const count = readSync(lease.sourceFd, buffer, 0, buffer.length, offset);
+                      lease.assertCurrent();
+                      if (!count) break;
+                      offset += count;
+                      if (offset > header.bytes)
+                        throw new HttpError(409, 'SOURCE_CHANGED', 'The retained original changed');
+                      yield Buffer.from(buffer.subarray(0, count));
+                    }
+                    if (offset !== header.bytes)
+                      throw new HttpError(409, 'SOURCE_CHANGED', 'The retained original changed');
+                  }
+                  await pipeline(
+                    Readable.from(chunks(), { objectMode: false, highWaterMark: 64 * 1024 }),
+                    res,
+                    { end: false },
+                  );
+                },
+                lifetime.signal,
+              );
+              assertAuthorizationSignalRunning(lifetime.signal);
+              res.end();
+            } finally {
+              lifetime.dispose();
+            }
+          } else if (id && action === 'operational-envelope') {
+            const header = q.sourceFileReference(db, id);
+            if (header.kind !== 'intake_original')
+              throw new HttpError(
+                400,
+                'INVALID_INPUT',
+                'Operational envelope export requires an original intake',
+              );
+            const iterator = iterateIntakeEnvelopeText(db, { id });
+            // Validate selection and the first fragment before starting a
+            // download. Later missing evidence aborts the stream; partial JSON
+            // can never become a completed retained export.
+            const first = iterator.next();
+            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+            res.setHeader('Content-Disposition', 'attachment; filename="retained-intake.json"');
+            function* chunks() {
+              if (!first.done) yield first.value;
+              yield* iterator;
+            }
+            await pipeline(
+              Readable.from(chunks(), { objectMode: false, highWaterMark: 8192 }),
+              res,
+            );
+          } else if (id) {
+            const view = q.sourceRecordFileView(params),
+              reference = q.sourceFileReference(db, id);
+            const native = reference.detailsUrl.endsWith('/operational-envelope');
+            if (native && params.has('fileView') && view === 'full')
+              throw new HttpError(
+                400,
+                'INVALID_INPUT',
+                'Use the retained operational envelope export for complete native intake details',
+              );
+            respond(view === 'reference' || native ? reference : q.getSourceFile(db, id));
+          } else list(q.sourceFiles(db, params));
           return;
         }
         if (resource === 'source-records') {
@@ -702,6 +920,18 @@ export function createApp({
                   : q.getSourceRecord(db, id, { fileView: 'full' }),
               )
             : list(q.sourceRecords(db, params));
+          return;
+        }
+        if (resource === 'record-import-corrections' && !id) {
+          respond(
+            clinicalImportCorrectionHistory(db, {
+              profileId,
+              kind: params.get('kind'),
+              recordId: params.get('recordId'),
+              after: params.get('after'),
+              limit: params.get('limit'),
+            }),
+          );
           return;
         }
         if (resource === 'record-owner') {
@@ -893,7 +1123,20 @@ export function createApp({
       throw new HttpError(404, 'NOT_FOUND', 'API resource not found');
     } catch (caught) {
       const error = caught as Error & { status?: number; code?: string };
+      if (res.headersSent) {
+        res.destroy(error);
+        return;
+      }
       const status = error.status || 500;
+      if (
+        process.env.CRS_TEST_QUEUE_GUARD_TRACE === '1' &&
+        status === 409 &&
+        error.code === 'REPORT_QUEUE_CURSOR' &&
+        !res.headersSent
+      ) {
+        const location = reportQueueGuardLocation(error);
+        if (location) res.setHeader(REPORT_QUEUE_GUARD_HEADER, location);
+      }
       send(res, status, {
         error: {
           code:
@@ -1010,8 +1253,20 @@ export function createApp({
       for (const [profileId, db] of dbs) {
         void disposePdfEvidenceSessions(profileId);
         cleanup(() => diagnostics.clear(profileId));
+        cleanup(() => clearPackageSourceSession(db));
+        cleanup(() => clearIntakeSourceFieldSessions(db));
         cleanup(() => clearIntakeStateCache(db));
+        cleanup(() => clearIdentityGrounding(db));
         cleanup(() => clearIntakeLookupCache(db));
+        cleanup(() => clearNativeOwnershipPlans(db));
+        cleanup(() => clearPreparedClinicalProjections(db));
+        cleanup(() => clearIntakeLiteralSessions(db));
+        cleanup(() => clearIntakeMappingSections(db));
+        cleanup(() => clearJournalActivityIndex(root, profileId));
+        cleanup(() => clearIntakeCollectionEvidenceFragments(db));
+        cleanup(() => clearPreparedCollectionQueues(db));
+        cleanup(() => clearCollectionReportQueues(db));
+        cleanup(() => clearCollectionImportFeeds(db));
         cleanup(() => clearSourceContextClassificationCache(db));
         cleanup(() => clearSourceTextProjectionCache(db));
         cleanup(() => clearSourceDetailsSearchCache(db));

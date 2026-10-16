@@ -165,6 +165,85 @@ it('refreshes opened reader notes after correction without unmounting a dirty ed
   expect(screen.queryByText(/These displayed observations are from an earlier/)).toBeNull();
 });
 
+it('retries a failed full reader note for the same selected unit without changing review', async () => {
+  const { fetcher } = setup();
+  const coverage: SourceReaderCoverage = {
+    intakeVersion: 7,
+    summary: { units: 1, pending: 0, partial: 0, unreadable: 0, context: 1 },
+    entries: [
+      {
+        planId: 'cookie-plan',
+        unitId: 'cookie-unit',
+        status: 'completed',
+        kind: 'pages',
+        locator: 'Page 2',
+        pages: [2],
+        coverageKind: 'context',
+        notes: 'Cookie Doe note preview.',
+        notesTruncated: true,
+      },
+    ],
+    offset: 0,
+    nextOffset: null,
+  };
+  const unitReads: string[] = [];
+  fetcher.mockImplementation(async (input, options) => {
+    const path = String(input);
+    if (options?.method && options.method !== 'GET') throw new Error('Unexpected write');
+    if (path.includes('/plan-unit?')) {
+      unitReads.push(path);
+      return unitReads.length === 1
+        ? Response.json(
+            { error: { message: 'The local reader was interrupted.' } },
+            { status: 500 },
+          )
+        : Response.json({
+            data: {
+              format: 'health-intake-unit-detail-v1',
+              intakeId: 'fictional-source',
+              planId: 'cookie-plan',
+              version: 7,
+              unit: {
+                id: 'cookie-unit',
+                coverage: { notes: 'Cookie Doe complete retained note.' },
+                pages: [2],
+              },
+            },
+          });
+    }
+    if (path.endsWith('/intakes/fictional-source'))
+      return Response.json({ data: { format: 'health-intake-summary-v2', version: 7 } });
+    if (path.includes('/source-issues?'))
+      return Response.json({ data: { readerCoverage: coverage } });
+    throw new Error(`Unexpected read: ${path}`);
+  });
+  const review = vi.fn();
+  render(
+    <SourceReaderObservations
+      intakeId="fictional-source"
+      initial={coverage}
+      blocked={false}
+      onReview={review}
+      renderReview={() => null}
+      onPageChange={() => {}}
+    />,
+  );
+  const observations = screen.getByText(/Reader observations ·/).closest('details')!;
+  observations.open = true;
+  fireEvent(observations, new Event('toggle'));
+  const note = screen.getByText('Full retained reader note').closest('details')!;
+  note.open = true;
+  fireEvent(note, new Event('toggle'));
+  expect(await screen.findByText('The local reader was interrupted.')).toBeVisible();
+  expect(screen.queryByText('Cookie Doe complete retained note.')).toBeNull();
+  await userEvent.click(screen.getByRole('button', { name: 'Retry full reader note' }));
+  expect(await screen.findByText('Cookie Doe complete retained note.')).toBeVisible();
+  expect(unitReads).toHaveLength(2);
+  expect(unitReads[1]).toBe(unitReads[0]);
+  expect(unitReads[1]).toContain('planId=cookie-plan&unitId=cookie-unit&version=7');
+  expect(review).not.toHaveBeenCalled();
+});
+
 const revision: SourceTextRevision = {
   protectedPages: [],
   format: 'intake-source-text-v1',

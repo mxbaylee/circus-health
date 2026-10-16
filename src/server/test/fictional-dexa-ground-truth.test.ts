@@ -97,7 +97,7 @@ async function acceptDexaAndSkipOtherSubject(
     }
     assert.equal(identity.status, 'confirmation_required');
     assert.ok(identity.scope && identity.scope.targets.length > 0);
-    current = await confirmIntakeIdentityScope(db, root, profileId, intake.id, {
+    const confirmed = await confirmIntakeIdentityScope(db, root, profileId, intake.id, {
       version: identity.scope.intakeVersion,
       operationId: `confirm-fictional-dexa-${group.id}`,
       scope: identity.scope,
@@ -106,6 +106,11 @@ async function acceptDexaAndSkipOtherSubject(
         ? 'confirmed_displayed_identity_questions'
         : 'reviewed_original_and_membership',
     });
+    assert.ok(
+      'validation' in confirmed,
+      'The direct legacy fixture retains its full intake contract',
+    );
+    current = confirmed;
   }
   const review = reviewIntake(db, root, profileId, intake.id, proposalId);
   beforeImport?.();

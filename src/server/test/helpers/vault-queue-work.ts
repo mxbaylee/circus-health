@@ -64,11 +64,21 @@ export function observeVaultQueueWork<T>(run: () => T) {
       classify(args[0]).stats++;
       return original(...args);
     });
-  for (const method of ['existsSync', 'realpathSync'])
-    instrument(method, (original) => (...args: any[]) => {
+  instrument('existsSync', (original) => (...args: any[]) => {
+    classify(args[0]).metadataChecks++;
+    return original(...args);
+  });
+  instrument('realpathSync', (original) => {
+    const observed = (...args: any[]) => {
       classify(args[0]).metadataChecks++;
       return original(...args);
-    });
+    };
+    observed.native = (...args: any[]) => {
+      classify(args[0]).metadataChecks++;
+      return original.native(...args);
+    };
+    return observed;
+  });
   instrument('fsyncSync', (original) => (...args: any[]) => {
     classify(args[0]).syncs++;
     return original(...args);

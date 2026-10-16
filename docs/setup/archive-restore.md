@@ -124,6 +124,8 @@ npm run qualify:archive-restore
 
 The drill uses a small committed, independently fictional fixture, fresh runtime encryption keys, the supported Compose deployment, and local unavailable/scripted upstream behavior. It requires no paid provider or OCR. It checks the independent copy, retained kit, restore, cache reconstruction, private-access refusal and explicit failure cases described above. Archives, kits and raw receipts remain outside Git. A command's existence is not evidence that a particular build passed: retain its actual result and build/format identity before claiming qualification. Publish only safe counts and scoped conclusions.
 
+The fictional oracle uses `circus-fictional-archive-restore-v2`; regenerate a fresh disposable fixture for this build instead of reusing a v1 qualification oracle. This changes qualification evidence, not personal archive formats. The fixture reads all native review sections with consistent version/token pins and accepts only its exact candidate versions through public report acceptance. Its oracle retains the explicit acceptance receipts, complete pending review, original bytes, ownership/correction history and Stop state. Cache-loss verification rereads the same public evidence and receipts; a summary is never treated as an unloaded history being empty.
+
 A passing fictional drill covers its observed release build and local setup. It does not certify power-loss behavior, forensic erasure, every filesystem, physical passkeys, an absent device or a configured live provider. Those require separate evidence.
 
 ## Operator recovery record

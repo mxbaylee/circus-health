@@ -523,7 +523,12 @@ export function TestResults() {
                           </div>
                         ) : null}
                       </dl>
-                      <RecordCorrectionHistory extra={result.extra} open />
+                      <RecordCorrectionHistory
+                        extra={result.extra}
+                        kind="observation"
+                        recordId={result.id}
+                        open
+                      />
                       <div className="detail-chart">
                         <div className="section-heading">
                           <h3>Over time</h3>

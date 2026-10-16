@@ -22,6 +22,11 @@ Refresh is disabled while the shared API has pending mutations or the server is 
 
 `useResource` refreshes mounted reads after recovery. It keeps previously loaded data only for the same profile/resource key; changing keys hides the previous resource immediately. `ResourceState` retains content and shows a retry message on a failed refresh. Note editors adopt newer fetched versions only when clean; dirty or uncertain edits retain their form and existing version-conflict behavior.
 
+Explicit profile lifecycle writes also separate read generations, without gaining
+automatic mutation retries. The global profile-list focus/visibility reader
+discards responses crossing a profile identity change; a fresh later response
+can still revoke the selected profile after another session locks it.
+
 There is no mutation queue or automatic save replay, and no durable browser queue. Health content can remain in component memory and in-flight response buffers while the tab is open. Direct lifecycle requests, exports, XMLHttpRequest uploads, PDF and assistant streams keep their specialized request paths; the helper does not claim to retry them. Once the bounded attempt fails, the caller still receives an error and owns its save/error presentation. A page refresh, tab close or process loss can discard unsaved local state.
 
 ## Verification

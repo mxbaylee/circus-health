@@ -1,14 +1,16 @@
-import { StrictMode } from 'react';
+import { StrictMode, useEffect, useState } from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
-import { ProfileProvider } from '../../app/components/ProfileProvider';
 import { ProfileManagement } from '../../app/components/ProfileManagement';
+import { ProfileProvider, ProfileSwitcher } from '../../app/components/ProfileProvider';
 import {
   clearProfile,
+  currentProfile,
   recordProfile,
   replaceProfiles,
   selectProfile,
+  useProfile,
 } from '../../app/data/profile';
 import {
   enrollProfilePasskey,
@@ -237,6 +239,89 @@ it('offers a passkey after ordinary recovery unlock without re-verifying setup',
   );
   expect(await screen.findByRole('heading', { name: 'Recovery unlocked' })).toBeVisible();
   expect(fetchMock.mock.calls.some(([url]) => url === '/api/profile-setups/s1/verify')).toBe(false);
+});
+
+it('keeps the recovery handoff for the incoming profile host after the outgoing host rerenders', async () => {
+  const unlocked = { ...profile, locked: false };
+  fetchMock.mockImplementation(async (url: string, init: RequestInit = {}) => {
+    if (url === '/api/profiles/p-one/unlock') return envelope(unlocked);
+    if (url === '/api/profiles' && !init.method) return envelope([unlocked]);
+    if (url === '/api/profiles/p-one/notes/patient' && !init.method) return envelope(selfNote());
+    return envelope({ message: 'Unexpected request' }, 400);
+  });
+  function DelayedProfileHost() {
+    const selected = useProfile();
+    const [active, setActive] = useState(false);
+    useEffect(() => {
+      if (!selected || active) return;
+      const timer = setTimeout(() => setActive(true), 0);
+      return () => clearTimeout(timer);
+    }, [selected, active]);
+    return active ? (
+      <div data-testid="incoming-profile-host">
+        <ProfileSwitcher />
+      </div>
+    ) : (
+      <div data-testid="outgoing-startup-host">
+        <ProfileManagement initialOpen handoffHost="startup" />
+      </div>
+    );
+  }
+  const user = userEvent.setup();
+  render(<DelayedProfileHost />);
+  await user.click(screen.getByRole('button', { name: /RobinLocked/ }));
+  await user.type(screen.getByLabelText('Recovery key'), kit.phrase);
+  await user.click(screen.getByRole('button', { name: 'Open profile' }));
+  await waitFor(() => expect(screen.getByTestId('incoming-profile-host')).toBeInTheDocument());
+  expect(screen.queryByTestId('outgoing-startup-host')).not.toBeInTheDocument();
+  expect(await screen.findByRole('dialog', { name: 'Recovery unlocked' })).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Add passkey' })).toBeEnabled();
+  await user.click(screen.getByRole('button', { name: 'Add passkey' }));
+  expect(screen.getByRole('dialog', { name: 'Add passkey for Robin' })).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Skip' }));
+  await waitFor(() =>
+    expect(
+      screen.getByTestId('incoming-profile-host').querySelector('.profile-current'),
+    ).toHaveFocus(),
+  );
+});
+
+it('keeps a switched profile recovery handoff for its incoming active host', async () => {
+  const unlocked = { ...profile, locked: false };
+  const second = { ...profile, id: 'p-two', name: 'Taylor' };
+  const secondUnlocked = { ...second, locked: false };
+  replaceProfiles([unlocked, second]);
+  selectProfile(unlocked);
+  fetchMock.mockImplementation(async (url: string, init: RequestInit = {}) => {
+    if (url === '/api/profiles/p-two/unlock') return envelope(secondUnlocked);
+    if (url === '/api/profiles' && !init.method) return envelope([unlocked, secondUnlocked]);
+    return envelope({ message: 'Unexpected request' }, 400);
+  });
+  function DelayedActiveHost() {
+    const selected = useProfile();
+    const [hostId, setHostId] = useState('p-one');
+    useEffect(() => {
+      if (!selected || selected.id === hostId) return;
+      const timer = setTimeout(() => setHostId(selected.id), 0);
+      return () => clearTimeout(timer);
+    }, [selected, hostId]);
+    return (
+      <div data-testid="active-profile-host" key={hostId}>
+        <ProfileSwitcher />
+      </div>
+    );
+  }
+  const user = userEvent.setup();
+  render(<DelayedActiveHost />);
+  await user.click(screen.getByRole('button', { name: /Robin/ }));
+  await user.click(screen.getByRole('button', { name: /TaylorLocked/ }));
+  await user.type(screen.getByLabelText('Recovery key'), kit.phrase);
+  await user.click(screen.getByRole('button', { name: 'Open profile' }));
+  await waitFor(() =>
+    expect(screen.getByTestId('active-profile-host')).toHaveTextContent('Taylor'),
+  );
+  expect(await screen.findByRole('dialog', { name: 'Recovery unlocked' })).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Add passkey' })).toBeEnabled();
 });
 
 it('keeps the new-profile passkey choice through selection and continues to onboarding when skipped', async () => {
@@ -1215,6 +1300,72 @@ it('a lock clears private setup fields and the Back path to them', async () => {
   expect(screen.queryByLabelText('Primary care provider')).not.toBeInTheDocument();
   expect(screen.queryByDisplayValue('Cookie Clinic')).not.toBeInTheDocument();
   expect(screen.queryByRole('button', { name: /Back/ })).not.toBeInTheDocument();
+});
+
+it('ignores a pre-verification profile refresh after recovery handoff but accepts a fresh lock', async () => {
+  const unlocked = { ...profile, locked: false };
+  let holdRefresh = false,
+    freshLock = false,
+    verified = false,
+    releaseStale!: (response: Response) => void,
+    staleStarted!: () => void;
+  const staleReady = new Promise<void>((resolve) => {
+    staleStarted = resolve;
+  });
+  fetchMock.mockImplementation(async (url: string, init: RequestInit = {}) => {
+    if (url === '/api/profile-setups')
+      return envelope({ setupId: 's1', profileId: 'p-one', recoveryKit: kit });
+    if (url === '/api/profile-setups/s1/verify') {
+      verified = true;
+      return envelope(unlocked);
+    }
+    if (url === '/api/profiles' && !init.method) {
+      if (holdRefresh) {
+        holdRefresh = false;
+        staleStarted();
+        return new Promise<Response>((resolve) => {
+          releaseStale = resolve;
+        });
+      }
+      return envelope(freshLock ? [profile] : verified ? [unlocked] : [profile]);
+    }
+    return envelope({ message: 'Unexpected request' }, 400);
+  });
+  const user = userEvent.setup();
+  render(
+    <ProfileProvider>
+      <ProfileSwitcher />
+      <p>Archive</p>
+    </ProfileProvider>,
+  );
+  await user.click(await screen.findByRole('button', { name: 'Choose profile' }));
+  await user.click(screen.getByRole('button', { name: 'Create profile' }));
+  await user.type(screen.getByLabelText('Display name'), 'Robin');
+  await user.type(screen.getByLabelText('Your name'), 'Robin Example');
+  fireEvent.change(screen.getByLabelText('Date of birth'), { target: { value: '1982-04-17' } });
+  await user.click(screen.getByRole('button', { name: 'Continue to recovery key' }));
+  await user.click(screen.getByLabelText(/I have saved/));
+  await user.click(screen.getByRole('button', { name: 'Verify recovery key' }));
+  await user.type(screen.getByLabelText('Recovery key'), kit.phrase);
+
+  holdRefresh = true;
+  fireEvent(window, new Event('focus'));
+  await staleReady;
+  await user.click(screen.getByRole('button', { name: 'Open profile' }));
+  await waitFor(() => expect(verified).toBe(true));
+  await waitFor(() =>
+    expect(fetchMock.mock.calls.filter(([url]) => url === '/api/profiles')).toHaveLength(3),
+  );
+  await waitFor(() => expect(currentProfile()?.id).toBe('p-one'));
+  expect(await screen.findByRole('dialog', { name: 'Recovery unlocked' })).toBeVisible();
+  await act(async () => releaseStale(envelope([profile])));
+  expect(currentProfile()?.id).toBe('p-one');
+  expect(screen.getByRole('dialog', { name: 'Recovery unlocked' })).toBeVisible();
+
+  freshLock = true;
+  fireEvent(window, new Event('focus'));
+  await waitFor(() => expect(currentProfile()).toBeNull());
+  expect(screen.queryByRole('dialog', { name: 'Recovery unlocked' })).not.toBeInTheDocument();
 });
 
 it('Back after activation returns through recovery options and onboarding without another setup or proof request', async () => {

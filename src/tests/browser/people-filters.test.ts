@@ -1,4 +1,5 @@
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
+import { observeRecoveryChoiceClick } from './recovery-choice-click-diagnostic.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
@@ -38,6 +39,7 @@ test(
     const browser = await launchBrowser(t);
     t.after(() => browser.close());
     const page = await newTestPage(browser, { viewport: { width: 1280, height: 900 } });
+    const recoveryChoiceDiagnostic = observeRecoveryChoiceClick(page);
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     const url = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
@@ -97,11 +99,34 @@ test(
     await page.getByLabel('I have saved my recovery key').check();
     await page.getByRole('button', { name: 'Verify recovery key', exact: true }).click();
     await page.getByLabel('Recovery key').fill(recovery);
-    await page.getByRole('button', { name: 'Open profile' }).click();
-    await page
-      .getByRole('dialog', { name: 'Recovery unlocked', exact: true })
-      .getByRole('button', { name: 'Skip', exact: true })
-      .click();
+    try {
+      const [verified] = await Promise.all([
+        page.waitForResponse((response) => {
+          const responseUrl = new URL(response.url());
+          return (
+            responseUrl.origin === new URL(url).origin &&
+            /^\/api\/profile-setups\/[^/]+\/verify$/.test(responseUrl.pathname) &&
+            response.request().method() === 'POST'
+          );
+        }),
+        page.getByRole('button', { name: 'Open profile' }).click(),
+      ]);
+      assert.equal(verified.status(), 201, 'recovery verification must succeed');
+      const recoveryChoice = page.getByRole('dialog', { name: 'Recovery unlocked', exact: true });
+      await recoveryChoice.waitFor();
+      await recoveryChoice.getByRole('button', { name: 'Skip', exact: true }).click();
+    } catch (error) {
+      let diagnostic = 'Recovery choice actionability: unavailable:diagnostic-failed';
+      try {
+        diagnostic =
+          'Recovery choice actionability: ' +
+          JSON.stringify(await recoveryChoiceDiagnostic('Skip'));
+      } catch {}
+      try {
+        t.diagnostic(diagnostic);
+      } catch {}
+      throw error;
+    }
     for (const step of ['Primary care provider', 'Emergency contact']) {
       await page
         .getByRole('dialog', { name: 'Care contacts' })

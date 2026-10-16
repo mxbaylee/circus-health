@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { HttpError, type Database } from './database.ts';
 import { resolveClinicalReference } from './clinical-references.ts';
 import { readPacketPreferences } from './packet-preferences.ts';
-import { readStoredIntakeDetails } from './intake-state-access.ts';
+import { packetSourceAncestry } from './packet-source-ancestry.ts';
 import type {
   PacketCandidate,
   PacketRecordRef,
@@ -267,39 +267,9 @@ export function packetDependencies(
     if (found.file) files.add(found.file);
   }
   // Follow retained source ancestry, not inferred filenames or arbitrary narrative links.
-  const pending = [...files],
-    visited = new Set<string>();
-  while (pending.length) {
-    const file = pending.pop()!;
-    if (visited.has(file)) continue;
-    if (visited.size > 100000) fail('Source relationships exceed the packet limit.');
-    visited.add(file);
-    let found = cache.files.get(file);
-    if (!found) {
-      const row = db.prepare('SELECT sha256,details_json FROM source_files WHERE id=?').get(file);
-      if (!row)
-        throw new HttpError(
-          409,
-          'EXPORT_SOURCE_MISSING',
-          'Retained source ancestry is unavailable.',
-        );
-      const metadata: unknown = JSON.parse(String(row.details_json || '{}'));
-      const intake = readStoredIntakeDetails(db, file);
-      found = {
-        hash: row.sha256 ? String(row.sha256) : null,
-        parents: [
-          object(metadata) ? metadata.originalSourceFileId : undefined,
-          intake?.parentSourceFileId,
-        ].filter((parent): parent is string => typeof parent === 'string'),
-      };
-      cache.files.set(file, found);
-    }
-    if (found.hash) hashes.add(found.hash);
-    for (const parent of found.parents)
-      if (!visited.has(parent)) {
-        files.add(parent);
-        pending.push(parent);
-      }
+  for (const file of packetSourceAncestry(db, files)) {
+    files.add(file.id);
+    if (file.hash) hashes.add(file.hash);
   }
   return {
     files,

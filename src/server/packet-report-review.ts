@@ -1,5 +1,8 @@
 import { readStoredIntakeDetails } from './intake-state-access.ts';
 import type { Database } from './database.ts';
+import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
+import { PacketOutputBudget } from './packet-output-budget.ts';
+import { iterateNativePacketReportReview } from './packet-report-review-native.ts';
 
 export interface PacketReportReview {
   intakeId: string;
@@ -12,7 +15,10 @@ export interface PacketReportReview {
 /** Count current clinical candidates, never historical versions or context rows.
  * Only reports represented by included source evidence belong in this disclosure.
  */
-export function packetReportReview(db: Database, sourceIds: string[]): PacketReportReview[] {
+export function* iteratePacketReportReview(
+  db: Database,
+  sourceIds: Iterable<string>,
+): Generator<PacketReportReview> {
   const byIntake = new Map<string, Set<string>>();
   const source = db.prepare('SELECT source_file_id, locator_json FROM source_records WHERE id=?');
   for (const id of new Set(sourceIds)) {
@@ -24,8 +30,14 @@ export function packetReportReview(db: Database, sourceIds: string[]): PacketRep
     ids.add(id);
     byIntake.set(intakeId, ids);
   }
-  const reports: PacketReportReview[] = [];
   for (const [intakeId, included] of byIntake) {
+    const file = db
+      .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
+      .get(intakeId);
+    if (file?.kind === 'intake_original' && hasIntakeCollectionEnvelope(db, { id: intakeId })) {
+      yield* iterateNativePacketReportReview(db, intakeId, included);
+      continue;
+    }
     const workflow = readStoredIntakeDetails(db, intakeId)?.workflow;
     if (!workflow) continue;
     // Older retained workflows and source-only reading plans may not have
@@ -55,14 +67,26 @@ export function packetReportReview(db: Database, sourceIds: string[]): PacketRep
         }),
       );
       if (!current.size) continue;
-      reports.push({
+      yield {
         intakeId,
         groupId: group.id,
         title: latest.title.slice(0, 500),
         savedCount: [...current.values()].filter((version) => version.status === 'accepted').length,
         totalCount: current.size,
-      });
+      };
     }
+  }
+}
+
+export function packetReportReview(
+  db: Database,
+  sourceIds: Iterable<string>,
+  budget = new PacketOutputBudget(),
+): PacketReportReview[] {
+  const reports: PacketReportReview[] = [];
+  for (const report of iteratePacketReportReview(db, sourceIds)) {
+    budget.add(report, reports.length ? 1 : 0);
+    reports.push(report);
   }
   return reports.sort(
     (a, b) => a.intakeId.localeCompare(b.intakeId) || a.groupId.localeCompare(b.groupId),

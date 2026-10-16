@@ -22,11 +22,34 @@ import {
   prepareIntakeStateCopy,
   prepareIntakeStateCopySnapshot,
   stageIntakeStateCopy,
+  disposeIntakeStateCopyPlan,
   type IntakeStateCopySnapshot,
 } from '../intake-state-bootstrap.ts';
 import { intakeDetails, storedIntakeDetails } from '../intake-state-access.ts';
 import { prepareInitialIntakeEnvelope, readIntakeEnvelopeText } from '../intake-authority.ts';
 import { readIntakeSourcePin, writeIntakeSourcePin } from '../intake-source-pin.ts';
+import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
+import {
+  openIntakeCollectionEnvelope,
+  selectedEnvelopeStore,
+} from '../intake-collection-envelope.ts';
+import { prepareIntakeEnvelopeMutation } from '../intake-envelope-mutation.ts';
+import {
+  prepareNativeDraftHistory,
+  readReviewDraftHistoryPage,
+} from '../intake-review-draft-state.ts';
+import { clinicalImportCorrectionHistory } from '../clinical-import-corrections.ts';
+import { retainAcceptedContribution } from '../ownership-contributions.ts';
+import {
+  createDuplicateEvidenceSnapshotPreparation,
+  prepareRetainedDuplicateEvidenceSnapshot,
+} from '../duplicate-evidence-snapshots.ts';
+import { canonicalLiteral } from '../intake-format.ts';
+import type { IntakeReviewDraft } from '../../shared/intake.ts';
+import {
+  createOwnershipSourceSnapshotPreparation,
+  readOwnershipSourceSnapshot,
+} from '../ownership-source-snapshots.ts';
 
 const sourceId = 'fictional-bootstrap-source';
 const targetId = 'fictional-bootstrap-target';
@@ -311,6 +334,254 @@ function fixture(t: test.TestContext, count = 2) {
   };
   return { root, source, target, sourceAuthority, targetAuthority, originals, options, open };
 }
+
+test('selected ownership and accepted correction snapshots remain readable after profile graph copy', async (t) => {
+  const f = fixture(t, 0),
+    source = { id: 'fictional-audit-original' },
+    sourceHash = sha('Fictional audit original'),
+    initial = prepareInitialIntakeEnvelope({
+      intake: {
+        version: 1,
+        originalName: 'fictional.txt',
+        workflow: { format: 'health-intake-workflow-v1', reviewDrafts: [] },
+      },
+    });
+  transaction(f.source, () => {
+    f.source
+      .prepare(
+        'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+      )
+      .run(
+        source.id,
+        `data/profiles/${sourceId}/sources/fictional.txt`,
+        sourceHash,
+        24,
+        'intake_original',
+        initial.detailsJson,
+      );
+    createIntakeStateStorage(f.source, {
+      profileId: sourceId,
+      intakeId: source.id,
+      sourceHash,
+    }).stage(initial.state, randomUUID());
+  });
+  await buildIntakeCollectionEnvelope(f.source, source);
+  const builder = createOwnershipSourceSnapshotPreparation(f.source, source),
+    references = await builder.prepareSplit({
+      sourceRecordIds: () => ['fictional-a', 'fictional-b', 'fictional-c'],
+      movingSourceRecordIds: () => ['fictional-b'],
+    }),
+    prepared = await builder.finish();
+  try {
+    transaction(f.source, () => prepared.apply());
+  } finally {
+    prepared.dispose();
+  }
+  for (let index = 0; index < 3; index++) {
+    const sourceRecordId = 'fictional-accepted-' + index,
+      draft: IntakeReviewDraft = {
+        id: 'fictional-draft-' + index,
+        proposalId: null,
+        recordId: sourceRecordId,
+        candidateId: 'fictional-candidate-' + index,
+        candidateVersionId: 'fictional-version-' + index,
+        mapping: { kind: 'document', documentTitle: 'Fictional reviewed' },
+        resolutions: [],
+        disposition: 'pending',
+        at: '2026-10-03T00:00:00.000Z',
+        corrections: [
+          {
+            operationId: 'fictional-draft-' + index,
+            at: '2026-10-03T00:00:00.000Z',
+            reason: 'Fictional literal correction',
+            before: { documentTitle: 'Fictional before' },
+            after: { documentTitle: 'Fictional reviewed' },
+          },
+        ],
+      },
+      view = openIntakeCollectionEnvelope(f.source, source),
+      history = await prepareNativeDraftHistory(f.source, source, view, undefined, draft),
+      operationId = randomUUID(),
+      mutation = await prepareIntakeEnvelopeMutation(f.source, source, {
+        reader: view,
+        operationId,
+        requestDigest: sha(operationId),
+        domainVersion: view.logical.domainVersion + 1,
+        additionalLogicalChanges: history.changes,
+        changes: [
+          {
+            op: 'append',
+            record: view.child(view.child(view.root(), 'intake')!, 'workflow')!,
+            field: 'reviewDrafts',
+            jsonText: JSON.stringify(history.draft),
+          },
+        ],
+      });
+    transaction(f.source, () => {
+      selectedEnvelopeStore(f.source, source).collections.stage(mutation.prepared!);
+      f.source
+        .prepare("INSERT INTO source_records(id,source_file_id,raw_json) VALUES(?,?,'{}')")
+        .run(sourceRecordId, source.id);
+      if (index === 0)
+        f.source
+          .prepare(
+            "INSERT INTO documents(id,source_record_id,title,extra_json) VALUES('fictional-document',?,'Fictional corrected record',?)",
+          )
+          .run(
+            sourceRecordId,
+            JSON.stringify({
+              import: {
+                correctionHistorySource: { format: 'health-accepted-contribution-corrections-v1' },
+              },
+            }),
+          );
+      f.source
+        .prepare(
+          "INSERT INTO evidence(id,entity_type,entity_id,source_record_id) VALUES(?,'document','fictional-document',?)",
+        )
+        .run('fictional-evidence-' + index, sourceRecordId);
+      retainAcceptedContribution(f.source, {
+        sourceRecordId,
+        identity: 'fictional-identity',
+        recordId: 'fictional-document',
+        kind: 'document',
+        mapping: { kind: 'document', documentTitle: 'Fictional reviewed' },
+        intakeId: source.id,
+        candidateVersionId: draft.candidateVersionId,
+        candidateId: draft.candidateId,
+        proposalId: draft.proposalId,
+        reviewDraftId: draft.id,
+        reviewDraftHistory: history.draft.history,
+      });
+    });
+  }
+  const duplicateRows = [
+      {
+        id: 'fictional-evidence-0',
+        value: {
+          label: 'Fictional provider',
+          locator: 'Fictional row',
+          sourceRecordId: 'fictional-accepted-0',
+          original: { literal: JSON.rawJSON('12.00') },
+          contentUrl: '/api/sources/' + source.id + '/content',
+        },
+      },
+    ],
+    duplicateBuilder = createDuplicateEvidenceSnapshotPreparation(f.source, source),
+    duplicateReference = await duplicateBuilder.prepareTarget({
+      kind: 'document',
+      recordId: 'fictional-document',
+      evidence: () => duplicateRows,
+    }),
+    duplicateStage = await duplicateBuilder.finish(),
+    duplicateSelection = duplicateStage.prepareStandalone();
+  try {
+    transaction(f.source, () => duplicateSelection.apply());
+  } finally {
+    duplicateSelection.dispose();
+    duplicateStage.dispose();
+  }
+  const beforeHistory = clinicalImportCorrectionHistory(f.source, {
+    profileId: sourceId,
+    kind: 'document',
+    recordId: 'fictional-document',
+    limit: 2,
+  });
+  assert.equal(beforeHistory.entries.length, 2);
+  assert.equal(beforeHistory.complete, false);
+  assert.equal(
+    clinicalImportCorrectionHistory(f.source, {
+      profileId: sourceId,
+      kind: 'document',
+      recordId: 'fictional-document',
+      limit: 2,
+      after: beforeHistory.nextCursor,
+    }).entries.length,
+    1,
+  );
+  for (const row of rows(f.source, 'app_meta'))
+    if (row.key !== 'owner_profile_id')
+      f.target
+        .prepare(
+          'INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+        )
+        .run(row.key!, row.value!);
+  for (const table of ['manual_batches', 'source_files', 'source_records', 'documents', 'evidence'])
+    for (const row of rows(f.source, table)) {
+      if (table === 'source_files')
+        row.path = String(row.path).replace(
+          `data/profiles/${sourceId}/`,
+          `data/profiles/${targetId}/`,
+        );
+      const keys = Object.keys(row);
+      f.target
+        .prepare(`INSERT INTO ${table}(${keys.join(',')}) VALUES(${keys.map(() => '?').join(',')})`)
+        .run(...(Object.values(row) as SQLInputValue[]));
+    }
+  const plan = prepareIntakeStateCopy(f.source, sourceId, targetId);
+  try {
+    transaction(f.target, () => stageIntakeStateCopy(f.target, plan, f.options));
+  } finally {
+    disposeIntakeStateCopyPlan(plan);
+  }
+  attachRecordDurability(f.target, { profileId: targetId, storage: f.targetAuthority.storage });
+  assert.deepEqual(readOwnershipSourceSnapshot(f.target, references.moving).sourceRecordIds, [
+    'fictional-b',
+  ]);
+  assert.deepEqual(readOwnershipSourceSnapshot(f.target, references.remaining).sourceRecordIds, [
+    'fictional-a',
+    'fictional-c',
+  ]);
+  const copiedHistory = clinicalImportCorrectionHistory(f.target, {
+    profileId: targetId,
+    kind: 'document',
+    recordId: 'fictional-document',
+    limit: 2,
+  });
+  assert.deepEqual(copiedHistory.entries, beforeHistory.entries);
+  const copiedDuplicate = await prepareRetainedDuplicateEvidenceSnapshot(
+    f.target,
+    duplicateReference,
+  );
+  try {
+    assert.equal(
+      [...copiedDuplicate.chunks()].join(''),
+      canonicalLiteral(duplicateRows.map((row) => row.value)),
+    );
+  } finally {
+    copiedDuplicate.close();
+  }
+  for (const entry of copiedHistory.entries) {
+    const page = readReviewDraftHistoryPage(f.target, { id: source.id }, entry.history, {
+      section: 'corrections',
+    });
+    assert.equal(page.total, 1);
+    assert.equal(page.complete, true);
+    assert.equal(
+      'value' in page.items[0]! && 'reason' in page.items[0].value && page.items[0].value.reason,
+      'Fictional literal correction',
+    );
+  }
+  assert.throws(
+    () =>
+      clinicalImportCorrectionHistory(f.target, {
+        profileId: sourceId,
+        kind: 'document',
+        recordId: 'fictional-document',
+      }),
+    /another profile/,
+  );
+  assert.throws(
+    () =>
+      clinicalImportCorrectionHistory(f.target, {
+        profileId: targetId,
+        kind: 'document',
+        recordId: 'fictional-document',
+        after: beforeHistory.nextCursor,
+      }),
+    /changed import history/,
+  );
+});
 
 test('preparation is side-effect-free, handles multiple/empty sources and distinguishes detached evidence from current authority', (t) => {
   const f = fixture(t);

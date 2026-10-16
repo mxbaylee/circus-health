@@ -1,3 +1,4 @@
+import { fixtureApi, fixtureReport, fixtureNativeReportReady } from './native-intake-fixture.ts';
 import { launchBrowser, newTestPage, startBrowserRuntime } from './harness.ts';
 import { createTestRuntimeDirectory } from '../../server/test/runtime-fixture.ts';
 import type { AddressInfo } from 'node:net';
@@ -121,14 +122,34 @@ test('People-only report stays separate, opens original evidence, and saves by e
   const reportQueueResponse = await page.request.get(url + prefix + '/intakes/report-queue');
   assert(reportQueueResponse.ok(), await reportQueueResponse.text());
   const reportQueue = (await reportQueueResponse.json()).data;
-  assert.equal(reportQueue.groups[0].peopleCounts.pending, 2);
-  assert.equal(reportQueue.groups[0].counts.pending, 0);
-  const groupId = reportQueue.groups[0].groupId;
+  const selectedGroup = reportQueue.groups[0];
+  assert(selectedGroup, 'People-only report remains in the native queue');
+  const groupId =
+    selectedGroup.kind === 'group' ? selectedGroup.group.groupId : selectedGroup.reference.groupId;
+  const selectedReport = await fixtureReport(fixtureApi(page, url), prefix, groupId, intake.id);
+  assert.equal(selectedReport.group.peopleCounts.pending, 2);
+  assert.equal(selectedReport.group.counts.pending, 0);
 
   await page.goto(
     `${url}/#/import?intake=${encodeURIComponent(intake.id)}&group=${encodeURIComponent(groupId)}`,
   );
-  await page.reload();
+  const browserReport = await fixtureNativeReportReady(
+    page,
+    prefix,
+    { intakeId: intake.id, groupId },
+    () => page.reload(),
+  );
+  assert.equal(browserReport.people.format, 'health-intake-people-page-v2');
+  assert.equal(browserReport.people.intakeId, intake.id);
+  assert.equal(browserReport.people.groupId, groupId);
+  assert.equal(browserReport.people.totalPeople, 2);
+  assert.equal(browserReport.people.nextCursor, null);
+  const rowan = browserReport.people.people.find(
+    (entry) => entry.kind === 'person' && entry.person.person.fullName === 'Rowan Finch',
+  );
+  assert.ok(rowan && rowan.kind === 'person');
+  assert.equal(rowan.person.state, 'pending');
+  assert.equal(!!rowan.person.selfMatch, false, 'this clinician can be added separately from Self');
   const people = page.getByRole('region', { name: 'People from this report' });
   await people.getByRole('tab', { name: /To review\s+2/ }).waitFor();
   assert.equal(
@@ -136,6 +157,7 @@ test('People-only report stays separate, opens original evidence, and saves by e
     0,
     'A People-only report does not invent clinical record links',
   );
+  await page.getByRole('button', { name: 'Back to Import', exact: true }).waitFor();
   assert.equal(await page.getByRole('button', { name: 'Back to Import', exact: true }).count(), 1);
 
   await people.getByRole('button', { name: /Rowan Finch/ }).click();
@@ -144,6 +166,7 @@ test('People-only report stays separate, opens original evidence, and saves by e
     .getByRole('region', { name: 'Original evidence' })
     .getByRole('link', { name: 'Open original' });
   assert.match((await original.getAttribute('href')) || '', /\/sources\/.+\/content/);
+  await page.getByRole('button', { name: 'Add as new person' }).waitFor();
   assert.equal(await page.getByRole('button', { name: 'Add as new person' }).count(), 1);
 
   const screenshots = process.env.CRS_TEST_SCREENSHOTS || resolve(root, 'screenshots');

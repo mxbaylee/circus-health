@@ -15,7 +15,11 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import type { ImportDiagnosticExport } from '../server/import-diagnostics.ts';
-import type { Intake, IntakeImportFeed } from '../shared/intake.ts';
+import { isIntakeSummary, type IntakeRead } from '../shared/intake-summary.ts';
+import {
+  collectQualificationFeed,
+  type QualificationFeedPage,
+} from './qualification-intake-read.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
 import {
   runQualificationBatch,
@@ -89,7 +93,7 @@ interface QualificationRun {
   proposals: number;
   supersededReviewVersions: number;
   extractionComplete: boolean;
-  remainingUnits: number;
+  remainingUnits: number | null;
   coordinator: ReturnType<typeof summarizeQualificationBatch>;
   reviewEvidenceFile: string;
   diagnostics: ReturnType<typeof summarizeQualificationDiagnostics>;
@@ -446,51 +450,17 @@ async function main() {
   async function collectFeed(
     prefix: string,
     signal = controller.signal,
-    onPage?: (pages: IntakeImportFeed[]) => void,
+    onPage?: (pages: QualificationFeedPage[]) => void,
   ) {
-    const blocks: IntakeImportFeed['blocks'] = [];
-    const pages: IntakeImportFeed[] = [];
-    let feed: IntakeImportFeed;
-    let cursor: string | null = null;
-    const seen = new Set<string>();
-    do {
-      const clientRequestId = diagnosticRequested ? randomUUID() : undefined;
-      if (clientRequestId) reviewFeedClientRequestIds.add(clientRequestId);
-      feed = await request<IntakeImportFeed>(
-        prefix +
-          '/intakes/import-feed?view=all&limit=100' +
-          (cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''),
-        undefined,
-        undefined,
-        signal,
-        clientRequestId,
-      );
-      blocks.push(...feed.blocks);
-      pages.push(feed);
-      onPage?.(pages);
-      cursor = feed.nextCursor;
-      check(
-        blocks.reduce((sum, block) => sum + block.records.length, 0) <= 1000,
-        'Review exceeded the qualification bound.',
-      );
-      if (cursor) {
-        check(!seen.has(cursor), 'Qualification pagination did not advance.');
-        seen.add(cursor);
-      }
-    } while (cursor);
-    return {
-      blocks: blocks.map((block) => ({
-        ...block,
-        records: block.records.filter((record) => record.queueState !== 'superseded'),
-      })),
-      supersededReviewVersions: blocks.reduce(
-        (sum, block) =>
-          sum + block.records.filter((record) => record.queueState === 'superseded').length,
-        0,
-      ),
-      feed,
-      pages,
-    };
+    return collectQualificationFeed(
+      async <T>(path: string): Promise<T> => {
+        const clientRequestId = diagnosticRequested ? randomUUID() : undefined;
+        if (clientRequestId) reviewFeedClientRequestIds.add(clientRequestId);
+        return request<T>(path, undefined, undefined, signal, clientRequestId);
+      },
+      prefix,
+      onPage,
+    );
   }
   async function retainDiagnostics(signal = AbortSignal.timeout(10_000)) {
     if (!activeDiagnostics) return true;
@@ -524,8 +494,8 @@ async function main() {
       capturedAt: new Date().toISOString(),
       partial: true,
       batch: active.batch,
-      intake: null as Intake | null,
-      pages: [] as IntakeImportFeed[],
+      intake: null as IntakeRead | null,
+      pages: [] as QualificationFeedPage[],
       proposalContent: [] as {
         proposalId: string;
         filename: string;
@@ -549,14 +519,14 @@ async function main() {
         report.coordinator = summarizeQualificationBatch(receipt.batch);
         persist();
       }
-      receipt.intake = await request<Intake>(
+      receipt.intake = await request<IntakeRead>(
         active.prefix + `/intakes/${encodeURIComponent(active.originalId)}`,
         undefined,
         undefined,
         signal,
       );
       persist();
-      await collectFeed(active.prefix, signal, (pages) => {
+      const collected = await collectFeed(active.prefix, signal, (pages) => {
         receipt.pages = pages;
         persist();
       });
@@ -564,9 +534,25 @@ async function main() {
       // Reads stay inside this freshly created profile and the shared capture
       // deadline; an interrupted capture is explicitly marked partial.
       let totalBytes = 0;
-      for (const [index, proposal] of receipt.intake.proposals.entries()) {
+      const proposalIds = isIntakeSummary(receipt.intake)
+        ? [
+            ...new Set(
+              collected.blocks.map((block) => block.proposalId).filter((id): id is string => !!id),
+            ),
+          ]
+        : receipt.intake.proposals.map((proposal) => proposal.fileId);
+      const expectedProposals = isIntakeSummary(receipt.intake)
+        ? receipt.intake.collections.proposals.total
+        : receipt.intake.proposals.length;
+      // Feed membership locates current proposals, not unloaded historical proposal evidence.
+      // Preserve the partial flag when the public summary reports additional history.
+      check(
+        proposalIds.length === expectedProposals,
+        'Retained proposal history requires separate inspection.',
+      );
+      for (const [index, proposalId] of proposalIds.entries()) {
         const response = await fetch(
-          base + active.prefix + `/sources/${encodeURIComponent(proposal.fileId)}/content`,
+          base + active.prefix + `/sources/${encodeURIComponent(proposalId)}/content`,
           { headers: { Origin: base, Cookie: cookie }, signal },
         );
         check(response.ok && response.body, 'Proposal evidence was unavailable.');
@@ -592,7 +578,7 @@ async function main() {
         const proposalFilename = `${captureStem}-proposal-${index + 1}.ndjson`;
         writeFileSync(join(root, proposalFilename), content, { mode: 0o600 });
         receipt.proposalContent.push({
-          proposalId: proposal.id,
+          proposalId,
           filename: proposalFilename,
           bytes,
           sha256: createHash('sha256').update(content).digest('hex'),
@@ -796,7 +782,7 @@ async function main() {
         const uploadClientRequestId = diagnosticRequested ? randomUUID() : undefined;
         const started = performance.now();
         stage('uploading');
-        const uploaded = await request<Intake>(
+        const uploaded = await request<IntakeRead>(
           prefix + '/intakes',
           undefined,
           readFileSync(fixturePath),
@@ -825,8 +811,8 @@ async function main() {
           capturedAt: new Date().toISOString(),
           purpose: 'Exact review pages used by the extraction oracle before any acceptance.',
           partial: true,
-          intake: null as Intake | null,
-          pages: [] as IntakeImportFeed[],
+          intake: null as IntakeRead | null,
+          pages: [] as QualificationFeedPage[],
           supersededReviewVersions: null as number | null,
           batch: activeReview.batch,
         };
@@ -836,7 +822,7 @@ async function main() {
         });
         const records = collected.blocks.flatMap((block) => block.records);
         const feed = collected.feed;
-        const detail = await request<Intake>(prefix + `/intakes/${uploaded.id}`);
+        const detail = await request<IntakeRead>(prefix + `/intakes/${uploaded.id}`);
         extracted.intake = detail;
         extracted.supersededReviewVersions = collected.supersededReviewVersions;
         extracted.partial = false;
@@ -866,11 +852,18 @@ async function main() {
           acceptedObservations: overview.counts.observations,
           acceptedClinicalRecords:
             overview.counts.observations + overview.counts.medications + overview.counts.procedures,
-          acceptedWrites: detail.imported !== null || detail.acceptedProposalId !== null,
-          proposals: detail.proposals.length,
+          acceptedWrites: isIntakeSummary(detail)
+            ? detail.collections.importHistory.total !== 0
+            : detail.imported !== null || detail.acceptedProposalId !== null,
+          proposals: isIntakeSummary(detail)
+            ? detail.collections.proposals.total
+            : detail.proposals.length,
           supersededReviewVersions: collected.supersededReviewVersions,
           extractionComplete: feed.activity.extractionComplete,
-          remainingUnits: feed.activity.remainingUnits,
+          remainingUnits:
+            typeof feed.activity.remainingUnits === 'number'
+              ? feed.activity.remainingUnits
+              : feed.activity.remainingUnits.value,
           coordinator,
           reviewEvidenceFile,
           diagnostics: summarizeQualificationDiagnostics(diagnostics, sequence),

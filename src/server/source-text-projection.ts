@@ -1,16 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
-import {
-  currentTransactionToken,
-  observeTransactionOutcome,
-  rejectCurrentTransaction,
-} from './database.ts';
+import { currentTransactionToken, rejectCurrentTransaction } from './database.ts';
+import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
 import { recordDurabilityStatus } from './record-versions.ts';
 import {
   intakeEnvelopeAuthorityBinding,
   readIntakeEnvelopeMaterialized,
   type IntakeEnvelopeSource,
 } from './intake-authority.ts';
+import { iterateIntakeEnvelopeText } from './intake-collection-envelope.ts';
 import {
   createTextPiecePlan,
   reconstructTextPieces,
@@ -29,6 +27,8 @@ import {
 } from './text-piece-reconcile.ts';
 
 const PREFIX = '__record_source_text_';
+const outcomes = createTransactionOutcomeIssuer();
+export const sourceTextTerminalOutcome = outcomes.recognizes;
 const DIRTY = '__source_text_dirty';
 const INVALIDATED = '__source_text_invalidated';
 const OBSOLETE = '__source_text_obsolete';
@@ -89,6 +89,32 @@ interface Connection {
   counters: SourceTextProjectionCounters;
 }
 const connections = new WeakMap<DatabaseSync, Connection>();
+const trackingInstalled = new WeakSet<DatabaseSync>();
+// Preparation owners retain their original raw SQL witness. Search must not
+// repair this shared disposable cache across their asynchronous gaps.
+const readOnlyOwners = new WeakMap<DatabaseSync, Set<() => void>>();
+export function holdReadOnlySourceTextProjection(db: DatabaseSync, assertCurrent: () => void) {
+  assertCurrent();
+  let owners = readOnlyOwners.get(db);
+  if (!owners) readOnlyOwners.set(db, (owners = new Set()));
+  const owner = () => assertCurrent();
+  owners.add(owner);
+  const owned = owners;
+  let closed = false;
+  return () => {
+    if (closed) return;
+    closed = true;
+    owned.delete(owner);
+    if (!owned.size) readOnlyOwners.delete(db);
+  };
+}
+/** Selects a read path only; it grants no write permission or witness refresh. */
+export function sourceTextProjectionReadOnly(db: DatabaseSync): boolean {
+  const owners = readOnlyOwners.get(db);
+  if (!owners?.size) return false;
+  for (const assertCurrent of owners) assertCurrent();
+  return true;
+}
 const table = (name: Table) => PREFIX + name;
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
 // Corrupt BLOB keys have no JSON text representation. Hex-encode them only for
@@ -144,7 +170,7 @@ function connectionFor(db: DatabaseSync): Connection {
       matching: {},
     },
   };
-  connection.dispose = observeTransactionOutcome(db, ({ succeeded }) => {
+  connection.dispose = outcomes.observe(db, ({ succeeded }) => {
     if (!succeeded) {
       connection.schema = -1;
       connection.snapshots.clear();
@@ -205,14 +231,47 @@ function sourceTracking(db: DatabaseSync): void {
     CREATE TEMP TRIGGER IF NOT EXISTS __source_text_insert AFTER INSERT ON main.source_files BEGIN ${mark('NEW.id')} END;
     CREATE TEMP TRIGGER IF NOT EXISTS __source_text_update AFTER UPDATE ON main.source_files BEGIN ${mark('OLD.id')} ${mark('NEW.id')} END;
     CREATE TEMP TRIGGER IF NOT EXISTS __source_text_delete AFTER DELETE ON main.source_files BEGIN ${mark('OLD.id')} END;`);
+  trackingInstalled.add(db);
+}
+
+/** Read only the selected source's indexed disposable invalidation row. */
+export function sourceTextAuthorityDirtyRow(
+  db: DatabaseSync,
+  sourceId: string,
+  authorityKey: string,
+) {
+  if (!trackingInstalled.has(db)) return null;
+  const triggers = db
+    .prepare(
+      "SELECT name,sql FROM sqlite_temp_master WHERE type='trigger' AND name IN ('__source_text_authority_INSERT','__source_text_authority_UPDATE','__source_text_authority_DELETE') ORDER BY name",
+    )
+    .all();
+  if (
+    triggers.length !== 3 ||
+    triggers.some(
+      (row) =>
+        typeof row.name !== 'string' ||
+        row.sql !== `CREATE TRIGGER ${sourceTextAuthorityTrigger(row.name.slice(24))}`,
+    )
+  )
+    throw Error('Source text authority tracking trigger changed');
+  if (
+    db.prepare(`SELECT source_id FROM temp.${AUTHORITIES} WHERE authority_key=?`).get(authorityKey)
+      ?.source_id !== sourceId
+  )
+    return null;
+  return {
+    authority: authorityKey,
+    dirty: !!db.prepare(`SELECT 1 FROM temp.${DIRTY} WHERE source_id=?`).get(sourceId),
+  };
+}
+function sourceTextAuthorityTrigger(op: string): string {
+  const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
+  return `__source_text_authority_${op} AFTER ${op} ON main.app_meta BEGIN ${refs.map((ref) => `INSERT INTO ${DIRTY} SELECT source_id FROM ${AUTHORITIES} a WHERE authority_key=${ref}.key AND NOT EXISTS(SELECT 1 FROM ${DIRTY} d WHERE d.source_id=a.source_id);`).join(' ')} END`;
 }
 function cacheTracking(db: DatabaseSync): void {
-  for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
-    const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
-    db.exec(
-      `CREATE TEMP TRIGGER IF NOT EXISTS __source_text_authority_${op} AFTER ${op} ON main.app_meta BEGIN ${refs.map((ref) => `INSERT INTO ${DIRTY} SELECT source_id FROM ${AUTHORITIES} a WHERE authority_key=${ref}.key AND NOT EXISTS(SELECT 1 FROM ${DIRTY} d WHERE d.source_id=a.source_id);`).join(' ')} END`,
-    );
-  }
+  for (const op of ['INSERT', 'UPDATE', 'DELETE'])
+    db.exec(`CREATE TEMP TRIGGER IF NOT EXISTS ${sourceTextAuthorityTrigger(op)}`);
   for (const name of ['heads', 'occurrences', 'links'] as const)
     for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
       const refs = op === 'INSERT' ? ['NEW'] : op === 'DELETE' ? ['OLD'] : ['OLD', 'NEW'];
@@ -424,6 +483,9 @@ function retained(
     const result = reconstructTextPieces(snapshot);
     addMetrics(connection.counters.engine, result.metrics);
     const selected = { row, snapshot, text: result.text };
+    // The compatibility engine materializes one bounded v3 value. Never retain
+    // one such value per source across a large source-list traversal.
+    connection.snapshots.clear();
     connection.snapshots.set(id, selected);
     return selected;
   } catch (error) {
@@ -453,6 +515,13 @@ function authority(db: DatabaseSync, connection: Connection, id: string): Row | 
   const binding = intakeEnvelopeAuthorityBinding(db, selected);
   source.authority_key = binding.key;
   source.authority_head = binding.head;
+  // V4 text already belongs to the checked logical tree. Keeping a second rope
+  // would copy that authority and hide a complete traversal in ordinary writes.
+  if (binding.logicalHead !== undefined) {
+    source.logical_head = binding.logicalHead;
+    connection.counters.authorityBytes += Buffer.byteLength(source.details_json as string);
+    return source;
+  }
   if (source.kind === 'intake_original') {
     const materialized = readIntakeEnvelopeMaterialized(db, selected);
     source.details_json = materialized.text;
@@ -620,6 +689,15 @@ function reconcile(
   connection.counters.reconciledSources++;
   if (!source) {
     removeSource(db, connection, id, obsolete);
+    return;
+  }
+  if (typeof source.logical_head === 'string') {
+    // Conversion removes a prior compatibility rope once. Subsequent logical or
+    // auxiliary changes touch no content rows; query-time export is explicit.
+    if (db.prepare(`SELECT 1 FROM ${table('heads')} WHERE source_id=?`).get(id))
+      removeSource(db, connection, id, obsolete);
+    db.prepare(`DELETE FROM temp.${AUTHORITIES} WHERE source_id=?`).run(id);
+    db.prepare(`INSERT INTO temp.${AUTHORITIES} VALUES(?,?)`).run(source.authority_key!, id);
     return;
   }
   const raw = source.details_json as string;
@@ -834,12 +912,144 @@ export function readSourceTextProjection(
     fail('source identity exceeds binding bound');
   return current(db, options, (connection, profile) => {
     const selected = retained(db, connection, sourceId, profile, true);
-    if (!selected) return fail('selected source is missing');
+    if (!selected) {
+      const source = authority(db, connection, sourceId);
+      if (typeof source?.logical_head === 'string')
+        return fail('native intake text requires ordered stream consumption');
+      return fail('selected source is missing');
+    }
     if (options.limits) {
       const result = reconstructTextPieces(selected.snapshot, { limits: options.limits });
       addMetrics(connection.counters.engine, result.metrics);
       return result.text;
     }
     return selected.text;
+  });
+}
+
+/** Read-only analogue of upfront dirty reconciliation. During preparation we
+ * cannot initialize or drain tracking rows, so validate the source inventory
+ * one identity at a time. These complete compatibility reads are counted. */
+export function prepareReadOnlySourceTextSearch(db: DatabaseSync): boolean {
+  if (!sourceTextProjectionReadOnly(db)) return false;
+  const connection = connectionFor(db);
+  if (recordDurabilityStatus(db)?.dirty) fail('accepted projection requires recovery');
+  for (const row of db
+    .prepare(
+      "SELECT CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB)) BETWEEN 1 AND 1024 THEN id END id FROM source_files ORDER BY id",
+    )
+    .iterate()) {
+    connection.counters.authorityReads++;
+    if (typeof row.id !== 'string') return fail('source identity exceeds binding bound');
+    const selected = authority(db, connection, row.id);
+    if (!selected) return fail('selected source text is unavailable');
+    if (
+      selected.logical_head === undefined &&
+      (selected.details_json as string).length > TEXT_PIECE_LIMITS.maxTextUtf16Units
+    )
+      fail('selected authority exceeds the text bound');
+  }
+  sourceTextProjectionReadOnly(db);
+  return true;
+}
+
+function consumeReadOnlySourceText(
+  db: DatabaseSync,
+  sourceId: string,
+  consume: (chunk: string) => void,
+): void {
+  const connection = connectionFor(db);
+  if (recordDurabilityStatus(db)?.dirty) fail('accepted projection requires recovery');
+  const profile = () =>
+    db
+      .prepare(
+        "SELECT CASE WHEN length(CAST(value AS BLOB))<=1024 THEN value END value FROM app_meta WHERE key='owner_profile_id'",
+      )
+      .get()?.value;
+  const owner = profile();
+  if (typeof owner !== 'string' || !owner) fail('profile binding');
+  const selected = authority(db, connection, sourceId);
+  if (!selected) return fail('selected source text is unavailable');
+  if (typeof selected.logical_head === 'string') {
+    for (const chunk of iterateIntakeEnvelopeText(
+      db,
+      selected as unknown as IntakeEnvelopeSource,
+    )) {
+      connection.counters.authorityReads++;
+      connection.counters.authorityBytes += Buffer.byteLength(chunk);
+      consume(chunk);
+    }
+  } else {
+    // Retained/raw compatibility remains explicitly bounded by authority().
+    // Consume UTF8-safe fragments through the same exact matcher as native text.
+    const text = selected.details_json as string;
+    if (text.length > TEXT_PIECE_LIMITS.maxTextUtf16Units)
+      fail('selected authority exceeds the text bound');
+    for (let at = 0; at < text.length;) {
+      let end = Math.min(at + 1024, text.length);
+      if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
+      consume(text.slice(at, end));
+      at = end;
+    }
+  }
+  const after = authority(db, connection, sourceId);
+  if (
+    profile() !== owner ||
+    !after ||
+    ['sha256', 'kind', 'details_json', 'authority_key', 'authority_head', 'logical_head'].some(
+      (key) => after[key] !== selected[key],
+    )
+  )
+    fail('selected source text binding changed');
+  // Final physical/source observations cannot adopt a changed-and-restored SQL
+  // witness. The original preparation owners still decide whether it is current.
+  sourceTextProjectionReadOnly(db);
+}
+
+/** Consume checked selected text in order without joining a query text operand.
+ * Retained v3 uses its explicitly bounded compatibility snapshot; v4 uses the
+ * selected authority's streamed logical export rather than a text-piece copy.
+ * Always finish traversal: a match before corrupt/missing evidence is incomplete.
+ */
+export function consumeSourceTextProjection(
+  db: DatabaseSync,
+  sourceId: string,
+  consume: (chunk: string) => void,
+): void {
+  if (typeof sourceId !== 'string' || !sourceId || Buffer.byteLength(sourceId) > 1024)
+    fail('source identity exceeds binding bound');
+  if (sourceTextProjectionReadOnly(db)) return consumeReadOnlySourceText(db, sourceId, consume);
+  current(db, {}, (connection, profile) => {
+    if (!db.prepare(`SELECT 1 FROM ${table('heads')} WHERE source_id=?`).get(sourceId)) {
+      const selected = authority(db, connection, sourceId);
+      if (!selected || typeof selected.logical_head !== 'string')
+        return fail('selected source text is unavailable');
+      for (const chunk of iterateIntakeEnvelopeText(
+        db,
+        selected as unknown as IntakeEnvelopeSource,
+      )) {
+        connection.counters.authorityReads++;
+        connection.counters.authorityBytes += Buffer.byteLength(chunk);
+        consume(chunk);
+      }
+      // A consumer cannot turn a traversal bound to one logical source into a
+      // successful result for a different selected source during consumption.
+      const after = authority(db, connection, sourceId);
+      if (
+        !after ||
+        after.sha256 !== selected.sha256 ||
+        after.logical_head !== selected.logical_head
+      )
+        return fail('selected source text binding changed');
+      return;
+    }
+    const selected = retained(db, connection, sourceId, profile, true);
+    if (!selected) return fail('selected source is missing');
+    let id = selected.snapshot.head.first;
+    while (id !== null) {
+      const piece = selected.snapshot.occurrences.get(id)!;
+      consume(selected.snapshot.contents.get(piece.contentId)!.text.slice(piece.start, piece.end));
+      id = selected.snapshot.links.get(id)!.next;
+    }
   });
 }

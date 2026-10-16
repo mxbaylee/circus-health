@@ -4,6 +4,7 @@ import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { expect, it, vi } from 'vitest';
 import { Sources } from '../../app/pages/Sources';
 import { selectProfile } from '../../app/data/profile';
+import type { SourceFileReference } from '../../shared/api';
 
 vi.mock('../../app/components/SourceDialog', () => ({
   SourceDialog: () => null,
@@ -112,7 +113,7 @@ it.each(['view=import&return=import&', '', 'view=records&return=import&'])(
 it('lists retained proposal records through their exact original-file lineage', async () => {
   selectProfile({ id: 'fictional-sources', name: 'Cookie Dough', placebo: true });
   const requests: string[] = [];
-  const originalFile = {
+  const originalFile: SourceFileReference = {
     id: 'root-original',
     providerId: 'fictional-provider',
     provider: 'Fictional Vision',
@@ -124,7 +125,8 @@ it('lists retained proposal records through their exact original-file lineage', 
     mimeType: 'image/png',
     kind: 'intake_original',
     coverageStatus: 'original_retained; clinical_coverage_unknown',
-    details: {},
+    detailsIncluded: false,
+    detailsUrl: '/api/sources/root-original/details',
     contentUrl: '/fictional-original',
   };
   vi.stubGlobal(
@@ -273,16 +275,17 @@ it('keeps a present source-record date scoped in the records list and detail', a
 it('keeps source review inside the selected original without a second inventory banner', async () => {
   selectProfile({ id: 'fictional-empty-import', name: 'Cookie Doe', placebo: true });
   const requests: string[] = [];
-  const file = {
+  const file: SourceFileReference = {
     id: 'empty-source',
+    providerId: null,
+    provider: null,
     path: 'cookie-empty.pdf',
-    filename: 'cookie-empty.pdf',
     kind: 'original',
     coverageStatus: 'unknown',
     mimeType: 'text/plain',
-    proposals: [],
     bytes: 100,
-    details: {},
+    detailsIncluded: false,
+    detailsUrl: '/api/sources/empty-source/details',
     sha256: 'fictional',
     contentUrl: '/api/sources/empty-source/content',
   };
@@ -293,11 +296,13 @@ it('keeps source review inside the selected original without a second inventory 
       requests.push(url);
       const data = url.includes('/source-issues?')
         ? { status: 'unavailable', issues: [], summary: { specificIssues: 0 }, nextOffset: null }
-        : url.endsWith('/sources/empty-source') || url.endsWith('/intakes/empty-source')
-          ? file
-          : url.includes('/sources?')
-            ? [file]
-            : [];
+        : url.endsWith('/intakes/empty-source')
+          ? { ...file, filename: file.path }
+          : url.split('?')[0]!.endsWith('/sources/empty-source')
+            ? file
+            : url.includes('/sources?')
+              ? [file]
+              : [];
       return new Response(JSON.stringify({ data, meta: { revision: 1, complete: true } }));
     }),
   );

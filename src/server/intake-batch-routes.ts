@@ -30,9 +30,9 @@ export async function handleIntakeBatchRoute({
   else if (method === 'GET' && id && !action) respond(intakeBatches.get(profileId, id));
   else if (method === 'POST' && !id)
     respond(
-      intakeBatches.create(
+      await intakeBatches.createPrepared(
         profileId,
-        (await jsonBody(req)) as Parameters<IntakeBatchManager['create']>[1],
+        (await jsonBody(req)) as Parameters<IntakeBatchManager['createPrepared']>[1],
       ),
       {},
       201,
@@ -45,7 +45,7 @@ export async function handleIntakeBatchRoute({
     respond(intakeBatches.resume(profileId, id));
   } else if (method === 'POST' && id && action === 'retry-exceptions') {
     await jsonBody(req);
-    respond(intakeBatches.retryExceptions(profileId, id));
+    respond(await intakeBatches.retryExceptions(profileId, id));
   } else throw new HttpError(404, 'NOT_FOUND', 'Reading batch action not found');
   return true;
 }
