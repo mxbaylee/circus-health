@@ -992,6 +992,8 @@ async function prepareProposalDerived(
             fromCollection: oldCache + '.' + kind,
           })),
         );
+        input.auxiliary?.retainCollection(newCache + '.versions');
+        input.auxiliary?.retainCollection(newCache + '.control');
         await writers.sources.put(sourceId, JSON.stringify(refreshed));
       }
     }

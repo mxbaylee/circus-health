@@ -1,12 +1,38 @@
 # Update an installation and recover from a failed candidate
 
+## Updating from `main` to this candidate
+
+This candidate changes durable authority, so it is not a restart-only update.
+The paragraphs below describe individual changes; read this summary first.
+
+- **One-way intake upgrade.** Retained V3 intake envelopes are bridged to
+  [V4 collections](../data/intake-state-storage.md#v4-collections-and-selected-publication)
+  on first use, including ordinary reads such as opening a package inventory.
+  Builds that understand only V3 cannot open an upgraded intake, and deleting
+  the disposable cache does not undo the upgrade. The same preparation indexes
+  an intake's retained report-source confirmations once, at its unchanged public
+  version.
+- **Newer journal and queue formats.** Accepted commits use v2 segment manifests
+  and processing queues use v3 events; older builds refuse both (see
+  [format notes](#release-configuration-and-format-notes)).
+- **Back up before the first start.** Take and check the
+  [pre-update backup](#prepare-the-checked-way-back) before starting the
+  candidate. There is no downgrade path: returning to the prior build means
+  restoring that untouched backup, and writes made after it are not recovered.
+- **Known limitations.** A passkey unlock or encrypted setup that runs past its
+  challenge or session window fails at the end rather than only at admission
+  ([CRS-245](../todo/CRS-245.md)); the recovery key still unlocks. Exact source
+  search has no aggregate work limit and can stall other requests on very large
+  profiles ([CRS-247](../todo/CRS-247.md)). Disposable scratch databases use the
+  128 MiB `/tmp` tmpfs in Compose, so very large profiles can exhaust it during
+  copy, compaction or replay ([CRS-246](../todo/CRS-246.md)).
+
 Collection approval now binds to the values actually displayed by its editor;
 background refresh cannot silently replace them, and native ownership split
 acknowledgements preserve reviewed edits. Restart into the reviewed build and
 reload open review pages before approving records. Portable staging also preserves
-nonzero row ordinals across empty personal tables. Accepted formats, recovery
-compatibility and operator configuration are unchanged; no migration or reset is
-required. See [review reliability](../import/review-reliability.md) and the
+nonzero row ordinals across empty personal tables. This change adds no operator
+configuration; the authority upgrade and backup requirement above still apply. See [review reliability](../import/review-reliability.md) and the
 [portable contract](../../src/server/PORTABLE.md). Open internal-integrity and
 cleanup limitations remain explicit in [the backlog](../todo/readme.md).
 
@@ -138,9 +164,9 @@ Cold schema-envelope builds now stage their changes in private scratch and
 publish them in sorted key order, writing about a third of the earlier
 authenticated nodes and journal bytes. The selected envelope format, keys,
 readers and recovery are unchanged, so a prior checkout reads envelopes built by
-this one. Build progress moves from `health-intake-envelope-build-resume-v1` to
-`-v2`: an interrupted build from either checkout is not resumed by the other and
-is rebuilt from the beginning, leaving the partial build unselected. No operator
+this one. Build progress is recorded as `health-intake-envelope-build-resume-v2`;
+an interrupted build without that progress record is rebuilt from the beginning,
+leaving the partial build unselected. No operator
 action or configuration is required.
 
 Package inventory HTTP reads, direct member reads and generic assistant package

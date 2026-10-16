@@ -85,8 +85,8 @@ The off-page package recovery and retained queue-window fixtures each use a
 clinical acceptance, backup reconstruction and exact retries across 61 members;
 the latter retains 13 groups, complete cursor traversal and changed-source work
 counts. Queue setup omits unused preparations and traverses the same groups in
-two pages. Neither fixture makes live model requests, and these guards do not
-change the original history, acceptance, continuation or browser budgets.
+two pages. Neither fixture makes live model requests. These guards are separate
+from the history, acceptance, continuation and browser budgets.
 
 The 257-artifact identity fixture uses a 450-second host guard. Its 449 occurrence
 checks, exact membership, payload-work counters, cancellation and same-byte
@@ -101,7 +101,7 @@ The optional `CRS_IDENTITY_PHYSICAL_DIAGNOSTIC=1` probe counts selected-original
 stats, proof rows and worker messages at 1, 8 and 32 proposals. Set
 `CRS_IDENTITY_COUNT_CASE` to one of those sizes to isolate it. This probe has its
 own host hang guards and runs only when explicitly enabled; it does not qualify
-or replace the unchanged 257-artifact fixture or establish a scaling bound.
+or replace the complete 257-artifact fixture or establish a scaling bound.
 
 The retained-plan retry fixture uses 300 seconds to publish 65 plans, clear their selected catalog in one version and verify units after cache loss. The off-page proposal-closure fixture uses 180 seconds for 65 questions and 65 unrelated versions, cancellation, atomic publication and reconstruction. The corrected-ownership fixture uses 180 seconds for a committed person correction, 97 retained identity receipts, exact policy comparison, in-history request progress and cancellation cleanup. Their work counts, retained evidence and exact replay assertions determine correctness; these budgets only bound a stalled host fixture.
 
@@ -159,7 +159,7 @@ The complete artifact-history and superseded-receipt fixtures run serially in
 `npm run test:history`, separate from server shards so they do not compete with
 another test file on the same runner. Both remain in `npm test` and in the
 aggregate-required `history` CI job. The 257-artifact/449-occurrence and 70-receipt
-fixtures, their 450/300-second case guards, and all assertions are unchanged.
+fixtures keep their 450/300-second case guards and all assertions.
 The history job has a 20-minute setup/execution budget and uses the same sanitized
 routine environment; it needs no live provider or extra native dependency.
 The suite-partition regression checks that server, history and continuation cover
@@ -177,8 +177,8 @@ a two-minute no-progress guard, measured with a monotonic clock. Only newly
 validated unique delivered pages or new canonical acknowledged durable unit/page coverage
 reset the latter; polling, requests, logs and duplicate acknowledgments do not.
 Late progress or completion cannot revive an expired guard. The 19-minute outer
-test guard covers setup, processing and final assertions within the unchanged
-20-minute CI job. These are coarse host hang guards, not a production model
+test guard covers setup, processing and final assertions within the 20-minute
+CI job. These are coarse host hang guards, not a production model
 timeout or a performance target for user-provided models. All page, request,
 receipt and final-coverage assertions remain required.
 

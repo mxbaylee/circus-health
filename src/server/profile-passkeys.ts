@@ -661,6 +661,8 @@ export function createProfilePasskeys(
             assertAuthorized: authorize,
             authorization,
           });
+          // The opened vault now owns the key; a late refusal must not zero it.
+          key = null;
           if (!passkeyUnlockAuthorized(authorization, manager, profileId))
             throw new HttpError(
               409,
@@ -668,7 +670,6 @@ export function createProfilePasskeys(
               'Profile access changed. Start the passkey request again.',
             );
           passkeyUnlockAuthorizations.delete(authorization);
-          key = null;
           return profile;
         } finally {
           key?.fill(0);

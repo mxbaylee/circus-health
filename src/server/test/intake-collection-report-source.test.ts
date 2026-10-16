@@ -891,3 +891,104 @@ test('prior occurrence authority includes every retained duplicate member', () =
   );
   assert.ok(!entries.some((entry) => entry.occurrence.recordId === hidden.recordId));
 });
+
+test('cold native preparation indexes retained legacy confirmations once and leaves unconfirmed intakes unwritten', async (t) => {
+  const { ensureNativeIntakeSchema } = await import('../intake.ts');
+  const { intakeSourceVersion } = await import('../intake-state-access.ts');
+  const root = mkdtempSync(join(tmpdir(), 'fictional-source-cold-index-')),
+    profileId = 'fictional',
+    db = openDatabase(join(root, 'cache.sqlite'), profileId);
+  memoryRecordAuthority(db);
+  t.after(() => {
+    clearIntakeStateCache(db);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const seed = (intakeId: string, sourceHash: string, workflow: IntakeWorkflow) => {
+    const initial = prepareInitialIntakeEnvelope({
+      intake: { version: 1, originalName: 'fictional.pdf', workflow },
+    });
+    transaction(db, () => {
+      db.prepare('INSERT OR IGNORE INTO providers(id,name) VALUES(?,?)').run(
+        'fictional-provider',
+        'Fictional reviewed source',
+      );
+      db.prepare(
+        'INSERT INTO source_files(id,provider_id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?,?)',
+      ).run(
+        intakeId,
+        'fictional-provider',
+        intakeId + '.pdf',
+        sourceHash,
+        0,
+        'intake_original',
+        initial.detailsJson,
+      );
+      createIntakeStateStorage(db, { profileId, intakeId, sourceHash }).stage(
+        initial.state,
+        randomUUID(),
+      );
+    });
+    return { id: intakeId, sha256: sourceHash };
+  };
+  // Every durable intake write adds rows or moves a head in app_meta.
+  const durable = () =>
+    createHash('sha256')
+      .update(JSON.stringify(db.prepare('SELECT key,value FROM app_meta ORDER BY key').all()))
+      .digest('hex');
+  const f = fixture('manual_report_label'),
+    request = {
+      candidateId: 'old',
+      candidateVersionId: 'old-v1',
+      references: () => [{ groupId: f.group.id, groupVersionId: 'version-old' }],
+    };
+  const plain = seed('fictional-unconfirmed', 'd'.repeat(64), {
+    ...f.workflow,
+    reportSourceConfirmations: [],
+    questions: [],
+    plans: [],
+    reportGroups: [{ ...f.group, versions: [f.group.versions[0]!] }],
+  } as IntakeWorkflow);
+  const confirmed = seed('fictional-confirmed', 'c'.repeat(64), {
+    ...f.workflow,
+    questions: [],
+    plans: [],
+    reportGroups: [{ ...f.group, versions: [f.group.versions[0]!] }],
+  } as IntakeWorkflow);
+
+  // An intake without confirmations gets only its representation build.
+  await ensureNativeIntakeSchema(db, profileId, plain.id);
+  const plainBuilt = durable();
+  await ensureNativeIntakeSchema(db, profileId, plain.id);
+  assert.equal(durable(), plainBuilt);
+  assert.equal(resolveNativeReportSource(db, plain, request), null);
+
+  // A direct envelope build alone leaves the retained confirmation unindexed.
+  await buildIntakeCollectionEnvelope(db, confirmed);
+  assert.throws(() => resolveNativeReportSource(db, confirmed, request), /pending/);
+  const before = intakeSourceVersion(db, confirmed.id);
+  await ensureNativeIntakeSchema(db, profileId, confirmed.id);
+  const indexed = intakeSourceVersion(db, confirmed.id),
+    prepared = durable();
+  assert.equal(indexed.version, before.version);
+  assert.notEqual(indexed.logicalBinding, before.logicalBinding);
+  const after = JSON.parse([...iterateIntakeEnvelopeText(db, confirmed)].join(''));
+  assert.equal(after.intake.version, 1);
+  assert.deepEqual(
+    after.intake.workflow.reportSourceConfirmations,
+    f.workflow.reportSourceConfirmations,
+  );
+  const resolved = resolveNativeReportSource(db, confirmed, request);
+  assert.ok(resolved);
+  assert.equal(resolved.confirmation.operationId, 'confirmation');
+  assert.equal(resolved.coverage.groupVersionId, 'version-old');
+  assert.equal(
+    resolved.confirmationHash,
+    createHash('sha256')
+      .update(canonicalLiteral(f.workflow.reportSourceConfirmations![0]!))
+      .digest('hex'),
+  );
+  // Already indexed: later cold preparation is point reads only.
+  await ensureNativeIntakeSchema(db, profileId, confirmed.id);
+  assert.equal(durable(), prepared);
+});

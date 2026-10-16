@@ -1115,6 +1115,63 @@ export async function* prepareNativeReportSourceIndex(
     };
 }
 
+/** Cold, once-only selection of the index for retained confirmations. An intake
+ * without confirmations, or one that already selects an index (current or stale),
+ * costs point reads and returns no preparation. Otherwise one envelope mutation
+ * adds only the index pointer and its catalog snapshots at the unchanged public
+ * version; the host stages it in its ordinary intake transaction. */
+export async function prepareRetainedReportSourceIndex(
+  db: Database,
+  source: import('./intake-authority.ts').IntakeEnvelopeSource,
+  options: { assertRunning?: () => void } = {},
+) {
+  options.assertRunning?.();
+  const reader = openIntakeCollectionEnvelope(db, source),
+    intake = reader.child(reader.root(), 'intake'),
+    workflow = intake && reader.child(intake, 'workflow');
+  if (
+    !workflow ||
+    !reader.childCount(workflow, 'reportSourceConfirmations') ||
+    reader.has(workflow, 'reportSourceIndex')
+  )
+    return undefined;
+  const [{ prepareIntakeEnvelopeMutation }, { intakeSourceVersion }] = await Promise.all([
+    import('./intake-envelope-mutation.ts'),
+    import('./intake-state-access.ts'),
+  ]);
+  const before = intakeSourceVersion(db, source.id),
+    assertCurrent = () => {
+      options.assertRunning?.();
+      const current = intakeSourceVersion(db, source.id);
+      if (current.version !== before.version || current.logicalBinding !== before.logicalBinding)
+        throw Error('Report source index preparation source changed');
+    },
+    catalog = createReportSnapshotCatalogForReceipt(db, source, { assertRunning: assertCurrent }),
+    operationId = randomUUID(),
+    requestDigest = createHash('sha256').update(operationId).digest('hex');
+  const prepared = await prepareIntakeEnvelopeMutation(db, source, {
+    reader,
+    operationId,
+    requestDigest,
+    domainVersion: before.rawVersion,
+    assertRunning: assertCurrent,
+    additionalLogicalChanges: () => catalog.finalChanges(),
+    async *changes(view) {
+      const flow = view.child(view.child(view.root(), 'intake')!, 'workflow')!;
+      yield* prepareNativeReportSourceIndex({
+        db,
+        source,
+        view,
+        workflow: flow,
+        catalog,
+        assertCurrent,
+      });
+    },
+  });
+  if (!prepared.prepared) throw Error('Unexpected report source index preparation replay');
+  return { prepared: prepared.prepared, operationId, fingerprint: requestDigest, assertCurrent };
+}
+
 /** Capture the complete prior index before appending; finish updates only the new receipt's pointers. */
 export async function prepareReportSourceIndexAppend(
   input: Pick<

@@ -18,6 +18,7 @@ import {
   authorizeCheckedPackageMember,
   authorizePackageVerifiedPrefix,
 } from './intake-package-index.ts';
+import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 import { withPackageSessionSource } from './intake-package-session.ts';
 import { emptyPackageSourceVerificationWork } from './intake-package-source-lease.ts';
 import {
@@ -357,18 +358,27 @@ export function readDurablePackageInventory(context: PackageStateReadContext) {
 
 /** Explicit new adapter; public package callers retain legacy safeguards until
  * their authority/consumer migration is complete. */
-export async function buildDurablePackageInventory(
+type PackageInventoryProgress = (work: {
+  checkpoints: number;
+  retainedRecords: number;
+  reusedRecords: number;
+  verifiedRecords: number;
+}) => void;
+/** Inventory chunk appends and attempt/reuse checks are not idempotent, so one
+ * builder at a time: join the caller's clinical operation, or admit a new one. */
+export function buildDurablePackageInventory(
   context: PackageStateContext,
-  {
-    onProgress,
-  }: {
-    onProgress?: (work: {
-      checkpoints: number;
-      retainedRecords: number;
-      reusedRecords: number;
-      verifiedRecords: number;
-    }) => void;
-  } = {},
+  options: { onProgress?: PackageInventoryProgress } = {},
+) {
+  return runExclusiveClinicalOperation(
+    context.db,
+    () => buildDurablePackageInventoryOwned(context, options),
+    { operation: currentClinicalOperation(context.db), assertRunning: context.assertRunning },
+  );
+}
+async function buildDurablePackageInventoryOwned(
+  context: PackageStateContext,
+  { onProgress }: { onProgress?: PackageInventoryProgress },
 ) {
   context.assertRunning?.();
   // A cold legacy package builder needs the fixed observer before its first

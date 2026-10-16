@@ -127,7 +127,8 @@ jobs:
   history:
     runs-on: ubuntu-latest
     # Preserve the full artifact and receipt oracles without sharing their CPU
-    # with another test file. Their existing 450/300-second guards are unchanged.
+    # with another test file. Their 450/300-second case guards are fixture-local
+    # host hang guards; CRS-259 tracks returning raised guards to counted baselines.
     timeout-minutes: 20
     env:
       HUSKY: '0'

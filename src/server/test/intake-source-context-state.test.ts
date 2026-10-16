@@ -2,7 +2,7 @@ import test, { type TestContext } from 'node:test';
 import { randomUUID, createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase, observeTransactionBeforePublication, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
@@ -890,6 +890,22 @@ for (const scenario of ['rematerialized', 'damaged', 'publication-race'] as cons
     const current = readSelectedSourceContextClassification(f.db, f.root, f.profileId, f.id);
     assert.ok(current.state === 'ready');
     assert.equal(current.isSourceContextVersion(f.versionIds[0]!), true);
+    const store = selectedEnvelopeStore(f.db, f.file).collections,
+      witness = JSON.parse(
+        store.get(
+          store.openView(),
+          'builds',
+          current.collection + '.sources',
+          f.sourceIds[0]!,
+        ) as string,
+      ),
+      cache = 'source.context.file.' + workflowHash([resolve(f.root), f.profileId, witness]);
+    assert.equal(
+      store.get(store.openView(), 'builds', cache + '.control', 'complete'),
+      'ready',
+      'The refreshed witness cache is published, so a later deactivation can read it',
+    );
+    assert.ok(store.collection(store.openView(), 'builds', cache + '.versions'));
     assert.throws(
       () => current.isSourceContextVersion(f.versionIds[2]!),
       SourceContextClassificationPending,

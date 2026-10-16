@@ -1024,6 +1024,7 @@ export function hasNativeIntakeSchema(db: DatabaseSync, profileId: string, id: s
   owner(db, profileId);
   return hasCollectionIntakeSchema(db, row(db, id));
 }
+const reportSourceIndexAttempts = new WeakMap<DatabaseSync, Set<string>>();
 /** Explicit, counted compatibility preparation before new public work. The
  * selected source and public version stay unchanged; a failed build leaves the
  * prior representation readable and a later call may retry it. */
@@ -1038,11 +1039,44 @@ export async function ensureNativeIntakeSchema(
     async () => {
       owner(db, profileId);
       options.assertRunning?.();
+      // Retained confirmations are indexed once; later calls are point reads.
+      // Indexing is best effort: a refusal leaves report-source reads pending,
+      // as before, and is not retried until the intake's selected head changes.
+      const indexReportSources = async () => {
+        const attempt = JSON.stringify([id, intakeSourceVersion(db, id)]);
+        let attempted = reportSourceIndexAttempts.get(db);
+        if (attempted?.has(attempt)) return;
+        try {
+          const { prepareRetainedReportSourceIndex } =
+              await import('./intake-report-source-state.ts'),
+            file = row(db, id),
+            index = await prepareRetainedReportSourceIndex(db, file, options);
+          if (!index) return;
+          intakeTransaction(
+            db,
+            () => {
+              owner(db, profileId);
+              index.assertCurrent();
+              options.assertPublicationCurrent?.();
+              selectedEnvelopeStore(db, file).collections.stage(index.prepared);
+            },
+            { operationId: index.operationId, fingerprint: index.fingerprint },
+          );
+        } catch {
+          // Cancellation and ownership changes still refuse the caller.
+          owner(db, profileId);
+          options.assertRunning?.();
+          options.assertPublicationCurrent?.();
+          if (!attempted) reportSourceIndexAttempts.set(db, (attempted = new Set()));
+          attempted.add(attempt);
+        }
+      };
       // Check readiness only after admission. A preceding owner may have built
       // this source; there is no external pending promise to wait on in the lane.
       if (hasCollectionIntakeSchema(db, row(db, id))) {
         const { prepareIntakeFilenameSummary } = await import('./intake-summary-name.ts');
         await prepareIntakeFilenameSummary(db, row(db, id), options);
+        await indexReportSources();
         return;
       }
       const { buildIntakeCollectionEnvelope } = await import('./intake-envelope-build.ts');
@@ -1051,6 +1085,7 @@ export async function ensureNativeIntakeSchema(
       options.assertRunning?.();
       if (!hasCollectionIntakeSchema(db, row(db, id)))
         throw new HttpError(409, 'INTAKE_CHANGED', 'The selected intake representation changed');
+      await indexReportSources();
     },
     { operation: currentClinicalOperation(db), assertRunning: options.assertRunning },
   );
