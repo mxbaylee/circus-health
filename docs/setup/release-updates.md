@@ -1,5 +1,26 @@
 # Update an installation and recover from a failed candidate
 
+The optional [fictional deployment qualification](docker-runtime.md#fictional-deployment-qualification)
+now joins the existing provider oracle with the drive probe, fresh-container
+authentication and accepted-record/cache-loss reconstruction checks. Set
+`CRS_DEPLOYMENT_QUALIFICATION=1` and choose an external output directory on the
+intended installation drive before running `npm run qualify:deployment` with the
+adopted proxy configuration/state. The drive driver also accepts Linux with a
+nonce-proven UID 1000 scratch subtree and scoped cleanup. These tools add no
+archive format, migration or provider-setting change; each installation still
+needs its own actual receipt. They do not qualify an unavailable host or physical
+power loss, and do not replace the checked backup/update drill below.
+
+Restart into the reviewed build before creating or resuming an encrypted setup.
+Setup now reuses checked chunked file copying and retains its prepared manifest
+handle across worker handoff, publication and activation. This addresses observed
+copy and released-inode behavior on one UID-mapped Docker Desktop mount while
+retaining exact physical identity, digest and replacement-refusal checks. It adds
+no archive format, recovery or configuration migration. Prior builds retain the
+earlier setup copy/handoff behavior; do not treat a drive-probe receipt alone as
+proof of successful setup or provider import. See the
+[setup resource contract](../security/profile-encryption.md#encrypted-private-copy-setup).
+
 ## Updating from `main` to this candidate
 
 The owner accepted the existing passkey compatibility baseline on 2026-10-15

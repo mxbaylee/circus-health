@@ -71,6 +71,8 @@ export async function prepareEncryptedUnlock<Result = PreparedUnlock>(
     checkpoint?: () => void;
     witnessDirectory?: string;
     physicalWitness?: UnlockPhysicalWitness;
+    /** Owns each received result until this helper returns it to its caller. */
+    discardPrepared?: (prepared: Result) => Promise<void>;
   },
   createWorker: (workerData: unknown, transferList: ArrayBuffer[]) => Worker = (
     workerData,
@@ -87,9 +89,16 @@ export async function prepareEncryptedUnlock<Result = PreparedUnlock>(
   keyCopy.set(options.key);
   let worker: Worker;
   try {
-    worker = createWorker({ ...options, signal: undefined, checkpoint: undefined, key: keyCopy }, [
-      keyCopy.buffer,
-    ]);
+    worker = createWorker(
+      {
+        ...options,
+        signal: undefined,
+        checkpoint: undefined,
+        discardPrepared: undefined,
+        key: keyCopy,
+      },
+      [keyCopy.buffer],
+    );
   } catch (error) {
     keyCopy.fill(0);
     throw error;
@@ -110,6 +119,20 @@ export async function prepareEncryptedUnlock<Result = PreparedUnlock>(
   let resultResolve!: (value: Result) => void;
   let resultReject!: (error: unknown) => void;
   let received = false;
+  const resources = new Set<Result>();
+  const discard = async (keep?: Result) => {
+    const discarded = [...resources].filter((prepared) => prepared !== keep);
+    for (const prepared of discarded) resources.delete(prepared);
+    const results = await Promise.allSettled(
+      discarded.map((prepared) => Promise.resolve().then(() => options.discardPrepared!(prepared))),
+    );
+    const failures = results.filter((result) => result.status === 'rejected');
+    if (failures.length)
+      throw new AggregateError(
+        failures.map((result) => result.reason),
+        'Encrypted profile preparation resource cleanup failed',
+      );
+  };
   const result = new Promise<Result>((resolve, reject) => {
     resultResolve = resolve;
     resultReject = reject;
@@ -139,6 +162,10 @@ export async function prepareEncryptedUnlock<Result = PreparedUnlock>(
       progress?: true;
       ready?: true;
     }) => {
+      // Transfer already happened even if authorization, a checkpoint, or the
+      // message protocol now refuses it. Capture before any rejecting check.
+      if (message.prepared !== undefined && options.discardPrepared)
+        resources.add(message.prepared);
       try {
         if (message.ready) {
           if (ready) throw Error('Encrypted profile preparation failed');
@@ -179,17 +206,34 @@ export async function prepareEncryptedUnlock<Result = PreparedUnlock>(
     exitResolve();
     if (code !== 0 || !received) fail(Error('Encrypted profile preparation failed'));
   });
+  let handedOff: Result | undefined;
   try {
     const prepared = await result;
     await exit;
     if (failed) throw failure;
     options.signal.throwIfAborted();
-    return prepared;
+    handedOff = prepared;
   } finally {
-    await boot;
-    if (!exited && started) await worker.terminate();
-    else if (!exited && ready) worker.postMessage({ cancel: true });
-    await exit;
-    options.signal.removeEventListener('abort', abort);
+    let drained = false;
+    try {
+      await boot;
+      if (!exited && started) await worker.terminate();
+      else if (!exited && ready) worker.postMessage({ cancel: true });
+      await exit;
+      drained = true;
+    } finally {
+      if (!drained) handedOff = undefined;
+      try {
+        await discard(handedOff);
+        if (handedOff !== undefined) options.signal.throwIfAborted();
+      } catch (error) {
+        handedOff = undefined;
+        await discard();
+        throw error;
+      } finally {
+        options.signal.removeEventListener('abort', abort);
+      }
+    }
   }
+  return handedOff!;
 }

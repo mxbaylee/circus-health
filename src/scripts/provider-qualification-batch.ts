@@ -38,7 +38,7 @@ export async function runQualificationBatch(options: {
   profileId: string;
   intakeId: string;
   operationId?: string;
-  timeoutMs: number;
+  timeoutMs?: number;
   signal: AbortSignal;
   request: <T>(path: string, input: unknown | undefined, signal: AbortSignal) => Promise<T>;
   onSnapshot: (batch: IntakeBatch) => void;
@@ -48,8 +48,11 @@ export async function runQualificationBatch(options: {
   const now = options.now ?? Date.now;
   const wait =
     options.wait ?? ((milliseconds, signal) => delay(milliseconds, undefined, { signal }));
-  const signal = AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs)]);
-  const deadline = now() + options.timeoutMs;
+  const signal =
+    options.timeoutMs === undefined
+      ? options.signal
+      : AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs)]);
+  const deadline = options.timeoutMs === undefined ? Infinity : now() + options.timeoutMs;
   const operationId = options.operationId ?? randomUUID();
   check(
     options.prefix === `/api/profiles/${options.profileId}`,

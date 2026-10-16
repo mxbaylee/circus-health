@@ -1,12 +1,14 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { resolve } from 'node:path';
-import { cpSync, mkdirSync } from 'node:fs';
+import { constants, mkdirSync } from 'node:fs';
+import { open, type FileHandle } from 'node:fs/promises';
 import type { createEncryptedProfiles } from './encrypted-profiles.ts';
 import {
   captureUnlockPhysicalWitness,
   verifyUnlockPhysicalWitness,
   unlockPhysicalIdentity,
   unlockPhysicalDigest,
+  unlockPhysicalFileDescriptorIdentity,
 } from './encrypted-unlock-physical.ts';
 import {
   stageSetupImmutableAdditions,
@@ -20,7 +22,8 @@ const task = workerData.setup.task,
   database = task === 'finish' ? undefined : await import('./database.ts'),
   vaultStore = task === 'inspect' ? await import('./vault-store.ts') : undefined,
   profiles =
-    task === 'finish' || task === 'inspect' ? undefined : await import('./encrypted-profiles.ts');
+    task === 'finish' || task === 'inspect' ? undefined : await import('./encrypted-profiles.ts'),
+  copyFiles = task === 'prepare' ? await import('./profile-copy-file-work.ts') : undefined;
 const key = Buffer.from(workerData.key);
 workerData.key.fill(0);
 const sourceKey = workerData.setup.sourceKey ? Buffer.from(workerData.setup.sourceKey) : undefined;
@@ -35,7 +38,8 @@ function close(state: State | undefined) {
   state.vault.close();
   state.key.fill(0);
 }
-function run() {
+async function run() {
+  let manifestHandle: FileHandle | undefined;
   try {
     const directory = resolve(workerData.dataDirectory, 'profiles', workerData.profileId),
       root = resolve(directory, 'vault'),
@@ -74,15 +78,19 @@ function run() {
         const candidateDirectory = resolve(setup.stageData, 'profiles', workerData.profileId);
         mkdirSync(resolve(setup.stageData, 'profiles'), { recursive: true, mode: 0o700 });
         mkdirSync(candidateDirectory, { mode: 0o700 });
-        cpSync(resolve(directory, 'keyring.json'), resolve(candidateDirectory, 'keyring.json'), {
-          errorOnExist: true,
-          force: false,
-        });
-        cpSync(root, resolve(candidateDirectory, 'vault'), {
-          recursive: true,
-          errorOnExist: true,
-          force: false,
-        });
+        // Reuse exclusive, no-follow, chunked copy I/O. Node's native recursive
+        // cp fast path can fail on UID-mapped bind mounts before copying bytes.
+        const checkCopy = () => preparation!.assertUnlockAuthority(directory, workerData.authority);
+        await copyFiles!.copyProfileFileCooperative(
+          resolve(directory, 'keyring.json'),
+          resolve(candidateDirectory, 'keyring.json'),
+          checkCopy,
+        );
+        await copyFiles!.copyProfileTreeCooperative(
+          root,
+          resolve(candidateDirectory, 'vault'),
+          checkCopy,
+        );
         verifyUnlockPhysicalWitness(root, witnessPath, setup.physicalWitness);
         if (setup.sourceId) {
           const sourceDirectory = resolve(workerData.dataDirectory, 'profiles', setup.sourceId);
@@ -113,9 +121,14 @@ function run() {
         close(source);
         source = undefined;
         const candidate = resolve(candidateDirectory, 'vault'),
-          manifestPath = resolve(candidate, 'manifest.enc'),
-          manifestIdentity = unlockPhysicalIdentity(manifestPath).value,
+          manifestPath = resolve(candidate, 'manifest.enc');
+        // Keep the exact owned file alive through transfer and publication.
+        // UID-mapped filesystems may remap an unheld inode after replacement.
+        manifestHandle = await open(manifestPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+        const manifestIdentity = unlockPhysicalFileDescriptorIdentity(manifestHandle.fd),
           manifestDigest = unlockPhysicalDigest(manifestPath);
+        if (unlockPhysicalIdentity(manifestPath).value !== manifestIdentity)
+          throw Error('Setup manifest changed');
         const physicalWitness = stageSetupImmutableAdditions(
           root,
           candidate,
@@ -134,6 +147,12 @@ function run() {
             setup.sourcePhysicalWitness,
           );
         }
+        if (
+          unlockPhysicalFileDescriptorIdentity(manifestHandle.fd) !== manifestIdentity ||
+          unlockPhysicalIdentity(manifestPath).value !== manifestIdentity ||
+          unlockPhysicalDigest(manifestPath) !== manifestDigest
+        )
+          throw Error('Setup manifest changed');
         result = {
           physicalWitness,
           sourcePhysicalWitness: setup.sourcePhysicalWitness,
@@ -142,11 +161,13 @@ function run() {
           manifestDigest,
           originalRootIdentity: unlockPhysicalIdentity(root).value,
           selectedHead,
+          manifestHandle,
         };
       }
       preparation!.assertUnlockAuthority(directory, workerData.authority);
     }
-    parentPort!.postMessage({ prepared: result });
+    parentPort!.postMessage({ prepared: result }, manifestHandle ? [manifestHandle] : []);
+    manifestHandle = undefined;
   } catch (error) {
     parentPort!.postMessage({
       failure:
@@ -163,15 +184,19 @@ function run() {
       close(target);
       close(source);
     } finally {
-      key.fill(0);
-      sourceKey?.fill(0);
-      parentPort!.close();
+      try {
+        await manifestHandle?.close();
+      } finally {
+        key.fill(0);
+        sourceKey?.fill(0);
+        parentPort!.close();
+      }
     }
   }
 }
 setImmediate(() => {
   parentPort!.once('message', (message: { start?: true }) => {
-    if (message.start) run();
+    if (message.start) void run();
     else {
       key.fill(0);
       sourceKey?.fill(0);

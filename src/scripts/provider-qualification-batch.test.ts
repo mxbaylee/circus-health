@@ -7,8 +7,34 @@ import type { IntakeBatch } from '../shared/intake-batch.ts';
 import { runQualificationBatch } from './provider-qualification-batch.ts';
 import {
   captureQualificationEvidence,
+  qualificationRequestSignal,
   writeQualificationPrivateJson,
 } from './qualify-provider-pdf.ts';
+
+test('deployment model-await requests ignore the host guard and retain operator cancellation', () => {
+  const operator = new AbortController();
+  const host = new AbortController();
+  let guards = 0;
+  const guard = () => {
+    guards++;
+    return host.signal;
+  };
+  const model = qualificationRequestSignal(operator.signal, true, guard);
+  const local = qualificationRequestSignal(operator.signal, false, guard);
+  assert.equal(guards, 1, 'model work must not create an elapsed-time guard');
+  const hostFailure = Error('Fictional host guard expired');
+  host.abort(hostFailure);
+  assert.equal(local.aborted, true);
+  assert.equal(local.reason, hostFailure);
+  assert.equal(model.aborted, false);
+  const canceled = Error('Fictional operator cancellation');
+  operator.abort(canceled);
+  assert.equal(model.aborted, true);
+  assert.equal(model.reason, canceled);
+  const otherHost = new AbortController();
+  const localCanceled = qualificationRequestSignal(operator.signal, false, () => otherHost.signal);
+  assert.equal(localCanceled.reason, canceled);
+});
 
 function snapshot(overrides: Partial<IntakeBatch> = {}): IntakeBatch {
   return {
@@ -196,6 +222,25 @@ test('a running batch reaches the harness deadline without another start or resu
   await assert.rejects(execution.run(5_000), /within its bound/);
   assert.equal(execution.calls.length, 1);
   assert.equal(execution.retained[0].status, 'running');
+});
+
+test('deployment qualification can follow coordinator progress without a model-time deadline', async () => {
+  const states = [snapshot(), snapshot(), complete()];
+  let time = 0;
+  const result = await runQualificationBatch({
+    prefix: '/api/profiles/fictional-profile',
+    profileId: 'fictional-profile',
+    intakeId: 'fictional-original',
+    signal: new AbortController().signal,
+    request: async <T>() => states.shift() as T,
+    onSnapshot: () => {},
+    now: () => time,
+    wait: async () => {
+      time += 365 * 24 * 60 * 60_000;
+    },
+  });
+  assert.equal(result.passed, true);
+  assert.equal(states.length, 0);
 });
 
 test('the coordinator receipt must remain in the freshly created profile and original', async () => {
