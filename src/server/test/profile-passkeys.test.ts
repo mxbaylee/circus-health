@@ -94,6 +94,9 @@ for (const creationPrf of [false, true]) {
       origin,
       creationPrf ? randomBytes(32).toString('base64url') : undefined,
     );
+    assert.deepEqual(options.options.extensions?.prf, {}, 'creation enables PRF only');
+    assert.equal(options.options.authenticatorSelection?.residentKey, 'required');
+    assert.equal(options.options.authenticatorSelection?.userVerification, 'required');
     assert.deepEqual(
       diskRing(manager, profile.id),
       before,
@@ -110,15 +113,18 @@ for (const creationPrf of [false, true]) {
     assert.deepEqual(confirmation.options.allowCredentials, [
       { id: credential.id, transports: credential.transports, type: 'public-key' },
     ]);
-    assert.deepEqual(
-      confirmation.options.extensions?.prf?.eval,
-      options.options.extensions?.prf?.eval,
-    );
+    const evaluation = confirmation.options.extensions?.prf?.eval;
+    assert.ok(evaluation);
+    assert.equal(typeof evaluation.first, 'string');
+    const salt = evaluation.first as unknown as string;
+    assert.equal(Buffer.from(salt, 'base64url').byteLength, 32);
+    assert.equal(Buffer.from(salt, 'base64url').toString('base64url'), salt);
     expectedChallenge = confirmation.options.challenge;
     assert.deepEqual(await passkeys.confirm(profile.id, session, input(confirmation, prf)), {
       registered: true,
     });
     assert.equal(manager.keyring(profile.id).passkeys[0]?.counter, 7);
+    assert.equal(manager.keyring(profile.id).passkeys[0]?.salt, salt);
     assert.deepEqual(opened(manager, profile.id).recordStorage.read('head'), head);
     const published = diskRing(manager, profile.id);
     await assert.rejects(passkeys.confirm(profile.id, session, input(confirmation, prf)), {
@@ -128,10 +134,7 @@ for (const creationPrf of [false, true]) {
     passkeys.invalidate(profile.id);
     manager.lock(profile.id);
     const unlock = await passkeys.authenticationOptions(profile.id, session, origin);
-    assert.deepEqual(
-      unlock.options.extensions?.prf?.evalByCredential?.[credential.id],
-      options.options.extensions?.prf?.eval,
-    );
+    assert.deepEqual(unlock.options.extensions?.prf?.evalByCredential?.[credential.id], evaluation);
     expectedChallenge = unlock.options.challenge;
     assert.equal(
       (await passkeys.authenticate(profile.id, session, input(unlock, prf))).locked,

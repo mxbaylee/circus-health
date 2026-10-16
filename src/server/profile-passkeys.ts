@@ -397,9 +397,12 @@ export function createProfilePasskeys(
           'PASSKEY_CANCELLED',
           'Profile access changed. Start the passkey request again.',
         );
-      (options as unknown as { extensions: { prf: { eval: { first: string } } } }).extensions = {
+      // Enable PRF at creation without requesting its optional evaluation. Some
+      // providers need this shape; the fresh exact-credential confirmation below
+      // still evaluates the staged salt before any unlock wrapper is persisted.
+      (options as unknown as { extensions: { prf: Record<string, never> } }).extensions = {
         ...options.extensions,
-        prf: { eval: { first: salt } },
+        prf: {},
       };
       return {
         challengeId: add({

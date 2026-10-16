@@ -179,6 +179,16 @@ for (const prfOutput of ['buffer', 'array'])
           window.pauseConfirmation = true;
           navigator.credentials.create = async (options) => {
             window.passkeyCalls.create++;
+            const publicKey = options?.publicKey;
+            if (
+              !publicKey?.extensions?.prf ||
+              Object.keys(publicKey.extensions.prf).length !== 0 ||
+              publicKey.authenticatorSelection?.residentKey !== 'required' ||
+              publicKey.authenticatorSelection?.userVerification !== 'required'
+            )
+              throw Error(
+                'Expected enable-only PRF creation with required discovery and verification',
+              );
             const credential = (await create(options)) as PublicKeyCredential,
               output = credential.getClientExtensionResults();
             // Simulate a provider that reports capability at creation, keeping real

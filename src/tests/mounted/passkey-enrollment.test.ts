@@ -41,14 +41,14 @@ beforeEach(() => {
     if (action === 'options')
       return result({
         challengeId: 'pending',
-        options: { extensions: { prf: { eval: { first: 'AQID' } } } },
+        options: { extensions: { prf: {} } },
       });
     if (action === 'verify')
       return result({
         challengeId: 'pending',
         options: {
           allowCredentials: [{ id: 'fictional-key' }],
-          extensions: { prf: { evalByCredential: { 'fictional-key': { first: 'AQID' } } } },
+          extensions: { prf: { eval: { first: 'AQID' } } },
         },
       });
     if (action === 'confirm') return result({ registered: true });
@@ -73,10 +73,10 @@ it.each(['buffer', 'array'])(
     });
     expect(phases).toEqual(['creating', 'confirming', 'saving']);
     expect(calls).toEqual(['options', 'verify', 'confirm']);
+    expect(vi.mocked(startRegistration).mock.calls[0][0].optionsJSON.extensions?.prf).toEqual({});
     const input = vi.mocked(startAuthentication).mock.calls[0][0].optionsJSON;
-    expect([
-      ...new Uint8Array((input.extensions as any).prf.evalByCredential['fictional-key'].first),
-    ]).toEqual([1, 2, 3]);
+    expect(input.allowCredentials).toEqual([{ id: 'fictional-key' }]);
+    expect([...new Uint8Array((input.extensions as any).prf.eval.first)]).toEqual([1, 2, 3]);
     const sent = JSON.parse(
       fetchMock.mock.calls.find(([url]) => url.endsWith('/confirm'))![1].body,
     );

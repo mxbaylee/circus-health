@@ -1,6 +1,6 @@
 # Debugging hosted passkey reports
 
-This supplements the [hosted checker contract](hosted-passkey-checker.md). It concerns the fictional GitHub Pages checker only. Real Circus Health enrollment, unlock, server verification and the shared production PRF helper are unchanged.
+This supplements the [hosted checker contract](hosted-passkey-checker.md). Its diagnostics concern the fictional GitHub Pages checker. The application adopts the owner's confirmed enable-only creation mode; its separate exact-credential confirmation, unlock, server verification and shared PRF decoder retain their existing checks.
 
 ## What each report supplies
 
@@ -46,4 +46,4 @@ After a reviewed merge, the existing main-push Pages publication workflow starts
 
 Focused regressions cover scalar error inspection, hostile getters and original exception identity, synchronous invocation, report output and OS hints, plus source-map pairing, module scope and deterministic real builds. Guided regressions add naming relationships, retained-ciphertext checks, repeated-failure linkage, skip/interruption handling and bounded messages. The controlled-browser guided journey checks actual IndexedDB reload, downloaded report bytes, failed-download refusal and export-before-clear behavior. Existing real-browser storage/controller and legacy tests remain required; controlled credentials do not establish physical provider compatibility.
 
-[CRS-236](../todo/CRS-236.md) stays open. Inspect new reports, fix evidenced checker defects or improve a specific missing signal, and preserve unresolved physical findings. Do not repeatedly loop on processed reports or blocked original-error export when no supported in-scope work remains; proceed to the next eligible backlog item. The separate CRS-163 and CRS-088 qualification holds remain.
+The owner reported completing passkey testing on 2026-10-15 and requested retirement of the compatibility-testing work; see the [owner-accepted baseline](profile-encryption.md#owner-accepted-passkey-baseline). Keep this checker, its publication workflow and prior reports available for future diagnosis. A new report should drive a scoped investigation of its actual failure or missing signal. The separate [profile-less sign-in feature](../todo/CRS-088.md) still needs implementation and its own new-flow qualification.
