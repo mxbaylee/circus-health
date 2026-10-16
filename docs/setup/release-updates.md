@@ -2,6 +2,23 @@
 
 ## Updating from `main` to this candidate
 
+The owner accepted the existing passkey compatibility baseline on 2026-10-15
+after reporting completed testing. The hosted checker and its GitHub Pages
+publication remain available for future tests. See the
+[acceptance boundary](../security/profile-encryption.md#owner-accepted-passkey-baseline)
+for the scope of that owner statement; the separate username-less sign-in feature
+and current challenge/session expiry limitation remain open.
+
+New passkey enrollment now enables PRF at creation (`prf: {}`) and evaluates its
+per-credential salt only in the separate exact-credential confirmation. This ports
+the owner's successful Proton Pass checker mode. Restart into the reviewed build
+and reload the browser before enrolling another passkey. Existing passkeys,
+salts and wrapped keys need no migration or re-enrollment; ordinary unlock still
+uses `evalByCredential`. Prior builds retain their creation-time evaluation
+request, so the new enrollment compatibility does not apply to them. No archive
+format or operator setting changes. See the
+[enrollment contract](../security/profile-encryption.md#keys-and-passkeys).
+
 This candidate changes durable authority, so it is not a restart-only update.
 The paragraphs below describe individual changes; read this summary first.
 
