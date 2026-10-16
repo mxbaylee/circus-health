@@ -8594,7 +8594,11 @@ for (const attributionOutcome of ['complete', 'closed'] as const)
     await stopped.promise;
     assert.equal(bridge.closed, true);
     assert.equal(chat.status, 'cancelled');
-    await assert.doesNotReject(async () => request);
+    if (attributionOutcome === 'closed')
+      // Database closure invalidates the admitted host frame even after Stop
+      // has preserved terminal state and closed its provider bridge.
+      await assert.rejects(async () => request, /Clinical operation is no longer active/);
+    else await assert.doesNotReject(async () => request);
     assert.equal(maintenance, 1, 'the request attributed once before Stop');
     assert.deepEqual(chat.reading, terminal!.reading);
     assert.equal(checkpoint.modelRequests, terminal!.conversionCheckpoint?.modelRequests);
