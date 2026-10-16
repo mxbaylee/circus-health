@@ -988,7 +988,18 @@ test(
         assert.deepEqual(identity.offeredSelfFields, {});
         assert.deepEqual(identity.conflicts, []);
       } else {
-        assert.equal(identityScope?.intakeId, intakeId);
+        assert.equal(
+          identityScope?.intakeId,
+          intakeId,
+          JSON.stringify({
+            status: identity.status,
+            blocking: identity.blocking,
+            message: identity.message?.slice(0, 1024),
+            hasScope: !!identity.scope,
+            hasScopeReference: !!identity.scopeReference,
+            hasScopeFragmentReference: !!identity.scopeFragmentReference,
+          }),
+        );
         assert.equal(identityScope?.groupId, group.groupId);
       }
       try {
