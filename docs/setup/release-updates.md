@@ -40,6 +40,19 @@ Restart into the reviewed build to recheck report identity quotes that differ on
 
 ## Updating from `main` to this candidate
 
+Acceptance receipt checking now certifies native absence in mixed legacy/native
+profiles and unprepared compatibility reads. Restart into the reviewed build;
+accepted receipts, operation IDs and archive formats need no migration. A damaged
+derived operation key refuses checking or exact replay rather than reporting a
+completed save absent. This adds no automatic repair for corrupt native builds
+that still claim completeness: restart or lookup-cache clearing may still refuse
+them. Retain the exact original request, operation ID and accepted authority for
+diagnosis or recovery. Unprepared compatibility reads scan native acceptance
+headers; prepared native and mixed reads reuse their complete certificate. Prior
+builds can report an accepted operation absent when a native working key is
+missing on mixed or unprepared reads. See the current
+[checked lookup contract](../data/intake-lookup-projection.md).
+
 The owner accepted the existing passkey compatibility baseline on 2026-10-15
 after reporting completed testing. The hosted checker and its GitHub Pages
 publication remain available for future tests. See the

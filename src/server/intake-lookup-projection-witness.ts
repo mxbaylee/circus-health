@@ -325,12 +325,19 @@ export function projectionAnswerWitness(db: DatabaseSync): object {
   return witnesses.get(db)!.sealed!;
 }
 
-export function assertProjectionAnswerWitness(db: DatabaseSync, seal: object): void {
+export function assertProjectionAnswerWitness(
+  db: DatabaseSync,
+  seal: object,
+  assertCompanionProof?: () => void,
+): void {
   const witness = witnesses.get(db);
   if (!witness || witness.sealed !== seal) throw Error('Intake projection answer witness changed');
   // The full trigger/schema check ran at capture. Supported local DDL and
   // replacement attempts are monotonic; peer changes advance data_version.
   const peer = scalar(db, 'data_version');
+  // Compose a selected authority proof after the last SQL read, then close our
+  // original passive seal over any callback-bearing work performed by it.
+  assertCompanionProof?.();
   if (
     witnesses.get(db) !== witness ||
     witness.sealed !== seal ||

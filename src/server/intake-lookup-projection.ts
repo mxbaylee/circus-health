@@ -1895,6 +1895,39 @@ function guardedReceiptReference(
   receiptSelectionGuards.set(reference, assertCurrent);
   return reference;
 }
+function catalogAcceptancePointer(catalog: NativeLookupCatalog, operation: string) {
+  return catalog.scratch.db
+    .prepare(
+      `SELECT a.operation,a.address,s.source_id,s.source_order,s.source_hash,
+      s.authority_head FROM acceptances a JOIN sources s ON s.source_id=a.source_id
+      WHERE a.operation=? AND a.source_order=s.source_order ORDER BY a.source_order LIMIT 1`,
+    )
+    .get(operation) as NativeLookupPointer | undefined;
+}
+/** An uncertified derived key cannot establish either absence or first occurrence. */
+function checkedCompatibilityAcceptance(
+  db: DatabaseSync,
+  source: NativeSource,
+  view: IntakeCollectionEnvelopeReader,
+  operation: string,
+): IntakeEnvelopeRecord | undefined {
+  let expected: string | null = null;
+  // Reverse contributions plus last matching address preserve SQLite-first
+  // semantics without retaining every operation or decoding any receipt body.
+  for (const contribution of intakeLookupContributions(db, view, 'acceptances'))
+    if (!('checkpoint' in contribution) && contribution.key[0] === operation)
+      expected = contribution.target ? view.address(contribution.target) : null;
+  const record = readNativeIntakeLookupTarget(
+    db,
+    source,
+    view,
+    'lookup-acceptance-operation-first',
+    [operation],
+  );
+  if ((record ? view.address(record) : null) !== expected)
+    fail('native acceptance index is incomplete or changed');
+  return record;
+}
 export function retainedIntakeAcceptance(db: DatabaseSync, operationId: string): unknown {
   const reference = retainedIntakeAcceptanceReference(db, operationId);
   if (!reference) return null;
@@ -1918,13 +1951,7 @@ export function retainedIntakeAcceptanceReference(
   const catalog = direct?.allOriginalsNative ? direct : checkedNativeCatalog(db, connection);
   const nativeOperation = Buffer.from(operationId, 'utf8').toString('hex').toUpperCase();
   if (catalog?.allOriginalsNative) {
-    const pointer = catalog.scratch.db
-      .prepare(
-        `SELECT a.operation,a.address,s.source_id,s.source_order,s.source_hash,
-        s.authority_head FROM acceptances a JOIN sources s ON s.source_id=a.source_id
-        WHERE a.operation=? AND a.source_order=s.source_order ORDER BY a.source_order LIMIT 1`,
-      )
-      .get(nativeOperation);
+    const pointer = catalogAcceptancePointer(catalog, nativeOperation);
     if (!pointer) {
       assertNativeCatalogCurrent(db, catalog);
       return null;
@@ -1943,34 +1970,46 @@ export function retainedIntakeAcceptanceReference(
   }
   refreshLegacyProjection(db, connection);
   const answerWitness = projectionAnswerWitness(db);
+  // Compatibility preparation can invalidate a previously captured catalog.
+  // A current mixed catalog still certifies its complete native subset.
+  const mixedCatalog = checkedNativeCatalog(db, connection);
+  const assertAnswerCurrent = () => {
+    assertProjectionAnswerWitness(
+      db,
+      answerWitness,
+      mixedCatalog ? () => assertNativeCatalogCurrent(db, mixedCatalog) : undefined,
+    );
+  };
   let native: IntakeLookupReceiptReference | null = null;
   let nativeOrder = Infinity;
-  let allOriginalsNative = true;
-  for (const row of actualOriginalSourceRows(db)) {
-    const source = actualNativeSource(db, row);
-    if (!source) {
-      allOriginalsNative = false;
-      continue;
+  let allOriginalsNative = mixedCatalog?.allOriginalsNative ?? true;
+  if (mixedCatalog) {
+    const pointer = catalogAcceptancePointer(mixedCatalog, nativeOperation);
+    if (pointer) {
+      const { view, record } = catalogTarget(db, pointer, 'lookup-acceptance-operation-first', [
+        nativeOperation,
+      ]);
+      native = { mode: 'native', sourceId: pointer.source_id, view, record };
+      nativeOrder = pointer.source_order;
     }
-    const view = nativeReader(db, source);
-    const record = readNativeIntakeLookupTarget(
-      db,
-      source,
-      view,
-      'lookup-acceptance-operation-first',
-      [nativeOperation],
-    );
-    if (record && Number(source.source_order) < nativeOrder) {
-      native = { mode: 'native', sourceId: String(source.id), view, record };
-      nativeOrder = Number(source.source_order);
+  } else {
+    for (const row of actualOriginalSourceRows(db)) {
+      const source = actualNativeSource(db, row);
+      if (!source) {
+        allOriginalsNative = false;
+        continue;
+      }
+      const view = nativeReader(db, source);
+      const record = checkedCompatibilityAcceptance(db, source, view, nativeOperation);
+      if (record && Number(source.source_order) < nativeOrder) {
+        native = { mode: 'native', sourceId: String(source.id), view, record };
+        nativeOrder = Number(source.source_order);
+      }
     }
   }
   if (allOriginalsNative) {
-    assertProjectionAnswerWitness(db, answerWitness);
-    return (
-      native &&
-      guardedReceiptReference(native, () => assertProjectionAnswerWitness(db, answerWitness))
-    );
+    assertAnswerCurrent();
+    return native && guardedReceiptReference(native, assertAnswerCurrent);
   }
   const row = db
     .prepare(
@@ -1981,11 +2020,8 @@ export function retainedIntakeAcceptanceReference(
     ? { mode: 'legacy', sourceId: String(row.source_id), value: JSON.parse(String(row.payload)) }
     : null;
   if (native && nativeOrder < (row ? Number(row.source_order) : Infinity)) selected = native;
-  assertProjectionAnswerWitness(db, answerWitness);
-  return (
-    selected &&
-    guardedReceiptReference(selected, () => assertProjectionAnswerWitness(db, answerWitness))
-  );
+  assertAnswerCurrent();
+  return selected && guardedReceiptReference(selected, assertAnswerCurrent);
 }
 type NativeSource = IntakeEnvelopeSource & {
   source_order: number;
