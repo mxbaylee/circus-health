@@ -523,18 +523,15 @@ test('a refusal after the vault opens leaves the opened vault key intact', async
   const head = opened(manager, profile.id).recordStorage.read('head');
   passkeys.invalidate(profile.id);
   manager.lock(profile.id);
-  const originalNow = Date.now,
-    unlockWithKeyAsync = manager.unlockWithKeyAsync;
-  let elapsed = 0,
-    owned: Buffer | undefined;
-  t.mock.method(Date, 'now', () => originalNow() + elapsed);
+  const unlockWithKeyAsync = manager.unlockWithKeyAsync;
+  let owned: Buffer | undefined;
   t.mock.method(
     manager,
     'unlockWithKeyAsync',
     async (...args: Parameters<Manager['unlockWithKeyAsync']>) => {
       owned = args[1] as Buffer;
       const result = await unlockWithKeyAsync(...args);
-      elapsed += 6 * 60 * 1000;
+      passkeys.invalidate(profile.id);
       return result;
     },
   );
@@ -764,4 +761,35 @@ test('usage recording cannot fail a completed unlock or overwrite newer enrollme
   assert.equal(passkeys.list(profile.id).length, 2);
   manager.lock(profile.id);
   assert.equal(passkeys.recordUse(profile.id, credential.id), false);
+});
+
+test('admitted authentication survives expiry during verification and challenge pruning', async (t) => {
+  const { manager } = vaultFixture(t),
+    { profile } = await newProfile(manager);
+  const prf = randomBytes(32).toString('base64url');
+  let admitted = false,
+    elapsed = 0;
+  const now = Date.now;
+  t.mock.method(Date, 'now', () => now() + elapsed);
+  const passkeys = createProfilePasskeys(manager, {
+    ...verified,
+    async verifyAuthenticationResponse() {
+      if (admitted) {
+        elapsed += 6 * 60 * 1000;
+        await passkeys.authenticationOptions(profile.id, session, origin);
+      }
+      return authentication(admitted ? 2 : 1);
+    },
+  });
+  await enroll(passkeys, profile.id, prf);
+  manager.lock(profile.id);
+  const options = await passkeys.authenticationOptions(profile.id, session, origin);
+  admitted = true;
+  assert.equal(
+    (await passkeys.authenticate(profile.id, session, input(options, prf))).locked,
+    false,
+  );
+  await assert.rejects(passkeys.authenticate(profile.id, session, input(options, prf)), {
+    code: 'PASSKEY_CHALLENGE',
+  });
 });

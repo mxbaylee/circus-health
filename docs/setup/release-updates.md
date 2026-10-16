@@ -40,6 +40,18 @@ Restart into the reviewed build to recheck report identity quotes that differ on
 
 ## Updating from `main` to this candidate
 
+Restart into the reviewed build before beginning a passkey unlock or setup.
+Authentication and setup now claim a valid request before the activation queue;
+their original expiry does not interrupt admitted work. Expired requests still
+refuse entry, and cancellation, disconnect, lock, credential/keyring changes and
+other authority changes still stop queued or active work. Enrollment expiry is
+unchanged. This changes only in-memory admission ownership: no archive, keyring,
+recovery-file or provider configuration migration is needed. A restart needs a
+new challenge or recovered setup session. Existing committed-head setup recovery
+is preserved; this update adds neither verified unpublished-stage continuation
+nor crash-leftover cleanup. See
+[unlock and setup admission](../security/profile-encryption.md#unlock-and-setup-admission).
+
 Acceptance receipt checking now certifies native absence in mixed legacy/native
 profiles and unprepared compatibility reads. Restart into the reviewed build;
 accepted receipts, operation IDs and archive formats need no migration. A damaged
@@ -58,7 +70,8 @@ after reporting completed testing. The hosted checker and its GitHub Pages
 publication remain available for future tests. See the
 [acceptance boundary](../security/profile-encryption.md#owner-accepted-passkey-baseline)
 for the scope of that owner statement; the separate username-less sign-in feature
-and current challenge/session expiry limitation remain open.
+remains open. Unlock and setup now use the separate
+[admission contract](../security/profile-encryption.md#unlock-and-setup-admission).
 
 New passkey enrollment now enables PRF at creation (`prf: {}`) and evaluates its
 per-credential salt only in the separate exact-credential confirmation. This ports
@@ -88,10 +101,8 @@ The paragraphs below describe individual changes; read this summary first.
   [pre-update backup](#prepare-the-checked-way-back) before starting the
   candidate. There is no downgrade path: returning to the prior build means
   restoring that untouched backup, and writes made after it are not recovered.
-- **Known limitations.** A passkey unlock or encrypted setup that runs past its
-  challenge or session window fails at the end rather than only at admission
-  ([CRS-245](../todo/CRS-245.md)); the recovery key still unlocks. Exact source
-  search has no aggregate work limit and can stall other requests on very large
+- **Known limitations.** Exact source search has no aggregate work limit and can
+  stall other requests on very large
   profiles ([CRS-247](../todo/CRS-247.md)). Disposable scratch databases use the
   128 MiB `/tmp` tmpfs in Compose, so very large profiles can exhaust it during
   copy, compaction or replay ([CRS-246](../todo/CRS-246.md)).

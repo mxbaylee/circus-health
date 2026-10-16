@@ -199,6 +199,9 @@ export interface OpenedProfile {
 interface SetupState {
   id: string;
   expires: number;
+  copyFrom?: string | null;
+  publishedManifest?: string;
+  claim?: object;
 }
 
 interface SetupDetails {
@@ -221,6 +224,7 @@ interface OpenOptions {
   copyState?: OpenedProfile;
   pendingActivation?: boolean;
   readonlyAuthority?: boolean;
+  initialPublication?: { before(): void; after(): void };
 }
 
 type RecordVersion = DurableRecordVersion;
@@ -422,6 +426,12 @@ export function createEncryptedProfiles({
   const opened = new Map<string, OpenedProfile>(),
     setups = new Map<string, SetupState>();
   const preparing = new Map<string, AbortController>();
+  const admissions = new Map<string, Set<AbortController>>();
+  let stopped = false;
+  const revokeAdmissions = (id: string, except?: AbortController) => {
+    for (const admission of admissions.get(id) ?? [])
+      if (admission !== except) admission.abort(Error('Profile access changed'));
+  };
   const copyDependents = new Map<string, Set<AbortController>>();
   const cancelCopies = (id: string) => {
     for (const attempt of copyDependents.get(id) ?? [])
@@ -452,10 +462,81 @@ export function createEncryptedProfiles({
       throw archiveRefusal('Profile keyring', 'This profile cannot be unlocked.');
     }
   };
-  const writeKeyring = (id: string, value: ProfileKeyring): void => {
+  const publishKeyring = (
+    id: string,
+    value: ProfileKeyring,
+    own?: AbortController,
+    beforeWrite?: () => void,
+  ): void => {
+    revokeAdmissions(id, own);
     preparing.get(id)?.abort(Error('Profile keyring changed'));
     cancelCopies(id);
+    beforeWrite?.();
     durableWrite(resolve(pathFor(id), 'keyring.json'), jsonBytes(value));
+  };
+  const writeKeyring = (id: string, value: ProfileKeyring): void => publishKeyring(id, value);
+  // Admission owns no plaintext key. Keep its original authority while it waits
+  // for activation; active preparation's stronger physical proof follows later.
+  const claimAccess = (id: string, signal?: AbortSignal, publishedManifest?: string) => {
+    if (stopped) throw Error('Application is stopping');
+    signal?.throwIfAborted();
+    let authority = unlockAuthorityWitness(pathFor(id));
+    if (publishedManifest && authority.manifest !== publishedManifest)
+      throw Error('Encrypted profile preparation changed');
+    const entry = registry.profiles.find((p) => p.id === id),
+      controller = new AbortController(),
+      abort = () => controller.abort(signal?.reason);
+    const owners = admissions.get(id) ?? new Set<AbortController>();
+    admissions.set(id, owners);
+    owners.add(controller);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    let released = false;
+    const assertCurrent = () => {
+      controller.signal.throwIfAborted();
+      if (
+        stopped ||
+        released ||
+        admissions.get(id) !== owners ||
+        !owners.has(controller) ||
+        registry.profiles.find((p) => p.id === id) !== entry
+      )
+        throw Error('Profile admission changed');
+      assertUnlockAuthority(pathFor(id), authority);
+      controller.signal.throwIfAborted();
+    };
+    return {
+      signal: controller.signal,
+      assertCurrent,
+      publishPasskeyCounter(credentialId: string, oldCounter: number, nextCounter: number) {
+        assertCurrent();
+        const ring = keyring(id),
+          credential = ring.passkeys.find((p) => p.id === credentialId);
+        if (!credential || credential.counter !== oldCounter)
+          throw new HttpError(409, 'PASSKEY_CHANGED', 'Passkey state changed. Try again.');
+        credential.counter = nextCounter;
+        publishKeyring(id, ring, controller, assertCurrent);
+        // Advance only the keyring component. Directory and manifest remain the
+        // original admission proof, including changes during publication.
+        const keyringPath = resolve(pathFor(id), 'keyring.json'),
+          identity = unlockPathIdentity(keyringPath),
+          nextAuthority = { ...authority, keyring: identity };
+        if (
+          !readFileSync(keyringPath).equals(jsonBytes(ring)) ||
+          unlockPathIdentity(keyringPath) !== identity
+        )
+          throw Error('Published passkey counter changed');
+        assertUnlockAuthority(pathFor(id), nextAuthority);
+        authority = nextAuthority;
+        assertCurrent();
+      },
+      release() {
+        released = true;
+        signal?.removeEventListener('abort', abort);
+        owners.delete(controller);
+        if (!owners.size && admissions.get(id) === owners) admissions.delete(id);
+      },
+    };
   };
   function bytesBelow(path: string): number {
     if (!existsSync(path)) return 0;
@@ -532,6 +613,7 @@ export function createEncryptedProfiles({
       copyState,
       pendingActivation = false,
       readonlyAuthority = false,
+      initialPublication,
     }: OpenOptions = {},
   ): OpenedProfile {
     if (preparing.has(id)) {
@@ -619,6 +701,7 @@ export function createEncryptedProfiles({
       const recordStorage = vault.recordStorage(
         () => vault.syncWorkspace(workspace, { ...workspaceSyncOptions, publishNow: false }),
         workspace,
+        initialPublication,
       );
       const verifyReferences = (versions: RecordVersion[]): void => {
         for (const v of versions) {
@@ -1048,7 +1131,7 @@ export function createEncryptedProfiles({
     vault.publish();
     vault.close();
     key.fill(0);
-    setups.set(setupId, { id, expires: Date.now() + 30 * 60 * 1000 });
+    setups.set(setupId, { id, expires: Date.now() + 30 * 60 * 1000, copyFrom: input.copyFrom });
     return {
       setupId,
       profileId: id,
@@ -1072,11 +1155,8 @@ export function createEncryptedProfiles({
       secret?.fill(0);
     }
   }
-  async function verify(
-    setupId: string,
-    input: VerifyInput,
-    { authorizeCopySource }: VerifyOptions = {},
-  ) {
+  function admitSetup(setupId: string, input: VerifyInput, options: VerifyOptions = {}) {
+    input = structuredClone(input);
     const setup = setups.get(setupId);
     if (!setup || setup.expires < Date.now())
       throw new HttpError(410, 'SETUP_EXPIRED', 'Restart profile setup.');
@@ -1086,11 +1166,161 @@ export function createEncryptedProfiles({
         'RECOVERY_ACKNOWLEDGMENT',
         'Download and acknowledge your recovery key first',
       );
+    if (setup.claim || preparing.has(setup.id))
+      throw new HttpError(409, 'PROFILE_PREPARING', 'This profile is already opening');
+    options.signal?.throwIfAborted();
+    options.assertAuthorized?.();
+    const source = setup.copyFrom ? opened.get(setup.copyFrom) : undefined;
+    if (setup.copyFrom) {
+      options.authorizeCopySource?.(setup.copyFrom);
+      if (!source || source.closing)
+        throw new HttpError(
+          423,
+          'PROFILE_LOCKED',
+          'Unlock the original profile before completing its copy',
+        );
+    }
+    const sourceHead = source?.recordStorage.read('head')?.toString('utf8'),
+      sourceAuthority = source ? unlockAuthorityWitness(pathFor(source.id)) : undefined,
+      lease = claimAccess(
+        setup.id,
+        options.signal,
+        registry.profiles.some((p) => p.id === setup.id) ? undefined : setup.publishedManifest,
+      ),
+      token = Object.freeze({});
+    // Authorization and source reads can invoke contributor callbacks. They
+    // cannot overwrite a claim acquired reentrantly during those reads.
+    if (setups.get(setupId) !== setup || setup.claim || preparing.has(setup.id)) {
+      lease.release();
+      throw new HttpError(409, 'PROFILE_PREPARING', 'This profile is already opening');
+    }
+    const releaseController = new AbortController(),
+      signal = AbortSignal.any([lease.signal, releaseController.signal]);
+    let releaseSource: (() => void) | undefined;
+    setup.claim = token;
+    if (source) {
+      const dependents = copyDependents.get(source.id) ?? new Set<AbortController>();
+      // A queued target claim also depends on its source before preparing exists.
+      const dependent = new AbortController();
+      dependents.add(dependent);
+      copyDependents.set(source.id, dependents);
+      dependent.signal.addEventListener(
+        'abort',
+        () => releaseController.abort(dependent.signal.reason),
+        { once: true },
+      );
+      releaseSource = () => {
+        dependents.delete(dependent);
+        if (!dependents.size && copyDependents.get(source.id) === dependents)
+          copyDependents.delete(source.id);
+      };
+    }
+    let started = false,
+      released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      releaseController.abort(Error('Setup admission released'));
+      lease.release();
+      releaseSource?.();
+      if (setups.get(setupId) === setup && setup.claim === token) delete setup.claim;
+    };
+    signal.addEventListener(
+      'abort',
+      () => {
+        if (!started) release();
+      },
+      { once: true },
+    );
+    if (signal.aborted) release();
+    const run = async (cooperative: boolean) => {
+      if (started || released) throw Error('Setup admission already consumed');
+      started = true;
+      try {
+        signal.throwIfAborted();
+        options.assertAuthorized?.();
+        lease.assertCurrent();
+        if (setups.get(setupId) !== setup || setup.claim !== token)
+          throw Error('Setup access changed');
+        if (source) {
+          options.authorizeCopySource?.(source.id);
+          if (
+            opened.get(source.id) !== source ||
+            source.closing ||
+            source.recordStorage.read('head')?.toString('utf8') !== sourceHead
+          )
+            throw Error('Copy source changed');
+          assertUnlockAuthority(pathFor(source.id), sourceAuthority!);
+        }
+        lease.assertCurrent();
+        return await (cooperative ? verifyAdmittedAsync : verifyAdmitted)(
+          setupId,
+          input,
+          {
+            ...options,
+            signal,
+            assertAuthorized() {
+              options.assertAuthorized?.();
+              signal.throwIfAborted();
+              if (source) {
+                if (
+                  opened.get(source.id) !== source ||
+                  source.closing ||
+                  source.recordStorage.read('head')?.toString('utf8') !== sourceHead
+                )
+                  throw Error('Copy source changed');
+                assertUnlockAuthority(pathFor(source.id), sourceAuthority!);
+                signal.throwIfAborted();
+              }
+            },
+          },
+          lease.assertCurrent,
+        );
+      } finally {
+        release();
+      }
+    };
+    return { verify: () => run(true), verifySync: () => run(false), release };
+  }
+  async function verify(setupId: string, input: VerifyInput, options: VerifyOptions = {}) {
+    return admitSetup(setupId, input, options).verifySync();
+  }
+  async function verifyAdmitted(
+    setupId: string,
+    input: VerifyInput,
+    { authorizeCopySource, signal, assertAuthorized }: VerifyOptions = {},
+    assertAdmission: () => void,
+  ) {
+    const setup = setups.get(setupId);
+    if (!setup) throw new HttpError(410, 'SETUP_EXPIRED', 'Restart profile setup.');
+    if (input.acknowledged !== true)
+      throw new HttpError(
+        400,
+        'RECOVERY_ACKNOWLEDGMENT',
+        'Download and acknowledge your recovery key first',
+      );
     const key = secretKey(setup.id, input.recovery);
+    let authority: UnlockAuthorityWitness | undefined;
+    const check = () => {
+      signal?.throwIfAborted();
+      assertAuthorized?.();
+      signal?.throwIfAborted();
+      if (setups.get(setupId) !== setup) throw Error('Setup access changed');
+      if (authority) assertUnlockAuthority(pathFor(setup.id), authority);
+    };
     let pending: OpenedProfile | undefined;
     try {
+      check();
+      assertAdmission();
+      authority = unlockAuthorityWitness(pathFor(setup.id));
       if (registry.profiles.some((p) => p.id === setup.id)) {
-        open(setup.id, key);
+        if (opened.has(setup.id)) open(setup.id, key);
+        else {
+          pending = open(setup.id, key, { pendingActivation: true });
+          check();
+          installOpened(pending);
+          check();
+        }
         return card(setup.id);
       }
       const vault = openVault({ directory: pathFor(setup.id), profileId: setup.id, key });
@@ -1108,6 +1338,7 @@ export function createEncryptedProfiles({
       let copyState;
       if (details.copyFrom && !published) {
         authorizeCopySource?.(details.copyFrom);
+        check();
         copyState = opened.get(details.copyFrom);
         if (!copyState || copyState.closing)
           throw new HttpError(
@@ -1121,12 +1352,37 @@ export function createEncryptedProfiles({
         // registry needed to resume first-time activation with the saved kit.
         writeRegistry();
       }
+      assertAdmission();
       pending = open(setup.id, key, {
         ...details,
         initial: !published,
         copyState,
         pendingActivation: true,
+        ...(!published
+          ? {
+              initialPublication: {
+                before: () => {
+                  check();
+                  assertAdmission();
+                },
+                after: () => {
+                  const nextAuthority = unlockAuthorityWitness(pathFor(setup.id));
+                  if (
+                    nextAuthority.directory !== authority!.directory ||
+                    nextAuthority.keyring !== authority!.keyring
+                  )
+                    throw Error('Encrypted profile preparation changed');
+                  authority = { ...authority!, manifest: nextAuthority.manifest };
+                  setup.publishedManifest = authority.manifest;
+                  // Future retries recover this own committed head. This attempt
+                  // still carries its original source through final activation.
+                  setup.copyFrom = null;
+                },
+              },
+            }
+          : {}),
       });
+      check();
       const identity = selfIdentity(pending.db) as {
         name: string;
         icon: string;
@@ -1134,7 +1390,18 @@ export function createEncryptedProfiles({
       };
       const ring = keyring(setup.id);
       ring.active = true;
-      writeKeyring(setup.id, ring);
+      // The owned setup activation is the same narrow active-bit transition as
+      // cooperative activation, rather than an unrelated keyring revocation.
+      durableWrite(resolve(pathFor(setup.id), 'keyring.json'), jsonBytes(ring));
+      const ringPath = resolve(pathFor(setup.id), 'keyring.json'),
+        ringIdentity = unlockPathIdentity(ringPath);
+      if (
+        !readFileSync(ringPath).equals(jsonBytes(ring)) ||
+        unlockPathIdentity(ringPath) !== ringIdentity
+      )
+        throw Error('Encrypted profile preparation changed');
+      authority = { ...authority, keyring: ringIdentity };
+      check();
       writeRegistry({
         ...registry,
         profiles: [
@@ -1150,6 +1417,7 @@ export function createEncryptedProfiles({
         ],
       });
       installOpened(pending);
+      check();
       return card(setup.id);
     } catch (error) {
       if (pending) discardFailedOpen(pending, error);
@@ -1202,30 +1470,36 @@ export function createEncryptedProfiles({
     published: boolean;
     physicalWitness: UnlockPhysicalWitness;
   }
-  async function verifyAsync(
+  async function verifyAsync(setupId: string, input: VerifyInput, options: VerifyOptions = {}) {
+    return admitSetup(setupId, input, options).verify();
+  }
+  async function verifyAdmittedAsync(
     setupId: string,
     input: VerifyInput,
     { signal, assertAuthorized, authorizeCopySource, authorization }: VerifyOptions = {},
+    assertAdmission: () => void,
   ) {
+    assertAdmission();
     const setup = setups.get(setupId);
-    if (!setup || setup.expires < Date.now())
-      throw new HttpError(410, 'SETUP_EXPIRED', 'Restart profile setup.');
+    if (!setup) throw new HttpError(410, 'SETUP_EXPIRED', 'Restart profile setup.');
     if (input.acknowledged !== true)
       throw new HttpError(
         400,
         'RECOVERY_ACKNOWLEDGMENT',
         'Download and acknowledge your recovery key first',
       );
-    if (registry.profiles.some((p) => p.id === setup.id))
+    if (registry.profiles.some((p) => p.id === setup.id)) {
+      const alreadyOpened = opened.has(setup.id);
       return unlockWithKeyAsync(setup.id, secretKey(setup.id, input.recovery), {
         signal,
         authorization: setupUnlockAuthorization(setupId, setup, authorization, signal),
         assertAuthorized: () => {
           assertAuthorized?.();
-          if (setups.get(setupId) !== setup || setup.expires < Date.now())
-            throw Error('Setup access changed');
+          if (alreadyOpened) assertAdmission();
+          if (setups.get(setupId) !== setup) throw Error('Setup access changed');
         },
       });
+    }
     const id = setup.id,
       key = secretKey(id, input.recovery),
       controller = new AbortController();
@@ -1254,7 +1528,6 @@ export function createEncryptedProfiles({
         if (
           preparing.get(id) !== controller ||
           setups.get(setupId) !== setup ||
-          setup.expires < Date.now() ||
           registry.profiles.some((p) => p.id === id) ||
           unlockPathIdentity(registryPath) !== registryIdentity
         )
@@ -1299,6 +1572,7 @@ export function createEncryptedProfiles({
       if (!inspected.published) {
         if (details.copyFrom) {
           authorizeCopySource?.(details.copyFrom);
+          check();
           source = opened.get(details.copyFrom);
           if (!source || source.closing)
             throw new HttpError(
@@ -1415,9 +1689,18 @@ export function createEncryptedProfiles({
             staged.manifestIdentity.split(':').slice(0, 4).join(':')
         )
           throw Error('Setup publication changed');
-        authority = unlockAuthorityWitness(pathFor(id));
-        if (!authority.manifest.endsWith(`:${staged.manifestDigest}`))
+        const nextAuthority = unlockAuthorityWitness(pathFor(id));
+        if (
+          nextAuthority.directory !== authority.directory ||
+          nextAuthority.keyring !== authority.keyring ||
+          !nextAuthority.manifest.endsWith(`:${staged.manifestDigest}`)
+        )
           throw Error('Setup publication changed');
+        authority = { ...authority, manifest: nextAuthority.manifest };
+        setup.publishedManifest = authority.manifest;
+        // Only the future admission loses its copy dependency. This attempt's
+        // original source remains pinned through the final activation seal.
+        setup.copyFrom = null;
         const finished = await setupWorker<{ physicalWitness: UnlockPhysicalWitness }>(
           id,
           key,
@@ -1610,7 +1893,6 @@ export function createEncryptedProfiles({
             setup.setup.id === id &&
             (!setup.signal || !authorizationSignalAborted(setup.signal)) &&
             setups.get(setup.setupId) === setup.setup &&
-            setup.setup.expires >= Date.now() &&
             (!setup.source ||
               (Map.prototype.get.call(opened, setup.sourceId) === setup.source &&
                 Object.getOwnPropertyDescriptor(setup.source, 'closing')?.value === false)) &&
@@ -1943,6 +2225,7 @@ export function createEncryptedProfiles({
     );
   }
   function lock(id: string) {
+    revokeAdmissions(id);
     cancelCopies(id);
     preparing.get(id)?.abort(new HttpError(423, 'PROFILE_LOCKED', 'Profile opening was cancelled'));
     const state = opened.get(id);
@@ -1989,6 +2272,10 @@ export function createEncryptedProfiles({
     rmSync(pathFor(id), { recursive: true, force: true });
     return { id, deleted: true, backupsRetained: true };
   }
+  function replaceSetup(id: string) {
+    revokeAdmissions(id);
+    for (const [setupId, setup] of setups) if (setup.id === id) setups.delete(setupId);
+  }
   function resume(recovery: unknown) {
     const id = (recovery as Partial<RecoveryKit> | null)?.profileId;
     if (!idValid(id))
@@ -1997,25 +2284,36 @@ export function createEncryptedProfiles({
         'RECOVERY_FILE',
         'Use the downloaded recovery file to resume interrupted setup',
       );
+    if (preparing.has(id))
+      throw new HttpError(409, 'PROFILE_PREPARING', 'This profile is already opening');
     const key = secretKey(id, recovery);
     try {
       if (registry.profiles.some((p) => p.id === id))
         return { profileId: id, active: true, name: card(id).name };
       // Resume the original encrypted setup identity for password-manager forms,
       // rather than reusing another profile's name from the browser's UI state.
+      const authority = unlockAuthorityWitness(pathFor(id));
       const vault = openVault({ directory: pathFor(id), profileId: id, key });
-      let details: Partial<SetupDetails>;
+      let details: Partial<SetupDetails>, published: boolean;
       try {
         details = JSON.parse(
           vault.readFile('setup.json') as unknown as string,
         ) as Partial<SetupDetails>;
+        published = vault.recordStorage().read('head') !== null;
       } finally {
         vault.close();
       }
       if (details.profileId !== id || typeof details.name !== 'string' || !details.name.trim())
         throw new HttpError(400, 'SETUP_INVALID', 'This recovery file could not resume setup');
+      assertUnlockAuthority(pathFor(id), authority);
       const setupId = randomBytes(32).toString('base64url');
-      setups.set(setupId, { id, expires: Date.now() + 30 * 60 * 1000 });
+      replaceSetup(id);
+      setups.set(setupId, {
+        id,
+        expires: Date.now() + 30 * 60 * 1000,
+        copyFrom: published ? null : details.copyFrom,
+        publishedManifest: published ? authority.manifest : undefined,
+      });
       return { setupId, profileId: id, active: false, name: details.name };
     } finally {
       key.fill(0);
@@ -2092,7 +2390,13 @@ export function createEncryptedProfiles({
         throw new HttpError(400, 'SETUP_INVALID', 'This recovery file could not resume setup');
       const setupId = randomBytes(32).toString('base64url');
       if (!ownerCurrent()) throw Error('Setup authorization changed');
-      setups.set(setupId, { id, expires: Date.now() + 30 * 60 * 1000 });
+      replaceSetup(id);
+      setups.set(setupId, {
+        id,
+        expires: Date.now() + 30 * 60 * 1000,
+        copyFrom: inspected.published ? null : inspected.details.copyFrom,
+        publishedManifest: inspected.published ? authority.manifest : undefined,
+      });
       return { setupId, profileId: id, active: false, name: inspected.details.name };
     } finally {
       key.fill(0);
@@ -2107,6 +2411,11 @@ export function createEncryptedProfiles({
     resumeAsync,
     verify,
     verifyAsync,
+    admitSetup,
+    admitPasskeyAuthentication(id: string, signal?: AbortSignal) {
+      card(id);
+      return claimAccess(id, signal);
+    },
     unlock,
     unlockAsync(id: string, recovery: unknown, options?: Parameters<typeof unlockWithKeyAsync>[2]) {
       return unlockWithKeyAsync(id, secretKey(id, recovery), options);
@@ -2145,6 +2454,8 @@ export function createEncryptedProfiles({
       return card(id);
     },
     close(): void {
+      stopped = true;
+      for (const id of admissions.keys()) revokeAdmissions(id);
       for (const attempt of preparing.values()) attempt.abort(Error('Application is stopping'));
       const errors: unknown[] = [];
       for (const id of [...opened.keys()])

@@ -79,7 +79,6 @@ const passkeyUnlockAuthorizations = new WeakMap<
     challenge: AuthenticationChallenge;
     challenges: Map<string, PasskeyChallenge>;
     generations: Map<string, number>;
-    expires: number;
     signal: AbortSignal;
   }
 >();
@@ -96,7 +95,6 @@ export function passkeyUnlockAuthorized(
     found.manager === manager &&
     found.profileId === profileId &&
     !authorizationSignalAborted(found.signal) &&
-    found.expires >= Date.now() &&
     Map.prototype.get.call(found.challenges, found.challengeId) === found.challenge &&
     found.challenge.used === true &&
     (Map.prototype.get.call(found.generations, profileId) || 0) === found.challenge.generation
@@ -244,15 +242,16 @@ export function createProfilePasskeys(
   };
   function add(value: NewChallenge): string {
     for (const [id, challenge] of challenges)
-      if (challenge.expires < Date.now()) challenges.delete(id);
+      if (challenge.expires < Date.now() && !(challenge.kind === 'authenticate' && challenge.used))
+        challenges.delete(id);
     if (challenges.size >= 1000)
       throw new HttpError(429, 'TOO_MANY_CHALLENGES', 'Try again shortly');
     const id = randomBytes(32).toString('base64url');
     challenges.set(id, { ...value, expires: Date.now() + 5 * 60 * 1000 } as PasskeyChallenge);
     return id;
   }
-  // Keep claimed challenges visible until verification finishes so cancellation,
-  // expiry and profile invalidation also stop requests already awaiting WebAuthn.
+  // Authentication expiry gates the one claim. Enrollment retains its expiry;
+  // cancellation and invalidation still stop all owned work.
   function take<K extends PasskeyChallenge['kind']>(
     id: unknown,
     profileId: string,
@@ -276,11 +275,173 @@ export function createProfilePasskeys(
   }
   function assertPending(id: unknown, value: PasskeyChallenge): void {
     assertCurrent(value.profileId, value.generation);
-    if (challenges.get(id as string) !== value || value.expires < Date.now())
+    if (
+      challenges.get(id as string) !== value ||
+      (value.kind !== 'authenticate' && value.expires < Date.now())
+    )
       throw new HttpError(400, 'PASSKEY_CHALLENGE', 'Passkey request expired. Try again.');
   }
   function finish(id: unknown, value: PasskeyChallenge): void {
     if (challenges.get(id as string) === value) challenges.delete(id as string);
+  }
+  function admitAuthentication(
+    profileId: string,
+    sessionId: string,
+    input: AuthenticationInput,
+    options: { signal?: AbortSignal; assertAuthorized?: () => void } = {},
+  ) {
+    input = structuredClone(input);
+    options.signal?.throwIfAborted();
+    options.assertAuthorized?.();
+    const challenge = take(input.challengeId, profileId, sessionId, 'authenticate');
+    const controller = new AbortController();
+    let lease: ReturnType<EncryptedProfileManager['admitPasskeyAuthentication']>;
+    try {
+      lease = manager.admitPasskeyAuthentication(
+        profileId,
+        AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]),
+      );
+    } catch (error) {
+      finish(input.challengeId, challenge);
+      throw error;
+    }
+    unlocking.set(challenge, controller);
+    let started = false,
+      released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      controller.abort(Error('Passkey admission released'));
+      lease.release();
+      unlocking.delete(challenge);
+      finish(input.challengeId, challenge);
+    };
+    lease.signal.addEventListener(
+      'abort',
+      () => {
+        if (!started) release();
+      },
+      { once: true },
+    );
+    if (lease.signal.aborted) release();
+    return {
+      release,
+      async authenticate() {
+        if (started || released) throw Error('Passkey admission already consumed');
+        started = true;
+        try {
+          assertPending(input.challengeId, challenge);
+          options.assertAuthorized?.();
+          lease.assertCurrent();
+          const ring = manager.keyring(profileId),
+            saved = ring.passkeys.find(
+              (p) =>
+                p.id === (input.response as { id?: unknown } | null)?.id &&
+                p.rpID === challenge.rpID,
+            );
+          if (!saved)
+            throw new HttpError(400, 'PASSKEY_UNKNOWN', 'Passkey does not belong to this profile');
+          const result = await verification.verifyAuthenticationResponse({
+            response: input.response as AuthenticationResponseJSON,
+            expectedChallenge: challenge.challenge,
+            expectedOrigin: challenge.origin,
+            expectedRPID: challenge.rpID,
+            credential: {
+              id: saved.id,
+              publicKey: Buffer.from(saved.publicKey, 'base64url'),
+              counter: saved.counter,
+              transports: saved.transports,
+            },
+            requireUserVerification: true,
+          });
+          assertPending(input.challengeId, challenge);
+          options.assertAuthorized?.();
+          if (
+            manager.keyring(profileId).passkeys.find((p) => p.id === saved.id)?.counter !==
+            saved.counter
+          )
+            throw new HttpError(409, 'PASSKEY_CHANGED', 'Passkey state changed. Try again.');
+          lease.assertCurrent();
+          if (!result.verified)
+            throw new HttpError(400, 'PASSKEY_VERIFICATION', 'Passkey could not be verified');
+          const secret = prfBytes(input.prf);
+          let key: VaultKey | null | undefined;
+          try {
+            key = unwrapKey(saved.wrapped, secret, profileId, `passkey:${saved.id}`);
+          } catch {
+            throw new HttpError(
+              400,
+              'PASSKEY_UNWRAP',
+              'This passkey could not unlock the profile. Use your recovery key.',
+            );
+          } finally {
+            secret.fill(0);
+          }
+          try {
+            const currentRing = manager.keyring(profileId),
+              current = currentRing.passkeys.find((p) => p.id === saved.id);
+            if (!current || current.counter !== saved.counter)
+              throw new HttpError(409, 'PASSKEY_CHANGED', 'Passkey state changed. Try again.');
+            lease.publishPasskeyCounter(
+              saved.id,
+              saved.counter,
+              result.authenticationInfo.newCounter,
+            );
+            const alreadyOpened = manager.opened.has(profileId);
+            const authorize = () => {
+              assertPending(input.challengeId, challenge);
+              options.assertAuthorized?.();
+              lease.signal.throwIfAborted();
+              const fresh = manager.keyring(profileId).passkeys.find((p) => p.id === saved.id);
+              if (
+                !fresh ||
+                fresh.counter !== result.authenticationInfo.newCounter ||
+                fresh.publicKey !== saved.publicKey ||
+                fresh.salt !== saved.salt ||
+                fresh.rpID !== saved.rpID ||
+                JSON.stringify(fresh.wrapped) !== JSON.stringify(saved.wrapped)
+              )
+                throw new HttpError(409, 'PASSKEY_CHANGED', 'Passkey state changed. Try again.');
+              // The already-open fast path has no separate preparation proof.
+              if (alreadyOpened) lease.assertCurrent();
+            };
+            authorize();
+            // Cold preparation pins this exact target before its next caller
+            // callback; the admission must remain intact up to that handoff.
+            lease.assertCurrent();
+            const authorization = Object.freeze({});
+            passkeyUnlockAuthorizations.set(authorization, {
+              manager,
+              profileId,
+              challengeId: input.challengeId as string,
+              challenge,
+              challenges,
+              generations,
+              signal: lease.signal,
+            });
+            const profile = await manager.unlockWithKeyAsync(profileId, key, {
+              signal: lease.signal,
+              assertAuthorized: authorize,
+              authorization,
+            });
+            // The opened vault now owns the key; a late refusal must not zero it.
+            key = null;
+            if (!passkeyUnlockAuthorized(authorization, manager, profileId))
+              throw new HttpError(
+                409,
+                'PASSKEY_CANCELLED',
+                'Profile access changed. Start the passkey request again.',
+              );
+            passkeyUnlockAuthorizations.delete(authorization);
+            return profile;
+          } finally {
+            key?.fill(0);
+          }
+        } finally {
+          release();
+        }
+      },
+    };
   }
   return {
     list(profileId: string) {
@@ -586,101 +747,9 @@ export function createProfilePasskeys(
         options,
       };
     },
+    admitAuthentication,
     async authenticate(profileId: string, sessionId: string, input: AuthenticationInput) {
-      const challenge = take(input.challengeId, profileId, sessionId, 'authenticate');
-      try {
-        const ring = manager.keyring(profileId),
-          saved = ring.passkeys.find(
-            (p) =>
-              p.id === (input.response as { id?: unknown } | null)?.id && p.rpID === challenge.rpID,
-          );
-        if (!saved)
-          throw new HttpError(400, 'PASSKEY_UNKNOWN', 'Passkey does not belong to this profile');
-        const result = await verification.verifyAuthenticationResponse({
-          response: input.response as AuthenticationResponseJSON,
-          expectedChallenge: challenge.challenge,
-          expectedOrigin: challenge.origin,
-          expectedRPID: challenge.rpID,
-          credential: {
-            id: saved.id,
-            publicKey: Buffer.from(saved.publicKey, 'base64url'),
-            counter: saved.counter,
-            transports: saved.transports,
-          },
-          requireUserVerification: true,
-        });
-        assertPending(input.challengeId, challenge);
-        if (!result.verified)
-          throw new HttpError(400, 'PASSKEY_VERIFICATION', 'Passkey could not be verified');
-        const secret = prfBytes(input.prf);
-        let key: VaultKey | null | undefined;
-        try {
-          key = unwrapKey(saved.wrapped, secret, profileId, `passkey:${saved.id}`);
-        } catch {
-          throw new HttpError(
-            400,
-            'PASSKEY_UNWRAP',
-            'This passkey could not unlock the profile. Use your recovery key.',
-          );
-        } finally {
-          secret.fill(0);
-        }
-        try {
-          const currentRing = manager.keyring(profileId),
-            current = currentRing.passkeys.find((p) => p.id === saved.id);
-          if (!current || current.counter !== saved.counter)
-            throw new HttpError(409, 'PASSKEY_CHANGED', 'Passkey state changed. Try again.');
-          current.counter = result.authenticationInfo.newCounter;
-          manager.writeKeyring(profileId, currentRing);
-          const controller = new AbortController();
-          unlocking.set(challenge, controller);
-          const authorize = () => {
-            assertPending(input.challengeId, challenge);
-            const fresh = manager.keyring(profileId).passkeys.find((p) => p.id === saved.id);
-            if (
-              !fresh ||
-              fresh.counter !== result.authenticationInfo.newCounter ||
-              fresh.publicKey !== saved.publicKey ||
-              fresh.salt !== saved.salt ||
-              fresh.rpID !== saved.rpID ||
-              JSON.stringify(fresh.wrapped) !== JSON.stringify(saved.wrapped)
-            )
-              throw new HttpError(409, 'PASSKEY_CHANGED', 'Passkey state changed. Try again.');
-          };
-          authorize();
-          const authorization = Object.freeze({});
-          passkeyUnlockAuthorizations.set(authorization, {
-            manager,
-            profileId,
-            challengeId: input.challengeId as string,
-            challenge,
-            challenges,
-            generations,
-            expires: challenge.expires,
-            signal: controller.signal,
-          });
-          const profile = await manager.unlockWithKeyAsync(profileId, key, {
-            signal: controller.signal,
-            assertAuthorized: authorize,
-            authorization,
-          });
-          // The opened vault now owns the key; a late refusal must not zero it.
-          key = null;
-          if (!passkeyUnlockAuthorized(authorization, manager, profileId))
-            throw new HttpError(
-              409,
-              'PASSKEY_CANCELLED',
-              'Profile access changed. Start the passkey request again.',
-            );
-          passkeyUnlockAuthorizations.delete(authorization);
-          return profile;
-        } finally {
-          key?.fill(0);
-        }
-      } finally {
-        unlocking.delete(challenge);
-        finish(input.challengeId, challenge);
-      }
+      return admitAuthentication(profileId, sessionId, input).authenticate();
     },
   };
 }
