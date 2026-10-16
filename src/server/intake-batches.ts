@@ -10,6 +10,7 @@ import {
   clearCollectionProcessingException,
 } from './intake-processing-exceptions.ts';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { withVaultIntakeBatchAuthorization } from './vault-app.ts';
 import { modelRecoveryKey } from './model-bridge.ts';
 import { INTAKE_PDF_BOUNDS } from './intake-files.ts';
@@ -2068,7 +2069,13 @@ export function createIntakeBatchManager({
         }
         if (chat.status === 'running') {
           return continueItemHost(profileId, batch, item, expected, undefined, async () => {
-            item.reading = chat.reading ? cloneIntakeBatch(chat.reading) : item.reading;
+            if (chat.reading) {
+              // Normalize with the journal's exact value semantics before comparing.
+              // Polls still observe progress and authorization, but only a changed
+              // reading snapshot belongs in the next durable checkpoint.
+              const reading = cloneIntakeBatch(chat.reading);
+              if (!isDeepStrictEqual(item.reading, reading)) item.reading = reading;
+            }
             const progressKey = key(profileId, `${batch.id}/${item.intakeId}`);
             if (observeReadingProgress(item, now())) dirtyProgress.add(progressKey);
             if (
