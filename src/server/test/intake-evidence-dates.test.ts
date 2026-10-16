@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   decodeOriginalIdentityText,
+  originalIdentityQuoteSpans,
+  originalContainsIdentityQuote,
   labelledBirthDateEvidence,
   originalSubjectBirthDateEvidence,
   originalSubjectBirthDates,
@@ -507,5 +509,96 @@ test('year-only dates suggest a century but remain unreadable original facts', (
     dates: [],
     unreadable: true,
     suggestions: ['1988'],
+  });
+});
+
+test('identity quote matching returns original spans without changing literal characters or line scope', () => {
+  const source = 'Fictional   report (A+B) [v1]. \nPatient:\t Iris   Meadow\nDOB: 1990-03-08';
+  const quote = 'Fictional report (A+B) [v1].\nPatient: Iris Meadow';
+  const spans = [...originalIdentityQuoteSpans(source, quote)];
+  assert.deepEqual(spans, [{ start: 0, end: source.indexOf('\nDOB:') }]);
+  assert.equal(originalContainsIdentityQuote(source, quote), true);
+  for (const wrong of [
+    'Fictional report (AAB) [v1].',
+    'Fictional report (A+B) [v1]!',
+    'fictional report (A+B) [v1].',
+    'Patient: IrisMeadow',
+    'Patient: Iris\nMeadow',
+    'Patient: Different Meadow',
+    'DOB: 1990-03-09',
+    '',
+    ' \t\n',
+  ])
+    assert.equal(originalContainsIdentityQuote(source, wrong), false, wrong);
+  assert.equal(
+    originalContainsIdentityQuote('Patient:\nIris Meadow', 'Patient: Iris Meadow'),
+    false,
+  );
+  assert.equal(
+    originalContainsIdentityQuote('Patient:\n\nIris Meadow', 'Patient:\nIris Meadow'),
+    false,
+  );
+});
+
+test('whitespace-equivalent name and report matching preserves raw DOB column and role boundaries', () => {
+  const subject = 'Iris Meadow',
+    anchor = 'Fictional report';
+  const banner = 'Fictional   report\nIris   Meadow  Female  03/04/1982';
+  assert.deepEqual(originalSubjectBirthDateEvidence(banner, subject, anchor), {
+    dates: [],
+    unreadable: false,
+    bannerDates: [['1982-03-04', '1982-04-03']],
+  });
+  assert.equal(originalSubjectNameGrounded(banner, subject, anchor), true);
+  for (const role of ['Mother', 'Subscriber', 'Guardian', 'Guarantor']) {
+    const original = `Fictional   report\n${role}: Iris   Meadow\nDOB: 1990-03-08`;
+    assert.equal(originalSubjectNameGrounded(original, subject, anchor), false, role);
+    assert.deepEqual(originalSubjectBirthDateEvidence(original, subject, anchor), {
+      dates: [],
+      unreadable: false,
+    });
+  }
+  const otherReport =
+    'Fictional   report\nPatient: Other Name\nOther report\nPatient: Iris   Meadow\nDOB: 1990-03-08';
+  assert.equal(originalSubjectNameGrounded(otherReport, subject, anchor), false);
+  assert.deepEqual(originalSubjectBirthDateEvidence(otherReport, subject, anchor), {
+    dates: [],
+    unreadable: false,
+  });
+  const repeatedAnchor =
+    'Fictional   report\nPatient: Iris   Meadow\nFictional report\nPatient: Iris Meadow\nDOB: 1990-03-08';
+  assert.equal(originalSubjectNameGrounded(repeatedAnchor, subject, anchor), false);
+});
+
+test('identity quote blank lines retain exact line count without an unanchored whitespace scan', () => {
+  for (const quote of ['\nA', '\n\nA', 'A\n\nB']) {
+    assert.equal(originalContainsIdentityQuote(' '.repeat(250000), quote), false);
+    assert.equal(originalContainsIdentityQuote('\n' + ' '.repeat(250000) + 'X', quote), false);
+  }
+  assert.equal(originalContainsIdentityQuote('\n \n A', '\n\nA'), true);
+  assert.equal(originalContainsIdentityQuote('A\n \n B', 'A\n\nB'), true);
+  assert.equal(originalContainsIdentityQuote('A\n B', 'A\n\nB'), false);
+});
+
+test('multiline subject spans cannot cross a retained record or report boundary', () => {
+  const original =
+    'Fictional report\nPatient: Iris Meadow\n[identity record boundary]\nOther report\nDOB: 1990-03-08';
+  const crossing = 'Patient: Iris Meadow\n[identity record boundary]\nOther report';
+  assert.equal(
+    originalContainsIdentityQuote(original, crossing),
+    true,
+    'literal containment alone is insufficient',
+  );
+  assert.equal(originalSubjectNameGrounded(original, crossing, 'Fictional report'), false);
+  assert.deepEqual(originalSubjectBirthDateEvidence(original, crossing, 'Fictional report'), {
+    dates: [],
+    unreadable: false,
+  });
+  const banner = 'Patient: Iris Meadow\nFictional report\nPatient: Other Person\nDOB: 1990-03-08';
+  const overlapping = 'Patient: Iris Meadow\nFictional report\nPatient: Other Person';
+  assert.equal(originalSubjectNameGrounded(banner, overlapping, 'Fictional report'), false);
+  assert.deepEqual(originalSubjectBirthDateEvidence(banner, overlapping, 'Fictional report'), {
+    dates: [],
+    unreadable: false,
   });
 });

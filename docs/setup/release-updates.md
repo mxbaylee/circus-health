@@ -23,6 +23,8 @@ proof of successful setup or provider import. See the
 
 New model proposals now explicitly separate grounded identity questions from independent clinical uncertainties. Restart into the reviewed build to use that instruction; existing proposals are preserved. The qualification fixture uses separate unpunctuated patient and DOB labels. Its reading gate inspects all version/source-pinned reader exception pages and the exact active plan, while preserving the native feed’s unknown extraction status and referenced accounting. This bounded known-answer fixture proof does not implement a general clinical-completeness aggregate.
 
+Restart into the reviewed build to recheck report identity quotes that differ only in horizontal whitespace introduced by PDF text extraction. Grounding now uses whitespace-equivalent matches with original text positions, preserving line, role, report/member/page, name, punctuation and DOB conflict checks. Retained proposals, original bytes, source/identity keys and accepted history are unchanged; there is no migration. Prior builds can still refuse these otherwise literal quotes. See [original identity grounding](../import/identity-review.md).
+
 ## Updating from `main` to this candidate
 
 The owner accepted the existing passkey compatibility baseline on 2026-10-15

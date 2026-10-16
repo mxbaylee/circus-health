@@ -25,7 +25,7 @@ export async function readQualificationReading(
   intake: IntakeRead,
   sourceHash: string,
   expectedUnits?: number,
-  onPage?: (pages: SourceTextIssueList[]) => void,
+  onPage?: (page: SourceTextIssueList, ordinal: number) => void,
 ) {
   check(isIntakeSummary(intake), 'inspect a bounded current intake summary');
   const plan = intake.activePlan.state === 'exact' ? intake.activePlan.plan : null;
@@ -44,6 +44,7 @@ export async function readQualificationReading(
   let offset = 0;
   let summary: string | undefined;
   let entries = 0;
+  let capturedBytes = 0;
   const seenUnits = new Set<string>();
   do {
     const params = new URLSearchParams({
@@ -52,8 +53,10 @@ export async function readQualificationReading(
       readerLimit: '50',
     });
     const page = await request<SourceTextIssueList>(path + '/source-issues?' + params);
+    capturedBytes += Buffer.byteLength(JSON.stringify(page));
+    check(capturedBytes <= 8 * 1024 * 1024, 'reader evidence exceeded qualification byte bound');
     pages.push(page);
-    onPage?.(pages);
+    onPage?.(page, pages.length - 1);
     const coverage = page.readerCoverage;
     check(
       page.sourceHash === sourceHash &&
@@ -108,7 +111,7 @@ export async function readQualificationReading(
     sourceHash,
     planId: plan.id,
     unitCount: plan.unitCount,
-    pages,
+    responsePages: pages.length,
   };
 }
 
@@ -313,16 +316,36 @@ export async function readQualificationReview(
   }
 }
 
+export type QualificationIdentityEvidence =
+  | { kind: 'review'; value: import('../shared/intake-identity.ts').IntakeIdentityReview }
+  | {
+      kind: 'page';
+      ordinal: number;
+      value: import('../shared/intake-identity.ts').IntakeIdentityScopePage;
+    }
+  | { kind: 'complete'; pageCount: number };
+
 /** Fully inspected scope for offline grading; commands retain the original server reference. */
-export async function readQualificationIdentity(request: QualificationRead, path: string) {
+export async function readQualificationIdentity(
+  request: QualificationRead,
+  path: string,
+  retain?: (
+    evidence: QualificationIdentityEvidence,
+    review: import('../shared/intake-identity.ts').IntakeIdentityReview,
+  ) => void,
+) {
   const review = await request<import('../shared/intake-identity.ts').IntakeIdentityReview>(path);
+  check(Buffer.byteLength(JSON.stringify(review)) <= 8 * 1024 * 1024, 'oversized identity review');
+  const pages: import('../shared/intake-identity.ts').IntakeIdentityScopePage[] = [];
+  let capturedBytes = Buffer.byteLength(JSON.stringify(review));
+  retain?.({ kind: 'review', value: review }, review);
   const reference = review.scopeReference;
   check(!review.warningsReference, 'inspect all referenced identity warnings before qualification');
   if (!reference) {
     check(review.scope, 'identity scope is unavailable');
+    retain?.({ kind: 'complete', pageCount: 0 }, review);
     return { review, inspectedScope: review.scope, confirmationScope: review.scope, pages: [] };
   }
-  const pages: import('../shared/intake-identity.ts').IntakeIdentityScopePage[] = [];
   const sections: Record<string, unknown[]> = {};
   let bytes = 0;
   for (const section of [
@@ -347,13 +370,23 @@ export async function readQualificationIdentity(request: QualificationRead, path
         path.split('?')[0]!.replace(/identity-review$/, 'identity-scope-page') + '?' + params,
       );
       check(
+        Buffer.byteLength(JSON.stringify(page)) <= 8 * 1024 * 1024,
+        'oversized identity scope page',
+      );
+      capturedBytes += Buffer.byteLength(JSON.stringify(page));
+      check(
+        capturedBytes <= 8 * 1024 * 1024 && pages.length < 100,
+        'identity capture exceeded qualification bound',
+      );
+      pages.push(page);
+      retain?.({ kind: 'page', ordinal: pages.length - 1, value: page }, review);
+      check(
         page.scopeToken === reference.scopeToken &&
           page.section === section &&
           page.total === reference.collection[section] &&
           page.total <= 1000,
         'identity scope changed or exceeded qualification bound',
       );
-      pages.push(page);
       for (const item of page.items) {
         check(
           item.kind === 'value',
@@ -391,5 +424,6 @@ export async function readQualificationIdentity(request: QualificationRead, path
     competingSubjects:
       sections.competingSubjects as import('../shared/intake-identity.ts').IntakeIdentityScope['competingSubjects'],
   };
+  retain?.({ kind: 'complete', pageCount: pages.length }, review);
   return { review, inspectedScope, confirmationScope: reference, pages };
 }

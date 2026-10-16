@@ -150,6 +150,7 @@ import { getNote } from './notes.ts';
 import { noteVisibilitySQL } from './visibility.ts';
 import {
   decodeOriginalIdentityText,
+  originalContainsIdentityQuote,
   originalSubjectBirthDateEvidence,
   originalSubjectNameGrounded,
 } from './intake-evidence-dates.ts';
@@ -538,7 +539,11 @@ async function evidence(context: Context) {
           .replace(/<[^>]*>/g, ' ');
     }
   }
-  if (text !== null && (!text.includes(subject.text) || !text.includes(anchor.text)))
+  if (
+    text !== null &&
+    (!originalContainsIdentityQuote(text, subject.text) ||
+      !originalContainsIdentityQuote(text, anchor.text))
+  )
     reject(
       'The report or subject quote was not found in the original text; inspect it individually',
     );
@@ -1315,7 +1320,7 @@ async function build(
               yield;
               if (issue.id === genericId || issue.selfSuggestion) continue;
               if (
-                original.pageText?.includes(issue.textAnchor || '\u0000') &&
+                originalContainsIdentityQuote(original.pageText, issue.textAnchor) &&
                 (yield* isGenericNameConfirmationWork(
                   issue,
                   group.report?.subject?.text,
@@ -1337,8 +1342,7 @@ async function build(
                 intakeId: id,
                 sourceHash: context.file.sha256,
                 originalFingerprint: original.originalFingerprint,
-                grounded: () =>
-                  !!issue.textAnchor && original.pageText?.includes(issue.textAnchor) === true,
+                grounded: () => originalContainsIdentityQuote(original.pageText, issue.textAnchor),
               });
               if (!receipt) {
                 stored.put(explicitSection, String(stored.count(explicitSection)), issue);

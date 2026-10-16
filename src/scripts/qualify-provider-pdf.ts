@@ -941,8 +941,8 @@ async function main() {
           detail,
           fixture.sha256,
           scenario === 'tiny' ? 1 : undefined,
-          (pages) =>
-            retainReviewFile(activeReview!.stem + '-reading.json', { partial: true, pages }),
+          (page, ordinal) =>
+            retainReviewFile(activeReview!.stem + '-reading-page-' + (ordinal + 1) + '.json', page),
         );
         retainReviewFile(activeReview.stem + '-reading.json', reading);
         extracted.intake = detail;
@@ -1012,6 +1012,8 @@ async function main() {
           run.remainingUnits === 0
         ) {
           let authority: ArchiveInventory | undefined;
+          const identityFiles = new WeakMap<object, string>();
+          let identitySequence = 0;
           run.acceptance = await performQualificationAcceptance({
             prefix,
             profileId: profile.id,
@@ -1025,6 +1027,21 @@ async function main() {
             request,
             collectFeed,
             originalHash,
+            retainIdentityEvidence: (evidence, review) => {
+              let filename = identityFiles.get(review);
+              if (!filename) {
+                filename = activeReview!.stem + '-identity-' + ++identitySequence;
+                identityFiles.set(review, filename);
+              }
+              retainReviewFile(
+                filename +
+                  '-' +
+                  evidence.kind +
+                  (evidence.kind === 'page' ? '-' + evidence.ordinal : '') +
+                  '.json',
+                evidence,
+              );
+            },
             ...(deployment
               ? {
                   recreate: async (phase: 'accepted' | 'cache_removed') => {

@@ -159,6 +159,7 @@ export interface QualificationAcceptanceOptions {
   originalHash: (prefix: string, originalId: string) => Promise<string>;
   afterAcceptedBeforeRecovery?: () => Promise<void>;
   recreate?: (stage: 'accepted' | 'cache_removed') => Promise<void>;
+  retainIdentityEvidence?: Parameters<typeof readQualificationIdentity>[2];
 }
 
 /** Caller must first lock its freshly created qualification profile. Never remove
@@ -245,6 +246,7 @@ export async function performQualificationAcceptance({
   originalHash,
   afterAcceptedBeforeRecovery,
   recreate,
+  retainIdentityEvidence,
 }: QualificationAcceptanceOptions) {
   check(
     /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(profileId) && prefix === `/api/profiles/${profileId}`,
@@ -322,6 +324,7 @@ export async function performQualificationAcceptance({
       const inspected = await readQualificationIdentity(
         request,
         prefix + `/intakes/${originalId}/identity-review?groupId=${encodeURIComponent(groupId)}`,
+        retainIdentityEvidence,
       );
       const { review, inspectedScope: scope, confirmationScope } = inspected;
       check(

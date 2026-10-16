@@ -13,6 +13,7 @@ import type { IdentityPolicyReceipt, IdentityPolicyTargets } from './intake-iden
 import { matchesSelfIdentityName } from '../shared/self-identity.ts';
 import {
   decodeOriginalIdentityText,
+  originalContainsIdentityQuote,
   originalSubjectBirthDateEvidence,
   originalSubjectNameGrounded,
 } from './intake-evidence-dates.ts';
@@ -217,7 +218,11 @@ async function identityEvidence(context: Context, groupId: string): Promise<Evid
           .replace(/<[^>]*>/g, ' ');
     }
   }
-  if (text !== null && (!text.includes(subject.text) || !text.includes(anchor.text)))
+  if (
+    text !== null &&
+    (!originalContainsIdentityQuote(text, subject.text) ||
+      !originalContainsIdentityQuote(text, anchor.text))
+  )
     return reject(
       'The report or subject quote was not found in the original text; inspect it individually',
     );
@@ -352,7 +357,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
         .filter((issue) => issue.id !== genericId && !issue.selfSuggestion)
         .filter((issue) => {
           if (
-            evidence.pageText?.includes(issue.textAnchor || '\u0000') &&
+            originalContainsIdentityQuote(evidence.pageText, issue.textAnchor) &&
             isGenericNameConfirmation(
               issue,
               group.report?.subject?.text,
@@ -371,8 +376,7 @@ function buildScope(context: Context, evidence: Evidence): BuiltScope {
             intakeId: id,
             sourceHash: intake.sha256,
             originalFingerprint: evidence.originalFingerprint,
-            grounded: () =>
-              !!issue.textAnchor && evidence.pageText?.includes(issue.textAnchor) === true,
+            grounded: () => originalContainsIdentityQuote(evidence.pageText, issue.textAnchor),
           });
           if (!receipt) return true;
           groundedQuestions.push({ issue, receipt });
