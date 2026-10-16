@@ -9,6 +9,7 @@ import {
   disposeIntakeLegacyBridgeReadWitness,
 } from './intake-state-migration.ts';
 import { createIntakeStateStorage } from './intake-state-storage.ts';
+import { retainIntakeCollectionCache } from './intake-state-collections.ts';
 import { ensureIntakeFrontierObserver } from './intake-lookup-frontier-observer.ts';
 import { parseIntakeFilenameFacts } from './intake-filename-facts.ts';
 import { hashIntakeJsonScalarSteps } from './intake-json-scalar.ts';
@@ -569,6 +570,7 @@ function currentEnvelopeView(
     throw Error('Referenced current envelope mode changed');
   const store: EnvelopeCellReader = {
     check,
+    retainRead: () => retainIntakeCollectionCache(data.db),
     get: (key) => {
       check();
       return data.collections.get(view, 'logical', 'envelope.data', key);

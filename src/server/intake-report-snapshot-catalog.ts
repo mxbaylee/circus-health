@@ -12,6 +12,7 @@ import type {
 import { withIntakeWork, recordIntakeWork } from './intake-work-accounting.ts';
 import { INTAKE_TREE_KEY_BYTES, INTAKE_TREE_VALUE_BYTES } from './intake-state-tree.ts';
 import { schemaOrdinal } from './intake-envelope-schema.ts';
+import { retainIntakeCollectionCache } from './intake-state-collections.ts';
 import type { RecordPublicationOriginals } from './record-versions.ts';
 import {
   assertClinicalOperation,
@@ -339,27 +340,36 @@ export function createReportSnapshotCatalog(
   }
   function* chunks(get: () => string | IntakeByteValue | undefined): Generator<string> {
     assertCurrent();
+    const retained = retainIntakeCollectionCache(db);
+    const check = () => {
+      retained();
+      assertCurrent();
+      retained();
+    };
     const value = get();
     if (value === undefined) throw Error('Missing report snapshot text');
     if (typeof value === 'string') {
       for (let at = 0; at < value.length;) {
         let end = Math.min(at + 1024, value.length);
         if (end < value.length && /[\uD800-\uDBFF]/.test(value[end - 1]!)) end--;
+        check();
         yield value.slice(at, end);
         at = end;
       }
+      check();
       return;
     }
     const decoder = new TextDecoder('utf-8', { fatal: true });
     let after: string | undefined;
     do {
-      assertCurrent();
+      check();
       const page = collections.readBytes(value, {
         after,
         items: 16,
         bytes: 65536,
       });
       for (const chunk of page.chunks) {
+        check();
         const text = decoder.decode(chunk, { stream: true });
         if (text) yield text;
       }
@@ -368,8 +378,9 @@ export function createReportSnapshotCatalog(
       after = page.after;
     } while (true);
     const tail = decoder.decode();
+    check();
     if (tail) yield tail;
-    assertCurrent();
+    check();
   }
   async function writer(
     from?: () => IntakeCollectionValue,

@@ -595,8 +595,8 @@ test('named field lookup shares one sealed scope without losing lexical values',
       );
       assert.equal(
         witnessQueries,
-        20,
-        'two six-query scopes and two four-query scopes share their entry certificates',
+        16,
+        'four four-query scopes share their entry certificates, including lexical-value minting',
       );
       assert.equal(items, 6, 'four field witnesses and both original payload reads are retained');
     } finally {
@@ -1046,7 +1046,7 @@ test('fixed scalar snapshots amortize complete admissions within one sealed read
         JSON.stringify({ fixture: 'fixed scalar snapshot baseline', count, ...baseline }),
       );
       assert.equal(baseline.heads, count * 5);
-      assert.equal(baseline.witnessQueries, count * 20);
+      assert.equal(baseline.witnessQueries, count * 16);
       assert.equal(baseline.items, count * 6);
       return { count, requests, baseline };
     });

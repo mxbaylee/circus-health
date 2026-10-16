@@ -340,6 +340,15 @@ const registries = new WeakMap<Database, Registry>();
 export function intakeCollectionCacheGeneration(db: Database): object {
   return registryFor(db).generation;
 }
+
+/** Compose this lifetime seal with the reader's selected-logical/owner check.
+ * A fresh traversal may capture a new registry; a started one may never do so. */
+export function retainIntakeCollectionCache(db: Database): () => void {
+  const generation = intakeCollectionCacheGeneration(db);
+  return () => {
+    if (intakeCollectionCacheGeneration(db) !== generation) invalid('expired collection traversal');
+  };
+}
 export function clearIntakeCollectionCache(db: Database): void {
   const registry = registries.get(db);
   const candidates = new Set(registry?.privateCandidates.keys());
@@ -947,18 +956,32 @@ export function createIntakeCollections(owner: {
     values.set(value, retained);
     return retained.descriptor;
   }
-  function referencedBytes(value: IntakeByteValue, pages: ReturnType<typeof tree>) {
+  function retainedBytes(
+    value: IntakeByteValue,
+    certificate?: IntakeTreeReadCertificate,
+    consuming = false,
+  ) {
     const retained = registryFor(db).byteValues.get(value);
+    if (!retained || retained.prefix !== prefix)
+      invalid(
+        consuming ? 'foreign or expired byte value' : 'foreign, stale or expired byte reference',
+      );
     if (
-      !retained ||
-      retained.prefix !== prefix ||
-      retained.logical !== JSON.stringify(selected().head?.logical ?? null) ||
+      retained.logical !== JSON.stringify(selected(certificate).head?.logical ?? null) ||
       value.kind !== 'bytes' ||
       value.bytes !== retained.bytes ||
       value.chunks !== retained.count ||
       (retained.root?.count ?? 0) !== retained.count
     )
       invalid('foreign, stale or expired byte reference');
+    return retained;
+  }
+  function referencedBytes(
+    value: IntakeByteValue,
+    pages: ReturnType<typeof tree>,
+    certificate?: IntakeTreeReadCertificate,
+  ) {
+    const retained = retainedBytes(value, certificate);
     if (retained.root) pages.load(retained.root);
     else if (retained.bytes !== 0) invalid('empty byte reference size');
     return {
@@ -1069,7 +1092,7 @@ export function createIntakeCollections(owner: {
             count = 0;
           do {
             const page = certificate
-              ? readByteRange(_readTree(), value, { after, items: 64, bytes: 4096 })
+              ? readByteRange(_readTree(), value, { after, items: 64, bytes: 4096 }, certificate)
               : schemaReadOperations.readBytes(value, { after, items: 64, bytes: 4096 });
             for (const chunk of page.chunks) {
               count += chunk.length;
@@ -1188,15 +1211,17 @@ export function createIntakeCollections(owner: {
     pages: ReturnType<typeof tree>,
     source: IntakeCollectionDescriptor | undefined,
     key: string,
+    certificate?: IntakeTreeReadCertificate,
   ): string | IntakeByteValue | undefined => {
     const raw = pages.get(source?.root ?? null, key);
     if (raw !== undefined) recordIntakeWork('collectionItemsRead');
-    return raw === undefined ? undefined : publicValue(raw, source!.kind);
+    return raw === undefined ? undefined : publicValue(raw, source!.kind, certificate);
   };
   const readCollectionRange = (
     pages: ReturnType<typeof tree>,
     source: IntakeCollectionDescriptor | undefined,
     options: { after?: string; prefix?: string; items: number; bytes: number },
+    certificate?: IntakeTreeReadCertificate,
   ) => {
     integer(options.items, 1);
     integer(options.bytes, 1);
@@ -1219,7 +1244,7 @@ export function createIntakeCollections(owner: {
         complete = false;
         break;
       }
-      items.push({ key: item.key, value: publicValue(item.value, source!.kind) });
+      items.push({ key: item.key, value: publicValue(item.value, source!.kind, certificate) });
       bytes += size;
       recordIntakeWork('collectionItemsRead');
     }
@@ -1236,9 +1261,9 @@ export function createIntakeCollections(owner: {
     pages: ReturnType<typeof tree>,
     value: IntakeByteValue,
     options: { after?: string; items: number; bytes: number },
+    certificate?: IntakeTreeReadCertificate,
   ) => {
-    const retained = registryFor(db).byteValues.get(value);
-    if (!retained || retained.prefix !== prefix) invalid('foreign or expired byte value');
+    const retained = retainedBytes(value, certificate, true);
     integer(options.items, 1);
     integer(options.bytes, 1);
     if (options.items > 64 || options.bytes > 256 * 1024) invalid('byte range budget');
@@ -1340,7 +1365,7 @@ export function createIntakeCollections(owner: {
           continue;
         }
         if (change.op === 'adoptBytesReferenced') {
-          const adopted = referencedBytes(change.value, pages);
+          const adopted = referencedBytes(change.value, pages, certificate);
           root = pages.put(root, change.collection, JSON.stringify(adopted));
           if (change.area === 'logical') logical = root;
           else builds = root;
@@ -2284,9 +2309,9 @@ export function createIntakeCollections(owner: {
                 return raw === undefined ? undefined : publicValue(raw, source.kind, certificate);
               },
               range: (after, items, bytes, prefix) =>
-                readCollectionRange(pages, source, { after, items, bytes, prefix }),
+                readCollectionRange(pages, source, { after, items, bytes, prefix }, certificate),
               chunks: (value, after, bytes = 4096) =>
-                readByteRange(pages, value, { after, items: 64, bytes }),
+                readByteRange(pages, value, { after, items: 64, bytes }, certificate),
             };
             const headers = new Map<string, SchemaRecord>();
             const values = input.map(({ id, name, bytes }): IntakeEnvelopeField => {
@@ -2387,11 +2412,11 @@ export function createIntakeCollections(owner: {
       name: string,
       key: string,
     ): string | IntakeByteValue | undefined {
-      return runRead((readTree) => {
+      return runRead((readTree, certificate) => {
         collectionName(name);
         const pages = readTree(),
-          collection = descriptor(pages.get(readScope(view, area), name));
-        return readCollectionItem(pages, collection, key);
+          collection = descriptor(pages.get(readScope(view, area, certificate), name));
+        return readCollectionItem(pages, collection, key, certificate);
       });
     },
     rank(
@@ -2424,23 +2449,23 @@ export function createIntakeCollections(owner: {
       });
     },
     preceding(view: IntakeCollectionView, area: IntakeCollectionArea, name: string, key: string) {
-      return runRead((readTree) => {
+      return runRead((readTree, certificate) => {
         collectionName(name);
         const pages = readTree(),
-          source = descriptor(pages.get(readScope(view, area), name));
+          source = descriptor(pages.get(readScope(view, area, certificate), name));
         const item = pages.preceding(source?.root ?? null, key);
         if (!item) return undefined;
         recordIntakeWork('collectionItemsRead');
-        return { key: item.key, value: publicValue(item.value, source!.kind) };
+        return { key: item.key, value: publicValue(item.value, source!.kind, certificate) };
       });
     },
     precedingReferenced(value: IntakeCollectionValue, key: string) {
-      return runRead((readTree) => {
+      return runRead((readTree, certificate) => {
         const source = referenced(value),
           item = readTree().preceding(source.root, key);
         if (!item) return undefined;
         recordIntakeWork('collectionItemsRead');
-        return { key: item.key, value: publicValue(item.value, source.kind) };
+        return { key: item.key, value: publicValue(item.value, source.kind, certificate) };
       });
     },
     referenceFrom(value: IntakeCollectionValue, key: string): IntakeCollectionValue | undefined {
@@ -2452,11 +2477,11 @@ export function createIntakeCollections(owner: {
       });
     },
     getReferenced(value: IntakeCollectionValue, key: string): string | IntakeByteValue | undefined {
-      return runRead((readTree) => {
+      return runRead((readTree, certificate) => {
         const source = referenced(value),
           raw = readTree().get(source.root, key);
         if (raw !== undefined) recordIntakeWork('collectionItemsRead');
-        return raw === undefined ? undefined : publicValue(raw, source.kind);
+        return raw === undefined ? undefined : publicValue(raw, source.kind, certificate);
       });
     },
     rankReferenced(value: IntakeCollectionValue, key: string): number {
@@ -2466,7 +2491,7 @@ export function createIntakeCollections(owner: {
       value: IntakeCollectionValue,
       options: { after?: string; items: number; bytes: number },
     ) {
-      return runRead((readTree) => {
+      return runRead((readTree, certificate) => {
         const source = referenced(value);
         integer(options.items, 1);
         integer(options.bytes, 1);
@@ -2483,7 +2508,7 @@ export function createIntakeCollections(owner: {
           bytes += added;
           items.push({
             key: item.key,
-            value: publicValue(item.value, source.kind),
+            value: publicValue(item.value, source.kind, certificate),
           });
           recordIntakeWork('collectionItemsRead');
         }
@@ -2543,23 +2568,24 @@ export function createIntakeCollections(owner: {
       name: string,
       options: { after?: string; prefix?: string; items: number; bytes: number },
     ) {
-      return runRead((readTree) => {
+      return runRead((readTree, certificate) => {
         collectionName(name);
         const pages = readTree(),
-          collection = descriptor(pages.get(readScope(view, area), name));
-        return readCollectionRange(pages, collection, options);
+          collection = descriptor(pages.get(readScope(view, area, certificate), name));
+        return readCollectionRange(pages, collection, options, certificate);
       });
     },
     readBytes(value: IntakeByteValue, options: { after?: string; items: number; bytes: number }) {
-      return runRead((readTree) => {
-        selected();
-        return readByteRange(readTree(), value, options);
-      });
+      return runRead((readTree, certificate) =>
+        readByteRange(readTree(), value, options, certificate),
+      );
     },
     /** A detached identity for one owner-issued, currently selected byte value.
      * This does not grant a caller authority to resolve a self-described root. */
     byteValueBinding(value: IntakeByteValue): string {
-      return runRead((readTree) => JSON.stringify(referencedBytes(value, readTree())));
+      return runRead((readTree, certificate) =>
+        JSON.stringify(referencedBytes(value, readTree(), certificate)),
+      );
     },
     replay(operationId: string, requestDigest: string): IntakeCollectionResult | undefined {
       return runRead((readTree) => {
@@ -3220,6 +3246,8 @@ export function createIntakeCollections(owner: {
       binding: string;
       collection: string;
       source: IntakeCollectionDescriptor;
+      generation: object;
+      logical: string;
       advancing: boolean;
       poisoned: boolean;
       exhausted: boolean;
@@ -3249,6 +3277,8 @@ export function createIntakeCollections(owner: {
         binding,
         collection: JSON.stringify(source),
         source,
+        generation: registryFor(db).generation,
+        logical: JSON.stringify(head.logical),
         advancing: false,
         poisoned: false,
         exhausted: false,
@@ -3274,8 +3304,13 @@ export function createIntakeCollections(owner: {
         if (retained.poisoned) invalid('poisoned record cursor');
         const pages = readTree();
         const current = () => {
+          if (registryFor(db).generation !== retained.generation) invalid('expired record cursor');
           const head = selected(certificate).head;
-          if (!head || selectedCursorBinding(head, retained.area) !== retained.binding)
+          if (
+            !head ||
+            JSON.stringify(head.logical) !== retained.logical ||
+            selectedCursorBinding(head, retained.area) !== retained.binding
+          )
             invalid('stale selected envelope');
           const scope = retained.area === 'logical' ? head.logical.root : head.builds;
           const source = descriptor(pages.get(scope, retained.name));
@@ -3285,16 +3320,21 @@ export function createIntakeCollections(owner: {
         current();
         const port: EnvelopeCellReader = {
           check: current,
-          get: (key) => readCollectionItem(pages, retained.source, key),
+          get: (key) => readCollectionItem(pages, retained.source, key, certificate),
           range: (after, items, bytes, keyPrefix) =>
-            readCollectionRange(pages, retained.source, {
-              after,
-              prefix: keyPrefix,
-              items,
-              bytes,
-            }),
+            readCollectionRange(
+              pages,
+              retained.source,
+              {
+                after,
+                prefix: keyPrefix,
+                items,
+                bytes,
+              },
+              certificate,
+            ),
           chunks: (value, after, bytes = 4096) =>
-            readByteRange(pages, value, { after, items: 64, bytes }),
+            readByteRange(pages, value, { after, items: 64, bytes }, certificate),
         };
         const parts: string[] = [];
         let bytes = 0;

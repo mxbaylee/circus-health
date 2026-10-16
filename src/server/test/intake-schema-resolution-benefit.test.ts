@@ -322,6 +322,78 @@ test('native record chunks share one owned read per iterator advancement', async
   assert.ok(witnesses <= 4 * steps + 16, 'one whole-call witness per native iterator advancement');
 });
 
+test('direct owned record cursor refuses disposal before returning buffered lexical text', async (t) => {
+  const f = await fixture(t, 16, true),
+    owner = intakeSchemaRecordOwner(f.selected.collections)!;
+  const cursor = owner.createCursor(
+    f.selected.collections.openView(),
+    f.control.root,
+    'logical',
+    'envelope.data',
+  )!;
+  assert.equal(owner.nextCursor(cursor).done, false);
+  clearIntakeStateCache(f.db);
+  assert.throws(() => owner.nextCursor(cursor), /expired|disposed|authority/);
+  const fresh = owner.createCursor(
+    f.selected.collections.openView(),
+    f.control.root,
+    'logical',
+    'envelope.data',
+  )!;
+  const pieces: string[] = [];
+  try {
+    for (;;) {
+      const next = owner.nextCursor(fresh);
+      if (next.done) break;
+      pieces.push(next.value);
+    }
+  } finally {
+    owner.closeCursor(fresh);
+  }
+  assert.equal(pieces.join(''), f.raw);
+});
+
+test('direct build record cursor also pins the selected logical generation', async (t) => {
+  const f = await fixture(t, 16, true),
+    collections = f.selected.collections,
+    owner = intakeSchemaRecordOwner(collections)!,
+    operationId = randomUUID();
+  collections.commitMaintenance(
+    collections.prepare(collections.openView(), {
+      operationId,
+      requestDigest: createHash('sha256').update(operationId).digest('hex'),
+      domainVersion: f.selected.head.logical.domainVersion,
+      changes: [
+        {
+          area: 'builds',
+          collection: 'fictional-cursor',
+          op: 'adoptCollection',
+          fromArea: 'logical',
+          fromCollection: 'envelope.data',
+        },
+      ],
+    }),
+  );
+  const cursor = owner.createCursor(
+    collections.openView(),
+    f.control.root,
+    'builds',
+    'fictional-cursor',
+  )!;
+  assert.equal(owner.nextCursor(cursor).done, false);
+  const nextId = randomUUID(),
+    prepared = collections.prepare(collections.openView(), {
+      operationId: nextId,
+      requestDigest: createHash('sha256').update(nextId).digest('hex'),
+      domainVersion: f.selected.head.logical.domainVersion + 1,
+      changes: [
+        { area: 'logical', collection: 'unrelated', op: 'put', key: 'status', value: 'changed' },
+      ],
+    });
+  transaction(f.db, () => collections.stage(prepared));
+  assert.throws(() => owner.nextCursor(cursor), /stale selected envelope/);
+});
+
 test('native record cursor refuses a same-byte selected write during a later lexical batch', async (t) => {
   const f = await fixture(t, 16, true);
   const iterator = f.reader.recordChunks(f.reader.root())[Symbol.iterator]();

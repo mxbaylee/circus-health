@@ -4,6 +4,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { setImmediate } from 'node:timers/promises';
 import { openDatabase, transaction, clinicalReviewRevision } from '../database.ts';
 import {
   consumeSelectedIntakeEnvelopeForBridge,
@@ -26,6 +27,9 @@ import {
   selectedEnvelopeStore,
   collectionCellReader,
   createSchemaEnvelopeReader,
+  iterateSchemaEnvelopeText,
+  iterateSchemaCellText,
+  intakeEnvelopeMissingScalarFactsSteps,
 } from '../intake-collection-envelope.ts';
 import { schemaKey, parseSchemaControl } from '../intake-envelope-schema.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
@@ -72,6 +76,285 @@ function fixture(t: test.TestContext, input: Record<string, unknown> | string) {
     source: { id: identity.intakeId, kind: 'intake_original', sha256: identity.sourceHash },
   };
 }
+
+for (const method of ['field', 'accessor', 'record', 'envelope'] as const)
+  test(`started ${method} stream refuses registry disposal, including buffered inline text`, async (t) => {
+    const raw = { intake: { version: 1 }, value: 'f'.repeat(6000) },
+      { db, source } = fixture(t, raw);
+    await buildIntakeCollectionEnvelope(db, source);
+    const reader = openIntakeCollectionEnvelope(db, source),
+      selected = collectionCellReader(db, source),
+      control = parseSchemaControl(
+        selected.collections.get(
+          selected.collections.openView(),
+          'logical',
+          'envelope.control',
+          'representation',
+        ),
+      );
+    const start = () =>
+      (method === 'field'
+        ? reader.fieldChunks(reader.root(), 'value')
+        : method === 'accessor'
+          ? intakeEnvelopeFieldAccess(reader).chunks(reader.root(), 'value')!
+          : method === 'record'
+            ? reader.recordChunks(reader.root())
+            : iterateSchemaEnvelopeText(selected.store, control))[Symbol.iterator]();
+    const pending = start();
+    assert.equal(pending.next().done, false);
+    await setImmediate();
+    clearIntakeStateCache(db);
+    assert.throws(() => pending.next(), /expired|disposed|authority|stale|generation/);
+    const fresh = start();
+    assert.equal(
+      [...{ [Symbol.iterator]: () => fresh }].join(''),
+      method === 'field' || method === 'accessor' ? JSON.stringify(raw.value) : JSON.stringify(raw),
+    );
+  });
+
+for (const method of ['field', 'accessor', 'record', 'fallback', 'envelope'] as const)
+  for (const change of ['logical', 'auxiliary', 'closed'] as const)
+    test(`${method} traversal checks ${change} changes after a cooperative yield`, async (t) => {
+      const raw = { intake: { version: 1 }, value: '🦊'.repeat(9000) },
+        { db, source } = fixture(t, raw);
+      await buildIntakeCollectionEnvelope(db, source);
+      const selected = collectionCellReader(db, source),
+        store = selected.collections,
+        control = parseSchemaControl(
+          store.get(store.openView(), 'logical', 'envelope.control', 'representation'),
+        ),
+        reader =
+          method === 'fallback'
+            ? createSchemaEnvelopeReader({ ...selected.store }, control, selected.head.logical)
+            : openIntakeCollectionEnvelope(db, source);
+      const chunks =
+          method === 'field'
+            ? reader.fieldChunks(reader.root(), 'value')
+            : method === 'accessor'
+              ? intakeEnvelopeFieldAccess(reader).chunks(reader.root(), 'value')!
+              : method === 'envelope'
+                ? iterateSchemaEnvelopeText(selected.store, control)
+                : reader.recordChunks(reader.root()),
+        pending = chunks[Symbol.iterator](),
+        first = pending.next();
+      assert.equal(first.done, false);
+      await setImmediate();
+      if (change === 'closed') db.close();
+      else {
+        const id = randomUUID();
+        const prepared = store.prepare(store.openView(), {
+          operationId: id,
+          requestDigest: createHash('sha256').update(id).digest('hex'),
+          domainVersion: selected.head.logical.domainVersion + (change === 'logical' ? 1 : 0),
+          changes: [
+            {
+              area: change === 'logical' ? 'logical' : 'builds',
+              collection: 'unrelated',
+              op: 'put',
+              key: 'status',
+              value: 'changed',
+            },
+          ],
+        });
+        if (change === 'auxiliary') store.commitMaintenance(prepared);
+        else transaction(db, () => store.stage(prepared));
+      }
+      if (change === 'auxiliary') {
+        const text = first.value + [...{ [Symbol.iterator]: () => pending }].join('');
+        assert.equal(
+          text,
+          method === 'field' || method === 'accessor'
+            ? JSON.stringify(raw.value)
+            : JSON.stringify(raw),
+        );
+      } else
+        assert.throws(() => pending.next(), /stale|expired|closed|not open|authority|database/i);
+    });
+
+for (const method of ['field', 'accessor', 'record', 'fallback', 'envelope'] as const)
+  for (const value of ['', 'Fictional inline', '🦊'.repeat(3000)])
+    test(`${method} checks terminal resume for ${value.length} characters`, async (t) => {
+      const raw = { intake: { version: 1 }, value },
+        { db, source } = fixture(t, raw);
+      await buildIntakeCollectionEnvelope(db, source);
+      const selected = collectionCellReader(db, source),
+        control = parseSchemaControl(
+          selected.collections.get(
+            selected.collections.openView(),
+            'logical',
+            'envelope.control',
+            'representation',
+          ),
+        ),
+        reader =
+          method === 'fallback'
+            ? createSchemaEnvelopeReader({ ...selected.store }, control, selected.head.logical)
+            : openIntakeCollectionEnvelope(db, source),
+        start = () =>
+          method === 'field'
+            ? reader.fieldChunks(reader.root(), 'value')
+            : method === 'accessor'
+              ? intakeEnvelopeFieldAccess(reader).chunks(reader.root(), 'value')!
+              : method === 'envelope'
+                ? iterateSchemaEnvelopeText(selected.store, control)
+                : reader.recordChunks(reader.root());
+      const expected = [...start()];
+      assert.ok(expected.length > 0);
+      const pending = start()[Symbol.iterator]();
+      for (const piece of expected) assert.deepEqual(pending.next(), { done: false, value: piece });
+      clearIntakeStateCache(db);
+      assert.throws(() => pending.next(), /expired|disposed|authority|stale|generation/);
+      assert.deepEqual(
+        [...start()],
+        expected,
+        'new traversal at unchanged logical binding remains usable',
+      );
+    });
+
+test('whole-envelope stream cannot renew its lifetime between lexical cells', async (t) => {
+  const { db, source } = fixture(t, '{"one":1,"two":2,"intake":{"version":1}}');
+  await buildIntakeCollectionEnvelope(db, source);
+  const selected = collectionCellReader(db, source),
+    control = parseSchemaControl(
+      selected.collections.get(
+        selected.collections.openView(),
+        'logical',
+        'envelope.control',
+        'representation',
+      ),
+    ),
+    pending = iterateSchemaEnvelopeText(selected.store, control);
+  assert.equal(pending.next().value, '{"one":');
+  assert.equal(pending.next().value, '1');
+  clearIntakeStateCache(db);
+  assert.throws(() => pending.next(), /expired|disposed|authority|stale|generation/);
+});
+
+test('captured field and envelope traversals cannot rebind to a later logical generation before first next', async (t) => {
+  const { db, source } = fixture(t, { intake: { version: 1 }, value: 'Fictional unchanged value' });
+  await buildIntakeCollectionEnvelope(db, source);
+  const selected = collectionCellReader(db, source),
+    collections = selected.collections,
+    control = parseSchemaControl(
+      collections.get(collections.openView(), 'logical', 'envelope.control', 'representation'),
+    ),
+    reader = openIntakeCollectionEnvelope(db, source),
+    root = reader.root(),
+    pending = [
+      reader.fieldChunks(root, 'value'),
+      intakeEnvelopeFieldAccess(reader).chunks(root, 'value')!,
+      reader.recordChunks(root),
+      iterateSchemaEnvelopeText(selected.store, control),
+    ].map((chunks) => chunks[Symbol.iterator]());
+  const operationId = randomUUID(),
+    prepared = collections.prepare(collections.openView(), {
+      operationId,
+      requestDigest: createHash('sha256').update(operationId).digest('hex'),
+      domainVersion: selected.head.logical.domainVersion + 1,
+      changes: [
+        { area: 'logical', collection: 'unrelated', op: 'put', key: 'status', value: 'changed' },
+      ],
+    });
+  transaction(db, () => collections.stage(prepared));
+  for (const iterator of pending) assert.throws(() => iterator.next(), /stale|authority|expired/);
+});
+
+test('direct lexical cell stream refuses buffered resumption after disposal', async (t) => {
+  const { db, source } = fixture(t, { intake: { version: 1 }, value: 'f'.repeat(12000) });
+  await buildIntakeCollectionEnvelope(db, source);
+  const { store, collections } = collectionCellReader(db, source),
+    control = parseSchemaControl(
+      collections.get(collections.openView(), 'logical', 'envelope.control', 'representation'),
+    ),
+    target = JSON.parse(store.get('f:' + control.root + ':' + schemaKey('value')) as string) as {
+      id: string;
+    },
+    pending = iterateSchemaCellText(store, 'c:' + target.id);
+  assert.equal(pending.next().done, false);
+  await setImmediate();
+  clearIntakeStateCache(db);
+  assert.throws(() => pending.next(), /expired/);
+  assert.equal(
+    [...iterateSchemaCellText(store, 'c:' + target.id)].join(''),
+    JSON.stringify('f'.repeat(12000)),
+  );
+});
+
+for (const terminal of [false, true])
+  test(`field traversal seals disposal during a returning current check: ${terminal ? 'terminal' : 'buffered'}`, async (t) => {
+    const { db, source } = fixture(t, {
+      intake: { version: 1 },
+      value: terminal ? 'Fictional inline' : 'f'.repeat(12000),
+    });
+    await buildIntakeCollectionEnvelope(db, source);
+    const selected = collectionCellReader(db, source),
+      control = parseSchemaControl(
+        selected.collections.get(
+          selected.collections.openView(),
+          'logical',
+          'envelope.control',
+          'representation',
+        ),
+      );
+    let armed = false,
+      disposed = false;
+    const store = {
+      ...selected.store,
+      check() {
+        if (armed) {
+          armed = false;
+          disposed = true;
+          clearIntakeStateCache(db);
+        }
+        selected.store.check();
+      },
+    };
+    const reader = createSchemaEnvelopeReader(store, control, selected.head.logical),
+      pending = reader.fieldChunks(reader.root(), 'value')[Symbol.iterator]();
+    assert.equal(pending.next().done, false);
+    armed = true;
+    assert.throws(() => pending.next(), /expired/);
+    assert.equal(
+      disposed,
+      true,
+      'logical check refreshed normally after disposing the old stream registry',
+    );
+  });
+
+for (const change of ['cache', 'logical', 'auxiliary'] as const)
+  test(`cooperative scalar-facts traversal checks ${change} between cells`, async (t) => {
+    const { db, source } = fixture(t, {
+      intake: { version: 1 },
+      ...Object.fromEntries(Array.from({ length: 65 }, (_, n) => ['fictional' + n, n])),
+    });
+    await buildIntakeCollectionEnvelope(db, source);
+    const pending = intakeEnvelopeMissingScalarFactsSteps(db, source);
+    assert.deepEqual(pending.next(), { done: false, value: undefined });
+    await setImmediate();
+    if (change === 'cache') clearIntakeStateCache(db);
+    else {
+      const { collections, head } = collectionCellReader(db, source),
+        id = randomUUID(),
+        prepared = collections.prepare(collections.openView(), {
+          operationId: id,
+          requestDigest: createHash('sha256').update(id).digest('hex'),
+          domainVersion: head.logical.domainVersion + (change === 'logical' ? 1 : 0),
+          changes: [
+            {
+              area: change === 'logical' ? 'logical' : 'builds',
+              collection: 'unrelated',
+              op: 'put',
+              key: 'status',
+              value: 'changed',
+            },
+          ],
+        });
+      if (change === 'auxiliary') collections.commitMaintenance(prepared);
+      else transaction(db, () => collections.stage(prepared));
+    }
+    if (change === 'auxiliary') assert.deepEqual(pending.next(), { done: true, value: undefined });
+    else assert.throws(() => pending.next(), /expired|stale|authority/);
+  });
 
 test('selected build proof is bound to its original read and consumed once', async (t) => {
   const { db, source, identity } = fixture(t, { intake: { version: 7 } });

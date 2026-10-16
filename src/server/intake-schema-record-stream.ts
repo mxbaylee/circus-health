@@ -6,6 +6,30 @@ const fail = (reason: string): never => {
   throw Error(`Intake collection envelope: ${reason}`);
 };
 
+/** Capture once at the first actual next(), never renew a resumed traversal.
+ * Historical graph ports keep their own immutable-authority check contract. */
+export function* checkedEnvelopeChunks<T>(
+  store: EnvelopeCellReader,
+  chunks: Iterable<T>,
+): Generator<T> {
+  store.check();
+  const retained = store.retainRead?.();
+  const iterator = chunks[Symbol.iterator]();
+  try {
+    while (true) {
+      retained?.();
+      const next = iterator.next();
+      retained?.();
+      store.check();
+      retained?.();
+      if (next.done) return;
+      yield next.value;
+    }
+  } finally {
+    iterator.return?.();
+  }
+}
+
 export function textValue(store: EnvelopeCellReader, key: string, max = 8192): string {
   const value = store.get(key);
   if (typeof value === 'string') {
