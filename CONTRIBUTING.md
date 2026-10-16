@@ -151,6 +151,18 @@ guard did not cover that sequence. Header visits, counted read bytes and exact
 confirmation/replay results remain the evidence. This guard is not a response-time
 target or a claim of constant history cost.
 
+The fragmented-PDF identity regression guards each independent mode/variation
+fixture separately: six legacy and six native cases, each with the default
+30-second guard and its own database, source and proposal. The cases run
+sequentially, sharing only two immutable PDF byte inputs. They retain six native
+envelope builds, all identity confirmation/refusal checks and zero accepted
+clinical writes. Moving from two parents containing six fixtures each to twelve
+top-level cases increases the effective aggregate allowance from 2 × 30 seconds
+to 12 × 30 seconds; the CI job budget is unchanged. The guarded unit is now one
+complete fresh fixture. This split does not reduce, explain or qualify the native
+work cost, and a uniform per-fixture slowdown can consume more aggregate time
+before a guard fires. Work reduction still needs separate counted evidence.
+
 Node suites run at most two files concurrently; browser and retained-history suites run one. These fixtures perform real PDF extraction, encryption and archive rebuilds; allowing concurrency to grow with the host CPU count can starve their bounded waits. HTTP upload tests should observe the automatically queued conversion rather than start a competing conversion immediately after upload. Large report fixtures establish each report-wide identity once; they retain representative row/version counts and full acceptance/rebuild assertions.
 
 The workflows in `.github/workflows/` run the full validation lanes on pull requests and remain useful for reproducing individual jobs or shards locally when CI failures persist. Server tests use sixteen deterministic file shards and browser tests use six, with fail-fast disabled so one failure does not hide another lane's results. Server jobs retain a 30-minute budget; browser jobs allow 20 minutes including setup. These finite host budgets cover large encrypted recovery and browser journeys and do not establish product latency. Each browser runner builds assets once; the unit lane owns type checking. The ordinary `build` command still includes type checking. To reproduce a server shard locally, append `-- --test-shard=1/16` through `16/16` to `npm run test:server`; for a browser shard, append `-- --test-shard=1/6` through `6/6` to `npm run test:browser:run`. Console logs retain assertions and the slow-test summary. On GitHub Actions, the reporter also publishes up to 50 bounded failure annotations containing test names and error causes, with an explicit omission notice if more failures occur. These help identify failures when full logs are unavailable; they do not change test results or budgets. Reruns are explicit validation runs, not a mechanism to turn a flaky test green.
