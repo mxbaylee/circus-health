@@ -560,42 +560,132 @@ test('partial v1 saves independent valid approvals and retains stale, blocked an
 });
 for (const n of [2, 10])
   test(`small independent partial saves prepare and publish one bounded clinical unit N=${n}`, async (t) => {
-    const objects = new Map<string, Buffer>();
-    const diagnostic =
-      process.env.CRS_PARTIAL_ACCEPTANCE_QUALIFY === '1'
-        ? createRecordPublicationDiagnostic(objects)
-        : undefined;
-    const clinicalPublications: number[] = [];
-    let armed = false;
-    const storage: RecordStorage = {
-      read: (name) => objects.get(name) || null,
-      writeImmutable(name, value) {
-        const previous = objects.get(name);
-        if (previous) assert.deepEqual(value, previous, 'Immutable object content changed');
-        objects.set(name, Buffer.from(value));
-        diagnostic?.immutable(name, value.length);
-      },
-      publishHead(value) {
-        objects.set('head', Buffer.from(value));
-        diagnostic?.published(value);
-        if (!armed) return;
-        const count = Number(f.db.prepare('SELECT count(*) n FROM observations').get()!.n);
-        if (count > (clinicalPublications.at(-1) || 0)) clinicalPublications.push(count);
+    let root = mkdtempSync(join(tmpdir(), 'fictional-small-unit-acceptance-'));
+    const profileId = 'cookie-dough';
+    let opened: Fixture['db'] | undefined;
+    let ownedStorage: ReturnType<typeof openContributorRecordStorage> | undefined;
+    let observation: ReturnType<typeof observeContributorRecordStorageWork> | undefined;
+    let restoreRename: (() => void) | undefined;
+    t.after(() => {
+      let failed = false;
+      let failure: unknown;
+      const attempt = (cleanup: () => void) => {
+        try {
+          cleanup();
+        } catch (error) {
+          if (!failed) {
+            failed = true;
+            failure = error;
+          }
+        }
+      };
+      attempt(() => restoreRename?.());
+      attempt(() => observation?.close());
+      if (opened?.isOpen) {
+        attempt(() => clearIntakeStateCache(opened!));
+        attempt(() => opened!.close());
+      }
+      attempt(() => ownedStorage?.close());
+      attempt(() => rmSync(root, { recursive: true, force: true }));
+      if (failed) throw failure;
+    });
+    root = realpathSync.native(root);
+    const f = {
+      root,
+      profileId,
+      db: openDatabase(ensureProfileDirectories(root, profileId).database, profileId),
+    };
+    opened = f.db;
+    const storage = openContributorRecordStorage(root, profileId, { initialize: true });
+    ownedStorage = storage;
+    const diagnose = process.env.CRS_PARTIAL_ACCEPTANCE_QUALIFY === '1';
+    const work = observeContributorRecordStorageWork(storage, diagnose ? 1_000_000 : 0);
+    observation = work;
+    const base = contributorAuthorityPath(root, profileId);
+    const headPath = join(base, 'head');
+    // Detached diagnostic reads do not replace or invoke factory methods, and
+    // retain no second copy of the fictional accepted payloads.
+    const objects = {
+      get(name: string) {
+        assert.match(name, /^objects\/[0-9a-f-]{36}$/);
+        try {
+          return readFileSync(join(base, name));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          throw error;
+        }
       },
     };
-    const f = fixture(t, storage);
-    diagnostic?.phase('upload');
+    const diagnostic = diagnose ? createRecordPublicationDiagnostic(objects) : undefined;
+    const clinicalPublications: number[] = [];
+    let eventCursor = 0;
+    const drainEvents = () => {
+      if (!diagnostic) return;
+      const retained = work.events(eventCursor);
+      assert.equal(retained.dropped, 0, 'Publication diagnostic event inventory overflowed');
+      for (const event of retained.events) diagnostic.immutable(event.name, event.bytes);
+      eventCursor = retained.count;
+    };
+    let physicalHeads = 0,
+      physicalHeadBytes = 0;
+    let phaseHeads = 0,
+      phaseHeadBytes = 0;
+    let phaseWork = work.snapshot();
+    const settlePhase = (next?: string) => {
+      drainEvents();
+      const current = work.snapshot();
+      assert.equal(physicalHeads - phaseHeads, current.headWrites - phaseWork.headWrites);
+      assert.equal(physicalHeadBytes - phaseHeadBytes, current.headBytes - phaseWork.headBytes);
+      phaseHeads = physicalHeads;
+      phaseHeadBytes = physicalHeadBytes;
+      phaseWork = current;
+      if (next) diagnostic?.phase(next);
+    };
+    const writes = () => {
+      const { immutableWrites, immutableBytes, headWrites, headBytes } = work.snapshot();
+      return { immutableWrites, immutableBytes, headWrites, headBytes };
+    };
+    let armed = false;
+    const nativeRename = fs.renameSync;
+    const observer = t.mock.method(
+      fs,
+      'renameSync',
+      (...args: Parameters<typeof fs.renameSync>) => {
+        nativeRename(...args);
+        if (String(args[1]) === headPath) {
+          // HEAD is host-visible here, before the factory's directory sync and
+          // readback. Settled phases separately reconcile successful transports.
+          physicalHeads++;
+          physicalHeadBytes += fs.statSync(headPath).size;
+          drainEvents();
+          if (diagnostic) diagnostic.published(readFileSync(headPath));
+          if (!armed) return;
+          const count = Number(f.db.prepare('SELECT count(*) n FROM observations').get()!.n);
+          if (count > (clinicalPublications.at(-1) || 0)) clinicalPublications.push(count);
+        }
+      },
+    );
+    restoreRename = () => {
+      try {
+        observer.mock.restore();
+      } finally {
+        syncBuiltinESMExports();
+      }
+    };
+    syncBuiltinESMExports();
+    attachRecordDurability(f.db, { profileId, storage });
+    settlePhase('upload');
     const item = upload(
       f,
       Array.from({ length: n }, (_, index) => envelope(`fictional-small-unit-${index}`)),
     );
-    diagnostic?.phase('approval');
+    settlePhase('approval');
     const input = partial(f, block(f, item.id));
-    diagnostic?.phase('adoption');
+    settlePhase('adoption');
     await intake.ensureNativeIntakeSchema(f.db, f.profileId, item.id);
     const before = intakeWorkCounters(f.db).warm.collectionClinicalReviewPreparations;
     armed = true;
-    diagnostic?.phase('save');
+    settlePhase('save');
     const result = await acceptPartial(f, input);
     const preparations =
       intakeWorkCounters(f.db).warm.collectionClinicalReviewPreparations - before;
@@ -603,15 +693,21 @@ for (const n of [2, 10])
     assert.equal(result.receipt.acceptedCount, n);
     assert.equal(preparations, 2);
     assert.deepEqual(clinicalPublications, [n]);
-    diagnostic?.phase('replay');
+    settlePhase('replay');
+    const settledWrites = writes();
     assert.deepEqual((await acceptPartial(f, input)).receipt, result.receipt);
     assert.deepEqual(clinicalPublications, [n]);
     assert.equal(intakeWorkCounters(f.db).warm.collectionClinicalReviewPreparations - before, 2);
+    assert.deepEqual(writes(), settledWrites, 'Exact receipt replay must not publish records');
+    settlePhase();
     if (diagnostic)
       process.stderr.write(
         JSON.stringify({
           audit: 'partial-publication-callers-v1',
           n,
+          headObservationBoundary: 'after native rename, before directory sync and readback',
+          successfulHeadWrites: phaseWork.headWrites,
+          successfulHeadBytes: phaseWork.headBytes,
           ...diagnostic.inventory(f.db),
         }) + '\n',
       );

@@ -6,7 +6,9 @@ import {
 
 /** Opt-in fictional diagnostic. Retains O(write events + publications) metadata
  * and caller stacks, without retaining a second copy of any clinical payload. */
-export function createRecordPublicationDiagnostic(objects: ReadonlyMap<string, Buffer>) {
+export function createRecordPublicationDiagnostic(
+  objects: Pick<ReadonlyMap<string, Buffer>, 'get'>,
+) {
   const events: ImmutableWriteEvent[] = [];
   const publications: Array<{
     phase: string;

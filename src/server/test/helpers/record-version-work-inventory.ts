@@ -107,7 +107,7 @@ export type ImmutableWriteEvent = { name: string; bytes: number };
  * This aggregate diagnostic reuses the fixture's object Map and retains O(events)
  * event metadata; it does not claim constant diagnostic memory. */
 export function encodedRecordObjectInventory(
-  objects: ReadonlyMap<string, Buffer>,
+  objects: Pick<ReadonlyMap<string, Buffer>, 'get'>,
   events: readonly ImmutableWriteEvent[],
   afterEvent: number,
   throughEvent = events.length,
