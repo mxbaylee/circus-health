@@ -2,12 +2,13 @@ import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, transaction } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
+import { clearIntakeStateCache } from '../intake-state-storage.ts';
 import {
   applyAcceptanceGroup,
   acceptIntakeReportSelection,
@@ -51,18 +52,26 @@ import { IncomingMessage } from 'node:http';
 import { Socket } from 'node:net';
 
 function fixture(t: TestContext, storage?: RecordStorage | 'memory') {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-counted-acceptance-')),
-    profileId = 'cookie-dough';
+  let root = mkdtempSync(join(tmpdir(), 'fictional-counted-acceptance-'));
+  const profileId = 'cookie-dough';
+  let opened: ReturnType<typeof openDatabase> | undefined;
+  t.after(() => {
+    try {
+      if (opened) clearIntakeStateCache(opened);
+    } finally {
+      try {
+        if (opened?.isOpen) opened.close();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+  root = realpathSync.native(root);
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+  opened = db;
   if (storage === 'memory') memoryRecordAuthority(db);
   else if (storage) attachRecordDurability(db, { profileId, storage });
   else attachPersonalDurability(db, { root, profileId });
-  t.after(() => {
-    try {
-      db.close();
-    } catch {}
-    rmSync(root, { recursive: true, force: true });
-  });
   return { root, profileId, db };
 }
 type Fixture = ReturnType<typeof fixture>;
@@ -1455,7 +1464,7 @@ test('partial commit groups reject a cached unavailable review instead of reread
 
 for (const restoreValue of [false, true])
   test(`a chosen comparison ${restoreValue ? 'history' : 'value'} changed between partial batches rejects its old approval while independent saves remain`, async (t) => {
-    const f = fixture(t, 'memory');
+    const f = fixture(t);
     const target = upload(f, [envelope('fictional-compared-marker')]);
     const accepted = accept(f, request(block(f, target.id))).receipt;
     const destination = accepted.receipts[0]!.records[0]!.entityId;
