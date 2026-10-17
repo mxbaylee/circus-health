@@ -839,10 +839,14 @@ test('SQL replacement preimages stay exact after rollback across sequence digit 
 });
 test('legacy approvals survive native adoption, later partial saves and journal-only restart', async (t) => {
   const f = fixture(t);
-  const { item, originalHash, expectedHash } = await prepare(f, 'legacy', 4);
-  const approved = await block(f, 'legacy', item.id, 0, 4);
+  const prepared = await f.measure('routine-initial-preparation', () => prepare(f, 'legacy', 4));
+  const { item, originalHash, expectedHash } = prepared.result;
+  const reviewed = await f.measure('routine-human-review', () => block(f, 'legacy', item.id, 0, 4));
+  const approved = reviewed.result;
   const version = intakeSourceVersion(f.db, item.id);
-  await intake.ensureNativeIntakeSchema(f.db, f.profileId, item.id);
+  await f.measure('routine-native-adoption', () =>
+    intake.ensureNativeIntakeSchema(f.db, f.profileId, item.id),
+  );
   assert.equal(intake.hasNativeIntakeSchema(f.db, f.profileId, item.id), true);
   const adopted = intakeSourceVersion(f.db, item.id);
   assert.equal(adopted.rawVersion, version.rawVersion);
