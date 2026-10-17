@@ -302,10 +302,10 @@ for (const v5 of [false, true])
       assert.equal(live.reads.length, v5 ? 25 : 17);
       assert.equal(live.yields, v5 ? 41 : 37);
       assert.equal(generic.callbacks, v5 ? 6483 : 6434);
-      assert.equal(live.callbacks, v5 ? 1752 : 1695);
+      assert.equal(live.callbacks, v5 ? 1424 : 1367);
       assert.ok(
-        live.callbacks < 1800,
-        'tiny tagged graph seals each canonical point/owned row with full policy checks',
+        live.callbacks < 1450,
+        'tiny tagged graph seals canonical points/owned rows and avoids work-accounting metadata rereads',
       );
       assert.ok(
         generic.callbacks > 6300,

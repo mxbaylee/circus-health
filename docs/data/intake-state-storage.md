@@ -83,6 +83,16 @@ reject reentry during an interval. A malformed later row or failed authority
 check invalidates the invocation and erases its keys. Generic and copy callers
 retain their original per-page checks and failure behavior.
 
+Live canonical preparation reserves its scratch before invoking the original
+authority callback or resetting it. Reentrant acquisition or closure during
+that reservation invalidates the preparation even if the callback catches the
+refusal; cleanup preserves the original failure and erases the keys. An ordinary
+attempt to reuse scratch already held by an existing preparation still reports
+that it is in use, and releasing that preparation permits healthy reuse.
+Private byte counters advance only after successful checked spool appends and
+supply work-accounting lengths. Public length reads and native append, flush and
+read checks remain unchanged. These counters cannot authorize a read or write.
+
 Each primitive scope retains at most 128 decoded pages; a graph with legacy
 replay can own three such scopes, plus the canonical engine's separate fixed
 caches. Capacity accounting is per scope, not a combined installation budget.

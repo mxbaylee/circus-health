@@ -766,6 +766,14 @@ changes disposable scratch work only; use the same restart procedure, with no
 retained-format migration or configuration change. See the
 [scratch lifetime and authority contract](../data/intake-state-storage.md).
 
+Live canonical preparation also reserves scratch before authority callbacks or
+reset, preventing a recursive preparation from replacing an earlier one's data.
+Caught reentry refuses the outer preparation and erases its scratch keys.
+Successful native writes update private byte counters for work accounting;
+public length reads and storage checks remain required. Restart into the
+reviewed build; accepted formats, prior-build readability and settings do not
+change, and no migration is needed.
+
 Native intake command preparation now builds its nonresumable candidate in
 private disk-backed storage and publishes only the final selected graph. Its
 auxiliary indexes retain the same original source and logical-owner checks;

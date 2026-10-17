@@ -208,13 +208,51 @@ class ScratchSet {
 }
 class EncryptedScratchSet {
   readonly data: ReturnType<typeof createEncryptedCanonicalIndex>;
+  readonly liveWorkAccounting: boolean;
   private readonly current: () => void;
+  private acquiring = false;
+  private acquisitionRefusal?: Error;
   busy = false;
   closed = false;
   uses = 0;
   constructor(options: IntakeEncryptedCanonicalOptions) {
-    this.current = options.assertCurrent;
-    this.data = createEncryptedCanonicalIndex(options);
+    const { assertCurrent, livePointChecks, ...owned } = options;
+    this.liveWorkAccounting = livePointChecks === true;
+    if (!this.liveWorkAccounting) {
+      // Keep the original generic constructor's policy selections and cadence.
+      this.current = assertCurrent;
+      this.data = createEncryptedCanonicalIndex({
+        ...owned,
+        assertCurrent: options.assertCurrent,
+        livePointChecks: false,
+      });
+      return;
+    }
+    // One captured mode/policy drives both engine and adapter. No later read of
+    // caller-owned options can rebind authority or select a different mode.
+    this.current = () => {
+      this.localCurrent();
+      assertCurrent();
+      this.localCurrent();
+    };
+    this.data = createEncryptedCanonicalIndex({
+      ...owned,
+      assertCurrent: this.current,
+      livePointChecks: true,
+    });
+  }
+  private localCurrent() {
+    if (this.acquisitionRefusal) throw this.acquisitionRefusal;
+    if (this.closed) throw Error('JSON canonical scratch is closed');
+  }
+  private refuseAcquisition(): never {
+    this.acquisitionRefusal ??= Error('JSON canonical scratch reentrant acquisition');
+    throw this.acquisitionRefusal;
+  }
+  closeHandle() {
+    if (this.liveWorkAccounting && this.acquiring) this.refuseAcquisition();
+    if (this.busy) throw Error('JSON canonical scratch is in use');
+    this.close();
   }
   check() {
     if (this.closed) throw Error('JSON canonical scratch is closed');
@@ -229,7 +267,30 @@ class EncryptedScratchSet {
   }
   acquire(_mode: 'canonical' | 'stringify') {
     if (this.closed) throw Error('JSON canonical scratch is closed');
+    if (this.liveWorkAccounting && this.acquiring) this.refuseAcquisition();
     if (this.busy) throw Error('JSON canonical scratch is in use');
+    if (this.liveWorkAccounting) {
+      // Reserve before any policy callback or reset. A caught nested acquire
+      // cannot create an inner preparation which this reset would overwrite.
+      this.busy = this.acquiring = true;
+      try {
+        this.check();
+        this.data.reset();
+        this.localCurrent();
+        this.uses++;
+      } catch (error) {
+        try {
+          this.close();
+        } catch {
+          /* Keep the original refusal after erasure. */
+        }
+        throw error;
+      } finally {
+        this.acquiring = false;
+        if (this.closed) this.busy = false;
+      }
+      return;
+    }
     this.check();
     this.data.reset();
     this.busy = true;
@@ -255,6 +316,7 @@ function scratchHandle(set: CanonicalScratchSet): IntakeJsonCanonicalScratch {
       return Math.max(0, set.uses - 1);
     },
     close() {
+      if (set instanceof EncryptedScratchSet) return set.closeHandle();
       if (set.busy) throw Error('JSON canonical scratch is in use');
       set.close();
     },
@@ -498,13 +560,26 @@ class Spool {
     }
   }
 }
+const typedArrayLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  'length',
+)!.get!;
 class EncryptedSpool {
   private sealed = -1;
+  private ownedBytes?: number;
   private readonly spool: CanonicalByteSpool;
   private readonly work: IntakeJsonCanonicalWork;
-  constructor(spool: CanonicalByteSpool, work: IntakeJsonCanonicalWork) {
+  constructor(
+    spool: CanonicalByteSpool,
+    work: IntakeJsonCanonicalWork,
+    liveWorkAccounting = false,
+  ) {
     this.spool = spool;
     this.work = work;
+    // Each engine exclusively acquires/resets its set before constructing these
+    // wrappers. Only private work accounting uses this ledger; public length
+    // and every native append/flush/read keep their original full checks.
+    if (liveWorkAccounting) this.ownedBytes = 0;
     work.maxBufferBytes = Math.max(work.maxBufferBytes, BUFFER);
   }
   get length() {
@@ -514,12 +589,25 @@ class EncryptedSpool {
     this.appendBytes(Buffer.from(text));
   }
   appendBytes(bytes: Uint8Array) {
+    if (this.ownedBytes !== undefined) {
+      const before = this.ownedBytes,
+        count = Reflect.apply(typedArrayLength, bytes, []) as number;
+      this.spool.appendBytes(bytes);
+      // Native append's safeAdd already enforces its exact logical byte range.
+      // No counter advances on failure, including a partially installed chunk.
+      const after = before + count;
+      if (!Number.isSafeInteger(after)) throw Error('JSON scratch byte count overflow');
+      this.ownedBytes = after;
+      this.work.scratchWrittenBytes +=
+        (Math.floor(after / 4096) - Math.floor(before / 4096)) * 4096;
+      return;
+    }
     const before = Math.floor(this.length / 4096);
     this.spool.appendBytes(bytes);
     this.work.scratchWrittenBytes += (Math.floor(this.length / 4096) - before) * 4096;
   }
   flush() {
-    const length = this.length;
+    const length = this.ownedBytes ?? this.length;
     this.spool.flush();
     if (this.sealed !== length) this.work.scratchWrittenBytes += length % 4096;
     this.sealed = length;
@@ -621,6 +709,18 @@ class CanonicalEngine {
       } else set = new ScratchSet();
       set.acquire(mode);
     } catch (error) {
+      if (set instanceof EncryptedScratchSet && set.liveWorkAccounting) {
+        // Terminal acquisition failures own revocation; ordinary busy rejection
+        // leaves the shared set healthy. Delegated cleanup preserves either
+        // first refusal rather than replacing it with an input/observer error.
+        try {
+          this.iterator.return?.();
+        } catch {}
+        try {
+          this.onWork?.(Object.freeze({ ...this.work }));
+        } catch {}
+        throw error;
+      }
       if (set && !shared) set.close();
       this.iterator.return?.();
       this.onWork?.(Object.freeze({ ...this.work }));
@@ -631,8 +731,8 @@ class CanonicalEngine {
       this.index = set.data.index;
       this.keyChunkUnits = 128;
       this.statements = new Map();
-      this.raw = new EncryptedSpool(set.data.raw, this.work);
-      this.output = new EncryptedSpool(set.data.output, this.work);
+      this.raw = new EncryptedSpool(set.data.raw, this.work, set.liveWorkAccounting);
+      this.output = new EncryptedSpool(set.data.output, this.work, set.liveWorkAccounting);
     } else {
       this.scratch = set.scratch;
       this.statements = set.statements;
