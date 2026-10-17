@@ -225,6 +225,7 @@ function* inspectGraphSteps(
           // The legacy ancestor is evidence beneath this exact outer V4/V5
           // selection. All transitive replay/canonical scratch shares its seal.
           encryptedScratch: { selectedHead: rawHead, assertCurrent: checkpoint },
+          liveCanonicalPointChecks: liveSummaryChecks,
         },
       );
       for (const key of legacyReplay.consumed()) {

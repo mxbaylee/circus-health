@@ -759,6 +759,13 @@ Complete reconstruction still traverses accepted history and validates the
 selected intake graph. The focused recovery evidence does not establish full
 64-record acceptance/recovery or general release-pair compatibility.
 
+Live graph validation also avoids repeated full authority proofs inside fixed
+encrypted canonical index operations, while retaining original entry/exit
+checks, reentry refusal and per-page checks outside those operations. This
+changes disposable scratch work only; use the same restart procedure, with no
+retained-format migration or configuration change. See the
+[scratch lifetime and authority contract](../data/intake-state-storage.md).
+
 Native intake command preparation now builds its nonresumable candidate in
 private disk-backed storage and publishes only the final selected graph. Its
 auxiliary indexes retain the same original source and logical-owner checks;

@@ -2,7 +2,8 @@ import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import fs, { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, transaction } from '../database.ts';
@@ -19,6 +20,11 @@ import { createBackup } from '../recovery.ts';
 import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { attachRecordDurability, rebuildRecordDatabase } from '../record-versions.ts';
 import type { RecordStorage } from '../record-versions.ts';
+import {
+  contributorAuthorityPath,
+  observeContributorRecordStorageWork,
+  openContributorRecordStorage,
+} from '../contributor-record-storage.ts';
 import { handleIntakeRoute } from '../intake-routes.ts';
 import { planIntakeReportAcceptance } from '../intake-acceptance-plan.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
@@ -996,23 +1002,49 @@ test('one stale approval in a bounded batch leaves every independent sibling sav
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 199);
 });
 test('a lost acknowledgement for 200 batched approvals rebuilds once under the original operation', async (t) => {
-  const objects = new Map<string, Buffer>();
-  let loseClinicalAcknowledgement = false;
-  const storage: RecordStorage = {
-    read: (name) => objects.get(name) || null,
-    writeImmutable(name, bytes) {
-      objects.set(name, Buffer.from(bytes));
-    },
-    publishHead(bytes) {
-      objects.set('head', Buffer.from(bytes));
-      if (
-        loseClinicalAcknowledgement &&
-        Number(f.db.prepare('SELECT count(*) n FROM observations').get()!.n) === 200
-      )
-        throw Error('Fictional lost batch acknowledgement');
-    },
+  let root = mkdtempSync(join(tmpdir(), 'fictional-batched-acknowledgement-'));
+  const profileId = 'cookie-dough';
+  const opened: Fixture['db'][] = [];
+  let ownedStorage: ReturnType<typeof openContributorRecordStorage> | undefined;
+  let restoreRename: (() => void) | undefined;
+  t.after(() => {
+    let failed = false;
+    let failure: unknown;
+    const attempt = (cleanup: () => void) => {
+      try {
+        cleanup();
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          failure = error;
+        }
+      }
+    };
+    attempt(() => restoreRename?.());
+    for (const db of opened)
+      if (db.isOpen) {
+        attempt(() => clearIntakeStateCache(db));
+        attempt(() => db.close());
+      }
+    attempt(() => ownedStorage?.close());
+    attempt(() => rmSync(root, { recursive: true, force: true }));
+    if (failed) throw failure;
+  });
+  root = realpathSync.native(root);
+  const f = {
+    root,
+    profileId,
+    db: openDatabase(ensureProfileDirectories(root, profileId).database, profileId),
   };
-  const f = fixture(t, storage);
+  opened.push(f.db);
+  const storage = openContributorRecordStorage(root, profileId, { initialize: true });
+  ownedStorage = storage;
+  attachRecordDurability(f.db, { profileId, storage });
+  const observation = observeContributorRecordStorageWork(storage);
+  const writes = () => {
+    const { immutableWrites, immutableBytes, headWrites, headBytes } = observation.snapshot();
+    return { immutableWrites, immutableBytes, headWrites, headBytes };
+  };
   const item = upload(
     f,
     Array.from({ length: 200 }, (_, index) => envelope(`fictional-rebuild-${index}`)),
@@ -1021,33 +1053,103 @@ test('a lost acknowledgement for 200 batched approvals rebuilds once under the o
   // Native adoption and review preparation precede the operation under test.
   // Arm the lost acknowledgement at the manifest/clinical boundary, not during adoption.
   await planIntakeReportAcceptance(f.db, f.root, f.profileId, input);
-  loseClinicalAcknowledgement = true;
-  await assert.rejects(() => acceptPartial(f, input), {
-    code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED',
+  const headPath = join(contributorAuthorityPath(root, profileId), 'head');
+  const nativeRename = fs.renameSync;
+  let armed = true,
+    lostAcknowledgements = 0;
+  let ambiguousHead: Buffer | undefined;
+  const fault = t.mock.method(fs, 'renameSync', (...args: Parameters<typeof fs.renameSync>) => {
+    nativeRename(...args);
+    if (
+      armed &&
+      String(args[1]) === headPath &&
+      Number(f.db.prepare('SELECT count(*) n FROM observations').get()!.n) === 200
+    ) {
+      armed = false;
+      lostAcknowledgements++;
+      ambiguousHead = readFileSync(headPath);
+      // HEAD is host-visible, but directory sync/readback has not completed.
+      throw Error('Fictional lost batch acknowledgement');
+    }
   });
-  loseClinicalAcknowledgement = false;
+  restoreRename = () => {
+    try {
+      fault.mock.restore();
+    } finally {
+      syncBuiltinESMExports();
+    }
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(() => acceptPartial(f, input), {
+      code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED',
+    });
+  } finally {
+    restoreRename();
+  }
+  assert.equal(lostAcknowledgements, 1);
+  assert.ok(ambiguousHead);
+  assert.deepEqual(readFileSync(headPath), ambiguousHead);
   attachRecordDurability(f.db, { profileId: f.profileId, storage });
   const recovered = getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId);
+  assert.equal(recovered.receipt.atomic, false);
+  if (recovered.receipt.atomic) throw Error('Expected partial receipt');
+  assert.equal(recovered.receipt.operationId, input.operationId);
+  assert.equal(recovered.receipt.selectedCount, 200);
   assert.equal(recovered.receipt.acceptedCount, 200);
-  assert.equal((await acceptPartial(f, input)).receipt.acceptedCount, 200);
+  assert.equal(recovered.receipt.items.length, 200);
+  assert.ok(recovered.receipt.items.every((entry) => entry.status === 'saved'));
+  assert.deepEqual(
+    recovered.receipt.items.map((entry) => ({
+      intakeId: entry.intakeId,
+      recordId: entry.recordId,
+      candidateId: entry.candidateId,
+      candidateVersionId: entry.candidateVersionId,
+      selectionReviewToken: entry.selectionReviewToken,
+    })),
+    input.blocks[0]!.selections.map((selection) => ({
+      intakeId: item.id,
+      recordId: selection.recordId,
+      candidateId: selection.candidateId,
+      candidateVersionId: selection.candidateVersionId,
+      selectionReviewToken: selection.selectionReviewToken,
+    })),
+  );
+  const settledWrites = writes();
+  assert.deepEqual((await acceptPartial(f, input)).receipt, recovered.receipt);
+  assert.deepEqual(
+    getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId).receipt,
+    recovered.receipt,
+  );
+  assert.deepEqual(writes(), settledWrites);
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 200);
   const target = join(f.root, 'partial-200-rebuilt.sqlite');
   await rebuildRecordDatabase(target, { profileId: f.profileId, storage });
   const db = openDatabase(target, f.profileId);
-  attachRecordDurability(db, { profileId: f.profileId, storage });
+  opened.push(db);
   try {
-    assert.equal(
-      getIntakeReportAcceptance(db, f.root, f.profileId, input.operationId).receipt.acceptedCount,
-      200,
+    attachRecordDurability(db, { profileId: f.profileId, storage });
+    assert.deepEqual(
+      getIntakeReportAcceptance(db, f.root, f.profileId, input.operationId).receipt,
+      recovered.receipt,
     );
-    assert.equal(
-      (await acceptIntakeReportSelectionAsync(db, f.root, f.profileId, input)).receipt
-        .acceptedCount,
-      200,
+    const rebuiltSettledWrites = writes();
+    assert.deepEqual(
+      (await acceptIntakeReportSelectionAsync(db, f.root, f.profileId, input)).receipt,
+      recovered.receipt,
     );
+    assert.deepEqual(
+      getIntakeReportAcceptance(db, f.root, f.profileId, input.operationId).receipt,
+      recovered.receipt,
+    );
+    assert.deepEqual(writes(), rebuiltSettledWrites);
     assert.equal(db.prepare('SELECT count(*) n FROM observations').get()!.n, 200);
   } finally {
-    db.close();
+    try {
+      clearIntakeStateCache(db);
+    } finally {
+      db.close();
+    }
   }
 });
 test('partial v1 pins exact records while unrelated intake changes do not invalidate approvals', async (t) => {

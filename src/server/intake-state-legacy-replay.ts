@@ -123,6 +123,8 @@ export function* prepareIntakeLegacyReplaySteps(
      * the legacy ancestor being replayed through a later V4/V5 anchor.
      * Capacity applies to each invocation; immutable pages remain until close. */
     encryptedScratch?: Omit<IntakeLegacyEncryptedScratchOptions, 'identity'>;
+    /** Private live graph only; generic/copy retain per-cell canonical checks. */
+    liveCanonicalPointChecks?: boolean;
   } = {},
 ): Generator<void, PreparedIntakeLegacyReplay> {
   const identity = validateIntakeIdentity(scope),
@@ -145,6 +147,7 @@ export function* prepareIntakeLegacyReplaySteps(
       checkpoint,
       work,
       options.encryptedScratch && { ...options.encryptedScratch, identity },
+      options.liveCanonicalPointChecks === true,
     ),
     db = state.db!,
     index = state.index;
@@ -714,6 +717,7 @@ class DiskIntakeValue {
     checkpoint: () => void,
     work: IntakeLegacyReplayWork,
     encrypted?: IntakeLegacyEncryptedScratchOptions,
+    liveCanonicalPointChecks = false,
   ) {
     this.checkpoint = checkpoint;
     this.work = work;
@@ -740,7 +744,10 @@ class DiskIntakeValue {
       this.encrypted = createIntakeLegacyEncryptedScratch(options);
       this.index = this.encrypted.index;
       try {
-        this.canonicalScratch = createEncryptedIntakeJsonCanonicalScratch(options);
+        this.canonicalScratch = createEncryptedIntakeJsonCanonicalScratch({
+          ...options,
+          livePointChecks: liveCanonicalPointChecks,
+        });
       } catch (error) {
         try {
           this.encrypted.close();

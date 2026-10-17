@@ -213,9 +213,7 @@ function stableIds(t: TestContext) {
 }
 for (const v5 of [false, true])
   test(
-    'live tagged V' +
-      (v5 ? '5' : '4') +
-      ' retains exact graph work with one full legacy policy path',
+    'live tagged V' + (v5 ? '5' : '4') + ' retains exact graph work with bounded canonical leaves',
     async (t) => {
       const reset = stableIds(t),
         f = await legacyFixture(v5),
@@ -304,10 +302,10 @@ for (const v5 of [false, true])
       assert.equal(live.reads.length, v5 ? 25 : 17);
       assert.equal(live.yields, v5 ? 41 : 37);
       assert.equal(generic.callbacks, v5 ? 6483 : 6434);
-      assert.equal(live.callbacks, v5 ? 3296 : 3239);
+      assert.equal(live.callbacks, v5 ? 1752 : 1695);
       assert.ok(
-        live.callbacks < 3400,
-        'tiny tagged graph has one full legacy policy callback per boundary',
+        live.callbacks < 1800,
+        'tiny tagged graph seals each canonical point/owned row with full policy checks',
       );
       assert.ok(
         generic.callbacks > 6300,

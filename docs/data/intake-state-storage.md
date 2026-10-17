@@ -73,6 +73,16 @@ replay failures close the owned scopes and erase their keys. External
 representation callbacks receive a closing authority check before validation
 returns or copy continues.
 
+Within live graph replay, canonical scratch also checks the original authority
+around each fixed point operation and each owned row written to its node, trie,
+output-position and member indexes. These intervals never span a batch, page,
+spool operation, parser step or yield. Rows and key chunks are detached without
+calling caller accessors or iterators; key chunks retain the parser's existing
+256-byte bound, without limiting total history. All index and spool methods
+reject reentry during an interval. A malformed later row or failed authority
+check invalidates the invocation and erases its keys. Generic and copy callers
+retain their original per-page checks and failure behavior.
+
 Each primitive scope retains at most 128 decoded pages; a graph with legacy
 replay can own three such scopes, plus the canonical engine's separate fixed
 caches. Capacity accounting is per scope, not a combined installation budget.
