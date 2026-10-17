@@ -45,6 +45,7 @@ import {
   prepareRetainedDuplicateEvidenceSnapshot,
 } from '../duplicate-evidence-snapshots.ts';
 import { canonicalLiteral } from '../intake-format.ts';
+import { openContributorRecordStorage } from '../contributor-record-storage.ts';
 import type { IntakeReviewDraft } from '../../shared/intake.ts';
 import {
   createOwnershipSourceSnapshotPreparation,
@@ -124,9 +125,10 @@ function withoutTransactionCounters(value: ReturnType<typeof snapshot>) {
 const acceptedSnapshot = (objects: Map<string, Buffer>) =>
   new Map([...objects].map(([key, bytes]) => [key, Buffer.from(bytes)]));
 
-function fixture(t: test.TestContext, count = 2) {
+function fixture(t: test.TestContext, count = 2, backend: 'memory' | 'contributor' = 'memory') {
   const root = mkdtempSync(join(tmpdir(), 'intake-bootstrap-'));
   const opened: Database[] = [];
+  const closeBackends: (() => void)[] = [];
   const open = (filename: string, profileId: string) => {
     const db = openDatabase(join(root, filename), profileId);
     opened.push(db);
@@ -137,11 +139,26 @@ function fixture(t: test.TestContext, count = 2) {
       clearIntakeStateCache(db);
       if (db.isOpen) db.close();
     }
+    for (const close of closeBackends) close();
     rmSync(root, { recursive: true, force: true });
   });
   const source = open('source.sqlite', sourceId);
   const sourceAuthority = memoryStorage();
   const targetAuthority = memoryStorage();
+  // Runtime collection writers require actual backend-owned publication proof.
+  // The remaining detached-graph tests keep their explicit in-memory inventory.
+  if (backend === 'contributor') {
+    for (const profileId of [sourceId, targetId])
+      mkdirSync(join(root, 'data', 'profiles', profileId), { recursive: true });
+    const sourceStorage = openContributorRecordStorage(root, sourceId, { initialize: true });
+    const targetStorage = openContributorRecordStorage(root, targetId, { initialize: true });
+    sourceAuthority.storage = sourceStorage;
+    targetAuthority.storage = targetStorage;
+    closeBackends.push(() => {
+      sourceStorage.close();
+      targetStorage.close();
+    });
+  }
   const originals: {
     id: string;
     hash: string;
@@ -336,9 +353,10 @@ function fixture(t: test.TestContext, count = 2) {
 }
 
 test('selected ownership and accepted correction snapshots remain readable after profile graph copy', async (t) => {
-  const f = fixture(t, 0),
+  const f = fixture(t, 0, 'contributor'),
     source = { id: 'fictional-audit-original' },
-    sourceHash = sha('Fictional audit original'),
+    originalBytes = Buffer.from('Fictional audit original'),
+    sourceHash = sha(originalBytes),
     initial = prepareInitialIntakeEnvelope({
       intake: {
         version: 1,
@@ -346,6 +364,11 @@ test('selected ownership and accepted correction snapshots remain readable after
         workflow: { format: 'health-intake-workflow-v1', reviewDrafts: [] },
       },
     });
+  for (const profileId of [sourceId, targetId]) {
+    const directory = join(f.root, 'data', 'profiles', profileId, 'sources');
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, 'fictional.txt'), originalBytes);
+  }
   transaction(f.source, () => {
     f.source
       .prepare(
@@ -355,7 +378,7 @@ test('selected ownership and accepted correction snapshots remain readable after
         source.id,
         `data/profiles/${sourceId}/sources/fictional.txt`,
         sourceHash,
-        24,
+        originalBytes.length,
         'intake_original',
         initial.detailsJson,
       );
@@ -474,7 +497,7 @@ test('selected ownership and accepted correction snapshots remain readable after
       evidence: () => duplicateRows,
     }),
     duplicateStage = await duplicateBuilder.finish(),
-    duplicateSelection = duplicateStage.prepareStandalone();
+    duplicateSelection = await duplicateStage.prepareStandalone();
   try {
     transaction(f.source, () => duplicateSelection.apply());
   } finally {

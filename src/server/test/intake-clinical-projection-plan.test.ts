@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { StatementSync } from 'node:sqlite';
+import { constants, StatementSync } from 'node:sqlite';
 import { randomUUID, createHash } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
-import { openDatabase, revision, transaction } from '../database.ts';
+import { openDatabase, revision, transaction, readOrdinaryCommitCursor } from '../database.ts';
 import { ensureProfileDirectories, profileOriginal } from '../profile-storage.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { uploadIntake } from '../intake.ts';
@@ -49,7 +49,12 @@ function publish<T>(
 ): Promise<T> {
   return withVerifiedClinicalProjectionPublication(db, plan, () => transaction(db, apply));
 }
-async function fixture(t: test.TestContext, clinical = true, scoped = false) {
+async function fixture(
+  t: test.TestContext,
+  clinical = true,
+  scoped = false,
+  setup?: (db: ReturnType<typeof openDatabase>) => void,
+) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-clinical-plan-')),
     profileId = 'fictional-profile';
   const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
@@ -61,6 +66,7 @@ async function fixture(t: test.TestContext, clinical = true, scoped = false) {
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
+  setup?.(db);
   const intake = uploadIntake(db, root, profileId, {
     filename: 'fictional.jsonl',
     newProviderName: 'Fictional clinic',
@@ -126,7 +132,19 @@ test('clinical projection preparation restores all SQL changes; ordinary apply p
     before = revision(db),
     work = intakeWorkCounters(db);
   cleanup.push(() => capture.close());
+  const cursorBefore = readOrdinaryCommitCursor(db);
   const plan = await prepareCollectionClinicalProjection(db, root, profileId, session, decisions);
+  const cursorAfter = readOrdinaryCommitCursor(db);
+  assert.equal(
+    cursorAfter.serial,
+    cursorBefore.serial,
+    'preview never publishes an ordinary transaction',
+  );
+  assert.equal(
+    cursorAfter.changes,
+    cursorAfter.settledChanges,
+    'rolled-back attempts are settled by their exact owner',
+  );
   cleanup.push(() => disposePreparedClinicalProjection(plan));
   assert.equal(capture.changeset().length, 0);
   assert.equal(revision(db), before);
@@ -776,3 +794,89 @@ for (const rewrite of [false, true])
     assert.equal(counts.worker, 1, 'the renewed witness spares a second sweep');
     assert.equal(counts.sync, 0);
   });
+
+for (const precompiled of [false, true])
+  test(`projection preview refuses ${precompiled ? 'precompiled ' : ''}callback COMMIT and rolls back NULL-key and unkeyed writes`, async (t) => {
+    const { db, root, profileId, session, decisions } = await fixture(t, true, false, (db) =>
+      db.exec(
+        'CREATE TABLE fictional_unkeyed(value TEXT); CREATE TABLE fictional_nullable(id TEXT PRIMARY KEY,value TEXT)',
+      ),
+    );
+    const commit = precompiled ? db.prepare('COMMIT') : undefined;
+    let attempted = false;
+    db.setAuthorizer((action, name) => {
+      if (!attempted && action === constants.SQLITE_INSERT && name === 'documents') {
+        attempted = true;
+        db.prepare("INSERT INTO fictional_unkeyed VALUES('Fictional unkeyed callback')").run();
+        db.prepare(
+          "INSERT INTO fictional_nullable VALUES(NULL,'Fictional NULL key callback')",
+        ).run();
+        try {
+          if (commit) commit.run();
+          else db.exec('COMMIT; BEGIN IMMEDIATE');
+        } catch {
+          /* The enclosing proof must also reject the swallowed control error. */
+        }
+      }
+      return constants.SQLITE_OK;
+    });
+    const before = revision(db);
+    await assert.rejects(
+      prepareCollectionClinicalProjection(db, root, profileId, session, decisions),
+    );
+    assert.equal(attempted, true, 'the attack reaches actual staging');
+    assert.equal(db.isTransaction, false);
+    assert.equal(revision(db), before);
+    assert.equal(db.prepare('SELECT count(*) n FROM fictional_unkeyed').get()!.n, 0);
+    assert.equal(db.prepare('SELECT count(*) n FROM fictional_nullable').get()!.n, 0);
+    assert.equal(
+      db.prepare("SELECT count(*) n FROM documents WHERE id LIKE 'import:%'").get()!.n,
+      0,
+    );
+    db.setAuthorizer(null);
+  });
+
+test('projection preview cannot settle a preceding unowned persistent write', async (t) => {
+  const { db, root, profileId, session, decisions } = await fixture(t);
+  const before = readOrdinaryCommitCursor(db);
+  db.prepare(
+    "INSERT INTO app_meta(key,value) VALUES('fictional-unowned-preview','Fictional unowned change')",
+  ).run();
+  await assert.rejects(
+    prepareCollectionClinicalProjection(db, root, profileId, session, decisions),
+  );
+  const after = readOrdinaryCommitCursor(db);
+  assert.equal(after.serial, before.serial);
+  assert.equal(after.settledChanges, before.settledChanges);
+  assert.notEqual(after.changes, after.settledChanges);
+  assert.equal(db.prepare("SELECT count(*) n FROM documents WHERE id LIKE 'import:%'").get()!.n, 0);
+});
+
+test('projection capture uses its intrinsic Session changeset method', async (t) => {
+  const { db, root, profileId, session, decisions, cleanup } = await fixture(t);
+  const probe = db.createSession();
+  const prototype = Object.getPrototypeOf(probe) as { changeset: typeof probe.changeset };
+  const original = prototype.changeset;
+  probe.close();
+  let calls = 0;
+  prototype.changeset = function () {
+    if (db.isTransaction && calls++ === 0)
+      db.prepare(
+        "INSERT INTO app_meta(key,value) VALUES('fictional-unreviewed-capture','must not publish')",
+      ).run();
+    return Reflect.apply(original, this, []);
+  };
+  try {
+    const plan = await prepareCollectionClinicalProjection(db, root, profileId, session, decisions);
+    cleanup.push(() => disposePreparedClinicalProjection(plan));
+    await publish(db, plan, () => applyPreparedClinicalProjection(db, plan));
+    assert.equal(
+      db.prepare("SELECT value FROM app_meta WHERE key='fictional-unreviewed-capture'").get(),
+      undefined,
+      'a substituted Session callback cannot add an unreviewed durable row to the capture',
+    );
+    assert.equal(calls, 0);
+  } finally {
+    prototype.changeset = original;
+  }
+});

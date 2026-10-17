@@ -1,3 +1,4 @@
+import { parseHead as parseIntakeLogHead, type Head as IntakeLogHead } from './intake-state-log.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { toUSVString } from 'node:util';
 import {
@@ -37,7 +38,9 @@ export interface IntakeStateResult {
   changed: boolean;
 }
 export const COLLECTION_FORMAT = 'health-intake-state-v4';
-export interface IntakeCollectionHead {
+export const LOG_COLLECTION_FORMAT = 'health-intake-state-v5';
+export type IntakeCollectionHead = IntakeCollectionHeadV4 | IntakeLogHead;
+export interface IntakeCollectionHeadV4 {
   format: typeof COLLECTION_FORMAT;
   identity: IntakeStateIdentity;
   storageSequence: number;
@@ -54,10 +57,10 @@ export interface IntakeCollectionResult {
   logical: IntakeCollectionHead['logical'];
   changed: boolean;
 }
-export function parseIntakeCollectionHead(
+export function parseIntakeCollectionHeadV4(
   raw: unknown,
   identity: IntakeStateIdentity,
-): IntakeCollectionHead | undefined {
+): IntakeCollectionHeadV4 | undefined {
   if (raw === undefined) return undefined;
   const value = decode(raw, HEAD_BYTES);
   exact(value, [
@@ -89,7 +92,18 @@ export function parseIntakeCollectionHead(
     value.history.count !== value.storageSequence
   )
     invalid('collection head evidence count');
-  return value as unknown as IntakeCollectionHead;
+  return value as unknown as IntakeCollectionHeadV4;
+}
+/** Dispatch exact selected bytes; anchors deliberately retain the V4-only parser. */
+export function parseIntakeCollectionHead(
+  raw: unknown,
+  identity: IntakeStateIdentity,
+): IntakeCollectionHead | undefined {
+  if (raw === undefined) return undefined;
+  const value = decode(raw, HEAD_BYTES);
+  if (value && typeof value === 'object' && Reflect.get(value, 'format') === LOG_COLLECTION_FORMAT)
+    return parseIntakeLogHead(raw, identity);
+  return parseIntakeCollectionHeadV4(raw, identity);
 }
 export type Limits = typeof DEFAULT_LIMITS;
 export type Usage = Limits;

@@ -618,12 +618,16 @@ async function prepareClassification(
         const changes = cacheChanges;
         cacheChanges = [];
         const operationId = randomUUID();
-        const prepared = store.prepare(store.openView(), {
-          operationId,
-          requestDigest: workflowHash(operationId),
-          domainVersion: view.logical.domainVersion,
-          changes,
-        });
+        const prepared = await store.prepareAsync(
+          store.openView(),
+          {
+            operationId,
+            requestDigest: workflowHash(operationId),
+            domainVersion: view.logical.domainVersion,
+            changes,
+          },
+          assertCurrent,
+        );
         store.commitMaintenance(prepared, {
           assertCurrent() {
             assertCurrent();
@@ -701,18 +705,22 @@ async function prepareClassification(
   assertCurrent();
   const operationId = randomUUID();
   store.commitMaintenance(
-    store.prepare(store.openView(), {
-      operationId,
-      requestDigest: workflowHash([attempt, 'select']),
-      domainVersion: view.logical.domainVersion,
-      changes: MAPS.map((kind) => ({
-        area: 'builds' as const,
-        collection: collection + '.' + kind,
-        op: 'adoptCollection' as const,
-        fromArea: 'builds' as const,
-        fromCollection: attempt + '.' + kind,
-      })),
-    }),
+    await store.prepareAsync(
+      store.openView(),
+      {
+        operationId,
+        requestDigest: workflowHash([attempt, 'select']),
+        domainVersion: view.logical.domainVersion,
+        changes: MAPS.map((kind) => ({
+          area: 'builds' as const,
+          collection: collection + '.' + kind,
+          op: 'adoptCollection' as const,
+          fromArea: 'builds' as const,
+          fromCollection: attempt + '.' + kind,
+        })),
+      },
+      assertCurrent,
+    ),
   );
   return readSelectedSourceContextClassification(db, root, profileId, id);
 }
@@ -745,7 +753,7 @@ async function prepareProposalDerived(
     input.auxiliary
       ? input.auxiliary.collection(name)
       : store.collection(store.openView(), 'builds', name);
-  const commit = (changes: IntakeCollectionChange[]) => {
+  const commit = async (changes: IntakeCollectionChange[]) => {
     assertCurrent();
     if (input.auxiliary) {
       input.auxiliary.apply(changes);
@@ -753,15 +761,19 @@ async function prepareProposalDerived(
     }
     const operationId = randomUUID();
     store.commitMaintenance(
-      store.prepare(store.openView(), {
-        operationId,
-        requestDigest: workflowHash(operationId),
-        domainVersion: before.logical.domainVersion,
-        changes,
-      }),
+      await store.prepareAsync(
+        store.openView(),
+        {
+          operationId,
+          requestDigest: workflowHash(operationId),
+          domainVersion: before.logical.domainVersion,
+          changes,
+        },
+        assertCurrent,
+      ),
     );
   };
-  commit(
+  await commit(
     MAPS.map((kind) => ({
       area: 'builds',
       collection: attempt + '.' + kind,
@@ -983,7 +995,7 @@ async function prepareProposalDerived(
           newCache = 'source.context.file.' + workflowHash([resolve(root), profileId, refreshed]);
         if (get(oldCache + '.control', 'complete') !== 'ready')
           return { state: 'pending', reason: 'not_prepared' };
-        commit(
+        await commit(
           ['versions', 'control'].map((kind) => ({
             area: 'builds',
             collection: newCache + '.' + kind,

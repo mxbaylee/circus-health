@@ -143,30 +143,5 @@ export function planPartialSave(
           : 'This record needs review before it can be saved.'
         : 'This record is no longer on the displayed page. Return to it and approve its current version.',
     }));
-  // Within the server's caps, one operation lets the server keep coupled selections together.
-  // Only an over-cap selection is split, in chunks of 200 (owner decision, 2026-09-30).
-  if (sent.size <= 1000 && blocks.length <= 100)
-    return { chunks: blocks.length ? [blocks] : [], sent, unsent };
-  const chunks: IntakeReportAcceptanceBlock[][] = [];
-  let chunk: IntakeReportAcceptanceBlock[] = [];
-  let count = 0;
-  for (const block of blocks) {
-    for (const selection of block.selections) {
-      const last = chunk.at(-1);
-      const newBlock =
-        !last || last.intakeId !== block.intakeId || last.proposalId !== block.proposalId;
-      if (count === 200 || (count && chunk.length === 100 && newBlock)) {
-        chunks.push(chunk);
-        chunk = [];
-        count = 0;
-      }
-      const tail = chunk.at(-1);
-      if (tail && tail.intakeId === block.intakeId && tail.proposalId === block.proposalId)
-        tail.selections.push(selection);
-      else chunk.push({ ...block, selections: [selection] });
-      count++;
-    }
-  }
-  if (chunk.length) chunks.push(chunk);
-  return { chunks, sent, unsent };
+  return { blocks, sent, unsent };
 }

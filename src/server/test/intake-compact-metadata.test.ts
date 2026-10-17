@@ -1,3 +1,4 @@
+import { intakeLogRowsForAdvance } from './helpers/intake-collection-log-evidence.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
@@ -2147,13 +2148,7 @@ test(
       null;
     const oldDataHeight = oldDataRoot?.height ?? 0;
     const outerPathBound =
-      4 *
-        ((smallHead.logical.root?.height ?? 0) +
-          (smallHead.receipts?.height ?? 0) +
-          (smallHead.history?.height ?? 0) +
-          (smallHead.builds?.height ?? 0) +
-          4) +
-      3;
+      4 * ((smallHead.logical.root?.height ?? 0) + (smallHead.builds?.height ?? 0) + 2) + 3;
     const smallUpdate = await withRecordVersionWork(smallUpdateWork, () =>
       prepareIntakeEnvelopeMutation(db, source, {
         reader: smallReader,
@@ -2248,13 +2243,19 @@ test(
     // New metadata plus one note and a version cell address at most 25 keys.
     assert.ok(changedAddressKeys > 0 && changedAddressKeys <= 25);
     const changedPathBound =
-      outerPathBound + 4 * changedAddressKeys * (Math.max(oldDataHeight, newDataHeight) + 1);
+      outerPathBound +
+      intakeLogRowsForAdvance(smallHead, newHead.storageSequence) +
+      4 * changedAddressKeys * (Math.max(oldDataHeight, newDataHeight) + 1);
     const reachable = new Set<string>();
     const nodeReachability = Object.fromEntries(
       Object.entries({
         logical: newHead.logical.root,
-        receipts: newHead.receipts,
-        history: newHead.history,
+        ...(newHead.format === 'health-intake-state-v4'
+          ? { receipts: newHead.receipts, history: newHead.history }
+          : {
+              log: newHead.peaks ? { hash: newHead.peaks } : null,
+              anchor: newHead.base ? { hash: newHead.base } : null,
+            }),
         builds: newHead.builds,
       }).map(([name, root]) => {
         const owned = new Set<string>();
@@ -2266,13 +2267,46 @@ test(
             .prepare('SELECT value FROM app_meta WHERE key=?')
             .get(changedNodes.get(ref.hash)!)?.value;
           const node = JSON.parse(String(raw)) as {
-            value: string;
-            left: { hash: string } | null;
-            right: { hash: string } | null;
+            format: string;
+            kind?: string;
+            value?: string;
+            left?: { hash: string } | null;
+            right?: { hash: string } | null;
+            tree?: { hash: string };
+            older?: string | null;
+            v4Head?: string;
+            event?: import('../intake-state-log.ts').Event;
           };
-          visit(node.left);
-          visit(node.right);
-          const decoded = JSON.parse(node.value) as unknown;
+          if (node.format === 'health-intake-state-log-node-v1') {
+            if (node.kind === 'peak') {
+              visit(node.tree ?? null);
+              visit(node.older ? { hash: node.older } : null);
+            } else if (node.kind === 'merge') {
+              visit(node.left ?? null);
+              visit(node.right ?? null);
+            } else if (node.kind === 'leaf') {
+              const event = node.event!;
+              visit(event.receipt.result.logical.root);
+              visit(event.transition.builds);
+              const previous = event.transition.previous;
+              visit(previous.logical.root);
+              visit(previous.builds);
+              visit(previous.peaks ? { hash: previous.peaks } : null);
+              visit(previous.base ? { hash: previous.base } : null);
+            } else if (node.kind === 'anchor') {
+              const base = JSON.parse(
+                node.v4Head!,
+              ) as import('../intake-state-evidence.ts').IntakeCollectionHeadV4;
+              visit(base.logical.root);
+              visit(base.builds);
+              visit(base.receipts);
+              visit(base.history);
+            } else assert.fail('unsupported changed log node');
+            return;
+          }
+          visit(node.left ?? null);
+          visit(node.right ?? null);
+          const decoded = JSON.parse(node.value!) as unknown;
           if (!decoded || typeof decoded !== 'object') return;
           const value = decoded as {
             kind?: string;

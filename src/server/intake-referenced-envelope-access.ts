@@ -69,6 +69,7 @@ const scopes = new WeakMap<
     originalOwned: boolean;
     accepted: Awaited<ReturnType<typeof captureRecordAcceptedIntakeHeadRead>>;
     collections: ReturnType<typeof createIntakeStateStorage>['collections'];
+    releaseLog: () => void;
     keys: Map<Field, string | null>;
     currentKeys: Map<ReferencedEnvelopeCurrentField, string | null>;
     current?: {
@@ -98,6 +99,7 @@ async function captureReferencedEnvelopeReadInternal(
     borrowed?.original ?? captureIntakeLegacyBridgeReadWitness(db, identity.intakeId);
   let accepted: Awaited<ReturnType<typeof captureRecordAcceptedIntakeHeadRead>> | undefined =
     borrowed?.accepted;
+  let releaseLog: (() => void) | undefined;
   try {
     const current = () => {
       assertRunning();
@@ -116,6 +118,8 @@ async function captureReferencedEnvelopeReadInternal(
       throw Error('Referenced envelope identity changed');
     const scope = Object.freeze({ kind: 'referenced-envelope-read' }) as ReferencedEnvelopeRead;
     const collections = createIntakeStateStorage(db, identity).collections;
+    releaseLog = await collections.admitLogAsync(original, accepted, current);
+    current();
     const selectedHead =
       selection === 'current'
         ? collections.acceptedCurrentEnvelopeSelection(original, accepted)
@@ -130,6 +134,7 @@ async function captureReferencedEnvelopeReadInternal(
       originalOwned: !borrowed,
       accepted,
       collections,
+      releaseLog,
       keys: new Map(),
       currentKeys: new Map(),
       current: selectedHead,
@@ -140,7 +145,11 @@ async function captureReferencedEnvelopeReadInternal(
     try {
       if (accepted) closeRecordAcceptedIntakeHeadRead(accepted);
     } finally {
-      if (!borrowed) disposeIntakeLegacyBridgeReadWitness(original);
+      try {
+        if (!borrowed) disposeIntakeLegacyBridgeReadWitness(original);
+      } finally {
+        releaseLog?.();
+      }
     }
     throw error;
   }
@@ -1011,7 +1020,11 @@ export function closeReferencedEnvelopeRead(scope: ReferencedEnvelopeRead): void
     try {
       closeRecordAcceptedIntakeHeadRead(data.accepted);
     } finally {
-      if (data.originalOwned) disposeIntakeLegacyBridgeReadWitness(data.original);
+      try {
+        if (data.originalOwned) disposeIntakeLegacyBridgeReadWitness(data.original);
+      } finally {
+        data.releaseLog();
+      }
     }
   }
 }

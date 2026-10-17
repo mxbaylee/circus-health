@@ -49,6 +49,19 @@ memo, and the original-owner, scratch transaction, change-counter, schema and
 peer checks remain in force. The memo does not certify a later publication or
 retain a whole workflow.
 
+Private envelope sealing groups original-authority checks within synchronous
+queue-walk and digest slices. A slice yields after 64 nodes or after processed
+new-node bytes reach 64 KiB; the byte threshold can be exceeded by the last
+bounded node. Original-backed queue nodes count toward the node limit, not that
+new-node byte threshold. Each slice checks the original source, SQL and physical accepted
+authority at entry and exit; no scope survives a host yield. Node signatures,
+hashes, references and descendants retain their existing checks, and scratch
+writes remain accounted for separately. Reentrant access poisons the slice even when
+its caller catches the refusal. Transactions and owners without the internal
+scope retain per-node authority checks. Public roster iteration and publication
+keep their existing checks. This reduces repeated host reads without changing
+the retained node roster, accepted bytes, recovery authority or archive format.
+
 Unchanged logical selections can continue after derived maintenance under a new
 read admission. Transactions, custom readers and replaced reader methods keep
 the checked point-read path. Once a cursor takes that fallback, its buffered
@@ -173,6 +186,29 @@ pending. An interrupted preparation keeps the old selected counts unchanged.
 The cold builders retain unselected checkpoint evidence after
 interruption; a new cold invocation starts a new build, and completed matching
 builds are reused.
+
+Report-member preparation packs ordinary new members and their first occurrences
+in discovery order into checkpoints of at most 64 actual map changes. Repeated
+identities, inherited members and oversized values flush pending work before
+using their existing individual paths. The final window is committed before a
+caller can read or publish the resulting snapshot. The single-member API and
+proposal builders with checkpoint observers retain their eager barriers.
+During bulk preparation, the writer rejects outside reads, writes and completion,
+including access through retained readers and iterators; bulk preparation cannot
+start inside another operation on that writer. A failed or cancelled batch drops
+only its pending window and retains completed checkpoints in the unselected
+build. A retry still requires current source authority. These bounded checkpoints
+do not establish proportional write growth for complete large acceptance runs.
+
+A missing candidate-occurrence index needs no construction when exactly one
+retained occurrence proves the current record and batch key is already present.
+The builder checks authenticated source and head authority across a cooperative
+yield, then reads the retained count and key again. Only that fresh proof can
+skip index publication and leave the occurrence unchanged. If the proof no longer
+matches, normal construction uses the refreshed count and index address. Existing
+indexes, larger indexes, different keys and checkpoint observers retain their
+construction and visibility barriers. This changes derived-index preparation,
+not the retained occurrence evidence or acceptance scope.
 
 ## Model context protocol
 
@@ -1790,8 +1826,12 @@ The complete fictional 140-question qualification retains exact question orderin
 
 Report-source preparation checkpoints retained references, group/version history,
 extension matching and complete membership hashing. Later duplicate-group
-precedence and the legacy canonical confirmation hash remain unchanged. Within
-one owned session, a memo retains only completed suggested-source hashes, with at
+precedence and the legacy canonical confirmation hash remain unchanged. A single
+retained reference can select its group and version directly when both IDs have
+matching first and last addresses. This proof applies to adopted inline versions
+and native member snapshots; missing or duplicate IDs retain the reverse history
+scan. Report basis, context, membership and confirmation checks still apply.
+Within one owned session, a memo retains only completed suggested-source hashes, with at
 most 32 entries and 256 KiB of encoded keys and digests. Exact authority changes
 or transaction entry discard that reuse; an interrupted hash is never cached.
 The source-hash, member-hash and reuse counters distinguish complete hashing from
@@ -2123,6 +2163,14 @@ without collecting the entire group scope. Repair compares and consumes one
 retained claim per current occurrence, so an identical claim cannot satisfy a
 second occurrence. A namespace inspection, claim comparison and merge step are
 cooperative work checkpoints under the current authority proof.
+
+The competing-boundary rule applies only to a selected group with a printed
+report anchor and a nonblank printed subject. For other groups, native review
+checks the selected view and its current authority before and after evaluating
+that condition, then skips unrelated group headers and repair receipts. Eligible
+printed reports retain the complete competing-claim and assignment checks above.
+All other identity review requirements continue to apply. This avoids repeatedly
+scanning every report group in an intake for each record without a printed boundary.
 
 Complete name-evidence collection also checkpoints while ingesting claims and
 reading distinct names. Records without a matching group or identity issue still

@@ -2,9 +2,18 @@ import { markModelToolTerminalError, ModelToolValidationError } from '../model-t
 import { ModelContextLimitError, ModelError } from '../model-config.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import {
   ProxyModelBridge,
   localProxyTransport,
@@ -15,6 +24,7 @@ import {
 } from '../proxy-model-bridge.ts';
 import type { HealthTool, ProxyConfig, ProxyModelBridgeOptions } from '../proxy-model-bridge.ts';
 import { createImportDiagnostics, measureImportPhase } from '../import-diagnostics.ts';
+import { createPrivateImportTrace } from '../import-private-trace.ts';
 import { requestInputComposition } from '../request-input-composition.ts';
 import {
   compactConsumedProxyHistory,
@@ -1374,6 +1384,88 @@ test('tool errors expose no unapproved application error code or message', async
       'The scoped tool rejected this request. Refresh the record and review the required arguments before trying again.',
   });
   assert.doesNotMatch(textContent(result), /SOURCE_CHANGED|private rejection/);
+});
+
+test('tool payloads and metadata retain explicit import scope without an ambient diagnostic context', async (t) => {
+  for (const failed of [false, true])
+    await t.test(failed ? 'rejected tool' : 'successful tool', async (t) => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'fictional-bridge-tool-trace-')));
+      t.after(() => rmSync(root, { recursive: true, force: true }));
+      const directory = join(root, 'trace');
+      mkdirSync(directory, { mode: 0o700 });
+      const grantFile = join(root, 'grant.json');
+      const profileId = 'fictional-tool-profile';
+      writeFileSync(
+        grantFile,
+        JSON.stringify({ profileId, expiresAt: new Date(Date.now() + 60_000).toISOString() }),
+        { mode: 0o600 },
+      );
+      const diagnostics = createImportDiagnostics({
+        enabled: true,
+        privateTrace: createPrivateImportTrace({ directory, grantFile, acknowledged: true }),
+      });
+      t.after(() => diagnostics.close());
+      // Exercise the supported explicit sink context without an AsyncLocalStorage
+      // scope. The model request path already supplies this context directly.
+      const sink = {
+        ...diagnostics,
+        run<T>(_context: unknown, operation: () => T): T {
+          return operation();
+        },
+      };
+      const secret = config().apiKey;
+      const reply = structuredClone(toolCall);
+      reply.choices[0].message.tool_calls[0].function.arguments = JSON.stringify({ id: secret });
+      const diagnosticContext = {
+        profileId,
+        importId: 'fictional-tool-import',
+        runId: 'fictional-tool-run',
+        operationId: undefined,
+      };
+      const f = harness([reply, answer], {
+        diagnostics: sink,
+        diagnosticContext,
+        onTool: async () => {
+          if (failed)
+            throw new ModelToolValidationError('VERSION_CONFLICT', `Fictional rejection ${secret}`);
+          return { record: `Fictional result ${secret}` };
+        },
+      });
+      await run(f);
+      assert.deepEqual(f.errors, []);
+      assert.equal(f.calls.length, 1);
+      const entries = readdirSync(directory).flatMap((partition) =>
+        readdirSync(join(directory, partition)).map(
+          (file) =>
+            JSON.parse(gunzipSync(readFileSync(join(directory, partition, file))).toString()) as {
+              event: string;
+              traceEventId: string;
+              context: Record<string, string>;
+              payload: unknown;
+            },
+        ),
+      );
+      for (const [event, metadata] of [
+        ['tool.request', 'model.tool.started'],
+        ['tool.response', failed ? 'model.tool.failed' : 'model.tool.completed'],
+      ]) {
+        const captures = entries.filter((entry) => entry.event === event);
+        assert.equal(captures.length, 1);
+        const capture = captures[0]!;
+        assert.equal(capture.context.importId, diagnosticContext.importId);
+        assert.equal(capture.context.runId, diagnosticContext.runId);
+        assert.equal(capture.context.operationId, undefined);
+        assert.doesNotMatch(JSON.stringify(capture.payload), /fictional-proxy-key/);
+        assert.match(JSON.stringify(capture.payload), /redacted/i);
+        const records = diagnostics.snapshot(profileId).filter((entry) => entry.event === metadata);
+        assert.equal(records.length, 1);
+        assert.equal(records[0]!.context.importId, diagnosticContext.importId);
+        assert.equal(records[0]!.context.runId, diagnosticContext.runId);
+        assert.equal(records[0]!.fields.traceEventId, capture.traceEventId);
+      }
+      const response = entries.find((entry) => entry.event === 'tool.response')!;
+      assert.equal((response.payload as { failed: boolean }).failed, failed);
+    });
 });
 
 test('terminal tool rejection records safe metadata after close without dispatching later actions', async (t) => {

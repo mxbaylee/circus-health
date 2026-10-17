@@ -1,6 +1,7 @@
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { selectProfile } from '../../app/data/profile';
 import type { Intake, IntakeAcceptedRecord } from '../../shared/intake';
 import {
   acceptedRecordDestination,
@@ -52,7 +53,16 @@ describe('saved Import destinations', () => {
       );
     }
   });
-  it('routes every durable accepted entity to its real profile destination', () => {
+  it('routes every durable accepted entity to its resolved current profile destination', async () => {
+    selectProfile({ id: 'fictional-saved-destinations', name: 'Fictional Reader', placebo: true });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input) =>
+        Response.json({
+          data: String(input).includes('/record-owner?') ? { personId: 'patient' } : [],
+        }),
+      ),
+    );
     const records = [
       accepted('observation-row', 'observation-entity', 'observation', 'Fictional ferritin'),
       accepted('medication-row', 'medication-entity', 'medication', 'Fictional capsule'),
@@ -85,23 +95,22 @@ describe('saved Import destinations', () => {
         <SavedRecordDestinations records={records} />
       </MemoryRouter>,
     );
-    expect(screen.getByRole('link', { name: /Fictional ferritin/ })).toHaveAttribute(
+    expect(await screen.findByRole('link', { name: /Fictional ferritin.*Self/ })).toHaveAttribute(
       'href',
       '/tests?result=observation-entity&visibility=all',
     );
-    expect(screen.getByRole('link', { name: /Fictional capsule/ })).toHaveAttribute(
+    expect(await screen.findByRole('link', { name: /Fictional capsule.*Self/ })).toHaveAttribute(
       'href',
       '/medications?id=medication-entity&status=all',
     );
-    expect(screen.getByRole('link', { name: /Fictional imaging/ })).toHaveAttribute(
+    expect(await screen.findByRole('link', { name: /Fictional imaging.*Self/ })).toHaveAttribute(
       'href',
       '/procedures?id=procedure-entity&category=all&visibility=all',
     );
-    expect(screen.getByRole('link', { name: /Fictional provider note/ })).toHaveAttribute(
-      'href',
-      '/sources?document=document-entity',
-    );
-    expect(screen.getByRole('link', { name: /Fictional lenses/ })).toHaveAttribute(
+    expect(
+      await screen.findByRole('link', { name: /Fictional provider note.*Self/ }),
+    ).toHaveAttribute('href', '/sources?document=document-entity');
+    expect(await screen.findByRole('link', { name: /Fictional lenses.*Self/ })).toHaveAttribute(
       'href',
       '/tests?view=vision&document=vision-entity&visibility=all',
     );

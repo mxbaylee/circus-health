@@ -1052,6 +1052,22 @@ export interface IntakeReportAcceptanceRequest {
   mode?: 'partial-v1';
   operationId: string;
   blocks: IntakeReportAcceptanceBlock[];
+  /** Disposable admission proof; recovery still uses only the operation UUID. */
+  plan?: { id: string; chunk: number };
+}
+export interface IntakeReportAcceptancePlan {
+  planId: string;
+  chunks: IntakeReportAcceptanceBlock[][];
+  unsent: {
+    intakeId: string;
+    proposalId: string | null;
+    recordId: string;
+    candidateId: string;
+    candidateVersionId: string;
+    label?: string;
+    reasonCode: string;
+    message: string;
+  }[];
 }
 export interface IntakeAtomicAcceptanceReceipt {
   operationId: string;

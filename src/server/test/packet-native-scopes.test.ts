@@ -115,7 +115,7 @@ test(
   },
 );
 
-test('native report member snapshots preserve duplicate/current-version counting and giant occurrence evidence', async (t) => {
+test('native report member snapshots preserve person-scoped duplicate/current-version counting and giant occurrence evidence', async (t) => {
   const db = fixture(t);
   registerRawIntakeFixture(
     db,
@@ -129,11 +129,28 @@ test('native report member snapshots preserve duplicate/current-version counting
             {
               id: 'one',
               versions: [
-                { id: 'old', status: 'accepted' },
-                { id: 'current', status: 'pending' },
+                {
+                  id: 'old',
+                  status: 'accepted',
+                  occurrences: [{ recordId: 'included', proposalId: null }],
+                },
+                {
+                  id: 'current',
+                  status: 'accepted',
+                  occurrences: [{ recordId: 'included', proposalId: null }],
+                },
               ],
             },
-            { id: 'two', versions: [{ id: 'saved', status: 'accepted' }] },
+            {
+              id: 'two',
+              versions: [
+                {
+                  id: 'saved',
+                  status: 'accepted',
+                  occurrences: [{ recordId: 'included', proposalId: null }],
+                },
+              ],
+            },
             {
               id: 'context',
               versions: [{ id: 'context-version', status: 'accepted', sourceContext: true }],
@@ -144,6 +161,11 @@ test('native report member snapshots preserve duplicate/current-version counting
       },
     }),
   );
+  transaction(db, () =>
+    db.exec(
+      "INSERT INTO source_records(id,source_file_id,raw_json) VALUES('included','fictional','{}'); INSERT INTO test_types(id,label) VALUES('fictional-test','Fictional test'); INSERT INTO observations(id,test_type_id,person_id,source_record_id,label,value_text) VALUES('fictional-observation','fictional-test','patient','included','Fictional test','10')",
+    ),
+  );
   await buildIntakeCollectionEnvelope(db, { id: 'fictional' });
   const catalog = createReportSnapshotCatalog(db, { id: 'fictional' }),
     writer = await createReportMemberSnapshot(catalog, 'fictional-members');
@@ -153,6 +175,7 @@ test('native report member snapshots preserve duplicate/current-version counting
     ['two', 'saved'],
     ['context', 'context-version'],
     ['two', 'saved'],
+    ['one', 'old'],
   ] as const) {
     let member = await writer.include(
       { candidateId, candidateVersionId },
@@ -198,18 +221,24 @@ test('native report member snapshots preserve duplicate/current-version counting
     selectedEnvelopeStore(db, { id: 'fictional' }).collections.stage(result.prepared!),
   );
   const before = { ...intakeWorkCounters(db).warm },
-    reports = nativePacketReportReview(db, 'fictional', new Set(['included']));
+    reports = nativePacketReportReview(db, 'fictional', new Set(['included']), 'patient');
   assert.deepEqual(
     reports.map(({ savedCount, totalCount, title }) => ({
       savedCount,
       totalCount,
       title: title.length,
     })),
-    [{ savedCount: 1, totalCount: 2, title: 500 }],
+    [{ savedCount: 2, totalCount: 2, title: 500 }],
   );
-  assert.deepEqual(nativePacketReportReview(db, 'fictional', new Set(['unrelated'])), []);
+  assert.deepEqual(
+    nativePacketReportReview(db, 'fictional', new Set(['unrelated']), 'patient'),
+    [],
+  );
   clearIntakeStateCache(db);
-  assert.deepEqual(nativePacketReportReview(db, 'fictional', new Set(['included'])), reports);
+  assert.deepEqual(
+    nativePacketReportReview(db, 'fictional', new Set(['included']), 'patient'),
+    reports,
+  );
   for (const key of ['envelopeHydrations', 'materializationReads', 'sourceDTOHydrations'] as const)
     assert.equal(intakeWorkCounters(db).warm[key], before[key], key);
 });

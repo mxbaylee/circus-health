@@ -19,7 +19,7 @@ import type { IntakeCollectionChange } from './intake-state-storage.ts';
 import { clinicalTables, type ClinicalKind } from './clinical-references.ts';
 type Factory = ReturnType<typeof createDuplicateEvidenceSnapshotPreparation>;
 type Stage = Awaited<ReturnType<Factory['finish']>>;
-type Standalone = ReturnType<Stage['prepareStandalone']>;
+type Standalone = Awaited<ReturnType<Stage['prepareStandalone']>>;
 const key = (kind: string, id: string) => JSON.stringify([kind, id]);
 
 /** Accepted corrections prove kind aliases; a coincidentally equal row ID is
@@ -277,7 +277,7 @@ export async function prepareDuplicateEvidenceSnapshots(
     for (const [id, factory] of factories) {
       const stage = await factory.finish();
       stages.set(id, stage);
-      standalone.set(id, stage.prepareStandalone());
+      standalone.set(id, await stage.prepareStandalone());
     }
     for (const context of contexts) artifacts.assertContains(context.consumedArtifactIds());
     const prepared = await artifacts.withVerifiedTerminal(

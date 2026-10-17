@@ -3,6 +3,7 @@ import { setImmediate } from 'node:timers/promises';
 import {
   prepareIntakeJsonCanonicalSteps,
   type IntakeJsonCanonicalWork,
+  type IntakeJsonCanonicalScratch,
 } from './intake-json-canonical.ts';
 import { prepareIntakeJsonLexical, type IntakeJsonLexicalSpan } from './intake-json-lexical.ts';
 import { hashIntakeJsonScalarSteps } from './intake-json-scalar.ts';
@@ -38,6 +39,7 @@ import {
   parseIntakeHead,
   parseIntakeCollectionHead,
   COLLECTION_FORMAT,
+  LOG_COLLECTION_FORMAT,
   integer,
   validateIntakeIdentity,
   type IntakeStateIdentity,
@@ -254,6 +256,7 @@ export async function prepareIntakeEnvelopeProjection(
   options: {
     assertRunning?: () => void;
     onWork?: (work: Readonly<IntakeJsonCanonicalWork>) => void;
+    scratch?: IntakeJsonCanonicalScratch;
   } = {},
 ): Promise<{ mode: Mode; format: IntakeEnvelopeProjectionFormat }> {
   const steps = prepareIntakeEnvelopeProjectionSteps(raw, options);
@@ -272,6 +275,7 @@ export function* prepareIntakeEnvelopeProjectionSteps(
   options: {
     assertRunning?: () => void;
     onWork?: (work: Readonly<IntakeJsonCanonicalWork>) => void;
+    scratch?: IntakeJsonCanonicalScratch;
   } = {},
 ): Generator<void, { mode: Mode; format: IntakeEnvelopeProjectionFormat }> {
   const tree = yield* prepareIntakeJsonCanonicalSteps(
@@ -830,7 +834,9 @@ function intakeEnvelopeAuthorityBindingChecked(
   if (
     typeof head === 'string' &&
     Buffer.byteLength(head) <= 4096 &&
-    (parse(head) as Record<string, unknown>)?.format === COLLECTION_FORMAT
+    [COLLECTION_FORMAT, LOG_COLLECTION_FORMAT].includes(
+      String((parse(head) as Record<string, unknown>)?.format),
+    )
   ) {
     const checked = parseIntakeCollectionHead(head, selected)!;
     // Classification is not metadata admission. Cold giant native metadata is

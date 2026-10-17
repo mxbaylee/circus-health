@@ -1,14 +1,20 @@
 /** Exact changed-row projection preparation. SQLite is only a disposable staging surface. */
-import { type DatabaseSync, type Session } from 'node:sqlite';
+import { constants, DatabaseSync, type Session } from 'node:sqlite';
 import { cloneLiteral } from './intake-format.ts';
 import {
   HttpError,
   revision,
   currentTransactionToken,
+  readOrdinaryCommitCursor,
   installTransactionTerminalGuard,
   rejectCurrentTransaction,
   observeTransactionOutcome,
   managedDatabaseMethodEpoch,
+  transaction,
+  observeManagedDatabaseAuthorization,
+  observeManagedDatabaseFunctionRegistration,
+  rearmManagedDatabaseAuthorization,
+  managedDatabaseAuthorizationNestedCallbackActive,
 } from './database.ts';
 import {
   projectClinicalReview,
@@ -71,6 +77,24 @@ interface State {
 const plans = new WeakMap<PreparedClinicalProjection, State>();
 const activePlans = new WeakMap<DatabaseSync, Set<PreparedClinicalProjection>>();
 const MAX_ACTIVE_PLANS = 64;
+const nativeCreateSession = DatabaseSync.prototype.createSession;
+// Session is not a public constructor. Retain its intrinsic method before an
+// application callback can replace the shared prototype and inject staged SQL.
+const nativeSessionChangeset = (() => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    const session = Reflect.apply(nativeCreateSession, db, []);
+    try {
+      return session.changeset;
+    } finally {
+      session.close();
+    }
+  } finally {
+    db.close();
+  }
+})();
+const sessionChangeset = (session: Session): Uint8Array =>
+  Reflect.apply(nativeSessionChangeset, session, []);
 function state(plan: PreparedClinicalProjection): State {
   const value = plans.get(plan);
   if (!value || value.closed) throw Error('Foreign or disposed clinical projection plan');
@@ -78,6 +102,197 @@ function state(plan: PreparedClinicalProjection): State {
 }
 const changed = () =>
   new HttpError(409, 'INTAKE_REVIEW_CHANGED', 'Refresh this selected clinical review');
+
+/** Stage real SQL only inside the ordinary rollback owner. Transaction control is
+ * lexical: callbacks cannot commit the preview or replace its rollback. */
+function rolledBackProjection<T>(
+  db: DatabaseSync,
+  capture: Session,
+  fn: (readChanges: () => Uint8Array) => T,
+): T {
+  if (db.isTransaction) throw changed();
+  const signal = {};
+  let beforeRevision = 0,
+    beforePeer = 0,
+    beforeSchema = 0,
+    beforeTempSchema = 0;
+  const physical = () => [
+    Number(db.prepare('PRAGMA data_version').get()!.data_version),
+    Number(db.prepare('PRAGMA main.schema_version').get()!.schema_version),
+    Number(db.prepare('PRAGMA temp.schema_version').get()!.schema_version),
+  ];
+  let phase: 'begin' | 'body' | 'rollback' | 'closed' = 'begin';
+  let begun = false,
+    rolledBack = false,
+    valid = true,
+    captureSlot = false,
+    captureSavepoint = 0,
+    result: T;
+  const invalidate = () => {
+    valid = false;
+  };
+  const dispose = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, _column, schema) => {
+      if (action === constants.SQLITE_TRANSACTION) {
+        if (
+          !managedDatabaseAuthorizationNestedCallbackActive(db) &&
+          name === 'BEGIN' &&
+          phase === 'begin' &&
+          !begun
+        ) {
+          begun = true;
+          return;
+        }
+        if (
+          !managedDatabaseAuthorizationNestedCallbackActive(db) &&
+          name === 'ROLLBACK' &&
+          begun &&
+          phase !== 'body' &&
+          !rolledBack
+        ) {
+          rolledBack = true;
+          return;
+        }
+        invalidate();
+        throw changed();
+      }
+      if (
+        action === constants.SQLITE_SAVEPOINT &&
+        phase === 'body' &&
+        captureSlot &&
+        _column === 'changeset' &&
+        !managedDatabaseAuthorizationNestedCallbackActive(db)
+      ) {
+        if (name === 'BEGIN' && captureSavepoint === 0) {
+          captureSavepoint = 1;
+          return;
+        }
+        if (name === 'RELEASE' && captureSavepoint === 1) {
+          captureSavepoint = 2;
+          return;
+        }
+      }
+      if (
+        (action === constants.SQLITE_PRAGMA &&
+          !(
+            ['data_version', 'schema_version', 'function_list'].includes(name || '') &&
+            _column === null
+          ) &&
+          !['table_info', 'table_xinfo', 'index_info', 'index_xinfo', 'foreign_key_list'].includes(
+            name || '',
+          )) ||
+        [
+          constants.SQLITE_CREATE_VTABLE,
+          constants.SQLITE_DROP_VTABLE,
+          constants.SQLITE_CREATE_INDEX,
+          constants.SQLITE_CREATE_TABLE,
+          constants.SQLITE_CREATE_TEMP_INDEX,
+          constants.SQLITE_CREATE_TEMP_TABLE,
+          constants.SQLITE_CREATE_TEMP_TRIGGER,
+          constants.SQLITE_CREATE_TEMP_VIEW,
+          constants.SQLITE_CREATE_TRIGGER,
+          constants.SQLITE_CREATE_VIEW,
+          constants.SQLITE_DROP_INDEX,
+          constants.SQLITE_DROP_TABLE,
+          constants.SQLITE_DROP_TEMP_INDEX,
+          constants.SQLITE_DROP_TEMP_TABLE,
+          constants.SQLITE_DROP_TEMP_TRIGGER,
+          constants.SQLITE_DROP_TEMP_VIEW,
+          constants.SQLITE_DROP_TRIGGER,
+          constants.SQLITE_DROP_VIEW,
+          constants.SQLITE_ALTER_TABLE,
+          constants.SQLITE_REINDEX,
+          constants.SQLITE_ANALYZE,
+        ].includes(action) ||
+        action === constants.SQLITE_SAVEPOINT ||
+        action === constants.SQLITE_ATTACH ||
+        action === constants.SQLITE_DETACH ||
+        (phase !== 'body' &&
+          schema !== 'temp' &&
+          [constants.SQLITE_INSERT, constants.SQLITE_UPDATE, constants.SQLITE_DELETE].includes(
+            action,
+          ))
+      ) {
+        invalidate();
+        throw changed();
+      }
+    },
+    invalidate,
+  );
+  const disposeFunction = observeManagedDatabaseFunctionRegistration(db, invalidate);
+  const methods = managedDatabaseMethodEpoch(db);
+  try {
+    if (!dispose || !disposeFunction || !methods || !rearmManagedDatabaseAuthorization(db))
+      throw changed();
+    const cursor = readOrdinaryCommitCursor(db);
+    if (cursor.changes !== cursor.settledChanges || !cursor.succeeded) throw changed();
+    beforeRevision = revision(db);
+    [beforePeer, beforeSchema, beforeTempSchema] = physical();
+    if (!valid || managedDatabaseMethodEpoch(db) !== methods) throw changed();
+    try {
+      transaction(db, () => {
+        if (
+          !valid ||
+          !begun ||
+          !db.isTransaction ||
+          !currentTransactionToken(db) ||
+          managedDatabaseMethodEpoch(db) !== methods
+        )
+          throw changed();
+        phase = 'body';
+        try {
+          result = fn(() => {
+            if (captureSlot) throw changed();
+            captureSavepoint = 0;
+            const token = currentTransactionToken(db);
+            if (!token || !db.isTransaction) throw changed();
+            captureSlot = true;
+            try {
+              const changes = sessionChangeset(capture);
+              if (
+                !changes ||
+                captureSavepoint !== 2 ||
+                !valid ||
+                !db.isTransaction ||
+                currentTransactionToken(db) !== token
+              )
+                throw changed();
+              return changes;
+            } finally {
+              captureSlot = false;
+            }
+          });
+        } finally {
+          phase = 'rollback';
+        }
+        throw signal;
+      });
+      throw changed();
+    } catch (error) {
+      phase = 'closed';
+      if (error !== signal) throw error;
+      const afterRevision = revision(db),
+        [afterPeer, afterSchema, afterTempSchema] = physical();
+      if (
+        !valid ||
+        !rolledBack ||
+        db.isTransaction ||
+        currentTransactionToken(db) ||
+        afterRevision !== beforeRevision ||
+        afterPeer !== beforePeer ||
+        afterSchema !== beforeSchema ||
+        afterTempSchema !== beforeTempSchema ||
+        managedDatabaseMethodEpoch(db) !== methods
+      )
+        throw changed();
+      return result!;
+    }
+  } finally {
+    disposeFunction?.();
+    dispose?.();
+  }
+}
 
 /** Staging uses private disposable scratch, with no durable authority
  * writes/publication or whole-table snapshots. Every entry point verifies the
@@ -463,76 +678,75 @@ function prepareProjectionGroup(
     const dataVersion = Number(db.prepare('PRAGMA data_version').get()!.data_version);
     const results: (Result | undefined)[] = [];
     let changes: Uint8Array;
-    const capture = db.createSession();
-    db.exec('SAVEPOINT clinical_projection_prepare');
+    const capture = Reflect.apply(nativeCreateSession, db, []);
     try {
-      const insert = db.prepare(
-        'INSERT OR IGNORE INTO source_records(id,source_file_id,provider_id,source_key,kind,label,raw_json,locator_json,extraction_status,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
-      );
-      const occurrenceAuthorityFinalizers: OccurrenceAuthorityFinalizer[] = [];
-      for (const { context, reviewed, decisions, acquisition, prevalidatedPairScopes } of blocks) {
-        for (const entry of context.proposal.entries) {
-          const retained = retainedClinicalSourceRecord(
-            entry,
-            context.proposal.inputFile.id,
-            context.proposal.file.id,
-            context.proposal.proposalId,
-            String(acquisition.provider_id),
-            String(acquisition.batch_id),
-          );
-          insert.run(
-            retained.id,
-            retained.sourceFileId,
-            retained.providerId,
-            retained.sourceKey,
-            retained.kind,
-            retained.label,
-            retained.raw,
-            retained.locator,
-            retained.extractionStatus,
-            retained.batchId,
-          );
+      rolledBackProjection(db, capture, (readChanges) => {
+        const insert = db.prepare(
+          'INSERT OR IGNORE INTO source_records(id,source_file_id,provider_id,source_key,kind,label,raw_json,locator_json,extraction_status,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        );
+        const occurrenceAuthorityFinalizers: OccurrenceAuthorityFinalizer[] = [];
+        for (const {
+          context,
+          reviewed,
+          decisions,
+          acquisition,
+          prevalidatedPairScopes,
+        } of blocks) {
+          for (const entry of context.proposal.entries) {
+            const retained = retainedClinicalSourceRecord(
+              entry,
+              context.proposal.inputFile.id,
+              context.proposal.file.id,
+              context.proposal.proposalId,
+              String(acquisition.provider_id),
+              String(acquisition.batch_id),
+            );
+            insert.run(
+              retained.id,
+              retained.sourceFileId,
+              retained.providerId,
+              retained.sourceKey,
+              retained.kind,
+              retained.label,
+              retained.raw,
+              retained.locator,
+              retained.extractionStatus,
+              retained.batchId,
+            );
+          }
+          if (reviewed) {
+            context.selected.materializeSourceProviders();
+            const medicationsBefore = Number(
+              db.prepare('SELECT count(*) AS n FROM medications').get()!.n,
+            );
+            const clinical = projectClinicalReview(db, {
+              ...context.proposal,
+              review: context.review,
+              decisions: cloneLiteral(decisions),
+              root,
+              profileId,
+              selected: context.selected,
+              prevalidatedPairScopes,
+              occurrenceAuthorityFinalizers,
+            });
+            results.push({
+              ...clinical,
+              newMedications: Math.max(
+                0,
+                Number(db.prepare('SELECT count(*) AS n FROM medications').get()!.n) -
+                  medicationsBefore,
+              ),
+            });
+          } else results.push(undefined);
         }
-        if (reviewed) {
-          context.selected.materializeSourceProviders();
-          const medicationsBefore = Number(
-            db.prepare('SELECT count(*) AS n FROM medications').get()!.n,
-          );
-          const clinical = projectClinicalReview(db, {
-            ...context.proposal,
-            review: context.review,
-            decisions: cloneLiteral(decisions),
-            root,
-            profileId,
-            selected: context.selected,
-            prevalidatedPairScopes,
-            occurrenceAuthorityFinalizers,
-          });
-          results.push({
-            ...clinical,
-            newMedications: Math.max(
-              0,
-              Number(db.prepare('SELECT count(*) AS n FROM medications').get()!.n) -
-                medicationsBefore,
-            ),
-          });
-        } else results.push(undefined);
-      }
-      refreshOccurrenceAttachmentAuthorities(db, occurrenceAuthorityFinalizers);
-      changes = capture.changeset();
-      withIntakeWork(db, 'warm', () =>
-        recordIntakeWork('clinicalProjectionChangesetBytes', changes.byteLength),
-      );
+        refreshOccurrenceAttachmentAuthorities(db, occurrenceAuthorityFinalizers);
+        changes = readChanges();
+        withIntakeWork(db, 'warm', () =>
+          recordIntakeWork('clinicalProjectionChangesetBytes', changes.byteLength),
+        );
+      });
     } finally {
-      try {
-        db.exec('ROLLBACK TO clinical_projection_prepare');
-      } finally {
-        try {
-          db.exec('RELEASE clinical_projection_prepare');
-        } finally {
-          capture.close();
-        }
-      }
+      capture.close();
     }
     for (const { context } of blocks) artifacts.assertContains(context.consumedArtifactIds());
     // Prepared contexts were verified in workers; the retained union is
@@ -583,7 +797,7 @@ function prepareProjectionGroup(
         revision(db) !== guardedRevision + 1 ||
         Number(db.prepare('PRAGMA data_version').get()!.data_version) !== dataVersion ||
         guards.some(
-          (guard, index) => tables[index] !== 'app_meta' && guard.changeset().length !== 0,
+          (guard, index) => tables[index] !== 'app_meta' && sessionChangeset(guard).length !== 0,
         )
       )
         return;
@@ -600,7 +814,7 @@ function prepareProjectionGroup(
         invalidated ||
         revision(db) !== guardedRevision ||
         Number(db.prepare('PRAGMA data_version').get()!.data_version) !== dataVersion ||
-        guards.some((guard) => guard.changeset().length !== 0)
+        guards.some((guard) => sessionChangeset(guard).length !== 0)
       )
         throw changed();
     };

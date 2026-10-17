@@ -238,6 +238,14 @@ it.each([
             current === old ? 12 : 13,
           );
         }
+        if (url.pathname.endsWith('/report-acceptance-plan')) {
+          const body = JSON.parse(String(init?.body));
+          return json({
+            planId: 'fictional-exact-approval-plan',
+            chunks: [body.blocks],
+            unsent: [],
+          });
+        }
         if (url.pathname.endsWith('/report-acceptance')) {
           const body = JSON.parse(String(init?.body));
           writes.push(body);

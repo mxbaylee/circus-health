@@ -18,10 +18,12 @@ import {
   intakeFrontierTerminalEvent,
   intakeFrontierTerminalStart,
   intakeFrontierTerminalOutcome,
+  readIntakeFrontierAuxiliaryChanges,
 } from './intake-lookup-frontier-observer.ts';
 import {
   intakeProjectionTerminalEvent,
   intakeProjectionTerminalOutcome,
+  readIntakeProjectionChanges,
 } from './intake-lookup-projection-witness.ts';
 import { sourceDetailsTerminalOutcome } from './source-details-search.ts';
 import { sourceTextTerminalOutcome } from './source-text-projection.ts';
@@ -126,6 +128,9 @@ const changesetTotalReads = new WeakMap<
   DatabaseSync,
   { readonly item: ChangesetInvocation; readonly statement: StatementSync; cursor: number }
 >();
+// Lexically owned observation SQL cannot call application policy while the
+// ordinary-commit cursor is being settled. It authorizes only this fixed read.
+const ordinaryTotalReads = new WeakMap<DatabaseSync, { cursor: number; functions: boolean }>();
 const changesetPrepare = DatabaseSync.prototype.prepare,
   changesetGet = StatementSync.prototype.get,
   changesetReadBigInts = StatementSync.prototype.setReadBigInts,
@@ -714,6 +719,22 @@ export function installManagedDatabaseAuthorization(db: DatabaseSync): void {
   } as DatabaseSync['setAuthorizer'];
   state.setter = setter;
   const dispatch: Authorizer = (...args) => {
+    const ordinaryRead = ordinaryTotalReads.get(db);
+    if (ordinaryRead) {
+      const expected: Parameters<Authorizer> = ordinaryRead.functions
+        ? [constants.SQLITE_PRAGMA, 'function_list', null, null, null]
+        : ordinaryRead.cursor === 0
+          ? [constants.SQLITE_SELECT, null, null, null, null]
+          : [constants.SQLITE_FUNCTION, null, 'total_changes', null, null];
+      if (
+        state.dispatchDepth ||
+        ordinaryRead.cursor >= (ordinaryRead.functions ? 1 : 2) ||
+        JSON.stringify(args) !== JSON.stringify(expected)
+      )
+        throw Error('Ordinary commit count read escaped its exact SQL');
+      ordinaryRead.cursor++;
+      return constants.SQLITE_OK;
+    }
     const totalRead = changesetTotalReads.get(db);
     if (totalRead) {
       const { item } = totalRead,
@@ -1063,6 +1084,81 @@ export function installTransactionTerminalGuard(
   };
 }
 const outcomeObservers = new WeakMap<DatabaseSync, Set<(outcome: TransactionOutcome) => void>>();
+type OrdinaryCommitCursor = {
+  identity: object;
+  serial: bigint;
+  token?: object;
+  succeeded: boolean;
+  settledChanges: number;
+};
+const ordinaryCommits = new WeakMap<DatabaseSync, OrdinaryCommitCursor>();
+const connectionChanges = (db: DatabaseSync) => {
+  const authorization = managedAuthorizers.get(db);
+  if (!authorization || authorization.dispatchDepth || ordinaryTotalReads.has(db))
+    throw Error('Ordinary commit count read requires its managed connection');
+  prepareManagedDatabaseCallbackBarrier(db);
+  const scope = { cursor: 0, functions: true };
+  ordinaryTotalReads.set(db, scope);
+  try {
+    const functions: Array<Record<string, unknown>> = Reflect.apply(
+      terminalNativeAll,
+      Reflect.apply(changesetPrepare, db, ['PRAGMA function_list']),
+      [],
+    );
+    if (
+      scope.cursor !== 1 ||
+      !functions.some((row) => row.name === 'total_changes' && row.builtin === 1) ||
+      functions.some(
+        (row) => String(row.name).toLowerCase() === 'total_changes' && row.builtin !== 1,
+      )
+    )
+      throw Error('Ordinary commit count requires the native total_changes function');
+    scope.cursor = 0;
+    scope.functions = false;
+    const statement = Reflect.apply(changesetPrepare, db, ['SELECT total_changes() AS n']);
+    const changes = Number(Reflect.apply(changesetGet, statement, []).n);
+    if (scope.cursor !== 2) throw Error('Ordinary commit count read did not close');
+    return (
+      changes -
+      Number(readIntakeFrontierAuxiliaryChanges(db)) -
+      Number(readIntakeProjectionChanges(db))
+    );
+  } finally {
+    ordinaryTotalReads.delete(db);
+  }
+};
+/** Passive connection evidence. It grants no publication or review authority and
+ * installs no callbacks in the native terminal publication path. */
+export function readOrdinaryCommitCursor(db: DatabaseSync) {
+  let value = ordinaryCommits.get(db);
+  if (!value) {
+    value = { identity: {}, serial: 0n, succeeded: true, settledChanges: connectionChanges(db) };
+    ordinaryCommits.set(db, value);
+  }
+  const dataVersion = Number(db.prepare('PRAGMA data_version').get()!.data_version),
+    schemaVersion = Number(db.prepare('PRAGMA schema_version').get()!.schema_version),
+    changes = connectionChanges(db);
+  return { ...value, changes, dataVersion, schemaVersion };
+}
+/** A rollback owns its in-transaction attempts, never earlier raw writes.
+ * Rotate the disposable provenance identity before participant work can settle
+ * them, including a write made by a callback while BEGIN was compiled. */
+function enterOrdinaryCommit(db: DatabaseSync): void {
+  const value = ordinaryCommits.get(db);
+  if (value && connectionChanges(db) !== value.settledChanges) value.identity = {};
+}
+function settleOrdinaryCommit(db: DatabaseSync, outcome: TransactionOutcome) {
+  const value = ordinaryCommits.get(db);
+  if (!value) return;
+  if (outcome.committed && !outcome.intakeMaintenance) {
+    value.serial++;
+    value.token = outcome.token;
+    value.succeeded = outcome.succeeded;
+  }
+  // Rollback changes SQLite's attempt count too. Capture only after participant
+  // cleanup, and before outcome callbacks can issue a different write.
+  value.settledChanges = connectionChanges(db);
+}
 const closeObservers = new WeakMap<DatabaseSync, Set<() => void>>();
 /** Dispose connection-owned resources after actual close, including explicit
  * resource management. Cleanup cannot replace the native close result or
@@ -1179,6 +1275,7 @@ export function executeRecordReplay<T>(
   terminalExecution(db, 'BEGIN IMMEDIATE');
   transactionTokens.set(db, token);
   try {
+    enterOrdinaryCommit(db);
     for (const observer of startObservers.get(db) ?? []) observer(token);
     result = body(token);
     if (
@@ -1211,6 +1308,7 @@ export function executeRecordReplay<T>(
         succeeded: committed,
         ...(committed && maintenance ? { intakeMaintenance: true as const } : {}),
       });
+      settleOrdinaryCommit(db, item.outcome);
     }
   }
   if (failed) throw firstFailure;
@@ -1362,6 +1460,7 @@ export function transaction<T>(
   let hooksAdmitted = true;
   let captured;
   try {
+    enterOrdinaryCommit(db);
     // A planning owner must reject start-observer hook substitution BEFORE
     // dispatching any begin/capture/prepare callback from that replacement.
     try {
@@ -1474,19 +1573,21 @@ export function transaction<T>(
       throw error;
     } finally {
       transactionTokens.delete(db);
+      const outcome: TransactionOutcome = {
+        token,
+        committed,
+        succeeded,
+        ...(prepared ? { prepared: true as const } : {}),
+        ...(verifiedIntakeMaintenance && committed && succeeded
+          ? { intakeMaintenance: true as const }
+          : {}),
+      };
+      settleOrdinaryCommit(db, outcome);
       for (const observer of outcomeObservers.get(db) ?? []) {
         // A disposable-cache observer cannot change a durable acknowledgement
         // or suppress cleanup by another observer.
         try {
-          observer({
-            token,
-            committed,
-            succeeded,
-            ...(prepared ? { prepared: true as const } : {}),
-            ...(verifiedIntakeMaintenance && committed && succeeded
-              ? { intakeMaintenance: true as const }
-              : {}),
-          });
+          observer(outcome);
         } catch {
           /* memory only */
         }

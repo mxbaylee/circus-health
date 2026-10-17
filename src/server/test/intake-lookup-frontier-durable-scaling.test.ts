@@ -1,3 +1,4 @@
+import { intakeLogRowsForAdvance } from './helpers/intake-collection-log-evidence.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
@@ -119,8 +120,16 @@ function changedTreePathBudget(
     pathBudget += 4 * localChanges * (Math.max(left?.height ?? 0, right?.height ?? 0) + 1);
   };
   compare(before.logical.root, after.logical.root);
-  compare(before.receipts, after.receipts);
-  compare(before.history, after.history);
+  if (after.format === 'health-intake-state-v4') {
+    assert.equal(before.format, 'health-intake-state-v4', 'selected history cannot downgrade');
+    if (before.format === 'health-intake-state-v4') {
+      compare(before.receipts, after.receipts);
+      compare(before.history, after.history);
+    }
+  } else {
+    pathBudget += intakeLogRowsForAdvance(before, after.storageSequence);
+    changedKeys += 2 * (after.storageSequence - before.storageSequence);
+  }
   compare(before.builds, after.builds);
   return { changedKeys, pathBudget };
 }
@@ -253,6 +262,10 @@ test(
           );
           const headBefore = head();
           const workBefore = intakeWorkCounters(db);
+          const nativeGetDescriptor = Object.getOwnPropertyDescriptor(
+            StatementSync.prototype,
+            'get',
+          )!;
           const nativeGet = StatementSync.prototype.get,
             nativeAll = StatementSync.prototype.all,
             nativeIterate = StatementSync.prototype.iterate;
@@ -285,7 +298,7 @@ test(
               unrelatedPointRows += rows;
             }
           };
-          StatementSync.prototype.get = function (
+          const sourceGet = function (
             this: StatementSync,
             ...parameters: Parameters<StatementSync['get']>
           ) {
@@ -293,6 +306,17 @@ test(
             count(this, row ? 1 : 0, parameters, true);
             return row;
           } as typeof StatementSync.prototype.get;
+          // Route only actual source-table statements through this observer.
+          // Prototype and private codec-index method lookups stay native.
+          Object.defineProperty(StatementSync.prototype, 'get', {
+            configurable: true,
+            get: function (this: StatementSync) {
+              return this === StatementSync.prototype ||
+                !/\b(?:FROM|JOIN)\s+(?:main\.)?source_files\b/i.test(this.sourceSQL)
+                ? nativeGet
+                : sourceGet;
+            },
+          });
           StatementSync.prototype.all = function (
             this: StatementSync,
             ...parameters: Parameters<StatementSync['all']>
@@ -323,7 +347,7 @@ test(
           try {
             result = await acceptIntakeReportSelectionAsync(db, root, profileId, input);
           } finally {
-            StatementSync.prototype.get = nativeGet;
+            Object.defineProperty(StatementSync.prototype, 'get', nativeGetDescriptor);
             StatementSync.prototype.all = nativeAll;
             StatementSync.prototype.iterate = nativeIterate;
           }

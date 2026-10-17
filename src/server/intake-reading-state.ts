@@ -103,12 +103,16 @@ export function prepareReadingStateCatalog(
     if (changes.length) {
       const id = randomUUID();
       collections.commitMaintenance(
-        collections.prepare(collections.openView(), {
-          operationId: id,
-          requestDigest: createHash('sha256').update(id).digest('hex'),
-          domainVersion: collections.binding(collections.openView())!.logical.domainVersion,
-          changes,
-        }),
+        await collections.prepareAsync(
+          collections.openView(),
+          {
+            operationId: id,
+            requestDigest: createHash('sha256').update(id).digest('hex'),
+            domainVersion: collections.binding(collections.openView())!.logical.domainVersion,
+            changes,
+          },
+          assertCurrent,
+        ),
       );
     }
     await options.onCheckpoint?.();

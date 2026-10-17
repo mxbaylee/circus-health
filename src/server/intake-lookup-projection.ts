@@ -45,6 +45,7 @@ import {
   ensureIntakeProjectionWitness,
   intakeProjectionWitnessCurrent,
   ownedIntakeProjectionWrite,
+  runIntakeProjectionAuxiliary,
   projectionInputVersion,
   projectionAnswerWitness,
   projectionWitnessHasForeignMutation,
@@ -326,14 +327,12 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
       CREATE TABLE ${table('identities')}(source_id TEXT NOT NULL,id INTEGER NOT NULL,next INTEGER,hash TEXT NOT NULL,PRIMARY KEY(source_id,id));
       CREATE TABLE ${table('payloads')}(hash TEXT PRIMARY KEY,payload TEXT NOT NULL);`);
     db.prepare(`INSERT INTO ${table('state')} VALUES(1,?,?)`).run(VERSION, profile);
-    db.exec('INSERT OR IGNORE INTO temp.__intake_lookup_dirty SELECT id FROM source_files');
+    runIntakeProjectionAuxiliary(db, 'seedDirtySources', []);
     connection.counters.builds++;
   } else if (cold) {
     // A new connection cannot assume that the closed connection's triggers saw later writes.
-    db.exec('INSERT OR IGNORE INTO temp.__intake_lookup_dirty SELECT id FROM source_files');
-    db.exec(
-      `INSERT OR IGNORE INTO temp.__intake_lookup_dirty SELECT source_id FROM ${table('sources')}`,
-    );
+    runIntakeProjectionAuxiliary(db, 'seedDirtySources', []);
+    runIntakeProjectionAuxiliary(db, 'seedDirtyProjected', []);
     connection.counters.builds++;
   }
   // Restore missing/replaced lookup indexes without reading any authority.
@@ -368,9 +367,8 @@ function initialize(db: DatabaseSync, connection: Connection, profile: string): 
     if (existing !== undefined && existing !== sql) fail('authority tracking schema');
     if (existing === undefined) db.exec(sql.replace('CREATE TRIGGER ', 'CREATE TEMP TRIGGER '));
   }
-  db.exec(
-    `DELETE FROM temp.__intake_lookup_authorities; INSERT OR IGNORE INTO temp.__intake_lookup_authorities SELECT authority_key,source_id FROM ${table('sources')} WHERE authority_key IS NOT NULL`,
-  );
+  runIntakeProjectionAuxiliary(db, 'clearAuthorities', []);
+  runIntakeProjectionAuxiliary(db, 'seedAuthorities', []);
   connection.rebuild = false;
   connection.schema = schemaVersion(db);
 }
@@ -444,7 +442,7 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
   connection.counters.reconciledSources++;
   connection.counters.authorityReads++;
   if (!source) {
-    db.prepare('DELETE FROM temp.__intake_lookup_authorities WHERE source_id=?').run(id);
+    runIntakeProjectionAuxiliary(db, 'removeAuthority', [id]);
     for (const name of ['groups', 'acceptances', 'identities', 'sources'] as const) {
       const rows = ownedIntakeProjectionWrite(
         db,
@@ -456,7 +454,7 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
       if (name === 'sources' && rows[0]?.identity_first !== null)
         connection.counters.identityLinksWritten += rows.length;
     }
-    db.prepare('DELETE FROM temp.__intake_lookup_dirty WHERE source_id=?').run(id);
+    runIntakeProjectionAuxiliary(db, 'removeDirty', [id]);
     return obsolete;
   }
   const selected = source as unknown as IntakeEnvelopeSource;
@@ -513,10 +511,10 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
       );
       countWrite(connection, { id, logicalHead: binding.logicalHead });
     }
-    db.prepare('DELETE FROM temp.__intake_lookup_authorities WHERE source_id=?').run(id);
+    runIntakeProjectionAuxiliary(db, 'removeAuthority', [id]);
     if (binding.key !== null)
-      db.prepare('INSERT INTO temp.__intake_lookup_authorities VALUES(?,?)').run(binding.key, id);
-    db.prepare('DELETE FROM temp.__intake_lookup_dirty WHERE source_id=?').run(id);
+      runIntakeProjectionAuxiliary(db, 'insertAuthority', [binding.key, id]);
+    runIntakeProjectionAuxiliary(db, 'removeDirty', [id]);
     return obsolete;
   }
   const material =
@@ -570,9 +568,9 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
       authority_key: binding.key,
       authority_head: binding.head,
     });
-    db.prepare('DELETE FROM temp.__intake_lookup_authorities WHERE source_id=?').run(id);
+    runIntakeProjectionAuxiliary(db, 'removeAuthority', [id]);
     if (binding.key !== null)
-      db.prepare('INSERT INTO temp.__intake_lookup_authorities VALUES(?,?)').run(binding.key, id);
+      runIntakeProjectionAuxiliary(db, 'insertAuthority', [binding.key, id]);
   }
   const entries = (name: string, originalOnly: boolean): ProjectionRow[] => {
     if (!validJson || (originalOnly && source.kind !== 'intake_original')) return [];
@@ -806,7 +804,7 @@ function reconcile(db: DatabaseSync, connection: Connection, id: string): Set<st
     connection.counters.identityLinksWritten++;
   }
   for (const hash of retainedHere) obsolete.delete(hash);
-  db.prepare('DELETE FROM temp.__intake_lookup_dirty WHERE source_id=?').run(id);
+  runIntakeProjectionAuxiliary(db, 'removeDirty', [id]);
   return obsolete;
 }
 function current(db: DatabaseSync): Connection {

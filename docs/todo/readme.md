@@ -2,15 +2,17 @@
 
 This is the complete open work list. Each row links to its requirements, persona story, walkthrough, decisions and acceptance evidence. **CRS-277 is next unused**; IDs are never reused. Sizes and production marks are maintained here only. See the [workflow](workflow.md) for scoring, selection, review and retirement, [history](history.md) for earlier checkpoints and closed identifiers, and [CRS-060](CRS-060.md) for independent qualification layers. Research listings authorize no paid runs or deployment.
 
-**Grooming checkpoint:** [PR #99](https://github.com/mxbaylee/circus-health/pull/99) merged on 2026-10-16 at 19:53:15 UTC (`ba746af`), resetting the completed-ticket count to **0 of 7**. This People retirement advances it to **1 of 7 only when this change merges**. The current catalog has 93 primary items and 91 scored items; the historical 94-item audit and its limits remain in the [full receipt](history.md).
+**Grooming checkpoint:** [PR #99](https://github.com/mxbaylee/circus-health/pull/99) merged on 2026-10-16 at 19:53:15 UTC (`ba746af`), resetting the completed-ticket count. [PR #100](https://github.com/mxbaylee/circus-health/pull/100) completed CRS-124 at 20:24:51 UTC (`0912b1d`), advancing the count to **1 of 7**. The current catalog has 93 primary items and 91 scored items; the historical 94-item audit and its limits remain in the [full receipt](history.md).
 
 ## <a id="top-5"></a>Next ready work
 
 Readiness follows the merged grooming checkpoint. Delegated product questions are implementation work, not a human hold. Scores below are a view of the catalog; the [selection rules](workflow.md#picking-the-next-item) govern ties.
 
+Current navigation work follows the owner's 2026-10-16 clarification: Import is entered from Sources; Conditions must have a usable first-class sidebar destination. After the active CRS-141 save-integrity work, finish CRS-143's shared policy and prioritize CRS-173 → CRS-174 for that Conditions workflow. Their dependency holds remain explicit; adding a placeholder would not fulfill the request.
+
 | Next | Ticket | Score | Why next / remaining input |
 | --- | --- | --- | --- |
-| 1 | [CRS-141](CRS-141.md) Progressive save correctness | 7 | Unblocks CRS-086; lead resolves recorded disclosure policy. |
+| 1 | [CRS-141](CRS-141.md) Progressive save correctness | 7 | Unblocks CRS-086; large-save and recovery qualification underway. |
 | 2 | [CRS-143](CRS-143.md) Current-record policy | 7 | Supplies CRS-173/174/175; lead resolves recorded policy. |
 | 3 | [CRS-232](CRS-232.md) Complete large text / embedded files | 7 | Unblocks CRS-233; preserve storage and review safeguards. |
 | 4 | [CRS-115](CRS-115.md) Complete durable source text | 7 | Next high-impact eligible ID after external-input waits; independent complete-text oracle remains work. |
@@ -22,7 +24,6 @@ These holds stay visible even when a lower-scoring item can proceed. Preparatory
 
 | Ticket / score | Exact hold and next action | Human input |
 | --- | --- | --- |
-| [CRS-271](CRS-271.md) / 8 | Intended native Linux host and chosen drive unavailable; qualify that actual environment. | [Issue #95](https://github.com/mxbaylee/circus-health/issues/95): identify machine/drive and arrange existing private access; small fictional provider scope already authorized. |
 | [CRS-212](CRS-212.md) / 8 | Runner/storage qualifications CRS-195/198 in [held PR #35](https://github.com/mxbaylee/circus-health/pull/35). | No new owner policy; finish the prerequisite work. |
 | [CRS-073](CRS-073.md) / 8 | Waits for CRS-150's final packet content, then inspect rendered output. | None; printing review is agent work. |
 | [CRS-062](CRS-062.md) / 7 | Full DEXA, optical and complete-record real-route qualification; small one-page evidence is insufficient. | [Scope issue #97](https://github.com/mxbaylee/circus-health/issues/97); prepare exact fixtures/run limits before requesting added authorization. |
@@ -31,6 +32,8 @@ These holds stay visible even when a lower-scoring item can proceed. Preparatory
 | [CRS-173](CRS-173.md), [CRS-174](CRS-174.md), [CRS-175](CRS-175.md), [CRS-150](CRS-150.md) / 7 | CRS-143 supplies source-current policy; preserve the Conditions integration and CRS-175 → CRS-150 → CRS-073 chain. | None for delegated design; actual qualification gates remain in each spec. |
 
 Optional private-library counts remain deferred under [issue #96](https://github.com/mxbaylee/circus-health/issues/96); that issue grants no private-data access. [Issue #97](https://github.com/mxbaylee/circus-health/issues/97) inventories later provider run scopes; [issue #98](https://github.com/mxbaylee/circus-health/issues/98) tracks future personal risk/adoption/device choices after preparation. Neither requests action or grants approval now. CRS-246 prohibits plaintext disk scratch and keeps RAM default until verified encryption. CRS-272 restarts unpublished copies and resumes the exact committed head. CRS-140 remains the shared recovery authority.
+
+[CRS-271](CRS-271.md), score 5, is conditional qualification for a separate native Linux installation if one is chosen. The current Docker Desktop installation already runs Linux containers and has its own scoped evidence. [Issue #95](https://github.com/mxbaylee/circus-health/issues/95) requests no decision or additional machine for that current deployment; it is not a production blocker for the qualified scope. A future host/drive still needs its own durability and recovery checks.
 
 ## <a id="product-and-maintenance"></a>🛠️ Product and maintenance
 
@@ -110,7 +113,7 @@ Optional private-library counts remain deferred under [issue #96](https://github
 - [ ] <a id="crs-061"></a> 🏁 [CRS-061](CRS-061.md) · 🚦 gate · 🚀 production — Qualify the full release before real-record reliance. [Run scope #97](https://github.com/mxbaylee/circus-health/issues/97).
 - [ ] <a id="crs-190"></a> 🎨 [CRS-190](CRS-190.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Audit production UI consistency, theme and end-to-end usability.
 - [ ] <a id="crs-055"></a><a id="crs-014"></a><a id="crs-056"></a> 📱 [CRS-055](CRS-055.md) · 🐕 M · 🟡 M · 🚀 production · score 7 — Qualify adopted physical devices and release browsers. [Later input #98](https://github.com/mxbaylee/circus-health/issues/98).
-- [ ] <a id="crs-271"></a> 🐧 [CRS-271](CRS-271.md) · 🐕 M · 🔴 L · 🚀 production · score 8 — Qualify deployment on the intended native Linux host and drive. [Host input #95](https://github.com/mxbaylee/circus-health/issues/95).
+- [ ] <a id="crs-271"></a> 🐧 [CRS-271](CRS-271.md) · 🐕 M · 🔴 L · score 5 — Qualify a separate native Linux installation if chosen. [Conditional scope #95](https://github.com/mxbaylee/circus-health/issues/95); no current owner input.
 - [ ] <a id="crs-065"></a><a id="crs-064"></a><a id="crs-076"></a> 🛣️ [CRS-065](CRS-065.md) · 🐕 M · 🟡 M · 🚀 production · score 7 — Qualify adopted route capabilities and privacy. [Run scope #97](https://github.com/mxbaylee/circus-health/issues/97).
 - [ ] <a id="crs-066"></a><a id="crs-077"></a><a id="crs-078"></a> 🚧 [CRS-066](CRS-066.md) · 🐕 M · 🟡 M · 🚀 production · score 7 — Qualify route workflows and failures. [Run scope #97](https://github.com/mxbaylee/circus-health/issues/97).
 - [ ] <a id="crs-062"></a><a id="crs-058"></a><a id="crs-067"></a> 🩻 [CRS-062](CRS-062.md) · 🐘 L · 🔴 L · 🚀 production · score 7 — Qualify complete-file imports against literal oracles. [Run scope #97](https://github.com/mxbaylee/circus-health/issues/97).
@@ -130,7 +133,7 @@ Optional private-library counts remain deferred under [issue #96](https://github
 
 - [ ] <a id="crs-044"></a> 🕳️ [CRS-044](CRS-044.md) · 🐕 M · 🟢 S · score 3 — Measure zero-yield pages without skipping evidence.
 - [ ] <a id="crs-087"></a> 📑 [CRS-087](CRS-087.md) · 🐕 M · 🟢 S · score 3 — Assess bounded PDF heading context.
-- [ ] <a id="crs-099"></a> 🧮 [CRS-099](CRS-099.md) · 🐭 S · 🟢 S · score 4 — Optional private-library counts; [owner choice #96](https://github.com/mxbaylee/circus-health/issues/96), deferred.
+- [ ] <a id="crs-099"></a> 🧮 [CRS-099](CRS-099.md) · 🐭 S · 🟢 S · score 4 — Optional processing research; [scope #96](https://github.com/mxbaylee/circus-health/issues/96), deferred with no current owner input.
 - [ ] <a id="crs-104"></a> 🪙 [CRS-104](CRS-104.md) · 🐭 S · 🟢 S · score 4 — Measure achieved provider cache share. [Run scope #97](https://github.com/mxbaylee/circus-health/issues/97).
 - [ ] <a id="crs-106"></a> 🗜️ [CRS-106](CRS-106.md) · 🐭 S · 🟢 S · score 4 — Qualify compaction only if adopted.
 - [ ] <a id="crs-107"></a><a id="crs-105"></a> 📏 [CRS-107](CRS-107.md) · 🐕 M · 🟢 S · score 3 — Verify route limits and media-token estimates. [Run scope #97](https://github.com/mxbaylee/circus-health/issues/97).

@@ -147,12 +147,16 @@ export async function prepareReviewQuestionDerived(
   if (input.auxiliary) input.auxiliary.apply([copy]);
   else
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId,
-        requestDigest: workflowHash(operationId),
-        domainVersion: before.logical.domainVersion,
-        changes: [copy],
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId,
+          requestDigest: workflowHash(operationId),
+          domainVersion: before.logical.domainVersion,
+          changes: [copy],
+        },
+        assertCurrent,
+      ),
     );
   const writer = createEnvelopeBuildWriter(db, source, build, before.logical.domainVersion, {
     assertRunning: assertCurrent,

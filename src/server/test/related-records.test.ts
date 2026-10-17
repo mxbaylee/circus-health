@@ -17,7 +17,10 @@ import { listIntakeReportQueue, getIntakeReportQueueGroup } from '../intake-repo
 import { duplicateRecord, saveDuplicateDecision } from '../duplicate-review.ts';
 import { previewRecordCorrection } from '../record-corrections.ts';
 import { applyClinicalDecision } from '../mapping-actions.ts';
-import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
+import {
+  acceptIntakeReportSelection,
+  acceptIntakeReportSelectionAsync,
+} from '../intake-report-acceptance.ts';
 import { createBackup } from '../recovery.ts';
 import { rebuildProfile } from '../portable.ts';
 import { getNote, saveNote } from '../notes.ts';
@@ -1096,7 +1099,7 @@ test('legacy pending choices remain visible but unpinned; historical accepted pa
 
 for (const discovery of ['later-page', 'explicit-search'] as const)
   for (const changed of [false, true])
-    test(`partial approval resolves ${discovery} destinations and preserves changed authority rejection (${changed})`, (t) => {
+    test(`partial approval resolves ${discovery} destinations and preserves changed authority rejection (${changed})`, async (t) => {
       const f = fixture(t);
       f.accept(
         f.review(
@@ -1135,11 +1138,13 @@ for (const discovery of ['later-page', 'explicit-search'] as const)
       if (changed) f.correct(target.id, '0.125');
       // The first independent commit advances transport revisions, not the person's
       // approval of this exact off-page destination. A real correction still rejects it.
-      const result = acceptIntakeReportSelection(f.db, f.root, f.profileId, {
-        mode: 'partial-v1',
-        operationId: randomUUID(),
-        blocks: [blockFor(independent), blockFor(pending, [choose(target)])],
-      }).receipt;
+      const result = (
+        await acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, {
+          mode: 'partial-v1',
+          operationId: randomUUID(),
+          blocks: [blockFor(independent), blockFor(pending, [choose(target)])],
+        })
+      ).receipt;
       assert.equal(result.atomic, false);
       if (result.atomic) throw Error('Expected partial receipt');
       assert.deepEqual(

@@ -1,3 +1,4 @@
+import { intakeLogRowsForAdvance } from './helpers/intake-collection-log-evidence.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
@@ -14,7 +15,6 @@ import { createIntakeStateStorage } from '../intake-state-storage.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { prepareIntakeCompactMetadata } from '../intake-compact-metadata.ts';
 import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
-import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
 
 test(
   'actual compact backing replays once and advances only exact accepted source certificates',
@@ -58,12 +58,12 @@ test(
             true,
           );
     };
-    // Construction uses independently fictional accepted immutable objects.
+    // Construction uses genuine encrypted authority over fictional originals.
     // Qualification starts only after actual encrypted reconstruction, never
     // by trusting/copied SQL state or skipping production preparation.
-    const fixture = memoryRecordAuthority(db);
-    const sources: { id: string; sha256: string; raw: string }[] = [];
-    for (let i = 0; i < 8; i++) {
+    attachRecordDurability(db, { profileId, storage, verifyReferences });
+    t.diagnostic('fixture: genuine encrypted construction started');
+    const sources = Array.from({ length: 8 }, (_, i) => {
       const id = 'fictional-frontier-' + i,
         path = originals[i]!,
         initial = prepareInitialIntakeEnvelope({
@@ -75,7 +75,12 @@ test(
             importHistory: [],
           },
         });
-      transaction(db, () => {
+      return { id, path, initial, sha256: sourceHash, raw: initial.detailsJson };
+    });
+    // These independent setup rows share real publications. The qualification
+    // below still starts only after rebuilding from encrypted accepted evidence.
+    transaction(db, () => {
+      for (const { id, path, initial } of sources) {
         db.prepare(
           'INSERT INTO source_files(id,path,sha256,bytes,kind,mime_type,details_json) VALUES(?,?,?,?,?,?,?)',
         ).run(
@@ -91,23 +96,24 @@ test(
           initial.state,
           randomUUID(),
         );
-      });
-      await buildIntakeCollectionEnvelope(db, { id, sha256: sourceHash });
-      transaction(db, () =>
-        db
-          .prepare('UPDATE source_files SET details_json=? WHERE id=?')
-          .run(initial.detailsJson, id),
-      );
-      sources.push({ id, sha256: sourceHash, raw: initial.detailsJson });
+      }
+    });
+    t.diagnostic('fixture: all original source rows accepted');
+    for (const [index, source] of sources.entries()) {
+      await buildIntakeCollectionEnvelope(db, source);
+      t.diagnostic(`fixture: constructed source ${index + 1}/8`);
     }
-    for (const [name, bytes] of fixture.objects)
-      if (name !== 'head') storage.writeImmutable(name, bytes);
-    storage.publishHead(fixture.objects.get('head')!);
+    transaction(db, () => {
+      for (const source of sources)
+        db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(source.raw, source.id);
+    });
+    t.diagnostic('fixture: all sources constructed; independent encrypted rebuild started');
     db.close();
     const recovered = join(root, 'actual-accepted.sqlite');
     rebuildRecordDatabase(recovered, { profileId, storage, verifyReferences });
     db = openDatabase(recovered, profileId);
     attachRecordDurability(db, { profileId, storage, verifyReferences });
+    t.diagnostic('qualification: independent encrypted rebuild complete');
     const startSequence = Number(
       db.prepare('SELECT sequence FROM __record_state WHERE singleton=1').get()!.sequence,
     );
@@ -119,15 +125,16 @@ test(
         sourceHash,
       }).collections;
       const selected = collections.binding(collections.openView())!;
-      // Empty logical changes still insert the operation's receipt/history.
-      // Persistent AVL paths, not a guessed number of metadata rows, bound them.
-      changedPathBound +=
-        4 * ((selected.receipts?.height ?? 0) + (selected.history?.height ?? 0) + 2) + 3;
+      // Empty logical changes retain one exact receipt/transition event. Count
+      // its carry path and optional V4 anchor, plus the original non-node bound.
+      changedPathBound += intakeLogRowsForAdvance(selected, selected.storageSequence + 1) + 3;
     }
     const work = createRecordVersionWorkCounters();
     await withRecordVersionWork(work, async () => {
-      for (const source of sources)
+      for (const [index, source] of sources.entries()) {
         assert.equal((await prepareIntakeCompactMetadata(db, source)).changed, true);
+        t.diagnostic(`qualification: compact backing advanced source ${index + 1}/8`);
+      }
     });
     assert.equal(work.operation.vaultBackingColdReplays, 1);
     assert.equal(work.operation.vaultBackingReuses, 7);
@@ -159,6 +166,7 @@ test(
       work.operation.vaultBackingPhysicalMembersVerified > 0,
       'full namespace remains explicitly counted',
     );
+    t.diagnostic('qualification: exact initial replay/write-count assertions passed');
     const source = sources[0]!;
     transaction(db, () =>
       db.prepare('UPDATE source_files SET details_json=? WHERE id=?').run(source.raw, source.id),

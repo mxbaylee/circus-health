@@ -19,10 +19,7 @@ import {
 import { CollectionImportReview } from './CollectionImportReview';
 import { ImportReadingActivity } from './ImportReadingActivity';
 import { ImportAcceptanceOutcomes } from './ImportAcceptanceOutcomes';
-import type {
-  IntakePartialAcceptanceReceipt,
-  IntakeReportAcceptanceReceipt,
-} from '../../../shared/intake';
+import type {} from '../../../shared/intake';
 import type { IntakeIdentityAnswers } from '../../../shared/intake-identity';
 import type { ImportPersonSelection } from './ImportPersonChoice';
 import type { ManualSourceRecordResult } from '../../../shared/intake-manual-source-record';
@@ -67,7 +64,7 @@ import { sameDisplayedSourceReview } from '../../data/source-label-freshness';
 import { LoadingIndicator } from '../../components/LoadingIndicator';
 import { useAssistantSelection } from '../assistant/pageContext';
 import { initialDraft } from '../intake/useReviewDrafts';
-import { useReportAcceptance } from '../intake/useReportAcceptance';
+import { usePlannedReportAcceptance } from './usePlannedReportAcceptance';
 import { intakeReadingPauseLabel, reportActivityLabel } from '../intake/reviewQueue';
 import { useIntakeBatch } from '../intake/useIntakeBatch';
 import {
@@ -80,14 +77,7 @@ import {
 import { ImportDetailReview, type ImportDetailSelection } from './ImportDetailReview';
 import { ImportSourceTextBrowser } from './ImportSourceTextBrowser';
 import { ImportSaveStatus } from './ImportSaveStatus';
-import {
-  combinePartialReceipts,
-  confirmedSelectionIds,
-  planPartialSave,
-  rejectedSelectionIds,
-  stoppedChildSelections,
-  type UnsentSelection,
-} from './partial-save-plan';
+import { confirmedSelectionIds, planPartialSave, rejectedSelectionIds } from './partial-save-plan';
 import { possibleSavedOverlapCount } from './possible-overlaps';
 import {
   loadAcceptedRecordsForScope,
@@ -249,6 +239,7 @@ export function ImportPage() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [recentSavedPeople, setRecentSavedPeople] = useState<SavedPersonDestination[]>([]);
+  const [confirmedClinicalIds, setConfirmedClinicalIds] = useState<string[]>([]);
   const [savedDestinationsError, setSavedDestinationsError] = useState('');
   const [savedDestinations, setSavedDestinations] = useState<Map<string, IntakeAcceptedRecord>>(
     new Map(),
@@ -309,6 +300,18 @@ export function ImportPage() {
   const requestScope = `${profile?.id || ''}:${feedPath}`;
   const displayedFeed = pagedFeedScope === requestScope ? pagedFeed : null;
   const committedPeople = useRef<{ people: IntakePersonProposal[] } | null>(null);
+  // A return to the same filters is a new review; ordinary feed refreshes keep the owner.
+  const committedClinicalReview = useRef<object | null>(null);
+  useLayoutEffect(() => {
+    const owner = {};
+    committedClinicalReview.current = owner;
+    setConfirmedClinicalIds([]);
+    setOperationStatus(null);
+    setNotice('');
+    return () => {
+      if (committedClinicalReview.current === owner) committedClinicalReview.current = null;
+    };
+  }, [requestScope, selectionQuery]);
   useLayoutEffect(() => {
     const owner = { people };
     committedPeople.current = owner;
@@ -459,29 +462,12 @@ export function ImportPage() {
     }
   }, [displayedFeed, profile?.id, profileIdentitySignature, feed.reload]);
 
-  const [acceptanceReceipt, setAcceptanceReceipt] = useState<IntakeReportAcceptanceReceipt | null>(
-    null,
-  );
-  const [unsentSelections, setUnsentSelections] = useState<UnsentSelection[]>([]);
   const savingChunks = useRef(false);
-  const confirmedPartialReceipts = useRef<IntakePartialAcceptanceReceipt[]>([]);
-  useEffect(() => {
-    setAcceptanceReceipt(null);
-    setUnsentSelections([]);
-    confirmedPartialReceipts.current = [];
-  }, [profile?.id]);
-  const acceptance = useReportAcceptance(profile?.id || '', (result) => {
+  const acceptance = usePlannedReportAcceptance(profile?.id || '', (result) => {
+    setConfirmedClinicalIds((prior) => [
+      ...new Set([...prior, ...confirmedSelectionIds(result.receipt)]),
+    ]);
     if (!savingChunks.current) setBusy(false);
-    if (result.receipt.atomic) setAcceptanceReceipt(result.receipt);
-    else {
-      confirmedPartialReceipts.current = [
-        ...confirmedPartialReceipts.current.filter(
-          (receipt) => receipt.operationId !== result.receipt.operationId,
-        ),
-        result.receipt,
-      ];
-      setAcceptanceReceipt(combinePartialReceipts(confirmedPartialReceipts.current));
-    }
     setNotice('');
     feed.reload();
   });
@@ -1033,11 +1019,7 @@ export function ImportPage() {
                                 : 'Moxie is getting ready to read. Your progress is saved.';
     const paused = batch.batch?.status === 'stopped' || batch.batch?.status === 'paused';
     return {
-      confirmedSavedIds: acceptanceReceipt?.receipts.flatMap((block) =>
-        block.records.map((record) =>
-          JSON.stringify([block.intakeId, record.candidateId, record.candidateVersionId]),
-        ),
-      ),
+      confirmedSavedIds: confirmedClinicalIds,
       contextKey: `${profile?.id || ''}:${feedPath}`,
       rejectedApprovalIds: rejectedPeople,
       loading: !data,
@@ -1194,7 +1176,7 @@ export function ImportPage() {
       },
     };
   }, [
-    acceptanceReceipt,
+    confirmedClinicalIds,
     batch.batch,
     batch.busy,
     displayedFeed,
@@ -1514,6 +1496,7 @@ export function ImportPage() {
       return { savedIds: [] };
     }
     const owner = retryOwner === undefined ? committedPeople.current : retryOwner;
+    const clinicalOwner = committedClinicalReview.current;
     let pinned: PeopleReviewApproval[];
     try {
       pinned = requirePeopleApprovals(ids, peopleApprovals);
@@ -1526,7 +1509,8 @@ export function ImportPage() {
     const run = {};
     peopleRunning.current = run;
     const succeeded = await perform(
-      async ({ prefix, current, operationId, request: requestApi }) => {
+      async ({ prefix, current: profileCurrent, operationId, request: requestApi }) => {
+        const current = () => profileCurrent() && committedClinicalReview.current === clinicalOwner;
         setOperationStatus(
           `Preparing ${ids.length} selected ${ids.length === 1 ? 'item' : 'items'}…`,
         );
@@ -1588,31 +1572,18 @@ export function ImportPage() {
         }
         if (clinical.length) {
           savingChunks.current = true;
-          confirmedPartialReceipts.current = [];
-          setAcceptanceReceipt(null);
           setOperationStatus(`Checking ${clinical.length} selected clinical records…`);
           const plan = planPartialSave(clinical, displayedFeed, approvals);
-          setUnsentSelections(plan.unsent);
-          for (const [index, blocks] of plan.chunks.entries()) {
-            if (!current()) break;
-            const request: IntakeReportAcceptanceRequest = {
-              mode: 'partial-v1',
-              operationId: crypto.randomUUID(),
-              blocks,
-            };
-            const result = await acceptance.submit(request, operationId);
-            if (!result) {
-              // An uncertain child operation blocks every later child. Its ID remains
-              // available to the reconciliation hook, and no new approval is inferred.
-              setUnsentSelections((prior) => [
-                ...prior,
-                ...stoppedChildSelections(plan.chunks.slice(index + 1)),
-              ]);
-              break;
-            }
+          const results = await acceptance.save(plan.blocks, {
+            current,
+            unsent: plan.unsent,
+            operationId,
+            onProgress: (completed, total) =>
+              setOperationStatus(`Checked ${completed} of ${total} save groups…`),
+          });
+          for (const result of results) {
             rejectedIds.push(...rejectedSelectionIds(result.receipt));
             savedIds.push(...confirmedSelectionIds(result.receipt));
-            setOperationStatus(`Checked ${index + 1} of ${plan.chunks.length} save groups…`);
           }
           savingChunks.current = false;
         } else {
@@ -1636,6 +1607,7 @@ export function ImportPage() {
       if (!succeeded && !uncertain && committedPeople.current === owner)
         setRejectedPeople(remaining.filter((id) => id.startsWith('person:')));
     }
+    if (committedClinicalReview.current !== clinicalOwner) return { savedIds: [], rejectedIds: [] };
     if (!succeeded && !uncertain)
       rejectedIds.push(...remaining.filter((id) => id.startsWith('person:')));
     return { savedIds, rejectedIds };
@@ -2309,7 +2281,11 @@ export function ImportPage() {
           {error || acceptance.error || batch.error}
         </div>
       )}
-      <ImportAcceptanceOutcomes receipt={acceptanceReceipt} unsent={unsentSelections} />
+      <ImportAcceptanceOutcomes
+        receipt={acceptance.receipt}
+        unsent={acceptance.unsent}
+        unknown={acceptance.unknown}
+      />
       {notice && (
         <div className="import-page-notice" role="status">
           <span>{notice}</span>

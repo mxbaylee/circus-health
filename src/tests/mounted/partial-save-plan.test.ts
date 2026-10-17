@@ -33,25 +33,13 @@ const id = (index: number) =>
     `fictional-version-${index}`,
   ]);
 
-it('plans over-cap approvals as ordered operations of at most 200 selections', () => {
+it('retains exact over-cap approvals for server commit-group and byte planning', () => {
   const selected = Array.from({ length: 1001 }, (_, index) => id(index));
   const plan = planPartialSave(selected, null, [block(1001)]);
   expect(plan.unsent).toEqual([]);
-  expect(plan.chunks.map((chunk) => chunk.flatMap((part) => part.selections).length)).toEqual([
-    200, 200, 200, 200, 200, 1,
-  ]);
-  expect(
-    plan.chunks.flatMap((chunk) =>
-      chunk.flatMap((part) => part.selections.map((selection) => selection.recordId)),
-    )[1000],
-  ).toBe('fictional-record-1000');
-});
-
-it('sends a selection within the server caps as one operation so coupled selections stay together', () => {
-  const selected = Array.from({ length: 1000 }, (_, index) => id(index));
-  const plan = planPartialSave(selected, null, [block(1000)]);
-  expect(plan.chunks).toHaveLength(1);
-  expect(plan.chunks[0]!.flatMap((part) => part.selections)).toHaveLength(1000);
+  expect(plan.blocks).toHaveLength(1);
+  expect(plan.blocks[0]?.selections).toHaveLength(1001);
+  expect(plan.blocks[0]?.selections[1000]?.recordId).toBe('fictional-record-1000');
 });
 
 it('explains every selected ID absent from exact approvals without submitting an empty request', () => {
@@ -59,7 +47,7 @@ it('explains every selected ID absent from exact approvals without submitting an
     blocks: [{ records: [{ feedKey: id(0), title: 'Fictional result', selectable: false }] }],
   } as IntakeImportFeed;
   const plan = planPartialSave([id(0), id(1)], shown, [block(0)]);
-  expect(plan.chunks).toEqual([]);
+  expect(plan.blocks).toEqual([]);
   expect(plan.unsent).toHaveLength(2);
   expect(plan.unsent[0]?.reason).toMatch(/needs review/);
   expect(plan.unsent[1]?.reason).toMatch(/no longer on the displayed page/);

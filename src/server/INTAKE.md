@@ -261,11 +261,43 @@ Durability is reported separately and must be honored. A failure after publishin
 
 ### Partial clinical mode (version 1)
 
+The HTTP handler and internal partial callers use
+`acceptIntakeReportSelectionAsync`; the synchronous contributor entry rejects
+partial mode explicitly. New partial work prepares the existing V4 schema for
+each selected original before capturing plan dependencies or publishing its
+manifest. The exact supplied approvals are preserved. Receipt recovery and
+operation conflicts precede conversion, and conversion is representation work,
+not clinical acceptance. Planning can therefore publish conversion metadata even
+though the plan itself remains disposable. Request cancellation and profile
+authorization remain checked during preparation. Atomic compatibility entry
+points retain their existing contract.
+
 New UI requests add `mode:"partial-v1"` and `selectionReviewToken` to every selection. The server produces that token on each review record. It binds the exact record review inputs and source/identity authority independently of unrelated transport revisions. Selected comparison decisions retain exact destination authority; only v2 transport pins may advance after their durable inputs compare equal. Validation and authorization precede durable work. Each record and its receipt publish atomically; explicit shared source assertion/destination effects form commit groups. Independent stale/blocked/invalid selections return needs-review without rolling back valid siblings.
+
+`POST /intakes/report-acceptance-plan` accepts `{blocks}` with these exact partial
+approval selections, including over-cap selections within the HTTP body limit.
+It returns `{planId,chunks,unsent}`. Each chunk contains complete request blocks;
+each unsent item identifies its intake, proposal, record and candidate version,
+with a reason code and explanation. The server derives coupled groups from
+current source assertions, selected/retained comparison decisions and duplicate
+destinations before packing. A complete selection that fits all three limits
+remains one operation. Otherwise 200 selections is a packing target, not a
+coupled-group boundary: an indivisible group may exceed 200 while remaining within
+1000 selections, 100 blocks and 64 MiB. A group exceeding a hard limit is unsent;
+missing dependency evidence conservatively refuses the selected scope.
+
+The browser submits each returned chunk sequentially as a partial request with
+`plan:{id:planId,chunk}` and its own stable operation ID. Plans are disposable,
+profile/database-bound state with at most eight retained plans per database;
+they neither approve a record nor publish a durable manifest. An unavailable or
+changed plan refuses unsent work. Exact receipt lookup/replay precedes plan
+validation, so losing a plan cannot erase an already issued operation's outcome.
+Current physical-source, approval, comparison and session checks remain required
+for every publication. Direct partial requests retain the same hard limits.
 
 The receipt is `{version:1,operationId,status:"completed",atomic:false,at,selectedCount,acceptedCount,receipts,items}`. Each item includes `intakeId,proposalId,recordId,candidateId,candidateVersionId,selectionReviewToken,reviewedSelectionHash,operationId,status` plus bounded optional `label,kind,personId,reportName` display fields; status is `saved|needs_review|failed|not_attempted`. Saved items include an exact single-selection receipt; unsuccessful items include `reasonCode` and `message`. Older receipts decode unchanged and the browser uses a neutral report fallback when display fields are absent. Legacy atomic receipts remain unchanged. Both modes reject operation-ID reuse with different content or mode.
 
-A durable parent manifest stores the exact request once. The server verifies and prepares each original intake, workflow and person authority once for the operation. It then reads and validates each distinct selected proposal's retained bytes once, producing that proposal's own review tokens; selections from the same proposal reuse that review. Independent selections apply in bounded transactions with yields between them. The server rechecks profile/session authorization and relevant source, person and name authority before each batch; a changed dependency sends that selection back for review. Deterministic child/group IDs and bounded per-item result rows use the existing journaled `app_meta` projection, without appending parent/history copies per child. GET and exact POST replay reconcile already published children; they do not continue interrupted clinical writes. Remaining items become not attempted and need a new explicit approval. An in-progress receipt lookup reports that the save is still processing, rather than reconciling live missing items as interrupted. A cache behind an ambiguous durable publication requires recovery before any outcome is declared. The browser splits more than 1000 selections into sequential operations of at most 200 each and stops after an unknown child outcome. Direct callers exceeding the cap receive an error that names the 1000-selection limit. See [reliable review](../../docs/import/review-reliability.md) for the owner rationale, unknown-outcome distinction and coupled-operation exception.
+A durable parent manifest stores the exact request once. Initial preparation verifies the selected originals, workflows and person authority and prepares each distinct selected proposal's review. Native commit groups then prepare their selected clinical projection and revalidate current evidence before publication; a preparation-call counter includes both stages and does not by itself count complete intake rereads. Independent selections apply in bounded transactions with yields between them. Work measurements must include initial representation preparation, proposal-file verification, selected projection work and publication rather than counting only the final commit. The server rechecks profile/session authorization and relevant source, person and name authority before each batch; a changed dependency sends that selection back for review. Deterministic child/group IDs and bounded per-item result rows use the existing journaled `app_meta` projection, without appending parent/history copies per child. GET and exact POST replay reconcile already published children; they do not continue interrupted clinical writes. Remaining items become not attempted and need a new explicit approval. An in-progress receipt lookup reports that the save is still processing, rather than reconciling live missing items as interrupted. A cache behind an ambiguous durable publication requires recovery before any outcome is declared. The browser follows the server plan and stops after an unknown child outcome; its summary retains every unknown selection and unsent successor until the original operation is reconciled. Direct callers exceeding the cap receive an error that names the 1000-selection limit. See [reliable review](../../docs/import/review-reliability.md) for the owner rationale, unknown-outcome distinction and coupled-operation exception.
 
 ## Report-scoped source confirmation
 

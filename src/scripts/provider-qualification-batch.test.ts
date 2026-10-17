@@ -1,15 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
-import { runQualificationBatch } from './provider-qualification-batch.ts';
+import {
+  runQualificationBatch,
+  summarizeQualificationBatch,
+} from './provider-qualification-batch.ts';
 import {
   captureQualificationEvidence,
+  finishQualificationBudgetFailure,
   qualificationRequestSignal,
+  readQualificationResponse,
+  recordQualificationCleanupFailure,
+  shareQualificationEvidence,
   writeQualificationPrivateJson,
 } from './qualify-provider-pdf.ts';
+import type { QualificationRequestBudget } from './provider-qualification-request-budget.ts';
 
 test('deployment model-await requests ignore the host guard and retain operator cancellation', () => {
   const operator = new AbortController();
@@ -190,6 +198,62 @@ test('upload-created automatic batch retains its own operation ID throughout pol
   );
 });
 
+test('batch observation awaits its asynchronous review checkpoint before another poll', async () => {
+  const order: string[] = [];
+  const states = [snapshot(), complete()];
+  const result = await runQualificationBatch({
+    prefix: '/api/profiles/fictional-profile',
+    profileId: 'fictional-profile',
+    intakeId: 'fictional-original',
+    signal: new AbortController().signal,
+    request: async <T>() => {
+      order.push('request');
+      return states.shift() as T;
+    },
+    onSnapshot: async (batch) => {
+      order.push('observe-' + batch.status);
+      await new Promise<void>((done) => setImmediate(done));
+      order.push('retained-' + batch.status);
+    },
+    wait: async () => {
+      order.push('wait');
+    },
+  });
+  assert.equal(result.passed, true);
+  assert.deepEqual(order, [
+    'request',
+    'observe-running',
+    'retained-running',
+    'wait',
+    'request',
+    'observe-complete',
+    'retained-complete',
+  ]);
+});
+
+test('asynchronous checkpoint failure stops polling without a retry', async () => {
+  let calls = 0;
+  await assert.rejects(
+    runQualificationBatch({
+      prefix: '/api/profiles/fictional-profile',
+      profileId: 'fictional-profile',
+      intakeId: 'fictional-original',
+      signal: new AbortController().signal,
+      request: async <T>() => {
+        calls++;
+        return snapshot() as T;
+      },
+      onSnapshot: async () => {
+        await Promise.resolve();
+        throw Error('Fictional retained review failure');
+      },
+      wait: async () => assert.fail('failed checkpoint must not continue'),
+    }),
+    /retained review failure/,
+  );
+  assert.equal(calls, 1);
+});
+
 test('paused, stopped and exhausted whole-job budgets cannot pass qualification', async () => {
   const exhausted = complete();
   exhausted.reason = 'items_paused';
@@ -319,4 +383,352 @@ test('read-only capture counts artifact rejection and partial results once per c
     signals.every((signal) => signal === signals[0]),
     'one shared cleanup deadline',
   );
+});
+
+const exhaustedBudget: QualificationRequestBudget = {
+  limit: 16,
+  admitted: 16,
+  denied: 1,
+  runtimeClaimed: true,
+  stopReason: 'completion_request_cap_reached',
+  scope: 'Independently fictional admission receipts.',
+};
+
+test('verified cap exhaustion captures once before teardown, including an observer during final capture', async () => {
+  const events: string[] = [];
+  const deadline = new AbortController();
+  let release!: (value: boolean) => void;
+  const evidence = shareQualificationEvidence(
+    [
+      async () => {
+        events.push('diagnostics');
+        return new Promise<boolean>((resolve) => {
+          release = resolve;
+        });
+      },
+      async () => {
+        events.push('review');
+        return false;
+      },
+    ],
+    (outcomes) => {
+      events.push('retained');
+      assert.deepEqual(outcomes, [true, false]);
+    },
+  );
+  const normal = evidence.capture(deadline.signal);
+  // Normal finalization has begun, but neither the observer nor finalization
+  // may issue another pair of capture requests or double-count their failures.
+  const cleanup = finishQualificationBudgetFailure(
+    exhaustedBudget,
+    {
+      abort: () => {
+        events.push('abort');
+      },
+      capture: evidence.capture,
+      stop: async () => {
+        events.push('stop');
+      },
+    },
+    deadline.signal,
+  );
+  await Promise.resolve();
+  assert.deepEqual(events, ['diagnostics', 'review', 'abort']);
+  release(true);
+  await normal;
+  await cleanup;
+  assert.deepEqual(events, ['diagnostics', 'review', 'abort', 'retained', 'stop']);
+});
+
+test('completed evidence refreshes for later run state while its cap observer shares the new capture', async () => {
+  let activeRun = 'fictional earlier run';
+  const capturedRuns: string[] = [];
+  const retained: (readonly boolean[])[] = [];
+  const events: string[] = [];
+  let release!: (value: boolean) => void;
+  const deadline = new AbortController();
+  const evidence = shareQualificationEvidence(
+    [
+      async () => {
+        capturedRuns.push(activeRun);
+        if (activeRun === 'fictional earlier run') return true;
+        return new Promise<boolean>((resolve) => {
+          release = resolve;
+        });
+      },
+    ],
+    (outcomes) => {
+      retained.push(outcomes);
+    },
+  );
+  const earlier = evidence.capture(deadline.signal);
+  await earlier;
+
+  activeRun = 'fictional later updated run';
+  const later = evidence.capture(deadline.signal);
+  assert.notEqual(later, earlier);
+  const observerDeadline = new AbortController();
+  const observer = evidence.capture(observerDeadline.signal);
+  assert.equal(observer, later);
+  const cleanup = finishQualificationBudgetFailure(
+    exhaustedBudget,
+    {
+      abort: () => {
+        events.push('abort');
+      },
+      capture: evidence.capture,
+      stop: async () => {
+        events.push('stop');
+      },
+    },
+    deadline.signal,
+  );
+  await Promise.resolve();
+  assert.deepEqual(capturedRuns, ['fictional earlier run', 'fictional later updated run']);
+  assert.deepEqual(events, ['abort']);
+  release(false);
+  await later;
+  await cleanup;
+  assert.deepEqual(retained, [[true], [false]]);
+  assert.deepEqual(events, ['abort', 'stop']);
+});
+
+test('an observer shares the existing capture deadline even if its own signal remains live', async () => {
+  const firstDeadline = new AbortController();
+  const laterDeadline = new AbortController();
+  const outcomes: (readonly boolean[])[] = [];
+  let stopped = false;
+  let captures = 0;
+  const evidence = shareQualificationEvidence(
+    [
+      async () => {
+        captures++;
+        return new Promise<boolean>(() => {});
+      },
+    ],
+    (result) => {
+      outcomes.push(result);
+    },
+  );
+  const normal = evidence.capture(firstDeadline.signal);
+  const cleanup = finishQualificationBudgetFailure(
+    exhaustedBudget,
+    {
+      abort() {},
+      capture: evidence.capture,
+      stop: async () => {
+        stopped = true;
+      },
+    },
+    laterDeadline.signal,
+  );
+  firstDeadline.abort();
+  await normal;
+  await cleanup;
+  assert.equal(laterDeadline.signal.aborted, false);
+  assert.equal(captures, 1);
+  assert.equal(stopped, true);
+  assert.deepEqual(outcomes, [[false]]);
+});
+
+test('cap capture deadline tears down an ignored signal and late completion cannot upgrade evidence', async () => {
+  const deadline = new AbortController();
+  const events: string[] = [];
+  let release!: (value: boolean) => void;
+  let retained: readonly boolean[] | undefined;
+  const evidence = shareQualificationEvidence(
+    [
+      async (signal) => {
+        assert.equal(signal, deadline.signal);
+        events.push('capture');
+        return new Promise<boolean>((resolve) => {
+          release = resolve;
+        });
+      },
+    ],
+    (outcomes) => {
+      retained = outcomes;
+    },
+  );
+  const cleanup = finishQualificationBudgetFailure(
+    exhaustedBudget,
+    {
+      abort: () => {
+        events.push('abort');
+      },
+      capture: evidence.capture,
+      stop: async () => {
+        events.push('stop');
+      },
+    },
+    deadline.signal,
+  );
+  assert.deepEqual(events, ['abort', 'capture']);
+  deadline.abort();
+  await cleanup;
+  assert.deepEqual(events, ['abort', 'capture', 'stop']);
+  assert.deepEqual(retained, [false]);
+  release(true);
+  await Promise.resolve();
+  assert.deepEqual(retained, [false]);
+});
+
+test('late batch JSON and deployment error bodies cannot mutate evidence after teardown', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-late-qualification-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  for (const kind of ['batch', 'deployment-error'] as const) {
+    const deadline = new AbortController();
+    let release!: () => void;
+    const transport = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let settled!: () => void;
+    const captureSettled = new Promise<void>((resolve) => {
+      settled = resolve;
+    });
+    const report = {
+      coordinator: summarizeQualificationBatch(snapshot()),
+      diagnosticCaptureFailures: 0,
+      reviewCaptureFailures: 0,
+      cookie: '',
+    };
+    let subsequentReads = 0;
+    let stopped = false;
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        async start(controller) {
+          await transport;
+          const body =
+            kind === 'batch'
+              ? JSON.stringify({ data: snapshot({ status: 'complete' }) })
+              : 'Independently fictional late body';
+          controller.enqueue(new TextEncoder().encode(body));
+          controller.close();
+        },
+      }),
+      { status: kind === 'batch' ? 200 : 503 },
+    );
+    const evidence = shareQualificationEvidence(
+      [
+        async (signal) => {
+          try {
+            const batch = await readQualificationResponse<IntakeBatch>(response, signal, {
+              cookie: (cookie) => {
+                report.cookie = cookie;
+              },
+              failure: (status, body) =>
+                writeQualificationPrivateJson(join(root, 'http-failure.json'), { status, body }),
+            });
+            // The production batch capture publishes only after this same guarded
+            // response reader returns, then proceeds to intake/feed/proposal reads.
+            report.coordinator = summarizeQualificationBatch(batch);
+            subsequentReads++;
+            writeQualificationPrivateJson(join(root, 'batch.json'), batch);
+            return true;
+          } finally {
+            settled();
+          }
+        },
+      ],
+      ([review]) => {
+        if (!review) report.reviewCaptureFailures++;
+      },
+    );
+    const cleanup = finishQualificationBudgetFailure(
+      exhaustedBudget,
+      {
+        abort() {},
+        capture: evidence.capture,
+        stop: async () => {
+          stopped = true;
+        },
+      },
+      deadline.signal,
+    );
+    deadline.abort();
+    await cleanup;
+    assert.equal(stopped, true);
+    assert.equal(report.reviewCaptureFailures, 1);
+    const beforeLateResponse = JSON.stringify(report);
+    release();
+    await captureSettled;
+    assert.equal(JSON.stringify(report), beforeLateResponse);
+    assert.equal(subsequentReads, 0);
+    assert.deepEqual(readdirSync(root), []);
+  }
+});
+
+test('unproven admission closure stops immediately without a diagnostic window', async () => {
+  for (const snapshot of [
+    null,
+    { ...exhaustedBudget, admitted: 15 },
+    { ...exhaustedBudget, runtimeClaimed: false },
+    ...(
+      [
+        'unexpected_request_route',
+        'worker_network_request_refused',
+        'runtime_restart_refused',
+        'receipt_integrity_failure',
+      ] as const
+    ).map((stopReason) => ({ ...exhaustedBudget, stopReason })),
+  ]) {
+    const events: string[] = [];
+    await finishQualificationBudgetFailure(snapshot, {
+      abort: () => {
+        events.push('abort');
+      },
+      capture: async () => {
+        events.push('capture');
+      },
+      stop: async () => {
+        events.push('stop');
+      },
+    });
+    assert.deepEqual(events, ['abort', 'stop']);
+  }
+});
+
+test('budget cleanup propagates teardown failure after evidence failure without replacing the budget verdict', async () => {
+  const failure = Error('Independently fictional teardown failure');
+  const events: string[] = [];
+  const evidence = shareQualificationEvidence(
+    [
+      async () => {
+        throw Error('Independently fictional capture failure');
+      },
+    ],
+    (outcomes) => {
+      assert.deepEqual(outcomes, [false]);
+      events.push('partial');
+    },
+  );
+  await assert.rejects(
+    finishQualificationBudgetFailure(exhaustedBudget, {
+      abort: () => {
+        events.push('abort');
+      },
+      capture: evidence.capture,
+      stop: async () => {
+        events.push('stop');
+        throw failure;
+      },
+    }),
+    (error) => error === failure,
+  );
+  assert.deepEqual(events, ['abort', 'partial', 'stop']);
+  assert.equal(exhaustedBudget.stopReason, 'completion_request_cap_reached');
+  assert.equal(exhaustedBudget.admitted, 16);
+});
+
+test('cleanup failure invalidates a successful verdict and preserves an earlier budget failure', () => {
+  for (const failure of [null, 'Qualification inconclusive: completion_request_cap_reached.']) {
+    const report = { passed: failure === null, failure, cleanupFailure: null as string | null };
+    recordQualificationCleanupFailure(report);
+    assert.equal(report.passed, false);
+    assert.equal(
+      report.cleanupFailure,
+      'Qualification cleanup failed; inspect the isolated Compose project.',
+    );
+    assert.equal(report.failure, failure ?? report.cleanupFailure);
+  }
 });

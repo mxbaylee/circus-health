@@ -410,8 +410,14 @@ test(
       const { resolutionsReference: _reference, ...header } = draft;
       assert.equal(
         hash(canonicalReviewValueChunks(draft)),
-        hash([canonicalLiteral({ ...header, resolutions: expected })]),
-        'presentation references preserve the full ordered canonical token input',
+        hash([
+          canonicalLiteral(
+            draft.history?.format === 'health-intake-review-draft-legacy-history-v1'
+              ? historical
+              : { ...header, resolutions: expected },
+          ),
+        ]),
+        'legacy adoption preserves the complete original draft; native saves preserve ordered policy witnesses',
       );
       assert.match(
         canonicalLiteral(latestReviewDraftResolution(draft, 'historical-issue:119')),

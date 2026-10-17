@@ -332,9 +332,12 @@ async function publishSourceLookupIndices(
   if (!hasIntakeCollectionEnvelope(db, source)) return undefined;
   const view = openIntakeCollectionEnvelope(db, source, { fieldSelection: 'first' });
   const { collections } = selectedEnvelopeStore(db, source);
+  // Resolve once; address() still checks this reader's selected source and
+  // current logical/physical authority on every nested admission guard.
+  const root = view.root();
   const current = () => {
     options.assertRunning?.();
-    view.address(view.root());
+    view.address(root);
   };
   const binding = JSON.stringify(view.logical);
   const selected = collections.openView();
@@ -355,16 +358,20 @@ async function publishSourceLookupIndices(
     collection = 'lookup.' + buildId + '.indexes';
   const changes: IntakeCollectionChange[] = [];
   let visited = 0;
-  const commit = (batch: IntakeCollectionChange[]) => {
+  const commit = async (batch: IntakeCollectionChange[]) => {
     current();
     const operationId = randomUUID();
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId,
-        requestDigest: hash(operationId),
-        domainVersion: view.logical.domainVersion,
-        changes: batch,
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId,
+          requestDigest: hash(operationId),
+          domainVersion: view.logical.domainVersion,
+          changes: batch,
+        },
+        current,
+      ),
     );
   };
   const checkpoint = async () => {
@@ -382,7 +389,7 @@ async function publishSourceLookupIndices(
         visited,
       }),
     });
-    commit(batch);
+    await commit(batch);
     await options.onCheckpoint?.({ sourceId: source.id, visited });
     await new Promise<void>((resolve) => setImmediate(resolve));
     current();
@@ -413,7 +420,7 @@ async function publishSourceLookupIndices(
     if (changes.length >= 15) await checkpoint();
   }
   if (changes.length) await checkpoint();
-  commit([
+  await commit([
     { area: 'builds', collection, op: 'put', key: 'complete', value: binding },
     { area: 'builds', collection, op: 'put', key: 'policy', value: INTAKE_LOOKUP_INDEX_POLICY },
     {

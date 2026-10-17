@@ -110,7 +110,10 @@ it('home opens the canonical Self, uses its sidebar icon and refreshes saved ide
             <Shell />
           </ThemeProvider>
         ),
-        children: [{ path: '/', element: <Patient /> }],
+        children: [
+          { path: '/', element: <Patient /> },
+          { path: '/import', element: <h1>Import review</h1> },
+        ],
       },
     ],
     { initialEntries: ['/'] },
@@ -125,6 +128,8 @@ it('home opens the canonical Self, uses its sidebar icon and refreshes saved ide
   expect(home).toHaveAttribute('aria-current', 'page');
   expect(home.querySelector('.person-emoji')).toHaveTextContent('🃏');
   expect(within(nav).queryByText('Overview')).not.toBeInTheDocument();
+  expect(within(nav).queryByRole('link', { name: 'Import' })).not.toBeInTheDocument();
+  expect(within(nav).getByRole('link', { name: 'Sources' })).toHaveAttribute('href', '/sources');
   recordProfile(profile.id, { ...profile, name: 'Moon Cookie', icon: '🌙', nameVersion: 2 });
   await waitFor(() =>
     expect(
@@ -132,6 +137,15 @@ it('home opens the canonical Self, uses its sidebar icon and refreshes saved ide
     ).toHaveTextContent('🌙'),
   );
   await waitFor(() => expect(document.title).toBe('Circus Health · Moon Cookie'));
+  await router.navigate('/import');
+  await waitFor(() =>
+    expect(within(nav).getByRole('link', { name: 'Sources' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    ),
+  );
+  expect(within(nav).getByRole('link', { name: 'Sources' })).toHaveClass('active');
+  expect(within(nav).queryByRole('link', { name: 'Import' })).not.toBeInTheDocument();
 });
 it('People has no note collection tabs and Notes offers only living and historical notes', async () => {
   selectProfile(profile);

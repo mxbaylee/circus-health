@@ -1,3 +1,5 @@
+import type { PacketReportReviewContext } from './packet-report-person.ts';
+import { prepareCollectionClinicalReviewDependencies } from './intake-review-collection-host.ts';
 import { readStoredIntakeDetails, intakeSourceMetadata } from './intake-state-access.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
 import { PacketOutputBudget, packetOutputLimit } from './packet-output-budget.ts';
@@ -1501,10 +1503,61 @@ export async function prepareNoteExportMetadata(
     sources.return(undefined);
   }
 }
+/** Prepare only the current pending proposal scopes represented by this selection.
+ * The snapshot repeats selection and ownership checks after these awaits. */
+export async function preparePacketReportReview(
+  db: Database,
+  value: unknown,
+  context: PacketReportReviewContext,
+  options: { assertRunning?: () => void } = {},
+): Promise<void> {
+  options.assertRunning?.();
+  const { personId, main, records } = snapshotSelection(db, value);
+  function* sources() {
+    for (const item of [main, ...records.values()])
+      for (const citation of item.citations) yield citation.id;
+  }
+  const pending = disposableSqlite('circus-packet-pending-review-');
+  try {
+    pending.db.exec(
+      'CREATE TABLE proposals(intake TEXT NOT NULL,proposal TEXT NOT NULL,PRIMARY KEY(intake,proposal))',
+    );
+    const insert = pending.db.prepare('INSERT OR IGNORE INTO proposals VALUES(?,?)');
+    for (const _report of iteratePacketReportReview(
+      db,
+      sources(),
+      personId,
+      undefined,
+      (intakeId, proposalId) => {
+        if (hasIntakeCollectionEnvelope(db, { id: intakeId }))
+          insert.run(intakeId, JSON.stringify(proposalId));
+      },
+    )) {
+      /* Traversal discovers scope without building a disclosure. */
+    }
+    for (const row of pending.db
+      .prepare('SELECT intake,proposal FROM proposals ORDER BY intake,proposal')
+      .iterate()) {
+      options.assertRunning?.();
+      await prepareCollectionClinicalReviewDependencies(
+        db,
+        context.root,
+        context.profileId,
+        String(row.intake),
+        JSON.parse(String(row.proposal)),
+        options,
+      );
+    }
+    options.assertRunning?.();
+  } finally {
+    pending.close();
+  }
+}
 export function exportSnapshot(
   db: Database,
   value: unknown,
   now = new Date().toISOString(),
+  reportContext?: PacketReportReviewContext,
 ): NoteExportSnapshot {
   let { input, personId, main, records, selected, plan, mainSelected } = snapshotSelection(
     db,
@@ -1874,7 +1927,7 @@ export function exportSnapshot(
       for (const citation of item.citations) yield citation.id;
   }
   let reviewIncomplete = false;
-  for (const report of iteratePacketReportReview(db, includedSources())) {
+  for (const report of iteratePacketReportReview(db, includedSources(), personId, reportContext)) {
     reviewIncomplete ||= report.savedCount < report.totalCount;
     if (!plan.active) {
       budget.add(report, reportReview.length ? 1 : 0);
@@ -2198,7 +2251,7 @@ export function exportHtml(snapshot: NoteExportSnapshot): string {
     (report) => report.savedCount < report.totalCount,
   );
   if (partialReports.length)
-    body += `<section><h2>Partly reviewed reports</h2>${partialReports.map((report) => `<p><strong>${esc(report.title)}</strong>: ${report.savedCount} of ${report.totalCount} current report items reviewed and saved. Remaining items are not accepted clinical records. These counts describe review of the source report, not how many items are included in this packet.</p>`).join('')}</section>`;
+    body += `<section><h2>Partly reviewed reports</h2>${partialReports.map((report) => `<p><strong>${esc(report.title)}</strong>: ${report.savedCount} of ${report.totalCount} current report items reviewed and saved. Remaining items are not accepted clinical records. These counts describe review of the source report, not how many items are included in this packet. Counts cover only this person's assigned items; other people’s items and unresolved ownership are excluded. They do not establish whole-report completion or complete reading.</p>`).join('')}</section>`;
   if (snapshot.readingGaps.length)
     body += `<section><h2>Unread source sections</h2><p>These source sections were not fully read. An absent finding in this packet does not establish absence in the original.</p>${snapshot.readingGaps.map((source) => `<h3>${esc(source.filename)}</h3><ul>${source.gaps.map((gap) => `<li>${esc(gap.locator)}: ${esc(gap.reason)}</li>`).join('')}</ul>`).join('')}</section>`;
   if (snapshot.mode === 'detailed')
@@ -2475,10 +2528,17 @@ export function createNoteExports() {
         await prepareNoteExportMetadata(db, profileId, input, {
           assertRunning: () => lifetime.signal.throwIfAborted(),
         });
+        if (root)
+          await preparePacketReportReview(
+            db,
+            input,
+            { root, profileId },
+            { assertRunning: () => lifetime.signal.throwIfAborted() },
+          );
       } finally {
         lifetime.dispose();
       }
-      const snapshot = exportSnapshot(db, input),
+      const snapshot = exportSnapshot(db, input, undefined, root ? { root, profileId } : undefined),
         token = randomUUID();
       if (snapshots.size >= 30) {
         const oldest = snapshots.keys().next().value;
@@ -2531,13 +2591,25 @@ export function createNoteExports() {
         await prepareNoteExportMetadata(db, profileId, entry.input, {
           assertRunning: () => lifetime.signal.throwIfAborted(),
         });
+        if (root)
+          await preparePacketReportReview(
+            db,
+            entry.input,
+            { root, profileId },
+            { assertRunning: () => lifetime.signal.throwIfAborted() },
+          );
       } finally {
         lifetime.dispose();
       }
       const validate = () => {
         let current: NoteExportSnapshot;
         try {
-          current = exportSnapshot(db, entry.input);
+          current = exportSnapshot(
+            db,
+            entry.input,
+            undefined,
+            root ? { root, profileId } : undefined,
+          );
         } catch (error) {
           if (
             error instanceof HttpError &&

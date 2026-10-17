@@ -57,6 +57,7 @@ import { withIntakeWork } from './intake-work-accounting.ts';
 import { prepareIntakeLegacyReplaySteps } from './intake-state-legacy-replay.ts';
 import {
   COLLECTION_FORMAT,
+  LOG_COLLECTION_FORMAT,
   DEFAULT_LIMITS,
   FRAME_BYTES,
   HEAD_BYTES,
@@ -647,9 +648,11 @@ function* inspectSnapshotSteps(
       if (rawHead === undefined) invalid('missing copy head');
       const header = decode(rawHead, HEAD_BYTES);
       if (!header || typeof header !== 'object' || Array.isArray(header)) invalid('copy head');
-      const v4 = Reflect.get(header, 'format') === COLLECTION_FORMAT;
+      const collections = [COLLECTION_FORMAT, LOG_COLLECTION_FORMAT].includes(
+        String(Reflect.get(header, 'format')),
+      );
       const identity = validateIntakeIdentity(
-        v4
+        collections
           ? Reflect.get(header, 'identity')
           : {
               profileId: Reflect.get(header, 'profileId'),
@@ -665,7 +668,7 @@ function* inspectSnapshotSteps(
       const original = originalRow ? savedOriginal(originalRow, manifest) : undefined;
       if (!original || original.sha256 !== identity.sourceHash)
         invalid('copy original identity/hash');
-      if (v4) {
+      if (collections) {
         yield* inspectIntakeCollectionGraphSteps(
           manifest,
           identity,

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,17 +19,36 @@ import { attachPersonalDurability, rebuildProfile } from '../portable.ts';
 import { attachRecordDurability, rebuildRecordDatabase } from '../record-versions.ts';
 import type { RecordStorage } from '../record-versions.ts';
 import { handleIntakeRoute } from '../intake-routes.ts';
+import { planIntakeReportAcceptance } from '../intake-acceptance-plan.ts';
+import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { canonicalLiteral } from '../intake-format.ts';
+import { prepareNativePartialReviews } from '../intake-partial-acceptance.ts';
+import { applyNativeAcceptanceGroup } from '../intake-report-acceptance-native.ts';
 import { createNote, getNote, saveNote } from '../notes.ts';
+import {
+  previewDirectRecordCorrection,
+  applyDirectRecordCorrection,
+} from '../clinical-review-routes.ts';
 import { vaultFixture, newProfile } from './helpers/vault-fixture.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
+import { createRecordPublicationDiagnostic } from './helpers/record-publication-callers.ts';
+import { iterateIntakeEnvelopeText } from '../intake-collection-envelope.ts';
+import {
+  recordVersionWorkInventory,
+  recordVersionSequence,
+  encodedRecordObjectInventory,
+  type ImmutableWriteEvent,
+} from './helpers/record-version-work-inventory.ts';
 import type {
   HealthRecordEnvelope,
   Intake,
   IntakeReportAcceptanceRequest,
   IntakeReportAcceptanceBlock,
   IntakeReportAcceptanceResult,
+  IntakePartialAcceptanceItem,
 } from '../../shared/intake.ts';
-import type { IncomingMessage } from 'node:http';
+import { IncomingMessage } from 'node:http';
+import { Socket } from 'node:net';
 
 function fixture(t: TestContext, storage?: RecordStorage | 'memory') {
   const root = mkdtempSync(join(tmpdir(), 'fictional-counted-acceptance-')),
@@ -108,6 +127,41 @@ function block(
 }
 function accept(f: Fixture, request: IntakeReportAcceptanceRequest) {
   return acceptIntakeReportSelection(f.db, f.root, f.profileId, request);
+}
+function acceptPartial(f: Fixture, request: IntakeReportAcceptanceRequest) {
+  return acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, request);
+}
+async function waitForCommittedObservations(
+  t: TestContext,
+  f: Fixture,
+  saving: Promise<unknown>,
+  count: number,
+  observe: () => void,
+) {
+  let settled = false;
+  void saving.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  const current = () => Number(f.db.prepare('SELECT count(*) n FROM observations').get()!.n);
+  // Native preparation can yield before the first clinical commit. Observe the
+  // actual committed state instead of assuming one microtask means 200 saves.
+  while (!settled && (f.db.isTransaction || current() < count)) {
+    t.signal.throwIfAborted();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  if (settled) await saving;
+  assert.equal(settled, false, 'save must remain pending at the observed commit boundary');
+  assert.equal(f.db.isTransaction, false);
+  assert.equal(current(), count, 'observe the exact bounded commit before changing its successor');
+  // Run the observation/mutation in this turn; awaiting this helper first would
+  // allow the next child to finish before the caller changes its authority.
+  const result: unknown = observe();
+  assert.equal(result, undefined, 'commit-boundary observer must finish synchronously');
 }
 function request(...blocks: IntakeReportAcceptanceBlock[]): IntakeReportAcceptanceRequest {
   return { operationId: randomUUID(), blocks };
@@ -396,19 +450,24 @@ test('acceptance routes return exact receipts and reject duplicate candidates an
     item = upload(f, [envelope('route')]);
   const input = request(block(f, item.id));
   let response: unknown;
+  const socket = new Socket();
+  t.after(() => socket.destroy());
+  const req = new IncomingMessage(socket);
+  req.headers['content-type'] = 'application/json';
   const context = {
     ...f,
     resource: 'intakes',
     id: 'report-acceptance',
     method: 'POST',
     params: new URLSearchParams(),
-    req: { headers: { 'content-type': 'application/json' } } as IncomingMessage,
+    req,
     body: async () => Buffer.from(JSON.stringify(input)),
     respond: (value: unknown) => {
       response = value;
     },
   } as unknown as Parameters<typeof handleIntakeRoute>[0];
   assert.equal(await handleIntakeRoute(context), true);
+  assert.equal(req.listenerCount('aborted'), 0);
   assert.equal((response as IntakeReportAcceptanceResult).receipt.acceptedCount, 1);
   await handleIntakeRoute({ ...context, method: 'GET', action: input.operationId });
   assert.equal((response as IntakeReportAcceptanceResult).replayed, true);
@@ -449,7 +508,7 @@ function partial(
   }
   return { ...request(...blocks), mode: 'partial-v1' };
 }
-test('partial v1 saves independent valid approvals and retains stale, blocked and invalid outcomes', (t) => {
+test('partial v1 saves independent valid approvals and retains stale, blocked and invalid outcomes', async (t) => {
   const f = fixture(t),
     blocked = envelope('blocked-partial');
   blocked.reviewIssues = [
@@ -465,7 +524,7 @@ test('partial v1 saves independent valid approvals and retains stale, blocked an
   const input = partial(f, block(f, item.id));
   input.blocks[0]!.selections[2]!.selectionReviewToken = 'stale';
   (input.blocks[0]!.selections[4]!.mapping as Record<string, unknown>).unit = 123;
-  const result = accept(f, input);
+  const result = await acceptPartial(f, input);
   assert.equal(result.receipt.atomic, false);
   if (result.receipt.atomic) throw Error('Expected partial receipt');
   // An unchanged sibling remains approvable: another save is not a new human review.
@@ -473,62 +532,290 @@ test('partial v1 saves independent valid approvals and retains stale, blocked an
   assert.deepEqual(
     result.receipt.items.map((i) => i.status),
     ['saved', 'saved', 'needs_review', 'needs_review', 'needs_review'],
+    JSON.stringify(result.receipt.items),
   );
   assert.equal(result.receipt.items[2]?.label, 'stale');
   assert.equal(result.receipt.items[2]?.kind, 'observation');
   assert.equal(result.receipt.items[2]?.personId, 'patient');
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
-  assert.deepEqual(accept(f, input).receipt, result.receipt);
+  assert.deepEqual((await acceptPartial(f, input)).receipt, result.receipt);
   const changed = structuredClone(input);
   changed.blocks[0]!.selections[0]!.mapping.unit = 'g';
-  assert.throws(() => accept(f, changed), { code: 'OPERATION_CONFLICT' });
+  await assert.rejects(() => acceptPartial(f, changed), { code: 'OPERATION_CONFLICT' });
 });
-test('partial approval reviews each intake once and journals proportional work', async (t) => {
+for (const n of [2, 10])
+  test(`small independent partial saves prepare and publish one bounded clinical unit N=${n}`, async (t) => {
+    const objects = new Map<string, Buffer>();
+    const diagnostic =
+      process.env.CRS_PARTIAL_ACCEPTANCE_QUALIFY === '1'
+        ? createRecordPublicationDiagnostic(objects)
+        : undefined;
+    const clinicalPublications: number[] = [];
+    let armed = false;
+    const storage: RecordStorage = {
+      read: (name) => objects.get(name) || null,
+      writeImmutable(name, value) {
+        const previous = objects.get(name);
+        if (previous) assert.deepEqual(value, previous, 'Immutable object content changed');
+        objects.set(name, Buffer.from(value));
+        diagnostic?.immutable(name, value.length);
+      },
+      publishHead(value) {
+        objects.set('head', Buffer.from(value));
+        diagnostic?.published(value);
+        if (!armed) return;
+        const count = Number(f.db.prepare('SELECT count(*) n FROM observations').get()!.n);
+        if (count > (clinicalPublications.at(-1) || 0)) clinicalPublications.push(count);
+      },
+    };
+    const f = fixture(t, storage);
+    diagnostic?.phase('upload');
+    const item = upload(
+      f,
+      Array.from({ length: n }, (_, index) => envelope(`fictional-small-unit-${index}`)),
+    );
+    diagnostic?.phase('approval');
+    const input = partial(f, block(f, item.id));
+    diagnostic?.phase('adoption');
+    await intake.ensureNativeIntakeSchema(f.db, f.profileId, item.id);
+    const before = intakeWorkCounters(f.db).warm.collectionClinicalReviewPreparations;
+    armed = true;
+    diagnostic?.phase('save');
+    const result = await acceptPartial(f, input);
+    const preparations =
+      intakeWorkCounters(f.db).warm.collectionClinicalReviewPreparations - before;
+    t.diagnostic(JSON.stringify({ n, preparations, clinicalPublications }));
+    assert.equal(result.receipt.acceptedCount, n);
+    assert.equal(preparations, 2);
+    assert.deepEqual(clinicalPublications, [n]);
+    diagnostic?.phase('replay');
+    assert.deepEqual((await acceptPartial(f, input)).receipt, result.receipt);
+    assert.deepEqual(clinicalPublications, [n]);
+    assert.equal(intakeWorkCounters(f.db).warm.collectionClinicalReviewPreparations - before, 2);
+    if (diagnostic)
+      process.stderr.write(
+        JSON.stringify({
+          audit: 'partial-publication-callers-v1',
+          n,
+          ...diagnostic.inventory(f.db),
+        }) + '\n',
+      );
+  });
+test('partial approval bounds native review preparations and journals proportional work', async (t) => {
+  const diagnose = process.env.CRS_PARTIAL_ACCEPTANCE_QUALIFY === '1';
   const metrics: Array<{
     n: number;
-    reviews: number;
+    preparations: number;
     writes: number;
     bytes: number;
     rows: number;
+    adoption: { writes: number; bytes: number; rows: number };
   }> = [];
-  for (const n of [10, 50, 200]) {
-    await t.test(`N=${n}`, (scope) => {
+  // One initial selected proposal session plus one selected acceptance projection
+  // per child commit. Every independent same-proposal save, including N<20,
+  // uses one bounded clinical transaction while retaining individual receipts.
+  for (const [n, expectedPreparations] of [
+    [10, 2],
+    [50, 2],
+    [200, 2],
+  ] as const) {
+    t.signal.throwIfAborted();
+    await t.test(`N=${n}`, async (scope) => {
+      if (diagnose)
+        process.stderr.write(
+          JSON.stringify({ audit: 'partial-version-inventory-stage-v1', n, stage: 'fixture' }) +
+            '\n',
+        );
       const objects = new Map<string, Buffer>();
+      const writeEvents: ImmutableWriteEvent[] = [];
+      const diagnostic = diagnose ? createRecordPublicationDiagnostic(objects) : undefined;
       let writes = 0,
         bytes = 0,
-        reviews = 0;
+        preparations = 0,
+        headWrites = 0,
+        headBytes = 0;
       const storage: RecordStorage = {
         read: (name) => objects.get(name) || null,
         writeImmutable(name, value) {
+          const previous = objects.get(name);
+          if (previous) assert.deepEqual(value, previous, 'Immutable object content changed');
           objects.set(name, Buffer.from(value));
           writes++;
           bytes += value.length;
+          if (diagnose) writeEvents.push({ name, bytes: value.length });
+          diagnostic?.immutable(name, value.length);
         },
         publishHead(value) {
           objects.set('head', Buffer.from(value));
+          headWrites++;
+          headBytes += value.length;
+          diagnostic?.published(value);
         },
       };
       const f = fixture(scope, storage);
+      diagnostic?.phase('upload');
       const item = upload(
         f,
         Array.from({ length: n }, (_, index) => envelope(`fictional-scale-${index}`)),
       );
       const input = partial(f, block(f, item.id));
+      diagnostic?.phase('adoption');
       writes = 0;
       bytes = 0;
       const before = Number(f.db.prepare('SELECT count(*) n FROM __record_versions').get()!.n);
-      const restore = intake.observeIntakeReviewCalls(() => reviews++);
-      let receipt;
-      try {
-        receipt = accept(f, input).receipt;
-      } finally {
-        restore();
-      }
+      const beforeSequence = diagnose ? recordVersionSequence(f.db) : 0;
+      const beforeEvent = writeEvents.length;
+      const beforeHeads = { writes: headWrites, bytes: headBytes };
+      // Account for one-time adoption separately while retaining it in the total
+      // write-growth oracle. The clinical operation keeps the original approval.
+      await intake.ensureNativeIntakeSchema(f.db, f.profileId, item.id);
+      const adoption = {
+        writes,
+        bytes,
+        rows: Number(f.db.prepare('SELECT count(*) n FROM __record_versions').get()!.n) - before,
+      };
+      if (diagnose)
+        process.stderr.write(
+          JSON.stringify({
+            audit: 'partial-version-inventory-stage-v1',
+            n,
+            stage: 'adoption-complete',
+            ...adoption,
+          }) + '\n',
+        );
+      const adoptionSequence = diagnose ? recordVersionSequence(f.db) : 0;
+      const adoptionEvent = writeEvents.length;
+      const adoptionHeads = { writes: headWrites, bytes: headBytes };
+      const preparation = intakeWorkCounters(f.db).warm.collectionClinicalReviewPreparations;
+      diagnostic?.phase('postAdoption');
+      const receipt = (await acceptPartial(f, input)).receipt;
+      preparations =
+        intakeWorkCounters(f.db).warm.collectionClinicalReviewPreparations - preparation;
       const rows =
         Number(f.db.prepare('SELECT count(*) n FROM __record_versions').get()!.n) - before;
+      scope.diagnostic(
+        JSON.stringify({
+          n,
+          acceptedCount: receipt.acceptedCount,
+          preparations,
+          writes,
+          bytes,
+          rows,
+          adoption,
+        }),
+      );
+      // Detached attribution reads run after every measured counter is captured.
+      // The existing opt-in enables this diagnostic without adding routine SQL.
+      if (diagnose) {
+        const afterSequence = recordVersionSequence(f.db);
+        const attribution = {
+          adoption: {
+            versions: recordVersionWorkInventory(f.db, beforeSequence, adoptionSequence),
+            objects: encodedRecordObjectInventory(objects, writeEvents, beforeEvent, adoptionEvent),
+            heads: {
+              writes: adoptionHeads.writes - beforeHeads.writes,
+              bytes: adoptionHeads.bytes - beforeHeads.bytes,
+            },
+          },
+          postAdoption: {
+            versions: recordVersionWorkInventory(f.db, adoptionSequence, afterSequence),
+            objects: encodedRecordObjectInventory(objects, writeEvents, adoptionEvent),
+            heads: {
+              writes: headWrites - adoptionHeads.writes,
+              bytes: headBytes - adoptionHeads.bytes,
+            },
+          },
+        };
+        for (const [phase, expected] of [
+          ['adoption', adoption],
+          [
+            'postAdoption',
+            {
+              rows: rows - adoption.rows,
+              writes: writes - adoption.writes,
+              bytes: bytes - adoption.bytes,
+            },
+          ],
+        ] as const) {
+          const observed = attribution[phase];
+          assert.equal(
+            observed.versions.buckets.reduce((sum, bucket) => sum + Number(bucket.rows), 0),
+            expected.rows,
+          );
+          assert.equal(
+            Object.values(observed.objects.families).reduce(
+              (sum, family) => sum + family.writes,
+              0,
+            ),
+            expected.writes,
+          );
+          assert.equal(
+            Object.values(observed.objects.families).reduce((sum, family) => sum + family.bytes, 0),
+            expected.bytes,
+          );
+        }
+        scope.diagnostic(
+          JSON.stringify({ audit: 'partial-version-inventory-v1', n, ...attribution }),
+        );
+        const callers = diagnostic!.inventory(f.db);
+        for (const [phase, after, through, expected] of [
+          ['adoption', beforeSequence, adoptionSequence, attribution.adoption],
+          ['postAdoption', adoptionSequence, afterSequence, attribution.postAdoption],
+        ] as const) {
+          const assigned = callers.publications
+            .filter(
+              (publication) => publication.sequence > after && publication.sequence <= through,
+            )
+            .flatMap((publication) => (publication.versions ? [publication.versions] : []));
+          const unknown = callers.unknownSequences.filter(
+            (row) => Number(row.sequence) > after && Number(row.sequence) <= through,
+          );
+          assert.equal(
+            [...assigned, ...unknown].reduce((sum, row) => sum + Number(row.rows), 0),
+            expected.versions.buckets.reduce((sum, row) => sum + Number(row.rows), 0),
+          );
+          const fragments = [
+            ...callers.publications.flatMap((publication) => publication.eventFragments),
+            ...callers.trailingFragments,
+          ].filter((fragment) => fragment.phase === phase);
+          for (const key of ['writes', 'bytes'] as const) {
+            assert.equal(
+              fragments.reduce(
+                (sum, fragment) =>
+                  sum +
+                  Object.values(fragment.objects.families).reduce(
+                    (total, family) => total + family[key],
+                    0,
+                  ),
+                0,
+              ),
+              Object.values(expected.objects.families).reduce(
+                (sum, family) => sum + family[key],
+                0,
+              ),
+            );
+            assert.equal(
+              callers.publications
+                .filter((publication) => publication.phase === phase)
+                .reduce(
+                  (sum, publication) => sum + (key === 'writes' ? 1 : publication.headBytes),
+                  0,
+                ),
+              expected.heads[key],
+            );
+          }
+        }
+        scope.diagnostic(
+          JSON.stringify({
+            audit: 'partial-publication-callers-v2',
+            n,
+            ...callers,
+          }),
+        );
+      }
       assert.equal(receipt.acceptedCount, n);
-      assert.equal(reviews, 1);
-      metrics.push({ n, reviews, writes, bytes, rows });
+      assert.equal(preparations, expectedPreparations);
+      metrics.push({ n, preparations, writes, bytes, rows, adoption });
     });
   }
   const small = metrics.find((item) => item.n === 50)!;
@@ -540,7 +827,7 @@ test('partial approval reviews each intake once and journals proportional work',
   assert.ok(large.bytes <= 4 * small.bytes + 32_768, JSON.stringify(metrics));
   t.diagnostic(`partial acceptance work counts: ${JSON.stringify(metrics)}`);
 });
-test('partial approval shares one original review context across distinct proposal blocks', (t) => {
+test('partial approval prepares each distinct proposal and selected commit projection once', async (t) => {
   const f = fixture(t);
   const original = upload(f, [envelope('fictional-original')]);
   const first = confirmedProposal(f, original, envelope('fictional-proposal-one'));
@@ -551,18 +838,12 @@ test('partial approval shares one original review context across distinct propos
     block(f, original.id, first.proposalId),
     block(f, original.id, second.proposalId),
   );
-  let reviews = 0;
-  const restore = intake.observeIntakeReviewCalls(() => reviews++);
-  let receipt;
-  try {
-    receipt = accept(f, input).receipt;
-  } finally {
-    restore();
-  }
-  // The original and its identity/workflow authority are prepared once; each
-  // distinct proposal still has to validate its own retained source bytes.
-  // Rationale: docs/import/review-reliability.md.
-  assert.equal(reviews, 1);
+  await intake.ensureNativeIntakeSchema(f.db, f.profileId, original.id);
+  const before = intakeWorkCounters(f.db).warm.collectionClinicalReviewPreparations;
+  const receipt = (await acceptPartial(f, input)).receipt;
+  // Three initial selected proposal sessions and three selected acceptance
+  // projections share this constructor counter; it does not measure reread bytes.
+  assert.equal(intakeWorkCounters(f.db).warm.collectionClinicalReviewPreparations - before, 6);
   assert.equal(receipt.acceptedCount, 3);
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 3);
 });
@@ -582,12 +863,13 @@ test('a 500-item partial save yields to a read and never reconciles live missing
   );
   // The first bounded transaction has returned to the event loop. A parallel
   // feed read can answer before the final result, without treating live work as interrupted.
-  await Promise.resolve();
-  const read = intake.getIntake(f.db, f.root, f.profileId, item.id);
-  assert.equal(read.id, item.id);
-  assert.equal(finished, false);
-  assert.throws(() => getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId), {
-    code: 'REPORT_ACCEPTANCE_IN_PROGRESS',
+  await waitForCommittedObservations(t, f, saving, 200, () => {
+    const read = intake.getIntakeRead(f.db, f.root, f.profileId, item.id);
+    assert.equal(read.id, item.id);
+    assert.equal(finished, false);
+    assert.throws(() => getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId), {
+      code: 'REPORT_ACCEPTANCE_IN_PROGRESS',
+    });
   });
   const result = await saving;
   assert.equal(result.receipt.acceptedCount, 500);
@@ -596,7 +878,7 @@ test('a 500-item partial save yields to a read and never reconciles live missing
     500,
   );
 });
-test('a source change during a yielded save rejects remaining old approvals', async (t) => {
+test('a source authority change during a yielded save rejects remaining old approvals', async (t) => {
   const f = fixture(t);
   // One pending record beyond the 200-item commit boundary proves invalidation.
   // The separate 500-item test above covers large-save yielding and receipt recovery.
@@ -606,8 +888,13 @@ test('a source change during a yielded save rejects remaining old approvals', as
   );
   const input = partial(f, block(f, item.id));
   const saving = acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, input);
-  await Promise.resolve();
-  disposition(f, item, 200, 'review_later');
+  await waitForCommittedObservations(t, f, saving, 200, () => {
+    // Clinical draft commands serialize behind this save. Exercise a separate
+    // authority writer here; draft invalidation before planning has its own case.
+    transaction(f.db, () =>
+      f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('f'.repeat(64), item.id),
+    );
+  });
   const result = (await saving).receipt;
   assert.equal(result.atomic, false);
   if (result.atomic) throw Error('Expected partial receipt');
@@ -639,11 +926,12 @@ test('a new same-named person during a yielded save invalidates cached identity 
   );
   const input = partial(f, block(f, item.id));
   const saving = acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, input);
-  await Promise.resolve();
-  createNote(f.db, {
-    kind: 'person',
-    title: 'Fictional Iris Meadow',
-    person: { fullName: 'Fictional Iris Meadow' },
+  await waitForCommittedObservations(t, f, saving, 200, () => {
+    createNote(f.db, {
+      kind: 'person',
+      title: 'Fictional Iris Meadow',
+      person: { fullName: 'Fictional Iris Meadow' },
+    });
   });
   const receipt = (await saving).receipt;
   if (receipt.atomic) throw Error('Expected partial receipt');
@@ -666,8 +954,9 @@ test('locking the profile between bounded commits stops the save and recovers co
   );
   const input = partial(local, block(local, item.id));
   const saving = acceptIntakeReportSelectionAsync(local.db, local.root, local.profileId, input);
-  await Promise.resolve();
-  f.manager.lock(profile.id);
+  await waitForCommittedObservations(t, local, saving, 200, () => {
+    f.manager.lock(profile.id);
+  });
   await assert.rejects(saving);
   await f.manager.unlock(profile.id, recoveryKit);
   const restored = f.manager.opened.get(profile.id)!;
@@ -682,7 +971,7 @@ test('locking the profile between bounded commits stops the save and recovers co
   assert.equal(recovered.items[200]?.status, 'not_attempted');
   assert.equal(restored.db.prepare('SELECT count(*) n FROM observations').get()!.n, 200);
 });
-test('one stale approval in a bounded batch leaves every independent sibling saved', (t) => {
+test('one stale approval in a bounded batch leaves every independent sibling saved', async (t) => {
   const f = fixture(t);
   const item = upload(
     f,
@@ -690,7 +979,7 @@ test('one stale approval in a bounded batch leaves every independent sibling sav
   );
   const input = partial(f, block(f, item.id));
   input.blocks[0]!.selections[73]!.selectionReviewToken = 'fictional-stale-token';
-  const result = accept(f, input).receipt;
+  const result = (await acceptPartial(f, input)).receipt;
   assert.equal(result.atomic, false);
   if (result.atomic) throw Error('Expected partial receipt');
   assert.equal(result.acceptedCount, 199);
@@ -699,8 +988,7 @@ test('one stale approval in a bounded batch leaves every independent sibling sav
 });
 test('a lost acknowledgement for 200 batched approvals rebuilds once under the original operation', async (t) => {
   const objects = new Map<string, Buffer>();
-  let publications = 0;
-  let failAt = Infinity;
+  let loseClinicalAcknowledgement = false;
   const storage: RecordStorage = {
     read: (name) => objects.get(name) || null,
     writeImmutable(name, bytes) {
@@ -708,7 +996,11 @@ test('a lost acknowledgement for 200 batched approvals rebuilds once under the o
     },
     publishHead(bytes) {
       objects.set('head', Buffer.from(bytes));
-      if (++publications === failAt) throw Error('Fictional lost batch acknowledgement');
+      if (
+        loseClinicalAcknowledgement &&
+        Number(f.db.prepare('SELECT count(*) n FROM observations').get()!.n) === 200
+      )
+        throw Error('Fictional lost batch acknowledgement');
     },
   };
   const f = fixture(t, storage);
@@ -717,16 +1009,21 @@ test('a lost acknowledgement for 200 batched approvals rebuilds once under the o
     Array.from({ length: 200 }, (_, index) => envelope(`fictional-rebuild-${index}`)),
   );
   const input = partial(f, block(f, item.id));
-  failAt = publications + 2; // manifest, then one bounded clinical transaction
-  assert.throws(() => accept(f, input), { code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED' });
-  failAt = Infinity;
+  // Native adoption and review preparation precede the operation under test.
+  // Arm the lost acknowledgement at the manifest/clinical boundary, not during adoption.
+  await planIntakeReportAcceptance(f.db, f.root, f.profileId, input);
+  loseClinicalAcknowledgement = true;
+  await assert.rejects(() => acceptPartial(f, input), {
+    code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED',
+  });
+  loseClinicalAcknowledgement = false;
   attachRecordDurability(f.db, { profileId: f.profileId, storage });
   const recovered = getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId);
   assert.equal(recovered.receipt.acceptedCount, 200);
-  assert.equal(accept(f, input).receipt.acceptedCount, 200);
+  assert.equal((await acceptPartial(f, input)).receipt.acceptedCount, 200);
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 200);
   const target = join(f.root, 'partial-200-rebuilt.sqlite');
-  rebuildRecordDatabase(target, { profileId: f.profileId, storage });
+  await rebuildRecordDatabase(target, { profileId: f.profileId, storage });
   const db = openDatabase(target, f.profileId);
   attachRecordDurability(db, { profileId: f.profileId, storage });
   try {
@@ -735,7 +1032,8 @@ test('a lost acknowledgement for 200 batched approvals rebuilds once under the o
       200,
     );
     assert.equal(
-      acceptIntakeReportSelection(db, f.root, f.profileId, input).receipt.acceptedCount,
+      (await acceptIntakeReportSelectionAsync(db, f.root, f.profileId, input)).receipt
+        .acceptedCount,
       200,
     );
     assert.equal(db.prepare('SELECT count(*) n FROM observations').get()!.n, 200);
@@ -743,25 +1041,38 @@ test('a lost acknowledgement for 200 batched approvals rebuilds once under the o
     db.close();
   }
 });
-test('partial v1 pins exact records while unrelated intake changes do not invalidate approvals', (t) => {
+test('partial v1 pins exact records while unrelated intake changes do not invalidate approvals', async (t) => {
   const f = fixture(t),
     item = upload(f, [envelope('one'), envelope('two')]);
   const input = partial(f, block(f, item.id, null, [0]));
   disposition(f, item, 1, 'review_later');
-  assert.equal(accept(f, input).receipt.acceptedCount, 1);
+  assert.equal((await acceptPartial(f, input)).receipt.acceptedCount, 1);
   const other = upload(f, [envelope('substitute')], 'substitute.jsonl');
   const swapped = partial(f, block(f, other.id));
   swapped.blocks[0]!.selections[0]!.selectionReviewToken =
     input.blocks[0]!.selections[0]!.selectionReviewToken;
-  const result = accept(f, swapped);
+  const result = await acceptPartial(f, swapped);
   assert.equal(result.receipt.acceptedCount, 0);
+});
+test('a relevant draft change before planning rejects the original partial approval', async (t) => {
+  const f = fixture(t),
+    item = upload(f, [envelope('fictional-draft-changed')]);
+  const input = partial(f, block(f, item.id));
+  disposition(f, item, 0, 'keep_original_only');
+  const receipt = (await acceptPartial(f, input)).receipt;
+  if (receipt.atomic) throw Error('Expected partial receipt');
+  assert.equal(receipt.acceptedCount, 0);
+  assert.equal(receipt.items[0]!.status, 'needs_review');
+  assert.equal(receipt.items[0]!.reasonCode, 'REPORT_ACCEPTANCE_STALE');
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
+  assert.deepEqual((await acceptPartial(f, input)).receipt, receipt);
 });
 test('partial v1 manifest and bounded item receipts survive backup and rebuild without duplicate publication', async (t) => {
   const f = fixture(t),
     item = upload(f, [envelope('durable-a'), envelope('durable-b')]);
   const input = partial(f, block(f, item.id));
   input.blocks[0]!.selections[1]!.selectionReviewToken = 'stale';
-  const original = accept(f, input).receipt;
+  const original = (await acceptPartial(f, input)).receipt;
   const backup = await createBackup(f.db, f.root, f.profileId),
     target = join(f.root, 'partial-rebuilt');
   const rebuilt = rebuildProfile(join(backup.path, 'files'), f.profileId, target),
@@ -772,17 +1083,185 @@ test('partial v1 manifest and bounded item receipts survive backup and rebuild w
       getIntakeReportAcceptance(db, target, f.profileId, input.operationId).receipt,
       original,
     );
-    assert.deepEqual(acceptIntakeReportSelection(db, target, f.profileId, input).receipt, original);
+    assert.deepEqual(
+      (await acceptIntakeReportSelectionAsync(db, target, f.profileId, input)).receipt,
+      original,
+    );
     assert.equal(db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
   } finally {
     db.close();
   }
 });
 
-test('partial children reconcile lost publication acknowledgement after earlier saves and reopen', (t) => {
+for (const recovery of ['lookup', 'retry'] as const)
+  test(`a historical small manifest recovers original child IDs via ${recovery} without regrouping interrupted selections`, async (t) => {
+    const objects = new Map<string, Buffer>();
+    let loseAcknowledgement = false;
+    let lost = false;
+    let publications = 0;
+    const storage: RecordStorage = {
+      read: (name) => objects.get(name) || null,
+      writeImmutable(name, bytes) {
+        objects.set(name, Buffer.from(bytes));
+      },
+      publishHead(bytes) {
+        objects.set('head', Buffer.from(bytes));
+        publications++;
+        if (
+          loseAcknowledgement &&
+          Number(f.db.prepare('SELECT count(*) n FROM observations').get()!.n) === 1
+        ) {
+          lost = true;
+          throw Error('Fictional historical child acknowledgement lost');
+        }
+      },
+    };
+    const f = fixture(t, storage);
+    const item = upload(f, [envelope('historical-alpha'), envelope('historical-beta')]);
+    const input = partial(f, block(f, item.id));
+    const digest = (value: unknown) =>
+      createHash('sha256').update(canonicalLiteral(value)).digest('hex');
+    // These are the pre-batching writer's exact deterministic IDs and retained
+    // shape. Publish through real journal transactions; no edited accepted bytes.
+    const oldChildId = (identity: unknown) => {
+      const hash = digest([input.operationId, identity]);
+      return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
+    };
+    const { selections, ...sourceBlock } = input.blocks[0]!;
+    const entries = selections.map((selection) => ({
+      block: sourceBlock,
+      selection,
+      childId: oldChildId([sourceBlock.intakeId, sourceBlock.proposalId, selection]),
+    }));
+    const manifest = {
+      fingerprint: digest(input),
+      operationId: input.operationId,
+      at: '2026-09-01T00:00:00.000Z',
+      entries,
+      groups: entries.map((_, index) => [index]),
+    };
+    const originalChildOperation = oldChildId([entries[0]!.childId]);
+    const regroupedOperation = oldChildId(entries.map((entry) => entry.childId));
+    const prefix = 'intake_partial_acceptance:v1:';
+    const prepared = await prepareNativePartialReviews(f.db, f.root, f.profileId, input);
+    try {
+      const source = prepared.sources.get(item.id)!;
+      if (source instanceof Error) throw source;
+      const reviewed = new Map([[canonicalLiteral([item.id, null]), source.review(null)]]);
+      intake.intakeTransaction(
+        f.db,
+        () => {
+          f.db
+            .prepare('INSERT INTO app_meta(key,value) VALUES(?,?)')
+            .run(prefix + input.operationId, JSON.stringify(manifest));
+          return { operationId: input.operationId };
+        },
+        { operationId: input.operationId, fingerprint: manifest.fingerprint },
+      );
+      loseAcknowledgement = true;
+      await assert.rejects(() =>
+        applyNativeAcceptanceGroup(
+          f.db,
+          f.root,
+          f.profileId,
+          {
+            operationId: originalChildOperation,
+            blocks: [{ ...sourceBlock, selections: [selections[0]!] }],
+          },
+          digest([entries[0]]),
+          {
+            reviewed,
+            retainResult(receipt) {
+              f.db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(
+                prefix + input.operationId + ':item:0',
+                JSON.stringify({
+                  intakeId: item.id,
+                  proposalId: null,
+                  recordId: selections[0]!.recordId,
+                  candidateId: selections[0]!.candidateId,
+                  candidateVersionId: selections[0]!.candidateVersionId,
+                  selectionReviewToken: selections[0]!.selectionReviewToken!,
+                  reviewedSelectionHash: digest(selections[0]),
+                  operationId: entries[0]!.childId,
+                  status: 'saved',
+                  receipt: receipt.receipts[0]!,
+                } satisfies IntakePartialAcceptanceItem),
+              );
+            },
+          },
+        ),
+      );
+    } finally {
+      prepared.close();
+    }
+    assert.equal(lost, true);
+    loseAcknowledgement = false;
+    attachRecordDurability(f.db, { profileId: f.profileId, storage });
+    const assertOriginalOperations = (db: Fixture['db']) => {
+      assert.ok(
+        db
+          .prepare('SELECT 1 FROM __record_transactions WHERE operation_id=?')
+          .get(originalChildOperation),
+      );
+      assert.equal(
+        db
+          .prepare('SELECT 1 FROM __record_transactions WHERE operation_id=?')
+          .get(regroupedOperation),
+        undefined,
+      );
+      assert.deepEqual(
+        JSON.parse(
+          String(
+            db.prepare('SELECT value FROM app_meta WHERE key=?').get(prefix + input.operationId)!
+              .value,
+          ),
+        ),
+        manifest,
+      );
+    };
+    assertOriginalOperations(f.db);
+    const recovered =
+      recovery === 'lookup'
+        ? getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId).receipt
+        : (await acceptPartial(f, input)).receipt;
+    if (recovered.atomic) throw Error('Expected partial');
+    assert.equal(recovered.acceptedCount, 1);
+    assert.deepEqual(
+      recovered.items.map((entry) => entry.operationId),
+      entries.map((entry) => entry.childId),
+    );
+    assert.deepEqual(
+      recovered.items.map((entry) => entry.status),
+      ['saved', 'not_attempted'],
+    );
+    assert.equal(recovered.items[1]!.reasonCode, 'SAVE_INTERRUPTED');
+    const settledPublications = publications;
+    assert.deepEqual((await acceptPartial(f, input)).receipt, recovered);
+    assert.equal(publications, settledPublications);
+    const target = join(f.root, 'historical-partial-rebuilt.sqlite');
+    await rebuildRecordDatabase(target, { profileId: f.profileId, storage });
+    const db = openDatabase(target, f.profileId);
+    attachRecordDurability(db, { profileId: f.profileId, storage });
+    try {
+      assertOriginalOperations(db);
+      assert.deepEqual(
+        getIntakeReportAcceptance(db, f.root, f.profileId, input.operationId).receipt,
+        recovered,
+      );
+      assert.deepEqual(
+        (await acceptIntakeReportSelectionAsync(db, f.root, f.profileId, input)).receipt,
+        recovered,
+      );
+      assert.equal(db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+      assert.equal(publications, settledPublications);
+    } finally {
+      db.close();
+    }
+  });
+
+test('partial children reconcile lost publication acknowledgement after earlier saves and reopen', async (t) => {
   const objects = new Map<string, Buffer>();
-  let publishes = 0,
-    failAt = Infinity;
+  let loseSecondClinicalAcknowledgement = false;
   const storage: RecordStorage = {
     read: (name) => objects.get(name) || null,
     writeImmutable(name, bytes) {
@@ -790,61 +1269,82 @@ test('partial children reconcile lost publication acknowledgement after earlier 
     },
     publishHead(bytes) {
       objects.set('head', Buffer.from(bytes));
-      if (++publishes === failAt) throw Error('Lost acknowledgement after publication');
+      // Bisection saves the first two valid siblings together, then the third.
+      // Lose that second clinical acknowledgement, not auxiliary publication.
+      if (
+        loseSecondClinicalAcknowledgement &&
+        Number(f.db.prepare('SELECT count(*) n FROM observations').get()!.n) === 3
+      )
+        throw Error('Lost acknowledgement after publication');
     },
   };
   const f = fixture(t, storage),
-    item = upload(f, [envelope('alpha'), envelope('beta'), envelope('gamma')]);
+    item = upload(f, [envelope('alpha'), envelope('beta'), envelope('gamma'), envelope('stale')]);
   const input = partial(f, block(f, item.id));
-  failAt = publishes + 3;
-  assert.throws(() => accept(f, input), { code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED' });
-  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
+  input.blocks[0]!.selections[3]!.selectionReviewToken = 'fictional-stale-token';
+  await planIntakeReportAcceptance(f.db, f.root, f.profileId, input);
+  loseSecondClinicalAcknowledgement = true;
+  await assert.rejects(() => acceptPartial(f, input), {
+    code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED',
+  });
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
   assert.throws(() => getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId), {
     code: 'REPORT_ACCEPTANCE_RECOVERY_REQUIRED',
   });
   // A lost response does not justify a new operation: recover the original journal.
   // Rationale: docs/import/review-reliability.md.
-  failAt = Infinity;
+  loseSecondClinicalAcknowledgement = false;
   attachRecordDurability(f.db, { profileId: f.profileId, storage });
   const recovered = getIntakeReportAcceptance(f.db, f.root, f.profileId, input.operationId);
-  assert.equal(recovered.receipt.acceptedCount, 2);
-  assert.equal(!recovered.receipt.atomic && recovered.receipt.items[2]!.status, 'not_attempted');
-  assert.deepEqual(accept(f, input).receipt, recovered.receipt);
-  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
+  assert.equal(recovered.receipt.acceptedCount, 3);
+  assert.equal(!recovered.receipt.atomic && recovered.receipt.items[3]!.status, 'not_attempted');
+  assert.deepEqual((await acceptPartial(f, input)).receipt, recovered.receipt);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 3);
 });
-test('partial shared storage failure stops later children with explicit terminal outcomes', (t) => {
-  const objects = new Map<string, Buffer>();
-  let publishes = 0,
-    stopAfter = Infinity,
-    failed = false;
-  const storage: RecordStorage = {
-    read: (name) => objects.get(name) || null,
-    writeImmutable(name, bytes) {
-      if (publishes === stopAfter && !failed) {
-        failed = true;
-        throw Error('Storage write failed before publication');
-      }
-      objects.set(name, Buffer.from(bytes));
-    },
-    publishHead(bytes) {
-      objects.set('head', Buffer.from(bytes));
-      publishes++;
-    },
-  };
-  const f = fixture(t, storage),
-    item = upload(f, [envelope('alpha'), envelope('beta'), envelope('gamma')]);
-  const input = partial(f, block(f, item.id));
-  stopAfter = publishes + 2;
-  const result = accept(f, input);
-  if (result.receipt.atomic) throw Error('Expected partial');
-  assert.deepEqual(
-    result.receipt.items.map((i) => i.status),
-    ['saved', 'failed', 'not_attempted'],
-  );
-  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
-  assert.deepEqual(accept(f, input).receipt, result.receipt);
-});
-test('partial coupled identical assertions reject together while an independent item saves', (t) => {
+for (const failAtCount of [2, 3])
+  test(`partial shared storage failure at ${failAtCount} rolls back its whole unit and stops later children`, async (t) => {
+    const objects = new Map<string, Buffer>();
+    let failSecondClinicalWrite = false,
+      failed = false;
+    const storage: RecordStorage = {
+      read: (name) => objects.get(name) || null,
+      writeImmutable(name, bytes) {
+        if (
+          failSecondClinicalWrite &&
+          !failed &&
+          Number(f.db.prepare('SELECT count(*) n FROM observations').get()!.n) === failAtCount
+        ) {
+          failed = true;
+          throw Error('Storage write failed before publication');
+        }
+        objects.set(name, Buffer.from(bytes));
+      },
+      publishHead(bytes) {
+        objects.set('head', Buffer.from(bytes));
+      },
+    };
+    const f = fixture(t, storage),
+      item = upload(f, [envelope('alpha'), envelope('beta'), envelope('gamma'), envelope('stale')]);
+    const input = partial(f, block(f, item.id));
+    input.blocks[0]!.selections[3]!.selectionReviewToken = 'fictional-stale-token';
+    await planIntakeReportAcceptance(f.db, f.root, f.profileId, input);
+    failSecondClinicalWrite = true;
+    const result = await acceptPartial(f, input);
+    if (result.receipt.atomic) throw Error('Expected partial');
+    assert.equal(failed, true);
+    assert.deepEqual(
+      result.receipt.items.map((i) => i.status),
+      failAtCount === 2
+        ? ['failed', 'failed', 'not_attempted', 'not_attempted']
+        : ['saved', 'saved', 'failed', 'not_attempted'],
+    );
+    assert.equal(
+      f.db.prepare('SELECT count(*) n FROM observations').get()!.n,
+      failAtCount === 2 ? 0 : 2,
+    );
+    assert.deepEqual((await acceptPartial(f, input)).receipt, result.receipt);
+  });
+test('partial coupled identical assertions reject together while an independent item saves', async (t) => {
   const f = fixture(t),
     first = envelope('same'),
     second = { ...envelope('same'), id: 'same-other' },
@@ -854,7 +1354,7 @@ test('partial coupled identical assertions reject together while an independent 
     other = upload(f, [second], 'second.jsonl');
   const input = partial(f, block(f, item.id), block(f, other.id));
   input.blocks[1]!.selections[0]!.selectionReviewToken = 'stale';
-  const result = accept(f, input);
+  const result = await acceptPartial(f, input);
   if (result.receipt.atomic) throw Error('Expected partial');
   assert.deepEqual(
     result.receipt.items.map((i) => i.status),
@@ -863,21 +1363,21 @@ test('partial coupled identical assertions reject together while an independent 
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 1);
 });
 
-test('operation IDs cannot change between atomic and partial modes', (t) => {
+test('operation IDs cannot change between atomic and partial modes', async (t) => {
   const f = fixture(t),
     item = upload(f, [envelope('one'), envelope('two')]);
   const atomic = request(block(f, item.id, null, [0]));
   accept(f, atomic);
   const altered = partial(f, block(f, item.id, null, [1]));
   altered.operationId = atomic.operationId;
-  assert.throws(() => accept(f, altered), { code: 'OPERATION_CONFLICT' });
+  await assert.rejects(() => acceptPartial(f, altered), { code: 'OPERATION_CONFLICT' });
   const next = partial(f, block(f, item.id, null, [1]));
-  accept(f, next);
+  await acceptPartial(f, next);
   const legacy = structuredClone(next);
   delete legacy.mode;
   assert.throws(() => accept(f, legacy), { code: 'OPERATION_CONFLICT' });
 });
-test('same-label same-date distinct source events remain independent approvals', (t) => {
+test('same-label same-date distinct source events remain independent approvals', async (t) => {
   const f = fixture(t),
     one = envelope('same-label'),
     two = envelope('same-label');
@@ -887,16 +1387,23 @@ test('same-label same-date distinct source events remain independent approvals',
   const item = upload(f, [one, two]);
   const input = partial(f, block(f, item.id));
   input.blocks[0]!.selections[1]!.selectionReviewToken = 'stale';
-  const result = accept(f, input);
+  const originalSelections = structuredClone(input.blocks[0]!.selections);
+  const result = await acceptPartial(f, input);
   if (result.receipt.atomic) throw Error('Expected partial');
   assert.deepEqual(
     result.receipt.items.map((i) => i.status),
     ['saved', 'needs_review'],
   );
+  assert.deepEqual(
+    result.receipt.items.map((entry) => entry.selectionReviewToken),
+    originalSelections.map((entry) => entry.selectionReviewToken),
+  );
+  assert.deepEqual(input.blocks[0]!.selections, originalSelections);
+  assert.deepEqual((await acceptPartial(f, input)).receipt, result.receipt);
 });
 
 // An identity question is not an assignment to Self; outcome labels must retain that distinction.
-test('partial outcomes do not label an unresolved report owner as Self', (t) => {
+test('partial outcomes do not label an unresolved report owner as Self', async (t) => {
   const f = fixture(t);
   const value = envelope('fictional-unassigned');
   value.clinical = { ...(value.clinical as Record<string, unknown>), subject: 'unknown' };
@@ -916,7 +1423,7 @@ test('partial outcomes do not label an unresolved report owner as Self', (t) => 
   const proposalId = proposed.proposals.at(-1)!.id;
   const current = intake.reviewIntake(f.db, f.root, f.profileId, item.id, proposalId);
   assert.equal(current.records[0]!.identityReview?.blocking, true);
-  const result = accept(f, partial(f, block(f, item.id, proposalId)));
+  const result = await acceptPartial(f, partial(f, block(f, item.id, proposalId)));
   assert.equal(result.receipt.atomic, false);
   if (result.receipt.atomic) throw Error('Expected partial receipt');
   assert.equal(result.receipt.items[0]?.status, 'needs_review');
@@ -944,4 +1451,148 @@ test('partial commit groups reject a cached unavailable review instead of reread
     { code: 'SELECTION_REVIEW_CHANGED' },
   );
   assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 0);
+});
+
+for (const restoreValue of [false, true])
+  test(`a chosen comparison ${restoreValue ? 'history' : 'value'} changed between partial batches rejects its old approval while independent saves remain`, async (t) => {
+    const f = fixture(t, 'memory');
+    const target = upload(f, [envelope('fictional-compared-marker')]);
+    const accepted = accept(f, request(block(f, target.id))).receipt;
+    const destination = accepted.receipts[0]!.records[0]!.entityId;
+    const rows = Array.from({ length: 201 }, (_, i) =>
+      envelope(`fictional-independent-comparison-${i}`),
+    );
+    rows[200]!.clinical = {
+      ...(rows[200]!.clinical as object),
+      testLabel: 'fictional-compared-marker',
+      valueText: '19',
+    };
+    const item = upload(f, rows, 'fictional-comparison-intake.jsonl');
+    const reviewed = intake.reviewIntake(f.db, f.root, f.profileId, item.id);
+    const incoming = reviewed.records[200]!;
+    const compared = incoming.comparisons?.find((c) => c.id === destination);
+    assert.ok(
+      compared,
+      'the final pending approval explicitly compared this exact saved destination',
+    );
+    const selected = block(f, item.id);
+    selected.selections[200]!.comparisons = [
+      {
+        otherRecordId: destination,
+        scope: compared.scope,
+        outcome: 'distinct',
+        reason: 'Separate fictional specimens.',
+      },
+    ];
+    const input = { operationId: randomUUID(), mode: 'partial-v1' as const, blocks: [selected] };
+    const saving = acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, input);
+    await waitForCommittedObservations(t, f, saving, 201, () => {
+      const preview = previewDirectRecordCorrection(f.db, f.root, f.profileId, {
+        kind: 'observation',
+        recordId: destination,
+        set: { valueText: '17' },
+        reason: 'Fictional source correction after comparison.',
+      });
+      applyDirectRecordCorrection(f.db, f.root, f.profileId, {
+        ...preview.request,
+        version: preview.version,
+        previewToken: preview.previewToken,
+        operationId: 'fictional-late-comparison-correction',
+      });
+      if (restoreValue) {
+        const restored = previewDirectRecordCorrection(f.db, f.root, f.profileId, {
+          kind: 'observation',
+          recordId: destination,
+          set: { valueText: '+14.00' },
+          reason: 'Fictional second reviewed correction restores displayed value.',
+        });
+        applyDirectRecordCorrection(f.db, f.root, f.profileId, {
+          ...restored.request,
+          version: restored.version,
+          previewToken: restored.previewToken,
+          operationId: 'fictional-late-comparison-restore',
+        });
+      }
+    });
+    const receipt = (await saving).receipt;
+    if (receipt.atomic) throw Error('Expected partial receipt');
+    assert.equal(receipt.acceptedCount, 200);
+    assert.equal(receipt.items[200]!.status, 'needs_review');
+    assert.equal(receipt.items[200]!.reasonCode, 'DUPLICATE_SCOPE_CHANGED');
+    assert.equal(
+      f.db.prepare('SELECT value_text FROM observations WHERE id=?').get(destination)!.value_text,
+      restoreValue ? '+14.00' : '17',
+    );
+    assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 201);
+  });
+
+test('cold singleton duplicates avoid derived indexes without appending retained occurrences', async (t) => {
+  const objects = new Map<string, Buffer>(),
+    diagnostic = createRecordPublicationDiagnostic(objects),
+    storage: RecordStorage = {
+      read: (name) => objects.get(name) || null,
+      writeImmutable(name, value) {
+        const old = objects.get(name);
+        if (old) assert.deepEqual(value, old);
+        objects.set(name, Buffer.from(value));
+        diagnostic.immutable(name, value.length);
+      },
+      publishHead(value) {
+        objects.set('head', Buffer.from(value));
+        diagnostic.published(value);
+      },
+    },
+    f = fixture(t, storage),
+    item = upload(f, [envelope('fictional-cold-one'), envelope('fictional-cold-two')]),
+    input = partial(f, block(f, item.id));
+  const before = intake
+    .getIntake(f.db, f.root, f.profileId, item.id)
+    .workflow!.candidates.map((candidate) => ({
+      id: candidate.id,
+      versions: candidate.versions.map((version) => ({
+        id: version.id,
+        occurrences: structuredClone(version.occurrences),
+      })),
+    }));
+  await intake.ensureNativeIntakeSchema(f.db, f.profileId, item.id);
+  assert.equal(before.length, 2);
+  assert.ok(
+    before.every(
+      (candidate) =>
+        candidate.versions.length === 1 && candidate.versions[0]!.occurrences.length === 1,
+    ),
+  );
+  diagnostic.phase('cold-save');
+  const result = await acceptPartial(f, input),
+    inventory = diagnostic.inventory(f.db),
+    catalogHeads = inventory.publications.filter(
+      (head) =>
+        head.phase === 'cold-save' &&
+        head.stack.some((frame) => frame.includes('/intake-report-snapshot-catalog.ts:')),
+    );
+  assert.equal(result.receipt.acceptedCount, 2);
+  assert.equal(
+    catalogHeads.length,
+    4,
+    'only contribution-index checkpoints remain, including its catalog initialization',
+  );
+  const native = JSON.parse([...iterateIntakeEnvelopeText(f.db, { id: item.id })].join('')) as {
+    intake: { workflow: NonNullable<Intake['workflow']> };
+  };
+  const after = native.intake.workflow.candidates.map((candidate) => ({
+    id: candidate.id,
+    versions: candidate.versions.map((version) => ({
+      id: version.id,
+      occurrences: structuredClone(version.occurrences),
+    })),
+  }));
+  assert.deepEqual(
+    after,
+    before,
+    'duplicate proof never appends or changes retained occurrence evidence',
+  );
+  const publications = inventory.publications.length;
+  assert.deepEqual((await acceptPartial(f, input)).receipt, result.receipt);
+  assert.equal(diagnostic.inventory(f.db).publications.length, publications);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM observations').get()!.n, 2);
 });

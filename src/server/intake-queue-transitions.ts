@@ -7,13 +7,29 @@ import type { NativeProposalAffected } from './intake-collection-proposals.ts';
 import type { NativeAcceptanceEffects } from './intake-collection-acceptance.ts';
 import type { WorkflowDraftEffects } from './intake-workflow-draft-index.ts';
 import { canonicalLiteral } from './intake-format.ts';
+import {
+  beginIntakeFrontierAuxiliaryPreparation,
+  execIntakeFrontierAuxiliarySQL,
+  prepareIntakeFrontierAuxiliaryInsert,
+  runIntakeFrontierAuxiliaryInsert,
+  finishIntakeFrontierAuxiliaryPreparation,
+} from './intake-lookup-frontier-observer.ts';
 const prefix = '__intake_queue_transitions';
 const initialized = new WeakSet<DatabaseSync>();
 export function prepareCollectionQueueTransitions(db: DatabaseSync) {
-  db.exec(
-    `CREATE TEMP TABLE IF NOT EXISTS ${prefix}(source TEXT,after TEXT,before TEXT,PRIMARY KEY(source,after));CREATE TEMP TABLE IF NOT EXISTS ${prefix}_effects(source TEXT,after TEXT,kind TEXT,key TEXT,value TEXT,PRIMARY KEY(source,after,kind,key));`,
-  );
-  initialized.add(db);
+  const preparation = beginIntakeFrontierAuxiliaryPreparation(db, 'queue-transition');
+  let complete = false;
+  try {
+    execIntakeFrontierAuxiliarySQL(
+      db,
+      preparation,
+      `CREATE TEMP TABLE IF NOT EXISTS ${prefix}(source TEXT,after TEXT,before TEXT,PRIMARY KEY(source,after));CREATE TEMP TABLE IF NOT EXISTS ${prefix}_effects(source TEXT,after TEXT,kind TEXT,key TEXT,value TEXT,PRIMARY KEY(source,after,kind,key));`,
+    );
+    initialized.add(db);
+    complete = true;
+  } finally {
+    finishIntakeFrontierAuxiliaryPreparation(db, preparation, complete);
+  }
 }
 export function recordCollectionQueueTransition(
   db: DatabaseSync,
@@ -30,50 +46,73 @@ export function recordCollectionQueueTransition(
   const before = canonicalLiteral(openIntakeCollectionEnvelope(db, source).logical),
     after = canonicalLiteral(input.logical);
   if (canonicalLiteral(input.reader.logical) !== before) throw Error('Foreign queue transition');
-  db.prepare(`INSERT OR IGNORE INTO ${prefix} VALUES(?,?,?)`).run(source.id, after, before);
-  const put = (kind: string, key: string, value: unknown) =>
-    db
-      .prepare(`INSERT OR REPLACE INTO ${prefix}_effects VALUES(?,?,?,?,?)`)
-      .run(source.id, after, kind, key, JSON.stringify(value));
-  for (const change of effect.affected.candidateChanges)
-    put('candidate', JSON.stringify([change.candidateId, change.candidateVersionId]), change);
-  for (const address of effect.affected.questionAddresses) {
-    const question = input.reader.resolve(address),
-      candidate = input.reader.field(question, 'candidateId', { bytes: 8192 });
-    if (candidate.kind === 'value' && typeof candidate.value === 'string')
-      put('candidate', JSON.stringify([candidate.value, null]), { candidateId: candidate.value });
-    else put('broad', 'questions', true);
-  }
-  const groups = new Set<string>();
-  for (const change of effect.affected.reportVersionChanges || []) {
-    groups.add(change.groupAddress);
-    put('group', change.versionAddress, change);
-  }
-  for (const id of effect.affected.proposalIds) put('proposal', id, id);
-  if (
-    effect.acceptance ||
-    effect.affected.reportGroupAddresses.some((address) => !groups.has(address)) ||
-    effect.affected.candidateChanges.some(
-      (change) =>
-        change.kind === 'append' &&
-        !(effect.affected.reportVersionChanges || []).some((group) =>
-          group.changed.some(
-            (member) =>
-              member.candidateId === change.candidateId &&
-              member.candidateVersionId === change.candidateVersionId,
-          ),
+  const preparation = beginIntakeFrontierAuxiliaryPreparation(db, 'queue-transition');
+  let complete = false;
+  try {
+    runIntakeFrontierAuxiliaryInsert(
+      db,
+      preparation,
+      prepareIntakeFrontierAuxiliaryInsert(
+        db,
+        preparation,
+        `INSERT OR IGNORE INTO ${prefix} VALUES(?,?,?)`,
+      ),
+      [source.id, after, before],
+    );
+    const put = (kind: string, key: string, value: unknown) =>
+      runIntakeFrontierAuxiliaryInsert(
+        db,
+        preparation,
+        prepareIntakeFrontierAuxiliaryInsert(
+          db,
+          preparation,
+          `INSERT OR REPLACE INTO ${prefix}_effects VALUES(?,?,?,?,?)`,
         ),
+        [source.id, after, kind, key, JSON.stringify(value)],
+      );
+    for (const change of effect.affected.candidateChanges)
+      put('candidate', JSON.stringify([change.candidateId, change.candidateVersionId]), change);
+    for (const address of effect.affected.questionAddresses) {
+      const question = input.reader.resolve(address),
+        candidate = input.reader.field(question, 'candidateId', { bytes: 8192 });
+      if (candidate.kind === 'value' && typeof candidate.value === 'string')
+        put('candidate', JSON.stringify([candidate.value, null]), { candidateId: candidate.value });
+      else put('broad', 'questions', true);
+    }
+    const groups = new Set<string>();
+    for (const change of effect.affected.reportVersionChanges || []) {
+      groups.add(change.groupAddress);
+      put('group', change.versionAddress, change);
+    }
+    for (const id of effect.affected.proposalIds) put('proposal', id, id);
+    if (
+      effect.acceptance ||
+      effect.affected.reportGroupAddresses.some((address) => !groups.has(address)) ||
+      effect.affected.candidateChanges.some(
+        (change) =>
+          change.kind === 'append' &&
+          !(effect.affected.reportVersionChanges || []).some((group) =>
+            group.changed.some(
+              (member) =>
+                member.candidateId === change.candidateId &&
+                member.candidateVersionId === change.candidateVersionId,
+            ),
+          ),
+      )
     )
-  )
-    put('broad', 'membership', true);
-  if (
-    !effect.affected.candidateChanges.length &&
-    !effect.affected.questionAddresses.length &&
-    !effect.affected.reportGroupAddresses.length &&
-    !effect.affected.proposalIds.length &&
-    !effect.packageBatch
-  )
-    put('metadata', 'metadata', true);
+      put('broad', 'membership', true);
+    if (
+      !effect.affected.candidateChanges.length &&
+      !effect.affected.questionAddresses.length &&
+      !effect.affected.reportGroupAddresses.length &&
+      !effect.affected.proposalIds.length &&
+      !effect.packageBatch
+    )
+      put('metadata', 'metadata', true);
+    complete = true;
+  } finally {
+    finishIntakeFrontierAuxiliaryPreparation(db, preparation, complete);
+  }
 }
 export interface CollectionQueueTransitionEffect {
   kind: 'candidate' | 'group' | 'proposal' | 'broad' | 'metadata';

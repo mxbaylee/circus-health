@@ -51,6 +51,7 @@ import { ImportSourceSheetControls } from './ImportSourceSheetControls';
 import {
   SavedPersonDestinationLink,
   SavedRecordDestinationLink,
+  SavedRecordPeople,
   type SavedPersonDestination,
 } from './SavedRecordDestinations';
 import './import-review.css';
@@ -1202,321 +1203,329 @@ export function ImportReviewPresentation({
         )}
         {!sourceAttention && (
           <>
-            <div className="import-report-list">
-              {[...new Set(visible.map((record) => record.reportId))].map((reportId) => {
-                const report = reports.find((item) => item.id === reportId)!;
-                const reportRecords = visible.filter((record) => record.reportId === reportId);
-                const showIdentity =
-                  !report.subject.hidden &&
-                  reportRecords.some((record) => record.kind !== 'People');
-                return (
-                  <section
-                    className="import-report"
-                    key={report.id}
-                    aria-label={`${report.source} ${report.reportType}`}
-                  >
-                    <header className="import-report-header">
-                      <div className="import-report-title">
-                        <span>
-                          New Import Source{report.filename ? `: ${report.filename}` : ''}
-                        </span>
-                        <strong>{report.reportType}</strong>
-                        <time>{report.date}</time>
-                      </div>
-                      <div className="import-report-context">
-                        {report.sourceLabelAvailable || report.sourceSuggested ? (
-                          <button
-                            className="import-source-control"
-                            type="button"
-                            disabled={actions.busy}
-                            aria-label={
-                              report.sourceSuggested
-                                ? `Change source: ${report.source}`
-                                : report.sourceNeedsLabel
-                                  ? 'Add source'
-                                  : `Change source for ${report.reportType}`
-                            }
-                            onClick={() => void openReportContext('source', report.id)}
-                          >
-                            <span className="import-source">{report.source}</span>
-                            <span className="import-source-action">
-                              {report.sourceNeedsLabel ? 'Add source' : 'Change'}
-                            </span>
-                          </button>
-                        ) : (
-                          <span className="import-source">{report.source}</span>
-                        )}
-
-                        {showIdentity && (
-                          <button
-                            className="import-source-control import-report-person"
-                            type="button"
-                            disabled={actions.busy}
-                            aria-label={`${report.subject.confirmed && !report.subject.nameOnlyMatch ? 'Change' : 'Review'} person for ${report.reportType}`}
-                            onClick={() => void openReportContext('identity', report.id)}
-                          >
-                            <UserRound size={14} aria-hidden="true" />
-                            <span className="import-source">
-                              {report.subject.correctedPerson
-                                ? `Corrected to ${report.subject.correctedPerson.fullName}`
-                                : report.subject.printedName || report.subject.label}
-                              {!report.subject.correctedPerson && (
-                                <>
-                                  {report.subject.confirmed &&
-                                  (!report.subject.assignedPerson ||
-                                    report.subject.assignedPerson.personId === 'patient')
-                                    ? report.subject.nameOnlyMatch
-                                      ? ' (you?)'
-                                      : ' (you)'
-                                    : report.subject.defaultPerson === 'new' &&
-                                        !report.subject.confirmed
-                                      ? ' (new)'
-                                      : report.subject.nameOnlyMatch
-                                        ? ' (?)'
-                                        : ''}
-                                </>
-                              )}
-                            </span>
-                            <span className="import-source-action">
-                              {report.subject.confirmed && !report.subject.nameOnlyMatch
-                                ? 'Change'
-                                : 'Review'}
-                            </span>
-                          </button>
-                        )}
-                        {showIdentity && (
-                          <ImportIdentityWarnings
-                            warnings={report.subject.warnings}
-                            onReviewPerson={() => void openReportContext('identity', report.id)}
-                            reviewLabel={
-                              report.subject.confirmed && !report.subject.nameOnlyMatch
-                                ? 'Change person'
-                                : 'Review person'
-                            }
-                          />
-                        )}
-                      </div>
-                    </header>
-                    {report.ownershipSelection && (
-                      <RecordOwnershipAction
-                        selection={report.ownershipSelection}
-                        label="Change person · saved and pending records"
-                      />
-                    )}
-                    {renderReportSourceReview &&
-                      !reports.some(
-                        (previous) =>
-                          previous.id !== report.id &&
-                          previous.sourceIntakeId === report.sourceIntakeId &&
-                          reports.indexOf(previous) < reports.indexOf(report) &&
-                          visible.some((row) => row.reportId === previous.id),
-                      ) &&
-                      renderReportSourceReview(report)}
-                    {reportRecords.map((record) => (
-                      <article className="import-record" key={record.id}>
-                        <div className="import-record-row">
-                          {view === 'review' || view === 'later' ? (
-                            <input
-                              type="checkbox"
-                              checked={selected.has(record.id)}
-                              onChange={() => toggle(record.id)}
-                              aria-label={`Select ${record.label}`}
-                            />
-                          ) : (
-                            <span />
-                          )}
-                          <div className="import-record-name">
-                            <strong>
-                              {record.label}
-                              {record.manuallyEdited && <span>Edited</span>}
-                            </strong>
-                            {needsApproval.has(record.id) && (
-                              <small>Review again, then approve.</small>
-                            )}
+            <SavedRecordPeople
+              people={
+                view === 'saved' && visible.some((record) => record.kind !== 'People')
+                  ? undefined
+                  : []
+              }
+            >
+              <div className="import-report-list">
+                {[...new Set(visible.map((record) => record.reportId))].map((reportId) => {
+                  const report = reports.find((item) => item.id === reportId)!;
+                  const reportRecords = visible.filter((record) => record.reportId === reportId);
+                  const showIdentity =
+                    !report.subject.hidden &&
+                    reportRecords.some((record) => record.kind !== 'People');
+                  return (
+                    <section
+                      className="import-report"
+                      key={report.id}
+                      aria-label={`${report.source} ${report.reportType}`}
+                    >
+                      <header className="import-report-header">
+                        <div className="import-report-title">
+                          <span>
+                            New Import Source{report.filename ? `: ${report.filename}` : ''}
+                          </span>
+                          <strong>{report.reportType}</strong>
+                          <time>{report.date}</time>
+                        </div>
+                        <div className="import-report-context">
+                          {report.sourceLabelAvailable || report.sourceSuggested ? (
                             <button
-                              className="text-link"
+                              className="import-source-control"
                               type="button"
-                              onClick={() => setSheet({ type: 'original', recordId: record.id })}
+                              disabled={actions.busy}
+                              aria-label={
+                                report.sourceSuggested
+                                  ? `Change source: ${report.source}`
+                                  : report.sourceNeedsLabel
+                                    ? 'Add source'
+                                    : `Change source for ${report.reportType}`
+                              }
+                              onClick={() => void openReportContext('source', report.id)}
                             >
-                              Original <ArrowUpRight size={12} />
+                              <span className="import-source">{report.source}</span>
+                              <span className="import-source-action">
+                                {report.sourceNeedsLabel ? 'Add source' : 'Change'}
+                              </span>
                             </button>
-                            {record.date && (
-                              <small className="import-record-date">{record.date}</small>
-                            )}
-                          </div>
-                          <div
-                            className={`import-record-value${record.value.length > 18 ? ' is-text' : ''}`}
-                          >
-                            <ImportMeasurementValue
-                              value={record.value}
-                              unit={record.unit}
-                              compactUnit
+                          ) : (
+                            <span className="import-source">{report.source}</span>
+                          )}
+
+                          {showIdentity && (
+                            <button
+                              className="import-source-control import-report-person"
+                              type="button"
+                              disabled={actions.busy}
+                              aria-label={`${report.subject.confirmed && !report.subject.nameOnlyMatch ? 'Change' : 'Review'} person for ${report.reportType}`}
+                              onClick={() => void openReportContext('identity', report.id)}
+                            >
+                              <UserRound size={14} aria-hidden="true" />
+                              <span className="import-source">
+                                {report.subject.correctedPerson
+                                  ? `Corrected to ${report.subject.correctedPerson.fullName}`
+                                  : report.subject.printedName || report.subject.label}
+                                {!report.subject.correctedPerson && (
+                                  <>
+                                    {report.subject.confirmed &&
+                                    (!report.subject.assignedPerson ||
+                                      report.subject.assignedPerson.personId === 'patient')
+                                      ? report.subject.nameOnlyMatch
+                                        ? ' (you?)'
+                                        : ' (you)'
+                                      : report.subject.defaultPerson === 'new' &&
+                                          !report.subject.confirmed
+                                        ? ' (new)'
+                                        : report.subject.nameOnlyMatch
+                                          ? ' (?)'
+                                          : ''}
+                                  </>
+                                )}
+                              </span>
+                              <span className="import-source-action">
+                                {report.subject.confirmed && !report.subject.nameOnlyMatch
+                                  ? 'Change'
+                                  : 'Review'}
+                              </span>
+                            </button>
+                          )}
+                          {showIdentity && (
+                            <ImportIdentityWarnings
+                              warnings={report.subject.warnings}
+                              onReviewPerson={() => void openReportContext('identity', report.id)}
+                              reviewLabel={
+                                report.subject.confirmed && !report.subject.nameOnlyMatch
+                                  ? 'Change person'
+                                  : 'Review person'
+                              }
                             />
-                          </div>
-                          <div className="import-record-actions">
-                            {renderRecordReview && record.kind !== 'People' && (
+                          )}
+                        </div>
+                      </header>
+                      {report.ownershipSelection && (
+                        <RecordOwnershipAction
+                          selection={report.ownershipSelection}
+                          label="Change person · saved and pending records"
+                        />
+                      )}
+                      {renderReportSourceReview &&
+                        !reports.some(
+                          (previous) =>
+                            previous.id !== report.id &&
+                            previous.sourceIntakeId === report.sourceIntakeId &&
+                            reports.indexOf(previous) < reports.indexOf(report) &&
+                            visible.some((row) => row.reportId === previous.id),
+                        ) &&
+                        renderReportSourceReview(report)}
+                      {reportRecords.map((record) => (
+                        <article className="import-record" key={record.id}>
+                          <div className="import-record-row">
+                            {view === 'review' || view === 'later' ? (
+                              <input
+                                type="checkbox"
+                                checked={selected.has(record.id)}
+                                onChange={() => toggle(record.id)}
+                                aria-label={`Select ${record.label}`}
+                              />
+                            ) : (
+                              <span />
+                            )}
+                            <div className="import-record-name">
+                              <strong>
+                                {record.label}
+                                {record.manuallyEdited && <span>Edited</span>}
+                              </strong>
+                              {needsApproval.has(record.id) && (
+                                <small>Review again, then approve.</small>
+                              )}
                               <button
                                 className="text-link"
                                 type="button"
-                                aria-expanded={expandedRecord === record.id}
-                                aria-controls={`record-review-${encodeURIComponent(record.id)}`}
-                                onClick={() => void openRecordReview(record)}
+                                onClick={() => setSheet({ type: 'original', recordId: record.id })}
                               >
-                                {expandedRecord === record.id ? 'Close review' : 'Review'}
+                                Original <ArrowUpRight size={12} />
                               </button>
-                            )}
-                            {(view === 'review' || view === 'later') && (
-                              <>
-                                <button
-                                  className="text-link"
-                                  type="button"
-                                  onClick={() =>
-                                    move([record.id], view === 'later' ? 'review' : 'later')
-                                  }
-                                >
-                                  {view === 'later' ? 'Return to review' : 'Later'}
-                                </button>
-                                <button
-                                  className="button primary"
-                                  type="button"
-                                  disabled={
-                                    !record.eligible ||
-                                    actions.busy ||
-                                    (record.kind === 'People' && actions.peopleBusy)
-                                  }
-                                  aria-describedby={
-                                    !record.eligible && record.saveBlockReason
-                                      ? saveBlockDescriptionId(record.id)
-                                      : undefined
-                                  }
-                                  onClick={() => move([record.id], 'saved')}
-                                >
-                                  <Check size={15} /> Confirm & save
-                                </button>
-                              </>
-                            )}
-                            {view === 'excluded' && (
-                              <button
-                                className="button secondary"
-                                type="button"
-                                onClick={() => move([record.id], 'review')}
-                              >
-                                Restore
-                              </button>
-                            )}
-                            {view === 'saved' && (
-                              <span className="import-saved">
-                                <Check size={15} /> Saved
-                              </span>
-                            )}
-                            <button
-                              className="icon-button"
-                              type="button"
-                              aria-label={`More actions for ${record.label}`}
-                              onClick={() => {
-                                if (renderRecordReview && record.kind !== 'People')
-                                  void openRecordReview(record);
-                                else setSheet({ type: 'edit', recordId: record.id });
-                              }}
-                            >
-                              <Ellipsis size={18} />
-                            </button>
-                          </div>
-                        </div>
-                        {!record.eligible &&
-                          record.saveBlockReason &&
-                          (view === 'review' || view === 'later') && (
-                            <div
-                              className="import-match import-save-blocker"
-                              id={saveBlockDescriptionId(record.id)}
-                            >
-                              <span>
-                                <FileSearch size={15} /> {record.saveBlockReason}
-                              </span>
-                              {(record.saveBlockReview === 'identity' || record.detailUrl) && (
-                                <button
-                                  className="text-link"
-                                  type="button"
-                                  onClick={() =>
-                                    record.saveBlockReview === 'identity'
-                                      ? void openReportContext('identity', report.id)
-                                      : void openRecordReview(record)
-                                  }
-                                >
-                                  {record.saveBlockReview === 'identity'
-                                    ? 'Review person'
-                                    : 'Open review'}{' '}
-                                  <ArrowRight size={14} />
-                                </button>
+                              {record.date && (
+                                <small className="import-record-date">{record.date}</small>
                               )}
                             </div>
-                          )}
-                        {record.relatedMatch && view !== 'saved' && (
-                          <div className="import-match">
-                            <span>
-                              <Link2 size={15} /> Possible match:{' '}
-                              <strong>{record.relatedMatch.value}</strong> from{' '}
-                              {record.relatedMatch.source}
-                            </span>
-                            <button
-                              className="text-link"
-                              type="button"
-                              onClick={() => setSheet({ type: 'compare', recordId: record.id })}
+                            <div
+                              className={`import-record-value${record.value.length > 18 ? ' is-text' : ''}`}
                             >
-                              Compare <ArrowRight size={14} />
-                            </button>
+                              <ImportMeasurementValue
+                                value={record.value}
+                                unit={record.unit}
+                                compactUnit
+                              />
+                            </div>
+                            <div className="import-record-actions">
+                              {renderRecordReview && record.kind !== 'People' && (
+                                <button
+                                  className="text-link"
+                                  type="button"
+                                  aria-expanded={expandedRecord === record.id}
+                                  aria-controls={`record-review-${encodeURIComponent(record.id)}`}
+                                  onClick={() => void openRecordReview(record)}
+                                >
+                                  {expandedRecord === record.id ? 'Close review' : 'Review'}
+                                </button>
+                              )}
+                              {(view === 'review' || view === 'later') && (
+                                <>
+                                  <button
+                                    className="text-link"
+                                    type="button"
+                                    onClick={() =>
+                                      move([record.id], view === 'later' ? 'review' : 'later')
+                                    }
+                                  >
+                                    {view === 'later' ? 'Return to review' : 'Later'}
+                                  </button>
+                                  <button
+                                    className="button primary"
+                                    type="button"
+                                    disabled={
+                                      !record.eligible ||
+                                      actions.busy ||
+                                      (record.kind === 'People' && actions.peopleBusy)
+                                    }
+                                    aria-describedby={
+                                      !record.eligible && record.saveBlockReason
+                                        ? saveBlockDescriptionId(record.id)
+                                        : undefined
+                                    }
+                                    onClick={() => move([record.id], 'saved')}
+                                  >
+                                    <Check size={15} /> Confirm & save
+                                  </button>
+                                </>
+                              )}
+                              {view === 'excluded' && (
+                                <button
+                                  className="button secondary"
+                                  type="button"
+                                  onClick={() => move([record.id], 'review')}
+                                >
+                                  Restore
+                                </button>
+                              )}
+                              {view === 'saved' && (
+                                <span className="import-saved">
+                                  <Check size={15} /> Saved
+                                </span>
+                              )}
+                              <button
+                                className="icon-button"
+                                type="button"
+                                aria-label={`More actions for ${record.label}`}
+                                onClick={() => {
+                                  if (renderRecordReview && record.kind !== 'People')
+                                    void openRecordReview(record);
+                                  else setSheet({ type: 'edit', recordId: record.id });
+                                }}
+                              >
+                                <Ellipsis size={18} />
+                              </button>
+                            </div>
                           </div>
-                        )}
-                        {!record.relatedMatch &&
-                          record.possibleOverlap &&
-                          record.detailUrl &&
-                          (view === 'review' || view === 'later') && (
+                          {!record.eligible &&
+                            record.saveBlockReason &&
+                            (view === 'review' || view === 'later') && (
+                              <div
+                                className="import-match import-save-blocker"
+                                id={saveBlockDescriptionId(record.id)}
+                              >
+                                <span>
+                                  <FileSearch size={15} /> {record.saveBlockReason}
+                                </span>
+                                {(record.saveBlockReview === 'identity' || record.detailUrl) && (
+                                  <button
+                                    className="text-link"
+                                    type="button"
+                                    onClick={() =>
+                                      record.saveBlockReview === 'identity'
+                                        ? void openReportContext('identity', report.id)
+                                        : void openRecordReview(record)
+                                    }
+                                  >
+                                    {record.saveBlockReview === 'identity'
+                                      ? 'Review person'
+                                      : 'Open review'}{' '}
+                                    <ArrowRight size={14} />
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          {record.relatedMatch && view !== 'saved' && (
                             <div className="import-match">
                               <span>
-                                <Link2 size={15} /> A saved result has this value and date in the
-                                same file. Matching numbers alone do not mean it is the same
-                                measurement. Compare the test name, date, and body region before
-                                excluding it.
+                                <Link2 size={15} /> Possible match:{' '}
+                                <strong>{record.relatedMatch.value}</strong> from{' '}
+                                {record.relatedMatch.source}
                               </span>
-                              <a className="text-link" href={`#${record.detailUrl}`}>
-                                Check possible overlap <ArrowRight size={14} />
-                              </a>
+                              <button
+                                className="text-link"
+                                type="button"
+                                onClick={() => setSheet({ type: 'compare', recordId: record.id })}
+                              >
+                                Compare <ArrowRight size={14} />
+                              </button>
                             </div>
                           )}
-                        {view === 'saved' &&
-                          !record.savedDestination &&
-                          renderSavedDestination?.(record)}
-                        {view === 'saved' && record.savedDestination && (
-                          <div className="import-record-destination">
-                            <SavedRecordDestinationLink record={record.savedDestination} />
-                          </div>
-                        )}
-                        {view === 'saved' && record.savedPersonDestination && (
-                          <div className="import-record-destination">
-                            <SavedPersonDestinationLink
-                              destination={record.savedPersonDestination}
-                            />
-                          </div>
-                        )}
-                        {expandedRecord === record.id && renderRecordReview && (
-                          <div
-                            className="import-record-accordion"
-                            id={`record-review-${encodeURIComponent(record.id)}`}
-                          >
-                            {renderRecordReview(record, closeRecordReview)}
-                          </div>
-                        )}
-                      </article>
-                    ))}
-                  </section>
-                );
-              })}
-              {visible.length === 0 && !(kind === 'All' && sourceCount > 0) && (
-                <div className="import-empty">
-                  {model?.loading ? 'Loading records…' : 'No records match this view.'}
-                </div>
-              )}
-            </div>
+                          {!record.relatedMatch &&
+                            record.possibleOverlap &&
+                            record.detailUrl &&
+                            (view === 'review' || view === 'later') && (
+                              <div className="import-match">
+                                <span>
+                                  <Link2 size={15} /> A saved result has this value and date in the
+                                  same file. Matching numbers alone do not mean it is the same
+                                  measurement. Compare the test name, date, and body region before
+                                  excluding it.
+                                </span>
+                                <a className="text-link" href={`#${record.detailUrl}`}>
+                                  Check possible overlap <ArrowRight size={14} />
+                                </a>
+                              </div>
+                            )}
+                          {view === 'saved' &&
+                            !record.savedDestination &&
+                            renderSavedDestination?.(record)}
+                          {view === 'saved' && record.savedDestination && (
+                            <div className="import-record-destination">
+                              <SavedRecordDestinationLink record={record.savedDestination} />
+                            </div>
+                          )}
+                          {view === 'saved' && record.savedPersonDestination && (
+                            <div className="import-record-destination">
+                              <SavedPersonDestinationLink
+                                destination={record.savedPersonDestination}
+                              />
+                            </div>
+                          )}
+                          {expandedRecord === record.id && renderRecordReview && (
+                            <div
+                              className="import-record-accordion"
+                              id={`record-review-${encodeURIComponent(record.id)}`}
+                            >
+                              {renderRecordReview(record, closeRecordReview)}
+                            </div>
+                          )}
+                        </article>
+                      ))}
+                    </section>
+                  );
+                })}
+                {visible.length === 0 && !(kind === 'All' && sourceCount > 0) && (
+                  <div className="import-empty">
+                    {model?.loading ? 'Loading records…' : 'No records match this view.'}
+                  </div>
+                )}
+              </div>
+            </SavedRecordPeople>
             {(model?.activity?.activeFiles || model?.activity?.paused) && (
               <p className="import-feed-note">
                 Showing records found so far. More may appear while Moxie reads.

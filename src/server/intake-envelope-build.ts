@@ -236,6 +236,7 @@ async function buildIntakeCollectionEnvelopeOwned(
       // The owner independently verifies the candidate graph/export before granting
       // the representation-only maintenance capability.
       const id = randomUUID();
+      await collections.admitCurrentLogAsync(resume.assertCurrent);
       const prepared = collections.prepare(collections.openView(), {
         operationId: id,
         requestDigest: digest(id),
@@ -257,6 +258,7 @@ async function buildIntakeCollectionEnvelopeOwned(
           },
         ],
       });
+      collections.releaseLogAdmission();
       await collections.certifySchemaAdoptionAsync(prepared, {
         assertRunning: resume.assertCurrent,
       });
@@ -431,12 +433,14 @@ function makeEnvelopeBuildWriter(
       options.assertRunning?.();
       return;
     }
+    await collections!.admitCurrentLogAsync(options.assertRunning);
     const prepared = collections!.prepare(collections!.openView(), {
       operationId: id,
       requestDigest: digest(id),
       domainVersion: version,
       changes: batch,
     });
+    collections!.releaseLogAdmission();
     resume?.assertCurrent();
     resume?.beginCheckpoint();
     const result = collections!.commitMaintenance(

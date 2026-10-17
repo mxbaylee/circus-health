@@ -27,7 +27,7 @@ import {
   disposeIntakeLegacyBridgeReadWitness,
   assertIntakeLegacyBridgeReadWitnessForSource,
 } from '../intake-state-migration.ts';
-import { intakeNamespace } from '../intake-state-evidence.ts';
+import { intakeNamespace, LOG_COLLECTION_FORMAT } from '../intake-state-evidence.ts';
 import { ensureIntakeFrontierObserver } from '../intake-lookup-frontier-observer.ts';
 import { attachPersonalDurability } from '../portable.ts';
 import { contributorAuthorityPath } from '../contributor-record-storage.ts';
@@ -157,6 +157,7 @@ test('historical V4 cell parts retain signed membership across later heads and c
   const other = otherCollections.binding(otherCollections.openView())!;
   assert.notDeepEqual(other.logical.root, before.logical.root);
   const operationId = randomUUID();
+  await collections.admitCurrentLogAsync();
   const prepared = collections.prepare(collections.openView(), {
     operationId,
     requestDigest: createHash('sha256').update(operationId).digest('hex'),
@@ -171,6 +172,7 @@ test('historical V4 cell parts retain signed membership across later heads and c
       },
     ],
   });
+  collections.releaseLogAdmission();
   transaction(db, () => collections.stage(prepared));
   const afterHead = collections.binding(collections.openView())!;
   assert.ok(afterHead.storageSequence > before.storageSequence);
@@ -254,8 +256,9 @@ test('historical V4 cell parts retain signed membership across later heads and c
   const peer = new DatabaseSync(paths.database);
   try {
     const prefix = intakeNamespace({ profileId, intakeId, sourceHash }) + 'node:';
-    const history = afterHead.history!;
-    const nodeKey = prefix + history.hash;
+    const nodeKey =
+      prefix +
+      (afterHead.format === LOG_COLLECTION_FORMAT ? afterHead.peaks! : afterHead.history!.hash);
     const saved = db.prepare('SELECT value FROM app_meta WHERE key=?').get(nodeKey)!
       .value as string;
     ensureIntakeFrontierObserver(db);
@@ -360,6 +363,7 @@ test('contributor historical V4 read binds selected HEAD to accepted backing bef
   const headKey = intakeNamespace(identity) + 'head';
   const beforeRaw = db.prepare('SELECT value FROM app_meta WHERE key=?').get(headKey)!.value;
   const operationId = randomUUID();
+  await collections.admitCurrentLogAsync();
   const prepared = collections.prepare(collections.openView(), {
     operationId,
     requestDigest: createHash('sha256').update(operationId).digest('hex'),
@@ -374,6 +378,7 @@ test('contributor historical V4 read binds selected HEAD to accepted backing bef
       },
     ],
   });
+  collections.releaseLogAdmission();
   transaction(db, () => collections.stage(prepared));
   const after = collections.binding(collections.openView())!;
   assert.ok(after.storageSequence > before.storageSequence);

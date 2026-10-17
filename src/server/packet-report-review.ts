@@ -1,3 +1,8 @@
+import {
+  packetReportPersonScope,
+  type PacketReportReviewContext,
+  type PendingPacketReportReview,
+} from './packet-report-person.ts';
 import { readStoredIntakeDetails } from './intake-state-access.ts';
 import type { Database } from './database.ts';
 import { hasIntakeCollectionEnvelope } from './intake-collection-envelope.ts';
@@ -5,6 +10,8 @@ import { PacketOutputBudget } from './packet-output-budget.ts';
 import { iterateNativePacketReportReview } from './packet-report-review-native.ts';
 
 export interface PacketReportReview {
+  personId: string;
+  countScope: 'current_person';
   intakeId: string;
   groupId: string;
   title: string;
@@ -18,6 +25,9 @@ export interface PacketReportReview {
 export function* iteratePacketReportReview(
   db: Database,
   sourceIds: Iterable<string>,
+  personId: string,
+  context?: PacketReportReviewContext,
+  preparePending?: PendingPacketReportReview,
 ): Generator<PacketReportReview> {
   const byIntake = new Map<string, Set<string>>();
   const source = db.prepare('SELECT source_file_id, locator_json FROM source_records WHERE id=?');
@@ -35,7 +45,14 @@ export function* iteratePacketReportReview(
       .prepare('SELECT id,kind,sha256,details_json FROM source_files WHERE id=?')
       .get(intakeId);
     if (file?.kind === 'intake_original' && hasIntakeCollectionEnvelope(db, { id: intakeId })) {
-      yield* iterateNativePacketReportReview(db, intakeId, included);
+      yield* iterateNativePacketReportReview(
+        db,
+        intakeId,
+        included,
+        personId,
+        context,
+        preparePending,
+      );
       continue;
     }
     const workflow = readStoredIntakeDetails(db, intakeId)?.workflow;
@@ -45,35 +62,51 @@ export function* iteratePacketReportReview(
     const candidates = new Map(
       (workflow.candidates || []).map((candidate) => [candidate.id, candidate]),
     );
-    for (const group of workflow.reportGroups || []) {
-      if (group.basis !== 'report_anchor') continue;
-      const latest = group.versions.at(-1);
-      if (
-        !latest ||
-        !latest.members.some((member) =>
-          member.occurrences.some((occurrence) => included.has(occurrence.recordId)),
+    const scope = packetReportPersonScope(db, intakeId, false, context, preparePending);
+    try {
+      for (const group of workflow.reportGroups || []) {
+        if (group.basis !== 'report_anchor') continue;
+        const latest = group.versions.at(-1);
+        if (
+          !latest ||
+          !latest.members.some((member) =>
+            member.occurrences.some((occurrence) => included.has(occurrence.recordId)),
+          )
         )
-      )
-        continue;
-      const current = new Map(
-        latest.members.flatMap((member) => {
-          const version = candidates.get(member.candidateId)?.versions.at(-1);
-          return version &&
-            version.id === member.candidateVersionId &&
-            !version.sourceContext &&
-            !version.peopleOnly
-            ? [[member.candidateId, version] as const]
-            : [];
-        }),
-      );
-      if (!current.size) continue;
-      yield {
-        intakeId,
-        groupId: group.id,
-        title: latest.title.slice(0, 500),
-        savedCount: [...current.values()].filter((version) => version.status === 'accepted').length,
-        totalCount: current.size,
-      };
+          continue;
+        const current = new Map(
+          latest.members.flatMap((member) => {
+            const version = candidates.get(member.candidateId)?.versions.at(-1);
+            return version &&
+              version.id === member.candidateVersionId &&
+              !version.sourceContext &&
+              !version.peopleOnly &&
+              (version.status === 'accepted'
+                ? scope.accepted(version.occurrences || member.occurrences, personId)
+                : scope.pending(
+                    version.occurrences || member.occurrences,
+                    member.candidateId,
+                    version.id,
+                    personId,
+                  ))
+              ? [[member.candidateId, version] as const]
+              : [];
+          }),
+        );
+        if (!current.size) continue;
+        yield {
+          personId,
+          countScope: 'current_person',
+          intakeId,
+          groupId: group.id,
+          title: latest.title.slice(0, 500),
+          savedCount: [...current.values()].filter((version) => version.status === 'accepted')
+            .length,
+          totalCount: current.size,
+        };
+      }
+    } finally {
+      scope.close();
     }
   }
 }
@@ -81,10 +114,12 @@ export function* iteratePacketReportReview(
 export function packetReportReview(
   db: Database,
   sourceIds: Iterable<string>,
+  personId: string,
+  context?: PacketReportReviewContext,
   budget = new PacketOutputBudget(),
 ): PacketReportReview[] {
   const reports: PacketReportReview[] = [];
-  for (const report of iteratePacketReportReview(db, sourceIds)) {
+  for (const report of iteratePacketReportReview(db, sourceIds, personId, context)) {
     budget.add(report, reports.length ? 1 : 0);
     reports.push(report);
   }

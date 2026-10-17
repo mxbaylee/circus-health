@@ -1,5 +1,38 @@
 # Update an installation and recover from a failed candidate
 
+Restart into the reviewed build and reload the browser before planning partial
+report saves. The server now groups coupled effects and admits operations by
+selection count, proposal blocks and retained bytes. Planning and partial saving
+prepare selected older intakes as collections before capturing the
+approval witness. Collection checkpoints now select V5 operation logs, retaining
+an exact V4 anchor when upgrading existing collections. The outer encrypted
+archive format is unchanged, but older V4-only builds cannot read the new intake
+heads. Keep a checked backup before updating and do not downgrade an archive
+after V5 checkpoints have been accepted. See the
+[V5 compatibility contract](../data/intake-state-storage.md#v5-operation-log-and-compatibility).
+Original approval tokens remain checked, and a lost reply
+is reconciled with its original operation ID before any conversion or new save.
+The initial preparation can write representation evidence without accepting
+clinical records. Interrupted preparation can be retried from durable evidence;
+keep originals and accepted history for recovery. See
+[partial-save planning and outcomes](../import/review-reliability.md).
+
+Older drafts retain their complete original approval input when represented by
+native history references. This fixes spurious stale-review refusals after
+conversion without discarding history from the proof. Reload open review pages
+after updating: a prior build's token derived from the native presentation may
+require fresh review. Existing operation receipts still reconcile by their
+original IDs; originals, accepted history and retained formats do not change.
+
+Regenerate packet previews after updating, especially after changing a saved
+record's person. Report-review counts now follow current saved ownership and
+the reviewed assignment of pending items. Prior previews can include another
+person's report items in those counts. New evidence rows include `personId` and
+`countScope: "current_person"`; unresolved ownership is excluded rather than
+treated as reviewed. This changes derived packet output, not accepted records or
+archive formats. No operator configuration is required. See
+[person-scoped report counts](../import/review-reliability.md).
+
 Restart into the reviewed build before adding files while an encrypted profile's
 earlier reading batch is running. Batch and conversation journal continuations,
 including public batch and chat controls, now publish through the profile's

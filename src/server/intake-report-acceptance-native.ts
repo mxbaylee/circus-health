@@ -1,3 +1,4 @@
+import { assertAcceptanceBytes } from './intake-report-acceptance.ts';
 import { currentClinicalOperation, runExclusiveClinicalOperation } from './clinical-operation.ts';
 /** Native report approval prepares bounded selected blocks before one commit. */
 import { HttpError, type Database } from './database.ts';
@@ -73,12 +74,14 @@ export async function applyNativeAcceptanceGroup(
   options: {
     retainResult?: (receipt: IntakeAtomicAcceptanceReceipt) => void;
     reviewed?: Map<string, IntakeReview | null>;
+    beforeTransaction?: () => void;
   } = {},
 ): Promise<IntakeReportAcceptanceResult> {
   return runExclusiveClinicalOperation(
     db,
     async () => {
       assertIntakeOwner(db, profileId);
+      assertAcceptanceBytes(db, selected);
       const pairPreparation = observeIntakePairPreparation(db);
       const reviewedAtEntry = new Set<IntakeReportAcceptanceRequest['blocks'][number]>();
       try {
@@ -426,7 +429,9 @@ export async function applyNativeAcceptanceGroup(
               intakeTransaction(
                 db,
                 () => {
+                  options.beforeTransaction?.();
                   assertRunning();
+                  assertAcceptanceBytes(db, selected);
                   for (const check of publicationChecks.values()) check();
                   consumeIntakeDiscoveryAdmission(db, admission);
                   const result = prepared.apply();

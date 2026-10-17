@@ -1,6 +1,7 @@
 /** Explicit supported-v3 bridge proof. This is one-time compatibility work,
  * never a V4 point-read path or a license to reset retained evidence. */
 import { setImmediate } from 'node:timers/promises';
+import { FORMAT as LOG_FORMAT, verifyIntakeLogExtension } from './intake-state-log.ts';
 import { constants, DatabaseSync } from 'node:sqlite';
 import { terminalStatement } from './database-terminal-statements.ts';
 import { createHash } from 'node:crypto';
@@ -17,6 +18,7 @@ import {
   limits,
   parseIntakeHead,
   parseIntakeCollectionHead,
+  parseIntakeCollectionHeadV4,
   reconstructIntakeEvidence,
   reconstructIntakeEvidenceSteps,
   integer,
@@ -1224,7 +1226,7 @@ export function prepareIntakeLegacyBridgeProof(
         legacy.value,
       ).domainVersion;
     }
-    const head = parseIntakeCollectionHead(afterHead, identity);
+    const head = parseIntakeCollectionHeadV4(afterHead, identity);
     if (
       !head ||
       head.storageSequence !== 1 ||
@@ -1535,18 +1537,27 @@ function* prepareIntakeSchemaAdoptionProofSteps(
     read,
     compactSameData ? INTAKE_ENVELOPE_FORMAT : undefined,
   );
-  const historyRaw = tree.get(after.history, String(after.storageSequence).padStart(16, '0'));
-  if (historyRaw === undefined) invalid('schema adoption history');
-  const event = parseIntakeCollectionHistory(historyRaw, identity);
-  if (
-    JSON.stringify(event.previous) !== beforeHead ||
-    JSON.stringify(event.logical) !== JSON.stringify(after.logical) ||
-    JSON.stringify(event.builds) !== JSON.stringify(after.builds)
-  )
-    invalid('schema adoption history edge');
-  const receiptRaw = tree.get(after.receipts, event.operationId);
-  if (receiptRaw === undefined) invalid('schema adoption receipt');
-  const receipt = parseIntakeCollectionReceipt(receiptRaw, identity, event.operationId);
+  const extension =
+    after.format === LOG_FORMAT
+      ? verifyIntakeLogExtension(beforeHead, afterHead, identity, read)
+      : undefined;
+  const receipt = extension
+    ? extension.event.receipt
+    : (() => {
+        if (after.format === LOG_FORMAT) invalid('schema adoption log extension');
+        const historyRaw = tree.get(after.history, String(after.storageSequence).padStart(16, '0'));
+        if (historyRaw === undefined) invalid('schema adoption history');
+        const event = parseIntakeCollectionHistory(historyRaw, identity);
+        if (
+          JSON.stringify(event.previous) !== beforeHead ||
+          JSON.stringify(event.logical) !== JSON.stringify(after.logical) ||
+          JSON.stringify(event.builds) !== JSON.stringify(after.builds)
+        )
+          invalid('schema adoption history edge');
+        const raw = tree.get(after.receipts, event.operationId);
+        if (raw === undefined) invalid('schema adoption receipt');
+        return parseIntakeCollectionReceipt(raw, identity, event.operationId);
+      })();
   if (
     receipt.result.storageSequence !== after.storageSequence ||
     JSON.stringify(receipt.result.logical) !== JSON.stringify(after.logical)
@@ -1555,6 +1566,7 @@ function* prepareIntakeSchemaAdoptionProofSteps(
   // Only final path nodes may be new. Traverse candidate-only edges using the
   // strict node grammar; existing accepted subtrees need no history-wide scan.
   const consumed = new Set<string>([headKey]);
+  for (const row of extension?.writes ?? []) consumed.add(prefix + 'node:' + row.hash);
   const visit = (
     root: import('./intake-state-tree.ts').IntakeTreeRoot,
     kind: 'directory' | 'values' | 'history' | 'receipts',
@@ -1583,8 +1595,10 @@ function* prepareIntakeSchemaAdoptionProofSteps(
   };
   visit(after.logical.root, 'directory');
   visit(after.builds, 'directory');
-  visit(after.receipts, 'receipts');
-  visit(after.history, 'history');
+  if (after.format !== LOG_FORMAT) {
+    visit(after.receipts, 'receipts');
+    visit(after.history, 'history');
+  }
   if (consumed.size !== rows.size) invalid('schema adoption disconnected writes');
   // The distinct compact factory checks every scalar and, for the streamed
   // vault route, compares the old text against its accepted prior in pieces.

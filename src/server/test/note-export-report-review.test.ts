@@ -8,11 +8,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase } from '../database.ts';
 import { ensureProfileDirectories } from '../profile-storage.ts';
-import { getNote } from '../notes.ts';
-import { uploadIntake, reviewIntake, importIntake } from '../intake.ts';
-import { exportSnapshot, exportHtml, exportEvidence } from '../note-exports.ts';
+import { createNote, getNote } from '../notes.ts';
+import { randomUUID } from 'node:crypto';
+import { previewRecordOwnership, commitRecordOwnership } from '../record-ownership.ts';
+import {
+  uploadIntake,
+  reviewIntake,
+  importIntake,
+  saveIntakeReviewDraft,
+  askIntakeQuestion,
+} from '../intake.ts';
+import {
+  exportSnapshot as snapshot,
+  preparePacketReportReview,
+  exportHtml,
+  exportEvidence,
+} from '../note-exports.ts';
 import type { HealthRecordEnvelope, IntakeWorkflow } from '../../shared/intake.ts';
-import { packetReportReview } from '../packet-report-review.ts';
+import { packetReportReview as reportReview } from '../packet-report-review.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { clearIntakeStateCache } from '../intake-state-storage.ts';
 import { rebuildProfile } from '../portable.ts';
@@ -79,6 +92,13 @@ test(
       bytes: Buffer.from(envelopes.map((entry) => JSON.stringify(entry)).join('\n')),
       newProviderName: 'Fictional Lab',
     });
+    const exportSnapshot = (database: typeof db, input: unknown): ReturnType<typeof snapshot> =>
+      snapshot(database, input, undefined, {
+        root: database === db ? root : recoveredRoot,
+        profileId,
+      });
+    const packetReportReview = (database: typeof db, ids: Iterable<string>) =>
+      reportReview(database, ids, 'patient', { root, profileId });
     const save = (indexes: number[]) => {
       const review = reviewIntake(db, root, profileId, item.id);
       importIntake(db, root, profileId, item.id, {
@@ -137,9 +157,10 @@ test(
     const candidate = workflow.candidates.find((entry) => entry.id === members[0]!.candidateId)!;
     const pending = {
       ...candidate.versions.at(-1)!,
-      id: 'current-revision',
       status: 'pending' as const,
     };
+    candidate.versions.at(-1)!.id = 'historical-accepted';
+    members.push({ ...members[0]!, candidateVersionId: 'historical-accepted' });
     candidate.versions.push(pending);
     members.push({ ...members[0]!, candidateVersionId: pending.id });
     members.push(structuredClone(members[1]!));
@@ -170,6 +191,7 @@ test(
     await buildIntakeCollectionEnvelope(db, { id: item.id });
     await buildIntakeCollectionEnvelope(db, { id: parent.id });
     const before = { ...intakeWorkCounters(db).warm };
+    await preparePacketReportReview(db, input, { root, profileId });
     const native = exportSnapshot(db, input);
     assert.deepEqual(native.reportReview, legacy.reportReview);
     assert.deepEqual(native.readingGaps, legacy.readingGaps);
@@ -222,6 +244,7 @@ test(
       recovered = openDatabase(rebuilt.database, profileId);
     try {
       attachPersonalDurability(recovered, { root: recoveredRoot, profileId });
+      await preparePacketReportReview(recovered, input, { root: recoveredRoot, profileId });
       assert.deepEqual(exportSnapshot(recovered, input).reportReview, native.reportReview);
       assert.deepEqual(exportSnapshot(recovered, input).readingGaps, native.readingGaps);
       const rebuiltSelective = exportSnapshot(recovered, selectiveInput);
@@ -238,3 +261,191 @@ test(
     }
   },
 );
+
+for (const native of [false, true])
+  test(`${native ? 'native' : 'legacy'} report review counts follow supported current record ownership and survive reconstruction`, async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'fictional-person-panel-'));
+    const profileId = 'fictional-person-panel';
+    const db = openDatabase(ensureProfileDirectories(root, profileId).database, profileId);
+    attachPersonalDurability(db, { root, profileId });
+    t.after(() => {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    });
+    const relative = createNote(db, {
+      kind: 'person',
+      title: 'Fictional Rowan',
+      person: { fullName: 'Fictional Rowan' },
+    });
+    const envelopes: HealthRecordEnvelope[] = Array.from({ length: 3 }, (_, index) => ({
+      format: 'health-record-v1',
+      id: `fictional-shared-${index}`,
+      kind: 'record',
+      payload: { literal: `Fictional result ${index}` },
+      provenance: {
+        sourceSystem: 'Fictional Lab',
+        sourceRecordId: `fictional-shared-${index}`,
+        capturedVia: null,
+        evidenceClass: 'provider_export',
+        locator: `Fictional row ${index}`,
+      },
+      coverage: { status: 'complete_response', notes: [] },
+      clinical: {
+        kind: 'observation',
+        subject: 'self',
+        testLabel: `Fictional test ${index}`,
+        valueText: String(index + 10),
+        unit: 'mg',
+        date: '2026-03-01',
+      },
+      report: {
+        key: 'shared',
+        title: 'Fictional shared panel',
+        anchor: { locator: 'heading', text: 'Fictional shared panel' },
+        subject: null,
+      },
+    }));
+    // All four source rows have the same proposed subject and report anchor.
+    // An explicit record-scoped "unknown" answer below leaves one unresolved
+    // without moving it into another report group.
+    envelopes.push({
+      ...structuredClone(envelopes[0]!),
+      id: 'fictional-unassigned',
+      provenance: { ...envelopes[0]!.provenance, sourceRecordId: 'fictional-unassigned' },
+      clinical: {
+        ...envelopes[0]!.clinical!,
+        testLabel: 'Fictional unresolved owner',
+      },
+    });
+    const intake = uploadIntake(db, root, profileId, {
+      filename: 'fictional-shared.jsonl',
+      bytes: Buffer.from(envelopes.map((value) => JSON.stringify(value)).join('\n')),
+      newProviderName: 'Fictional Lab',
+    });
+    let review = reviewIntake(db, root, profileId, intake.id);
+    const unresolved = review.records[3]!;
+    askIntakeQuestion(db, root, profileId, intake.id, {
+      version: review.version,
+      operationId: randomUUID(),
+      key: 'fictional-fourth-record-identity',
+      candidateId: unresolved.candidateId!,
+      candidateVersionId: unresolved.candidateVersionId!,
+      prompt: 'Which person does this independently fictional result belong to?',
+      locator: 'Fictional row 3',
+      field: 'subject',
+    });
+    review = reviewIntake(db, root, profileId, intake.id);
+    const identity = review.records[3]!.issues!.find((issue) => issue.kind === 'identity')!;
+    assert.ok(identity, 'The exact fourth record has its own identity review issue');
+    saveIntakeReviewDraft(db, root, profileId, intake.id, {
+      version: review.version,
+      operationId: randomUUID(),
+      proposalId: review.proposalId,
+      recordId: unresolved.id,
+      candidateVersionId: unresolved.candidateVersionId!,
+      resolutions: [{ issueId: identity.id, outcome: 'unknown' }],
+    });
+    review = reviewIntake(db, root, profileId, intake.id);
+    assert.equal(review.records[3]!.mapping.subject, 'self');
+    assert.equal(review.records[3]!.identityReview?.blocking, true);
+    assert.ok(review.records.slice(0, 3).every((record) => !record.identityReview?.blocking));
+    const retained = JSON.parse(readIntakeEnvelopeText(db, { id: intake.id }));
+    const groups = (retained.intake.workflow as IntakeWorkflow).reportGroups!;
+    assert.equal(groups.length, 1, 'The unresolved fourth item remains in the represented report');
+    assert.deepEqual(
+      groups[0]!.versions
+        .at(-1)!
+        .members.map((member) => member.candidateId)
+        .sort(),
+      review.records.map((record) => record.candidateId).sort(),
+      'All four current candidates belong to that same report',
+    );
+    importIntake(db, root, profileId, intake.id, {
+      version: review.version,
+      reviewToken: review.reviewToken,
+      decisions: review.records
+        .slice(0, 2)
+        .map((record) => ({ recordId: record.id, action: 'accept', mapping: {} })),
+    });
+    if (native) await buildIntakeCollectionEnvelope(db, { id: intake.id });
+    if (native) {
+      const note = getNote(db, 'person-note:self');
+      await preparePacketReportReview(
+        db,
+        { type: 'note', id: note.id, noteVersion: note.version, mode: 'provider' },
+        { root, profileId },
+      );
+    }
+    const moved = String(db.prepare('SELECT id FROM observations ORDER BY id LIMIT 1').get()!.id);
+    const preview = previewRecordOwnership(db, root, profileId, {
+      selection: { type: 'records', records: [{ kind: 'observation', recordId: moved }] },
+      destination: { noteId: relative.id, expectedVersion: relative.version },
+    });
+    assert.deepEqual(preview.blockers, []);
+    commitRecordOwnership(db, root, profileId, {
+      operationId: randomUUID(),
+      request: preview.request,
+      version: preview.version,
+      scopeToken: preview.scopeToken,
+    });
+    const self = getNote(db, 'person-note:self');
+    const inputs = [self, getNote(db, relative.id)].map((note) => ({
+      type: 'note',
+      id: note.id,
+      noteVersion: note.version,
+      mode: 'provider',
+    }));
+    assert.throws(() => snapshot(db, inputs[0]), { code: 'PACKET_REPORT_REVIEW_CONTEXT' });
+    const expected = [[{ savedCount: 1, totalCount: 2 }], [{ savedCount: 1, totalCount: 1 }]];
+    const counts = (
+      database: typeof db,
+    ): Array<Array<{ savedCount: number; totalCount: number }>> =>
+      inputs.map((input) =>
+        snapshot(database, input, undefined, {
+          root: database === db ? root : rebuiltRoot,
+          profileId,
+        }).reportReview.map(({ savedCount, totalCount }) => ({ savedCount, totalCount })),
+      );
+    for (const input of inputs) await preparePacketReportReview(db, input, { root, profileId });
+    assert.deepEqual(counts(db), expected);
+    for (const [index, input] of inputs.entries()) {
+      const reports = snapshot(db, input, undefined, { root, profileId }).reportReview;
+      assert.ok(
+        reports.every(
+          (report) =>
+            report.personId === (index ? relative.personId : 'patient') &&
+            report.countScope === 'current_person',
+        ),
+      );
+    }
+    const brief = snapshot(
+      db,
+      {
+        ...inputs[0],
+        mode: 'brief',
+        selected: db
+          .prepare('SELECT id FROM observations WHERE id<>?')
+          .all(moved)
+          .map((row) => `observation:${row.id}`),
+      },
+      undefined,
+      { root, profileId },
+    );
+    assert.match(exportHtml(brief), /1 of 2 current report items reviewed and saved/);
+    assert.match(exportHtml(brief), /unresolved ownership are excluded/);
+    assert.match(exportHtml(brief), /do not establish whole-report completion/);
+    clearIntakeStateCache(db);
+    assert.deepEqual(counts(db), expected);
+    const rebuiltRoot = mkdtempSync(join(tmpdir(), 'fictional-person-panel-rebuilt-'));
+    t.after(() => rmSync(rebuiltRoot, { recursive: true, force: true }));
+    const rebuilt = rebuildProfile(root, profileId, rebuiltRoot);
+    const recovered = openDatabase(rebuilt.database, profileId);
+    try {
+      attachPersonalDurability(recovered, { root: rebuiltRoot, profileId });
+      for (const input of inputs)
+        await preparePacketReportReview(recovered, input, { root: rebuiltRoot, profileId });
+      assert.deepEqual(counts(recovered), expected);
+    } finally {
+      recovered.close();
+    }
+  });

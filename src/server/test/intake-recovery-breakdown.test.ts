@@ -1,17 +1,16 @@
 /** Independently fictional stage isolation; does not replace HTTP/encrypted qualification. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { openDatabase, transaction } from '../database.ts';
-import {
-  memoryRecordAuthority,
-  registerRawIntakeFixture,
-} from './helpers/intake-authority-fixture.ts';
+import { ensureProfileDirectories, profilePaths } from '../profile-storage.ts';
+import { openContributorRecordStorage } from '../contributor-record-storage.ts';
+import { registerIntakeFile } from '../intake-state-access.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
-import { rebuildRecordDatabase } from '../record-versions.ts';
+import { attachRecordDurability, rebuildRecordDatabase } from '../record-versions.ts';
 import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
 import {
   captureIntakeStateCopySnapshot,
@@ -29,14 +28,49 @@ import {
 import { clearIntakeStateCache } from '../intake-state-storage.ts';
 import { validateIntakeSchemaReachability } from '../intake-envelope-schema-validation.ts';
 import { prepareIntakeLookupIndices } from '../intake-lookup-projection.ts';
+import { intakeWorkCounters, withIntakeWork } from '../intake-work-accounting.ts';
+
+const nonzero = (values: Record<string, number>) =>
+  Object.fromEntries(Object.entries(values).filter(([, value]) => value !== 0));
+const delta = (after: Record<string, number>, before: Record<string, number>) =>
+  nonzero(
+    Object.fromEntries(
+      Object.entries(after).map(([key, value]) => [key, value - (before[key] ?? 0)]),
+    ),
+  );
 
 for (const count of [4, 16])
   test(`cold recovery stage breakdown retains exact evidence at ${count} records`, async (t) => {
-    const directory = mkdtempSync(join(tmpdir(), 'fictional-recovery-breakdown-'));
+    const temporary = mkdtempSync(join(tmpdir(), 'fictional-recovery-breakdown-'));
+    const opened: ReturnType<typeof openDatabase>[] = [];
+    let storage: ReturnType<typeof openContributorRecordStorage> | undefined;
+    t.after(() => {
+      let firstError: unknown;
+      let failed = false;
+      const cleanup = (run: () => void) => {
+        try {
+          run();
+        } catch (error) {
+          if (!failed) firstError = error;
+          failed = true;
+        }
+      };
+      for (const connection of opened) {
+        cleanup(() => clearIntakeStateCache(connection));
+        cleanup(() => {
+          if (connection.isOpen) connection.close();
+        });
+      }
+      cleanup(() => storage?.close());
+      cleanup(() => rmSync(temporary, { recursive: true, force: true }));
+      if (failed) throw firstError;
+    });
+    const directory = realpathSync.native(temporary);
     const profileId = 'fictional-recovery-stages';
-    const db = openDatabase(join(directory, 'source.sqlite'), profileId);
-    const authority = memoryRecordAuthority(db);
-    const source = { id: 'fictional-original', kind: 'intake_original', sha256: 'a'.repeat(64) };
+    const paths = ensureProfileDirectories(directory, profileId),
+      db = openDatabase(paths.database, profileId);
+    opened.push(db);
+    storage = openContributorRecordStorage(directory, profileId, { initialize: true });
     const text =
       '{"intake":{"version":0,"state":"pending","workflow":' +
       JSON.stringify({
@@ -47,21 +81,47 @@ for (const count of [4, 16])
         })),
       }) +
       '},"unknown":{"same":1,"same":2,"literal":"fictional"}}';
-    const opened = [db];
-    t.after(() => {
-      for (const connection of opened) {
-        clearIntakeStateCache(connection);
-        if (connection.isOpen) connection.close();
-      }
-      rmSync(directory, { recursive: true, force: true });
+    const originalPath = profilePaths(directory, profileId).relativeRoot + '/sources/fictional.txt',
+      source = {
+        id: 'fictional-original',
+        kind: 'intake_original',
+        sha256: createHash('sha256').update(text).digest('hex'),
+      };
+    writeFileSync(join(directory, originalPath), text);
+    attachRecordDurability(db, { profileId, storage });
+    const initialStarted = performance.now(),
+      initialRecords = createRecordVersionWorkCounters(),
+      initialBefore = intakeWorkCounters(db);
+    await withRecordVersionWork(initialRecords, async () => {
+      transaction(db, () =>
+        registerIntakeFile(db, {
+          ...source,
+          path: originalPath,
+          size: Buffer.byteLength(text),
+          mimeType: 'text/plain',
+          coverage: 'unknown',
+          details: text,
+        }),
+      );
+      await buildIntakeCollectionEnvelope(db, source);
     });
-    registerRawIntakeFixture(db, source.id, text);
-    transaction(db, () =>
-      db
-        .prepare('UPDATE source_files SET path=? WHERE id=?')
-        .run(`data/profiles/${profileId}/sources/fictional.txt`, source.id),
+    const initialAfter = intakeWorkCounters(db);
+    t.diagnostic(
+      JSON.stringify({
+        stage: 'initial-registration-and-build',
+        count,
+        ms: performance.now() - initialStarted,
+        records: {
+          operation: nonzero(initialRecords.operation),
+          reconstruction: nonzero(initialRecords.reconstruction),
+        },
+        intake: {
+          primitive: delta(initialAfter.primitive, initialBefore.primitive),
+          warm: delta(initialAfter.warm, initialBefore.warm),
+          reconstruction: delta(initialAfter.reconstruction, initialBefore.reconstruction),
+        },
+      }),
     );
-    await buildIntakeCollectionEnvelope(db, source);
     const original = captureIntakeStateCopySnapshot(db, profileId);
     const fingerprint = () =>
       createHash('sha256')
@@ -71,9 +131,7 @@ for (const count of [4, 16])
     const recordWork = createRecordVersionWorkCounters();
     const path = join(directory, 'rebuilt.sqlite');
     let started = performance.now();
-    withRecordVersionWork(recordWork, () =>
-      rebuildRecordDatabase(path, { profileId, storage: authority.storage }),
-    );
+    withRecordVersionWork(recordWork, () => rebuildRecordDatabase(path, { profileId, storage }));
     t.diagnostic(
       JSON.stringify({
         stage: 'accepted-journal-replay',
@@ -104,30 +162,8 @@ for (const count of [4, 16])
       const head = parseIntakeCollectionHead(get.get(prefix + 'head')!.value, identity)!;
       let checkpoints = 0;
       started = performance.now();
-      const statements = new Map<string, { prepares: number; executions: number }>();
-      const prepare = manifest.db.prepare;
-      // Observe the actual scratch operations, without retaining their row arguments.
-      manifest.db.prepare = function (sql) {
-        const statement = prepare.call(this, sql);
-        if (
-          sql === 'SELECT ref,bytes FROM graph_seen WHERE hash=? AND kind=?' ||
-          sql === 'INSERT INTO graph_seen VALUES(?,?,?,?,?)'
-        ) {
-          let count = statements.get(sql);
-          if (!count) statements.set(sql, (count = { prepares: 0, executions: 0 }));
-          count.prepares++;
-          const observed = count;
-          for (const method of ['get', 'run'] as const) {
-            const execute = statement[method];
-            statement[method] = ((...args: unknown[]) => {
-              observed.executions++;
-              return Reflect.apply(execute, statement, args);
-            }) as typeof statement.get & typeof statement.run;
-          }
-        }
-        return statement;
-      };
-      try {
+      const beforeGraph = intakeWorkCounters(db).reconstruction;
+      withIntakeWork(db, 'reconstruction', () => {
         inspectIntakeCollectionGraph(
           manifest,
           identity,
@@ -135,15 +171,19 @@ for (const count of [4, 16])
           undefined,
           () => checkpoints++,
         );
-      } finally {
-        manifest.db.prepare = prepare;
-      }
-      t.diagnostic(JSON.stringify({ stage: 'graph-sql-work', count, queries: [...statements] }));
-      assert.equal(statements.size, 2);
-      for (const [sql, work] of statements) {
-        assert.ok(work.executions > 100, `${sql}: complete graph work was executed`);
-        assert.equal(work.prepares, 1, `${sql}: one compilation per private graph validation`);
-      }
+      });
+      const afterGraph = intakeWorkCounters(db).reconstruction;
+      const graphWork = {
+        reads: afterGraph.graphScratchSeenReads - beforeGraph.graphScratchSeenReads,
+        writes: afterGraph.graphScratchSeenWrites - beforeGraph.graphScratchSeenWrites,
+      };
+      t.diagnostic(JSON.stringify({ stage: 'typed-encrypted-graph-work', count, ...graphWork }));
+      // Actual typed summary operations replace the removed SQL implementation
+      // probe. These counts establish substantial graph work, not coverage by
+      // themselves; exact recovery and representation checks remain below.
+      assert.ok(graphWork.reads > 100, 'typed graph summary reads execute substantial work');
+      assert.ok(graphWork.writes > 100, 'typed graph summary writes execute substantial work');
+      assert.ok(graphWork.reads >= graphWork.writes);
       t.diagnostic(
         JSON.stringify({
           stage: 'historical-graph',
@@ -239,7 +279,7 @@ for (const count of [4, 16])
     }
     started = performance.now();
     validateProductionIntakeAuthority(rebuilt, profileId);
-    authority.attach(rebuilt);
+    attachRecordDurability(rebuilt, { profileId, storage });
     t.diagnostic(
       JSON.stringify({
         stage: 'full-production-validation-and-attach',
@@ -248,13 +288,27 @@ for (const count of [4, 16])
       }),
     );
     started = performance.now();
-    const indexed = await prepareIntakeLookupIndices(rebuilt);
+    const lookupBefore = intakeWorkCounters(rebuilt),
+      lookupRecords = createRecordVersionWorkCounters();
+    const indexed = await withRecordVersionWork(lookupRecords, () =>
+      prepareIntakeLookupIndices(rebuilt),
+    );
+    const lookupAfter = intakeWorkCounters(rebuilt);
     t.diagnostic(
       JSON.stringify({
         stage: 'lookup-index-preparation',
         count,
         ms: performance.now() - started,
         prepared: indexed.prepared,
+        records: {
+          operation: nonzero(lookupRecords.operation),
+          reconstruction: nonzero(lookupRecords.reconstruction),
+        },
+        intake: {
+          primitive: delta(lookupAfter.primitive, lookupBefore.primitive),
+          warm: delta(lookupAfter.warm, lookupBefore.warm),
+          reconstruction: delta(lookupAfter.reconstruction, lookupBefore.reconstruction),
+        },
       }),
     );
     assert.equal([...iterateIntakeEnvelopeText(rebuilt, source)].join(''), text);

@@ -1675,14 +1675,18 @@ export class ProxyModelBridge {
             tool: call.name,
             arguments: call.args,
           },
-          undefined,
+          this.diagnosticContext,
           [this.config.apiKey],
         );
-        this.diagnostics.record('model.tool.started', {
-          toolName: call.name,
-          toolIndex: index,
-          ...(this.diagnostics.enabled ? structuralFields('arguments', call.args) : {}),
-        });
+        this.diagnostics.record(
+          'model.tool.started',
+          {
+            toolName: call.name,
+            toolIndex: index,
+            ...(this.diagnostics.enabled ? structuralFields('arguments', call.args) : {}),
+          },
+          this.diagnosticContext,
+        );
         const toolSpan = beginImportPhase(
           'model_tool',
           { toolName: call.name, toolIndex: index },
@@ -1753,17 +1757,21 @@ export class ProxyModelBridge {
             failed: !!toolError,
             result: value,
           },
-          undefined,
+          this.diagnosticContext,
           [this.config.apiKey],
         );
-        this.diagnostics.record(toolError ? 'model.tool.failed' : 'model.tool.completed', {
-          toolName: call.name,
-          toolIndex: index,
-          durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
-          ...toolFailureFields,
-          ...hostTimingFields(value),
-          ...(this.diagnostics.enabled ? structuralFields('result', value) : {}),
-        });
+        this.diagnostics.record(
+          toolError ? 'model.tool.failed' : 'model.tool.completed',
+          {
+            toolName: call.name,
+            toolIndex: index,
+            durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
+            ...toolFailureFields,
+            ...hostTimingFields(value),
+            ...(this.diagnostics.enabled ? structuralFields('result', value) : {}),
+          },
+          this.diagnosticContext,
+        );
         group.calls[index].successful = !toolError;
         if (!toolError)
           group.calls[index].compactArguments = compactIntakeMutationArguments(

@@ -926,6 +926,8 @@ it('keeps saved records intact and offers retry when their destination receipt c
     'fetch',
     vi.fn(async (input) => {
       const url = String(input);
+      if (url.includes('/record-owner?')) return response({ personId: 'patient' });
+      if (url.endsWith('/record-ownership/people')) return response([]);
       if (url.includes('/intakes/report-queue/fictional-report'))
         return response({
           ...reportDetail,

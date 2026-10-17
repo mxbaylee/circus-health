@@ -1,3 +1,6 @@
+import { uploadIntake, reviewIntake, importIntake } from '../intake.ts';
+import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
+import type { HealthRecordEnvelope } from '../../shared/intake.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -919,34 +922,53 @@ test('selective packets preserve generic incomplete-reading and incomplete-revie
               ],
             },
           ],
-          candidates: [
-            { id: 'reviewed', versions: [{ id: 'reviewed-v1', status: 'accepted' }] },
-            { id: 'pending', versions: [{ id: 'pending-v1', status: 'pending' }] },
-          ],
-          reportGroups: [
-            {
-              id: 'private-report',
-              basis: 'report_anchor',
-              versions: [
-                {
-                  title: SECRET,
-                  members: [
-                    {
-                      candidateId: 'reviewed',
-                      candidateVersionId: 'reviewed-v1',
-                      occurrences: [{ recordId: 'raw' }],
-                    },
-                    { candidateId: 'pending', candidateVersionId: 'pending-v1', occurrences: [] },
-                  ],
-                },
-              ],
-            },
-          ],
         },
       },
     }),
   );
-  const before = exportSnapshot(f.db, f.input);
+  memoryRecordAuthority(f.db);
+  const envelopes: HealthRecordEnvelope[] = Array.from({ length: 2 }, (_, index) => ({
+    format: 'health-record-v1',
+    id: `fictional-packet-review-${index}`,
+    kind: 'record',
+    payload: { literal: `Independently fictional packet result ${index}` },
+    provenance: {
+      sourceSystem: 'Fictional packet lab',
+      sourceRecordId: `fictional-packet-review-${index}`,
+      capturedVia: null,
+      evidenceClass: 'provider_export',
+      locator: `Fictional packet row ${index}`,
+    },
+    coverage: { status: 'complete_response', notes: [] },
+    clinical: {
+      kind: 'observation',
+      subject: 'self',
+      testLabel: `Fictional packet review ${index}`,
+      valueText: String(index + 1),
+      date: '2026-10-01',
+    },
+    report: {
+      key: 'fictional-shared-panel',
+      title: SAFE,
+      anchor: { locator: 'heading', text: SAFE },
+      subject: null,
+    },
+  }));
+  const intake = uploadIntake(f.db, f.root, 'cookie-dough', {
+    filename: 'fictional-packet-review.jsonl',
+    newProviderName: 'Fictional packet lab',
+    bytes: Buffer.from(envelopes.map((value) => JSON.stringify(value)).join('\n')),
+  });
+  const review = reviewIntake(f.db, f.root, 'cookie-dough', intake.id);
+  importIntake(f.db, f.root, 'cookie-dough', intake.id, {
+    version: review.version,
+    reviewToken: review.reviewToken,
+    decisions: [{ recordId: review.records[0]!.id, action: 'accept', mapping: {} }],
+  });
+  const before = exportSnapshot(f.db, f.input, undefined, {
+    root: f.root,
+    profileId: 'cookie-dough',
+  });
   assert.equal(before.reportReview[0]?.savedCount, 1);
   assert.equal(before.reportReview[0]?.totalCount, 2);
   assert.ok(before.readingGaps.length > 0);

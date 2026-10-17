@@ -5,7 +5,12 @@ import {
   type IntakeCollectionChange,
   type IntakeCollectionDescriptor,
 } from './intake-state-storage.ts';
-import { COLLECTION_FORMAT, FORMAT, intakeNamespace } from './intake-state-evidence.ts';
+import {
+  COLLECTION_FORMAT,
+  LOG_COLLECTION_FORMAT,
+  FORMAT,
+  intakeNamespace,
+} from './intake-state-evidence.ts';
 import {
   PACKAGE_PROTOCOL_RECORD_BYTES,
   validPackageDescriptor,
@@ -405,7 +410,7 @@ async function buildDurablePackageInventoryOwned(
         domainVersion: context.rawDomainVersion,
       }),
     );
-  } else if (format !== COLLECTION_FORMAT)
+  } else if (format !== COLLECTION_FORMAT && format !== LOG_COLLECTION_FORMAT)
     fail('Package inventory requires initialized intake authority');
   const existing = readDurablePackageInventory(context);
   if (existing)
@@ -456,19 +461,23 @@ async function buildDurablePackageInventoryOwned(
   const pending = new Map<string, IntakeCollectionChange>();
   let group: IntakeCollectionChange[] | undefined;
   let pendingBytes = 0;
-  const flush = () => {
+  const flush = async () => {
     if (!pending.size) return;
     context.assertRunning?.();
     const view = store.openView(),
       operationId = randomUUID();
     const version = store.binding(view)!.logical.domainVersion;
     const changes = [...pending.values()];
-    const prepared = store.prepare(view, {
-      operationId,
-      requestDigest: hash(JSON.stringify(changes)),
-      domainVersion: version,
-      changes,
-    });
+    const prepared = await store.prepareAsync(
+      view,
+      {
+        operationId,
+        requestDigest: hash(JSON.stringify(changes)),
+        domainVersion: version,
+        changes,
+      },
+      () => context.assertRunning?.(),
+    );
     store.commitMaintenance(prepared);
     work.checkpointEdits += changes.length;
     work.checkpointEncodedBytes += pendingBytes;
@@ -480,35 +489,35 @@ async function buildDurablePackageInventoryOwned(
     onProgress?.({ ...work });
     context.assertRunning?.();
   };
-  const add = (change: IntakeCollectionChange) => {
+  const add = async (change: IntakeCollectionChange) => {
     if (group) {
       group.push(change);
       return;
     }
     const bytes = Buffer.byteLength(JSON.stringify(change));
-    if (pending.size >= 60 || pendingBytes + bytes > 32768) flush();
+    if (pending.size >= 60 || pendingBytes + bytes > 32768) await flush();
     const key = change.collection + ':' + ('key' in change ? change.key : randomUUID());
     const old = pending.get(key);
     if (old) pendingBytes -= Buffer.byteLength(JSON.stringify(old));
     pending.set(key, change);
     pendingBytes += bytes;
   };
-  const put = (suffix: string, key: string, value: string) =>
-    add({ area: 'builds', collection: name(inventoryId, suffix), op: 'put', key, value });
+  const put = async (suffix: string, key: string, value: string) =>
+    await add({ area: 'builds', collection: name(inventoryId, suffix), op: 'put', key, value });
   const lookup = (suffix: string, key: string) => {
     const edit = pending.get(name(inventoryId, suffix) + ':' + key);
     if (edit?.op === 'put') return edit.value;
     return plain(store.get(store.openView(), 'builds', name(inventoryId, suffix), key));
   };
   if (!attemptText) {
-    add({
+    await add({
       area: 'builds',
       collection: 'package.attempts',
       op: 'put',
       key: binding.sourceHash,
       value: inventoryId,
     });
-    flush();
+    await flush();
   }
   let ordinal = -1,
     offset = 0,
@@ -617,7 +626,7 @@ async function buildDurablePackageInventoryOwned(
                 if (old !== Buffer.from(chunk.data).toString('base64'))
                   fail('Retained partial metadata differs from verified source');
               } else
-                add({
+                await add({
                   area: 'builds',
                   collection: chunkCollection,
                   op: 'appendBytes',
@@ -660,9 +669,9 @@ async function buildDurablePackageInventoryOwned(
               };
               const key = ordinalKey(ordinal);
               group = [];
-              if (bytes.length <= 3072) put('records', key, bytes.toString());
+              if (bytes.length <= 3072) await put('records', key, bytes.toString());
               else
-                add({
+                await add({
                   area: 'builds',
                   collection: name(inventoryId, 'records'),
                   op: 'putBytes',
@@ -670,12 +679,12 @@ async function buildDurablePackageInventoryOwned(
                   fromArea: 'builds',
                   fromCollection: chunkCollection,
                 });
-              put('manifests', key, JSON.stringify(manifest));
-              put('byId', memberId, String(ordinal));
-              put('byUnit', manifest.unitId, String(ordinal));
-              put('byName', hash(descriptor.filename) + ':' + key, String(ordinal));
-              put('byContent', descriptor.sourceHash + ':' + key, String(ordinal));
-              put(
+              await put('manifests', key, JSON.stringify(manifest));
+              await put('byId', memberId, String(ordinal));
+              await put('byUnit', manifest.unitId, String(ordinal));
+              await put('byName', hash(descriptor.filename) + ':' + key, String(ordinal));
+              await put('byContent', descriptor.sourceHash + ':' + key, String(ordinal));
+              await put(
                 'contents',
                 descriptor.sourceHash,
                 JSON.stringify({ ...first, count: first.count + 1 }),
@@ -691,8 +700,8 @@ async function buildDurablePackageInventoryOwned(
                   ) >
                   32768
               )
-                flush();
-              for (const change of changes) add(change);
+                await flush();
+              for (const change of changes) await add(change);
               work.verifiedRecords++;
             }
             pieces = [];
@@ -701,14 +710,14 @@ async function buildDurablePackageInventoryOwned(
         }
         // Checkpoint partial records before ACK. Completed small records are batched
         // until the byte/edit budget or final clean completion requires a flush.
-        if (pieces.length) flush();
+        if (pieces.length) await flush();
         batch.assertRunning();
       },
     });
   });
   try {
     if (offset || pieces.length) fail('Inventory ended with partial metadata');
-    flush();
+    await flush();
     current = store.openView();
     const roots: Inventory['roots'] = {};
     for (const suffix of suffixes)
@@ -727,14 +736,14 @@ async function buildDurablePackageInventoryOwned(
       uniqueByteContents: roots.contents?.root?.count ?? 0,
       roots,
     };
-    add({
+    await add({
       area: 'builds',
       collection: 'package.inventories',
       op: 'put',
       key: binding.sourceHash,
       value: JSON.stringify(inventory),
     });
-    flush();
+    await flush();
     return {
       inventory: readDurablePackageInventory(context)!,
       reused: false,

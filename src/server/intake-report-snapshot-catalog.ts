@@ -180,12 +180,16 @@ export function createReportSnapshotCatalog(
         );
         withIntakeWork(db, 'warm', () => recordIntakeWork('reportSnapshotCheckpointBatches'));
         const id = randomUUID();
-        const prepared = collections.prepare(collections.openView(), {
-          operationId: id,
-          requestDigest: hash(id),
-          domainVersion: version,
-          changes,
-        });
+        const prepared = await collections.prepareAsync(
+          collections.openView(),
+          {
+            operationId: id,
+            requestDigest: hash(id),
+            domainVersion: version,
+            changes,
+          },
+          assertCurrent,
+        );
         try {
           const commit = (terminalPhysicalCurrent: () => void) => {
             terminalPhysicalCurrent();

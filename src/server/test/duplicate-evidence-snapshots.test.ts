@@ -1,21 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, readdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase, transaction } from '../database.ts';
+import { attachRecordDurability } from '../record-versions.ts';
 import {
-  memoryRecordAuthority,
-  registerRawIntakeFixture,
-} from './helpers/intake-authority-fixture.ts';
+  openContributorRecordStorage,
+  contributorAuthorityPath,
+} from '../contributor-record-storage.ts';
+import { ensureProfileDirectories, profilePaths } from '../profile-storage.ts';
+import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import {
   openIntakeCollectionEnvelope,
   selectedEnvelopeStore,
 } from '../intake-collection-envelope.ts';
 import { prepareIntakeEnvelopeMutation } from '../intake-envelope-mutation.ts';
-import { clearIntakeStateCache } from '../intake-state-storage.ts';
+import { clearIntakeStateCache, createIntakeStateStorage } from '../intake-state-storage.ts';
 import { intakeSourceVersion } from '../intake-state-access.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { canonicalLiteral } from '../intake-format.ts';
@@ -36,17 +39,49 @@ type Row = { id: string; value: SavedDuplicateEvidenceValue };
 const ordered = (rows: Row[]) =>
   rows.sort((a, b) => Buffer.compare(Buffer.from(a.id), Buffer.from(b.id)));
 async function fixture(t: test.TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-duplicate-snapshot-')),
-    db = openDatabase(join(root, 'cache.sqlite'), 'fictional'),
-    authority = memoryRecordAuthority(db),
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'fictional-duplicate-snapshot-'))),
+    profileId = 'fictional',
+    paths = ensureProfileDirectories(root, profileId),
+    db = openDatabase(paths.database, profileId),
+    storage = openContributorRecordStorage(root, profileId, { initialize: true }),
     source = { id: 'fictional-original' };
+  const original = Buffer.from('Independently fictional duplicate-evidence original.\n'),
+    sourceHash = createHash('sha256').update(original).digest('hex'),
+    path = profilePaths(root, profileId).relativeRoot + '/sources/fictional-original.txt';
+  writeFileSync(join(root, path), original);
+  attachRecordDurability(db, { profileId, storage });
   t.after(() => {
     clearIntakeStateCache(db);
     db.close();
+    storage.close();
     rmSync(root, { recursive: true, force: true });
   });
-  registerRawIntakeFixture(db, source.id, JSON.stringify({ intake: { version: 1 } }));
+  const initial = prepareInitialIntakeEnvelope(JSON.stringify({ intake: { version: 1 } }));
+  transaction(db, () => {
+    db.prepare(
+      'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
+    ).run(source.id, path, sourceHash, original.length, 'intake_original', initial.detailsJson);
+    createIntakeStateStorage(db, { profileId, intakeId: source.id, sourceHash }).stage(
+      initial.state,
+      randomUUID(),
+    );
+  });
   await buildIntakeCollectionEnvelope(db, source);
+  // Observe the actual immutable backend objects; this never supplies read or
+  // publication authority and counts the same HEAD/object roster as before.
+  const authority = {
+    get objects() {
+      const entries = new Map<string, Buffer>();
+      const head = storage.read('head');
+      if (head) entries.set('head', head);
+      for (const name of readdirSync(join(contributorAuthorityPath(root, profileId), 'objects'))) {
+        const key = 'objects/' + name,
+          bytes = storage.read(key);
+        if (bytes) entries.set(key, bytes);
+      }
+      return entries;
+    },
+  };
   return { db, source, authority };
 }
 async function publish(
@@ -54,7 +89,7 @@ async function publish(
   db: ReturnType<typeof openDatabase>,
 ) {
   const stage = await builder.finish(),
-    prepared = stage.prepareStandalone();
+    prepared = await stage.prepareStandalone();
   try {
     transaction(db, () => prepared.apply());
   } finally {
@@ -303,8 +338,8 @@ test('same-custodian duplicate snapshots compose and reject stale publication an
   await right.prepareTarget({ kind: 'document', recordId: 'fictional-right', evidence: () => [] });
   const leftStage = await left.finish(),
     rightStage = await right.finish(),
-    leftSelection = leftStage.prepareStandalone(),
-    rightSelection = rightStage.prepareStandalone();
+    leftSelection = await leftStage.prepareStandalone(),
+    rightSelection = await rightStage.prepareStandalone();
   try {
     transaction(db, () => leftSelection.apply());
     assert.throws(

@@ -270,15 +270,19 @@ export function createDuplicateEvidenceSnapshotPreparation(
       return {
         changes,
         assertCurrent,
-        prepareStandalone() {
+        async prepareStandalone() {
           assertCurrent();
           const operationId = randomUUID(),
-            prepared = collections.prepare(collections.openView(), {
-              operationId,
-              requestDigest: hash(operationId),
-              domainVersion: version,
-              changes,
-            });
+            prepared = await collections.prepareAsync(
+              collections.openView(),
+              {
+                operationId,
+                requestDigest: hash(operationId),
+                domainVersion: version,
+                changes,
+              },
+              assertCurrent,
+            );
           let released = false;
           return {
             assertCurrent,

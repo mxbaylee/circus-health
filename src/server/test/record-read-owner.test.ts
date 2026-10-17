@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -25,7 +25,7 @@ import { freshKey } from '../vault-crypto.ts';
 import { openVault } from '../vault-store.ts';
 
 function contributor(t: TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-record-read-owner-')),
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'fictional-record-read-owner-'))),
     profileId = 'fictional',
     paths = ensureProfileDirectories(root, profileId),
     db = openDatabase(paths.database, profileId),

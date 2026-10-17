@@ -98,18 +98,22 @@ async function prepareStructuredArray(
   try {
     if (lexical.root.shape !== 'array') return { changed: false };
     const build = 'schema.upgrade.' + randomUUID();
-    const commit = (changes: Parameters<typeof collections.prepare>[1]['changes']) => {
+    const commit = async (changes: Parameters<typeof collections.prepare>[1]['changes']) => {
       assertCurrent();
       const operationId = randomUUID();
-      return collections.prepare(collections.openView(), {
-        operationId,
-        requestDigest: createHash('sha256').update(operationId).digest('hex'),
-        domainVersion: head.logical.domainVersion,
-        changes,
-      });
+      return await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId,
+          requestDigest: createHash('sha256').update(operationId).digest('hex'),
+          domainVersion: head.logical.domainVersion,
+          changes,
+        },
+        assertCurrent,
+      );
     };
     collections.commitMaintenance(
-      commit([
+      await commit([
         {
           area: 'builds',
           collection: build,
@@ -245,7 +249,7 @@ async function prepareStructuredArray(
     await writer.put(key, JSON.stringify(replacement));
     await writer.put(orderKey, JSON.stringify({ ...order, target: replacement }));
     await writer.flush();
-    const prepared = commit([
+    const prepared = await commit([
       {
         area: 'logical',
         collection: 'envelope.data',

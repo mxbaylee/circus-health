@@ -12,6 +12,7 @@ import {
   getIntakeReportAcceptanceRead,
 } from './intake-report-acceptance.ts';
 import { HttpError } from './database.ts';
+import { planIntakeReportAcceptance } from './intake-acceptance-plan.ts';
 import * as intake from './intake.ts';
 import {
   listIntakeReportQueueRead,
@@ -586,9 +587,29 @@ export async function handleIntakeRoute({
           input,
         }),
       );
-    else if (id === 'report-acceptance' && !action)
-      respond(await acceptIntakeReportSelectionAsync(db, root, profileId, input));
-    else if (id === 'people-disposition' && !action)
+    else if (id === 'report-acceptance-plan' && !action) {
+      const lifetime = intakeIdentityRequestLifetime(req, res);
+      try {
+        respond(
+          await planIntakeReportAcceptance(db, root, profileId, input, {
+            assertRunning: () => lifetime.signal.throwIfAborted(),
+          }),
+        );
+      } finally {
+        lifetime.dispose();
+      }
+    } else if (id === 'report-acceptance' && !action) {
+      const lifetime = intakeIdentityRequestLifetime(req, res);
+      try {
+        respond(
+          await acceptIntakeReportSelectionAsync(db, root, profileId, input, {
+            assertRunning: () => lifetime.signal.throwIfAborted(),
+          }),
+        );
+      } finally {
+        lifetime.dispose();
+      }
+    } else if (id === 'people-disposition' && !action)
       respond(
         await saveIntakePersonDispositionRead(
           db,

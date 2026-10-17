@@ -634,13 +634,7 @@ function* prepareCollectionClinicalReviewWork(
           if (group && lastGroup && view.address(group) === view.address(lastGroup)) {
             const version = view.find('version', group, versionId),
               lastVersion = view.find('version', group, versionId, { match: 'last' });
-            if (
-              version &&
-              lastVersion &&
-              view.address(version) === view.address(lastVersion) &&
-              field<string>(view, version, 'format', metadataBytes) ===
-                'health-intake-report-group-version-v2'
-            )
+            if (version && lastVersion && view.address(version) === view.address(lastVersion))
               result = { group, version, groupId, versionId };
           }
         }

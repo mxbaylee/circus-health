@@ -1,5 +1,31 @@
 /** V4 bounded collections owned and staged by intake-state-storage. */
 import { constants } from 'node:sqlite';
+import { setImmediate } from 'node:timers/promises';
+import { validateIntakeCollectionGraphSteps } from './intake-state-graph.ts';
+import {
+  FORMAT as LOG_FORMAT,
+  initializeIntakeLog,
+  authenticateIntakeLogHeadRoots,
+  intakeLogBaseHead,
+  rebuildIntakeLogSnapshot,
+  rebuildIntakeLogSnapshotSteps,
+  replayIntakeLog,
+  readIntakeLogSequence,
+  prepareIntakeLogAppend,
+  forkIntakeLogSnapshot,
+  inspectIntakeLogAppend,
+  discardIntakeLogAppend,
+  disposeIntakeLogSnapshot,
+  cacheIntakeLogSnapshot,
+  holdIntakeLogSnapshot,
+  isIntakeLogSnapshotResident,
+  retireIntakeLogSnapshot,
+  confirmOwnedIntakeLogPublication,
+  type IntakeLogSnapshot,
+  type IntakeLogAppend,
+  type Head as LogHead,
+  type LogAdmission,
+} from './intake-state-log.ts';
 import { types as utilTypes } from 'node:util';
 import { terminalStatement } from './database-terminal-statements.ts';
 import {
@@ -24,12 +50,18 @@ import { currentClinicalOperation, assertClinicalOperation } from './clinical-op
 import {
   blockIntakeFrontierReadmission,
   captureIntakeFrontierAttempts,
+  readIntakeFrontierAttempts,
+  readIntakeFrontierActiveUnwritten,
+  type IntakeFrontierAttemptSnapshot,
   ensureIntakeFrontierObserver,
   expectIntakeFrontierMetaWrite,
   finishIntakeFrontierMetaWrite,
 } from './intake-lookup-frontier-observer.ts';
 import {
   assertRecordCompactReadmission,
+  captureRecordAcceptedIntakeHeadRead,
+  closeRecordAcceptedIntakeHeadRead,
+  registerRecordIntakeLogPublication,
   finishRecordCompactContributorReadmission,
   authenticateRecordTransactionPreparation,
   commitRecordTransactionPreparation,
@@ -43,6 +75,8 @@ import {
 } from './record-versions.ts';
 import {
   prepareIntakeLegacyBridgeProof,
+  captureIntakeLegacyBridgeReadWitness,
+  disposeIntakeLegacyBridgeReadWitness,
   prepareIntakeLegacyBridgeProofAsync,
   type IntakeLegacyBridgeReadWitness,
   assertIntakeLegacyBridgeReadWitnessForSource,
@@ -71,6 +105,7 @@ import {
   limits,
   type Head,
   type IntakeCollectionHead,
+  type IntakeCollectionHeadV4,
   type IntakeCollectionResult,
   type IntakeStateIdentity,
 } from './intake-state-evidence.ts';
@@ -197,6 +232,8 @@ interface PreparedData {
   size: number;
   legacyBridge?: IntakeLegacyBridgeProof;
   compactMetadata?: IntakeCompactMetadataProof;
+  logAppend?: IntakeLogAppend;
+  logSnapshot?: IntakeLogSnapshot;
   privateEnvelope?: {
     candidate: PrivateEnvelopeCandidate;
     roster: PrivateEnvelopeNodeRoster;
@@ -335,6 +372,41 @@ interface Registry {
     }
   >;
 }
+interface CompleteLogState {
+  raw: string | undefined;
+  snapshot: IntakeLogSnapshot;
+  head: LogHead;
+  frontier: IntakeFrontierAttemptSnapshot;
+  methods: object | undefined;
+  current: () => void;
+  admissions?: Map<object, () => void>;
+  close?: () => void;
+  pending?: {
+    append: IntakeLogAppend;
+    before: string | undefined;
+    token?: object;
+    publication?: import('./record-versions.ts').RecordIntakeLogPublication;
+  };
+}
+const completeLogs = new WeakMap<Database, Map<string, CompleteLogState>>();
+function dropCompleteLogs(db: Database, preparedToken?: object) {
+  const entries = completeLogs.get(db);
+  for (const [prefix, entry] of entries ?? []) {
+    if (preparedToken && entry.pending?.token === preparedToken) continue;
+    entries!.delete(prefix);
+    try {
+      entry.close?.();
+    } catch {
+      /* derivative cleanup */
+    }
+    try {
+      disposeIntakeLogSnapshot(entry.snapshot);
+    } catch {
+      /* already revoked */
+    }
+  }
+  if (!entries?.size) completeLogs.delete(db);
+}
 const registries = new WeakMap<Database, Registry>();
 /** Invalidates owner-handle reuse along with the existing disposable registry. */
 export function intakeCollectionCacheGeneration(db: Database): object {
@@ -349,7 +421,8 @@ export function retainIntakeCollectionCache(db: Database): () => void {
     if (intakeCollectionCacheGeneration(db) !== generation) invalid('expired collection traversal');
   };
 }
-export function clearIntakeCollectionCache(db: Database): void {
+export function clearIntakeCollectionCache(db: Database, preparedToken?: object): void {
+  dropCompleteLogs(db, preparedToken);
   const registry = registries.get(db);
   const candidates = new Set(registry?.privateCandidates.keys());
   for (const data of registry?.preparations.values() ?? [])
@@ -449,7 +522,7 @@ export function parseIntakeCollectionReceipt(
   )
     invalid('collection receipt');
   return {
-    format: value.format,
+    format: 'health-intake-state-receipt-v4' as const,
     requestDigest: value.requestDigest,
     result: checkIntakeCollectionResult(value.result, identity, operationId),
   };
@@ -792,9 +865,15 @@ export function createIntakeCollections(owner: {
     if (!head && db.prepare('SELECT 1 FROM app_meta WHERE key GLOB ? LIMIT 1').get(prefix + '*'))
       invalid('missing collection head');
     if (head) {
+      if (head.format === LOG_FORMAT)
+        authenticateIntakeLogHeadRoots(head, identity, (hash) => get(prefix + 'node:' + hash));
       const check = certificate && schemaTransactionReads.get(certificate);
       const pages = check ? tree({ certificate: certificate!, check }) : tree();
-      for (const root of [head.logical.root, head.receipts, head.history, head.builds])
+      for (const root of [
+        head.logical.root,
+        head.builds,
+        ...(head.format === COLLECTION_FORMAT ? [head.receipts, head.history] : []),
+      ])
         if (root) pages.load(root);
     }
     const value = { prefix, raw: raw as string | undefined, head };
@@ -830,12 +909,173 @@ export function createIntakeCollections(owner: {
     if (!same(beforeRoot, currentRoot)) invalid('stale collection view');
     return area === 'logical' ? (before.head?.logical.root ?? null) : (before.head?.builds ?? null);
   }
+  const logEntries = () => {
+    let entries = completeLogs.get(db);
+    if (!entries) {
+      entries = new Map();
+      completeLogs.set(db, entries);
+    }
+    trimLogEntries(entries);
+    return entries;
+  };
+  function trimLogEntries(entries: Map<string, CompleteLogState>) {
+    // Only optional idle continuations expire. A registered preparation still
+    // owns its frozen roster; a live transaction owns its acceptance candidate.
+    const prepared = new Set(
+      [...(registries.get(db)?.preparations.values() ?? [])]
+        .filter((data) => data.logAppend)
+        .map((data) => data.prefix),
+    );
+    const token = currentTransactionToken(db);
+    const idle = [...entries].filter(
+      ([key, entry]) =>
+        !entry.close &&
+        !entry.admissions?.size &&
+        !prepared.has(key) &&
+        !(token && entry.pending?.token === token),
+    );
+    while (idle.length > 64) {
+      const [key, entry] = idle.shift()!;
+      retireIntakeLogSnapshot(entry.snapshot);
+      disposeIntakeLogSnapshot(entry.snapshot);
+      entries.delete(key);
+    }
+  }
+  function cacheLogEntry(entry: CompleteLogState) {
+    if (entry.admissions?.size) return;
+    try {
+      cacheIntakeLogSnapshot(entry.snapshot);
+      const entries = completeLogs.get(db);
+      if (entries?.get(prefix) === entry) {
+        entries.delete(prefix);
+        entries.set(prefix, entry);
+        trimLogEntries(entries);
+      }
+    } catch {
+      try {
+        disposeIntakeLogSnapshot(entry.snapshot);
+      } catch {
+        /* Accepted evidence survives derivative cleanup failure. */
+      }
+    }
+  }
+  function holdLogAdmission(entry: CompleteLogState, current: () => void): () => void {
+    let releaseIndex: () => void;
+    try {
+      releaseIndex = holdIntakeLogSnapshot(entry.snapshot);
+    } catch (error) {
+      cacheLogEntry(entry);
+      throw error;
+    }
+    const admissions = (entry.admissions ??= new Map()),
+      token = {};
+    admissions.set(token, current);
+    entry.current = current;
+    let closed = false;
+    return () => {
+      if (closed) return;
+      closed = true;
+      admissions.delete(token);
+      releaseIndex();
+      const remaining = [...admissions.values()].at(-1);
+      if (remaining) entry.current = remaining;
+      else cacheLogEntry(entry);
+    };
+  }
+  function logAdmission(): LogAdmission {
+    const entry = completeLogs.get(db)?.get(prefix);
+    if (!entry) invalid('collection log requires asynchronous accepted admission');
+    const assertCurrent = () => {
+      ready();
+      if (managedDatabaseMethodEpoch(db) !== entry.methods || get(headKey) !== entry.raw)
+        invalid('collection log storage interval changed');
+      if (db.isTransaction) {
+        if (!readIntakeFrontierActiveUnwritten(db, entry.frontier))
+          invalid('collection log transaction interval changed');
+      } else {
+        const interval = readIntakeFrontierAttempts(db, entry.frontier);
+        if (!interval || interval.headSourceIds.includes(identity.intakeId))
+          invalid('collection log storage provenance changed');
+        entry.current();
+      }
+    };
+    return {
+      assertCurrent,
+      lookupBaseOperation(base, operationId) {
+        assertCurrent();
+        const raw = tree().get(base.receipts, operationId);
+        assertCurrent();
+        return raw === undefined
+          ? { kind: 'absent' }
+          : {
+              kind: 'receipt',
+              receipt: parseIntakeCollectionReceipt(raw, identity, operationId),
+              identity,
+            };
+      },
+    };
+  }
+  function completeLog(head?: LogHead): IntakeLogSnapshot {
+    const entry = completeLogs.get(db)?.get(prefix);
+    if (!entry || (head && JSON.stringify(head) !== JSON.stringify(entry.head)))
+      invalid('collection log requires asynchronous accepted admission');
+    logAdmission().assertCurrent();
+    return entry.snapshot;
+  }
+  function v4Base(head: IntakeCollectionHead): IntakeCollectionHeadV4 | undefined {
+    return head.format === COLLECTION_FORMAT
+      ? head
+      : intakeLogBaseHead(head, identity, (hash) => get(prefix + 'node:' + hash));
+  }
+  function historyAt(head: IntakeCollectionHead, sequence: number, pages: ReturnType<typeof tree>) {
+    if (head.format === LOG_FORMAT && sequence > head.baseSequence) {
+      const event = readIntakeLogSequence(
+        JSON.stringify(head),
+        identity,
+        (hash) => get(prefix + 'node:' + hash),
+        sequence,
+        { assertCurrent: ready },
+      );
+      return event.transition;
+    }
+    const base = v4Base(head);
+    const raw = pages.get(base?.history ?? null, orderedKey(sequence));
+    if (raw === undefined) invalid('missing historical envelope membership');
+    return parseIntakeCollectionHistory(raw, identity);
+  }
   function receipt(
     head: IntakeCollectionHead | undefined,
     operationId: string,
     requestDigest: string,
     pages: typeof tree = tree,
   ) {
+    if (head?.format === LOG_FORMAT) {
+      const pending = completeLogs.get(db)?.get(prefix)?.pending;
+      if (pending) {
+        const append = inspectIntakeLogAppend(pending.append);
+        if (append.head === JSON.stringify(head)) {
+          const event = readIntakeLogSequence(
+            append.head,
+            identity,
+            (hash) => get(prefix + 'node:' + hash),
+            head.storageSequence,
+            { assertCurrent: ready },
+          );
+          if (event.receipt.result.operationId === operationId) {
+            if (event.receipt.requestDigest !== requestDigest)
+              invalid('collection operation replay conflict');
+            return event.receipt.result;
+          }
+        }
+      }
+      const retained = replayIntakeLog(
+        completeLog(head),
+        operationId,
+        requestDigest,
+        logAdmission(),
+      );
+      return retained?.result;
+    }
     const raw = pages().get(head?.receipts ?? null, operationId);
     if (raw === undefined) return undefined;
     const value = parseIntakeCollectionReceipt(raw, identity, operationId);
@@ -849,10 +1089,20 @@ export function createIntakeCollections(owner: {
     if (!value || value.prefix !== prefix) invalid('foreign or expired collection preparation');
     return value;
   }
-  function discard(prepared: PreparedIntakeCollectionMutation) {
+  function discard(prepared: PreparedIntakeCollectionMutation, staged = false) {
     const registry = registryFor(db),
       data = registry.preparations.get(prepared);
     if (data) {
+      if (data.logAppend && !staged) {
+        try {
+          discardIntakeLogAppend(data.logAppend);
+        } catch {
+          /* A sibling accepted publication may already revoke this reservation. */
+        }
+        if (data.logSnapshot) disposeIntakeLogSnapshot(data.logSnapshot);
+        const entry = completeLogs.get(db)?.get(prefix);
+        if (entry?.pending?.append === data.logAppend) entry.pending = undefined;
+      }
       registry.preparedBytes -= data.size;
       registry.preparations.delete(prepared);
       if (data.privateEnvelope) registry.privateCandidates.delete(data.privateEnvelope.candidate);
@@ -1300,6 +1550,7 @@ export function createIntakeCollections(owner: {
     // starts this preparation from another read. Existing page-cache bounds
     // apply; SQL transactions retain the uncached, checked fallback.
     readEpoch = {};
+    if (!db.isTransaction) ensureIntakeFrontierObserver(db);
     const prepareCurrent = (readTree: typeof tree, certificate?: IntakeTreeReadCertificate) => {
       uuid(input.operationId);
       if (!/^[a-f0-9]{64}$/.test(input.requestDigest)) invalid('collection request digest');
@@ -1563,37 +1814,106 @@ export function createIntakeCollections(owner: {
         logical: { root: logical, domainVersion: input.domainVersion },
         changed: before.legacy ? false : !same(logical, before.head?.logical.root ?? null),
       };
-      const receipts = pages.put(
-        before.head?.receipts ?? null,
-        input.operationId,
-        JSON.stringify({
-          format: 'health-intake-state-receipt-v4',
-          requestDigest: input.requestDigest,
-          result,
-        }),
-      );
-      const history = pages.put(
-        before.head?.history ?? null,
-        orderedKey(sequence),
-        JSON.stringify({
-          format: 'health-intake-state-history-v4',
-          operationId: input.operationId,
-          previous: before.legacy
-            ? { format: 'health-intake-legacy-v3', head: before.legacy }
-            : (before.head ?? null),
+      let receipts: IntakeTreeRoot = null,
+        history: IntakeTreeRoot = null;
+      let head: IntakeCollectionHead,
+        logAppend: IntakeLogAppend | undefined,
+        logSnapshot: IntakeLogSnapshot | undefined;
+      const logWrites: Array<{ key: string; value: string }> = [];
+      if (before.legacy) {
+        const base = before.head?.format === COLLECTION_FORMAT ? before.head : undefined;
+        receipts = pages.put(
+          base?.receipts ?? null,
+          input.operationId,
+          JSON.stringify({
+            format: 'health-intake-state-receipt-v4',
+            requestDigest: input.requestDigest,
+            result,
+          }),
+        );
+        history = pages.put(
+          base?.history ?? null,
+          orderedKey(sequence),
+          JSON.stringify({
+            format: 'health-intake-state-history-v4',
+            operationId: input.operationId,
+            previous: { format: 'health-intake-legacy-v3', head: before.legacy },
+            logical: result.logical,
+            builds,
+          }),
+        );
+        head = {
+          format: COLLECTION_FORMAT,
+          identity,
+          storageSequence: sequence,
           logical: result.logical,
+          receipts,
+          history,
           builds,
-        }),
-      );
-      const head: IntakeCollectionHead = {
-        format: COLLECTION_FORMAT,
-        identity,
-        storageSequence: sequence,
-        logical: result.logical,
-        receipts,
-        history,
-        builds,
-      };
+        };
+      } else {
+        let entry = completeLogs.get(db)?.get(prefix);
+        if (!entry && before.head === undefined) {
+          const initial = initializeIntakeLog(identity),
+            frontier = captureIntakeFrontierAttempts(db);
+          if (!frontier) invalid('collection log initial storage provenance unavailable');
+          const current = () => ready();
+          const steps = rebuildIntakeLogSnapshotSteps(
+            initial.head,
+            identity,
+            (hash) => get(prefix + 'node:' + hash),
+            {
+              assertCurrent: current,
+            },
+          );
+          const next = steps.next();
+          if (!next.done) {
+            steps.return(undefined as never);
+            invalid('empty log verifier yielded');
+          }
+          entry = {
+            raw: undefined,
+            snapshot: next.value,
+            head: JSON.parse(initial.head) as LogHead,
+            frontier,
+            methods: managedDatabaseMethodEpoch(db),
+            current,
+          };
+          logEntries().set(prefix, entry);
+        }
+        if (!entry || entry.raw !== before.raw)
+          invalid('collection log requires asynchronous accepted admission');
+        if (before.head?.format === COLLECTION_FORMAT) {
+          for (const row of initializeIntakeLog(identity, before.raw).writes)
+            logWrites.push({ key: prefix + 'node:' + row.hash, value: row.raw });
+        }
+        while (registryFor(db).preparations.size >= 8)
+          discard(registryFor(db).preparations.keys().next().value!);
+        logSnapshot = forkIntakeLogSnapshot(completeLog(), logAdmission());
+        logAppend = prepareIntakeLogAppend(
+          logSnapshot,
+          {
+            receipt: {
+              format: 'health-intake-state-receipt-v4',
+              requestDigest: input.requestDigest,
+              result,
+            },
+            transition: {
+              format: 'health-intake-state-log-transition-v1',
+              operationId: input.operationId,
+              previous: entry.head,
+              logical: result.logical,
+              builds,
+            },
+          },
+          logAdmission(),
+        );
+        const log = inspectIntakeLogAppend(logAppend);
+        for (const row of log.writes)
+          logWrites.push({ key: prefix + 'node:' + row.hash, value: row.raw });
+        head = JSON.parse(log.head) as LogHead;
+        entry.pending = { append: logAppend, before: before.raw };
+      }
       const after = JSON.stringify(head);
       parseIntakeCollectionHead(after, identity);
       if (Buffer.byteLength(after) > HEAD_BYTES) invalid('collection head bytes');
@@ -1635,6 +1955,7 @@ export function createIntakeCollections(owner: {
         decodeIntakeTreeNode(raw, ref, identity);
         return { key: prefix + 'node:' + hash, value: raw };
       });
+      writes.push(...logWrites);
       writes.push({ key: headKey, value: after });
       if (writes.length > 4096) invalid('collection prepared write count');
       const size = writes.reduce(
@@ -1673,6 +1994,8 @@ export function createIntakeCollections(owner: {
         requestDigest: input.requestDigest,
         size,
         legacyBridge,
+        logAppend,
+        logSnapshot,
       });
       // The candidate does not escape until its physical authority and
       // closing SQL/registry witness are checked. runRead invalidates every
@@ -1683,6 +2006,263 @@ export function createIntakeCollections(owner: {
     return runRead(prepareCurrent, { sealTransaction: true, privateCandidate });
   }
   const api = {
+    /** Async owning preflight around the existing synchronous preparation core. */
+    async prepareAsync(
+      view: IntakeCollectionView,
+      input: IntakeCollectionMutation,
+      assertRunning: () => void = () => {},
+    ): Promise<PreparedIntakeCollectionMutation> {
+      const operation = currentClinicalOperation(db);
+      const current = () => {
+        if (operation) assertClinicalOperation(db, operation);
+        assertRunning();
+      };
+      await api.admitCurrentLogAsync(current);
+      try {
+        current();
+        return api.prepare(view, input);
+      } finally {
+        api.releaseLogAdmission();
+      }
+    },
+    releaseLogAdmission(): void {
+      const entry = completeLogs.get(db)?.get(prefix),
+        close = entry?.close;
+      if (entry) entry.close = undefined;
+      try {
+        close?.();
+      } catch {
+        /* Accepted evidence is independent of derivative lease cleanup. */
+      }
+      if (entry) cacheLogEntry(entry);
+    },
+    /** Generic collection preflight for legacy build checkpoints. Existing
+     * accepted source/build guards remain required; referenced descriptors also
+     * request the genuine source/HEAD pair from the original record owner. */
+    async admitCurrentLogAsync(assertRunning: () => void = () => {}): Promise<void> {
+      assertRunning();
+      ready();
+      if (db.isTransaction) invalid('collection log admission requires no transaction');
+      ensureIntakeFrontierObserver(db);
+      if (typeof get(headKey) !== 'string') return;
+      const old = completeLogs.get(db)?.get(prefix);
+      try {
+        old?.close?.();
+      } catch {
+        /* The previous owned publication may have advanced the lease. */
+      }
+      if (old) old.close = undefined;
+      const original = captureIntakeLegacyBridgeReadWitness(db, identity.intakeId);
+      let accepted: RecordAcceptedIntakeHeadRead | undefined;
+      let releaseResource: (() => void) | undefined;
+      const current = () => {
+        assertRunning();
+        assertIntakeLegacyBridgeReadWitnessForSource(db, original, identity.intakeId);
+      };
+      const close = () => {
+        try {
+          if (accepted) closeRecordAcceptedIntakeHeadRead(accepted);
+        } finally {
+          try {
+            disposeIntakeLegacyBridgeReadWitness(original);
+          } finally {
+            releaseResource?.();
+          }
+        }
+      };
+      try {
+        current();
+        const selectedSource = db
+          .prepare(
+            'SELECT substr(details_json,1,16385) AS value, length(CAST(details_json AS BLOB)) AS bytes FROM main.source_files WHERE id=?',
+          )
+          .get(identity.intakeId);
+        let pair: { identity: IntakeStateIdentity; sourceVersionId: string } | undefined;
+        if (typeof selectedSource?.value === 'string' && Number(selectedSource.bytes) <= 16384) {
+          const source = JSON.parse(selectedSource.value) as {
+            intakeAuthority?: { format?: unknown };
+          };
+          if (source.intakeAuthority?.format === 'health-intake-envelope-v3') {
+            const version = db
+              .prepare(
+                "SELECT version_id FROM __record_current WHERE entity='source_files' AND record_id=?",
+              )
+              .get(JSON.stringify([identity.intakeId]));
+            if (typeof version?.version_id !== 'string')
+              invalid('collection log source pair version unavailable');
+            pair = { identity, sourceVersionId: version.version_id };
+          }
+        }
+        accepted = await captureRecordAcceptedIntakeHeadRead(db, identity, current, pair);
+        releaseResource = await api.admitLogAsync(original, accepted, assertRunning);
+        current();
+        const entry = completeLogs.get(db)?.get(prefix);
+        if (!entry) invalid('collection log admission unavailable');
+        entry.close = close;
+      } catch (error) {
+        close();
+        throw error;
+      }
+    },
+    async admitLogAsync(
+      originalRead: IntakeLegacyBridgeReadWitness,
+      acceptedHead: RecordAcceptedIntakeHeadRead,
+      assertRunning: () => void = () => {},
+    ): Promise<() => void> {
+      assertRunning();
+      ready();
+      if (db.isTransaction) invalid('collection log admission requires no transaction');
+      ensureIntakeFrontierObserver(db);
+      const raw = get(headKey);
+      if (typeof raw !== 'string') return () => {};
+      const head = parseIntakeCollectionHead(raw, identity)!;
+      const current = () => {
+        assertRunning();
+        ready();
+        assertIntakeLegacyBridgeReadWitnessForSource(db, originalRead, identity.intakeId);
+        assertRecordAcceptedIntakeHeadRead(db, acceptedHead, identity, raw);
+        if (get(headKey) !== raw) invalid('collection log accepted head changed');
+      };
+      current();
+      const frontier = captureIntakeFrontierAttempts(db);
+      if (!frontier) invalid('collection log storage provenance unavailable');
+      const prior = completeLogs.get(db)?.get(prefix);
+      if (prior && prior.raw === raw && isIntakeLogSnapshotResident(prior.snapshot)) {
+        const interval = readIntakeFrontierAttempts(db, prior.frontier);
+        if (
+          interval &&
+          !interval.headSourceIds.includes(identity.intakeId) &&
+          prior.methods === managedDatabaseMethodEpoch(db)
+        ) {
+          prior.frontier = frontier;
+          const previousCurrent = prior.current;
+          prior.current = current;
+          try {
+            logAdmission().assertCurrent();
+            return holdLogAdmission(prior, current);
+          } catch (error) {
+            prior.current = previousCurrent;
+            throw error;
+          }
+        }
+      }
+      if (prior?.pending?.publication) {
+        try {
+          const prepared = inspectIntakeLogAppend(prior.pending.append);
+          if (prepared.head === raw) {
+            const promoted = await confirmOwnedIntakeLogPublication(
+              db,
+              prior.pending.append,
+              prior.pending.publication,
+              prior.pending.before,
+              { assertCurrent: current },
+            );
+            if (promoted?.snapshot) {
+              const afterFrontier = captureIntakeFrontierAttempts(db);
+              if (!afterFrontier) {
+                disposeIntakeLogSnapshot(promoted.snapshot);
+                invalid('collection log promotion interval');
+              }
+              const promotedEntry: CompleteLogState = {
+                raw,
+                snapshot: promoted.snapshot,
+                head: head as LogHead,
+                frontier: afterFrontier,
+                methods: managedDatabaseMethodEpoch(db),
+                current,
+              };
+              let installed = false;
+              try {
+                logEntries().set(prefix, promotedEntry);
+                current();
+                const release = holdLogAdmission(promotedEntry, current);
+                installed = true;
+                return release;
+              } finally {
+                if (!installed) {
+                  if (completeLogs.get(db)?.get(prefix) === promotedEntry)
+                    completeLogs.get(db)?.delete(prefix);
+                  disposeIntakeLogSnapshot(promoted.snapshot);
+                }
+              }
+            }
+          }
+        } catch {
+          current(); /* Accepted evidence remains; rebuild only the derivative. */
+        }
+      }
+      if (prior) {
+        try {
+          prior.close?.();
+        } catch {
+          /* Discarded derivative lease. */
+        }
+        completeLogs.get(db)?.delete(prefix);
+        disposeIntakeLogSnapshot(prior.snapshot);
+      }
+      const steps = validateIntakeCollectionGraphSteps(
+        identity,
+        raw,
+        (key, bytes) => {
+          const value = owner.get(key, bytes);
+          if (value !== undefined && typeof value !== 'string') invalid('collection graph row');
+          return value;
+        },
+        current,
+      );
+      try {
+        for (;;) {
+          current();
+          const next = steps.next();
+          current();
+          if (next.done) break;
+          await setImmediate();
+          current();
+        }
+      } finally {
+        steps.return(undefined as never);
+      }
+      const initial = head.format === LOG_FORMAT ? undefined : initializeIntakeLog(identity, raw);
+      const codecRaw = initial?.head ?? raw,
+        codecHead = JSON.parse(codecRaw) as LogHead;
+      const extra = new Map(initial?.writes.map((row) => [row.hash, row.raw]));
+      const lookup = (hash: string) => extra.get(hash) ?? get(prefix + 'node:' + hash);
+      const snapshot = await rebuildIntakeLogSnapshot(codecRaw, identity, lookup, {
+        assertCurrent: current,
+        lookupBaseOperation(base, operationId) {
+          current();
+          const found = tree().get(base.receipts, operationId);
+          current();
+          return found === undefined
+            ? { kind: 'absent' }
+            : {
+                kind: 'receipt',
+                identity,
+                receipt: parseIntakeCollectionReceipt(found, identity, operationId),
+              };
+        },
+      });
+      let installed = false;
+      try {
+        current();
+        const finalFrontier = captureIntakeFrontierAttempts(db);
+        if (!finalFrontier) invalid('collection log admission changed');
+        const entries = logEntries();
+        entries.set(prefix, {
+          raw,
+          snapshot,
+          head: codecHead,
+          frontier: finalFrontier,
+          methods: managedDatabaseMethodEpoch(db),
+          current,
+        });
+        const release = holdLogAdmission(entries.get(prefix)!, current);
+        installed = true;
+        return release;
+      } finally {
+        if (!installed) disposeIntakeLogSnapshot(snapshot);
+      }
+    },
     prepareLegacyBridge(
       input: {
         operationId: string;
@@ -1791,7 +2371,7 @@ export function createIntakeCollections(owner: {
         validateIntakeLegacyBridgeControl(identity, current.head, (hash) =>
           get(prefix + 'node:' + hash),
         );
-        const raw = tree().get(current.head.history, orderedKey(1));
+        const raw = tree().get(v4Base(current.head)!.history, orderedKey(1));
         if (raw === undefined) invalid('missing retained legacy edge');
         const event = parseIntakeCollectionHistory(raw, identity);
         if (!event.previous || event.previous.format !== 'health-intake-legacy-v3')
@@ -1810,7 +2390,7 @@ export function createIntakeCollections(owner: {
         validateIntakeLegacyBridgeControl(identity, current.head, (hash) =>
           get(prefix + 'node:' + hash),
         );
-        const raw = tree().get(current.head.history, orderedKey(1));
+        const raw = tree().get(v4Base(current.head)!.history, orderedKey(1));
         if (raw === undefined) invalid('missing retained legacy edge');
         const event = parseIntakeCollectionHistory(raw, identity);
         if (!event.previous || event.previous.format !== 'health-intake-legacy-v3')
@@ -1911,9 +2491,7 @@ export function createIntakeCollections(owner: {
         if (!head || storageSequence > head.storageSequence)
           invalid('historical envelope sequence');
         const pages = readTree();
-        const rawHistory = pages.get(head.history, orderedKey(storageSequence));
-        if (rawHistory === undefined) invalid('missing historical envelope membership');
-        const history = parseIntakeCollectionHistory(rawHistory, identity);
+        const history = historyAt(head, storageSequence, pages);
         if (!same(history.logical.root, logicalRoot)) invalid('historical envelope root differs');
         if (storageSequence === head.storageSequence && !same(history.logical, head.logical))
           invalid('historical envelope selected head differs');
@@ -2030,9 +2608,7 @@ export function createIntakeCollections(owner: {
         if (!head || storageSequence > head.storageSequence)
           invalid('historical envelope sequence');
         const pages = readTree();
-        const rawHistory = pages.get(head.history, orderedKey(storageSequence));
-        if (rawHistory === undefined) invalid('missing historical envelope membership');
-        const history = parseIntakeCollectionHistory(rawHistory, identity);
+        const history = historyAt(head, storageSequence, pages);
         if (!same(history.logical.root, logicalRoot)) invalid('historical envelope root differs');
         if (storageSequence === head.storageSequence && !same(history.logical, head.logical))
           invalid('historical envelope selected head differs');
@@ -2112,9 +2688,7 @@ export function createIntakeCollections(owner: {
         if (!head || storageSequence > head.storageSequence)
           invalid('historical filename sequence');
         const pages = readTree();
-        const rawHistory = pages.get(head.history, orderedKey(storageSequence));
-        if (rawHistory === undefined) invalid('missing historical filename membership');
-        const history = parseIntakeCollectionHistory(rawHistory, identity);
+        const history = historyAt(head, storageSequence, pages);
         if (!same(history.logical.root, logicalRoot)) invalid('historical filename root differs');
         if (storageSequence === head.storageSequence && !same(history.logical, head.logical))
           invalid('historical filename selected head differs');
@@ -2632,22 +3206,61 @@ export function createIntakeCollections(owner: {
           registry.generation !== generation
         )
           invalid('private envelope source binding');
-        const assertOriginal = () => {
-          runRead((_pages, certificate) => {
-            const currentSource = terminalStatement(
-              db,
-              'SELECT sha256,details_json FROM source_files WHERE id=?',
-              sourceStatement,
-            ).get(identity.intakeId);
-            if (
-              managedDatabaseMethodEpoch(db) !== methods ||
-              registryFor(db).generation !== generation ||
-              JSON.stringify(selected(certificate).head?.logical) !== logical ||
-              currentSource?.sha256 !== sourceHash ||
-              currentSource?.details_json !== sourceDetails
-            )
-              invalid('private envelope original owner changed');
-          });
+        const assertOriginalSelection = (certificate?: IntakeTreeReadCertificate) => {
+          const currentSource = terminalStatement(
+            db,
+            'SELECT sha256,details_json FROM source_files WHERE id=?',
+            sourceStatement,
+          ).get(identity.intakeId);
+          if (
+            managedDatabaseMethodEpoch(db) !== methods ||
+            registryFor(db).generation !== generation ||
+            JSON.stringify(selected(certificate).head?.logical) !== logical ||
+            currentSource?.sha256 !== sourceHash ||
+            currentSource?.details_json !== sourceDetails
+          )
+            invalid('private envelope original owner changed');
+        };
+        const assertOriginal = () =>
+          runRead((_pages, certificate) => assertOriginalSelection(certificate));
+        let originalReadScope: { poisoned: boolean } | undefined;
+        const readOriginalScope = <T>(read: () => T): T => {
+          if (originalReadScope) {
+            originalReadScope.poisoned = true;
+            invalid('reentrant private original read');
+          }
+          // Transaction reads retain their existing per-edge fallback checks.
+          if (db.isTransaction) {
+            assertOriginal();
+            const result = read();
+            assertOriginal();
+            return result;
+          }
+          const scope = { poisoned: false };
+          originalReadScope = scope;
+          try {
+            return runRead(
+              (_pages, certificate) => {
+                assertOriginalSelection(certificate);
+                const result = read();
+                if (
+                  result &&
+                  (typeof result === 'object' || typeof result === 'function') &&
+                  ('then' in result || 'next' in result)
+                )
+                  invalid('private original read must finish synchronously');
+                assertOriginalSelection(certificate);
+                // A SQL witness alone cannot detect an external accepted HEAD
+                // replacement. Keep a real physical authority check at exit.
+                ready();
+                if (scope.poisoned) invalid('poisoned private original read');
+                return result;
+              },
+              { sealTransaction: true },
+            );
+          } finally {
+            originalReadScope = undefined;
+          }
         };
         const candidate = createPrivateEnvelopeCandidate({
           db,
@@ -2657,7 +3270,11 @@ export function createIntakeCollections(owner: {
           descriptor: initial,
           originalBuilds: selected().head?.builds ?? null,
           assertOriginal,
-          readOriginal: (hash) => runRead(() => get(prefix + 'node:' + hash)),
+          readOriginalScope,
+          readOriginal: (hash) =>
+            originalReadScope
+              ? get(prefix + 'node:' + hash)
+              : runRead(() => get(prefix + 'node:' + hash)),
           readOriginalDescriptor: (area, name) =>
             runRead(() =>
               tree().get(
@@ -2830,6 +3447,7 @@ export function createIntakeCollections(owner: {
         const token = currentTransactionToken(db);
         if (!token || !db.isTransaction)
           invalid('collection stage requires application transaction');
+        const freshRows: Array<{ key: string; value: string }> = [];
         const data = inspect(prepared),
           current =
             data.legacyBridge || data.compactMetadata
@@ -2837,7 +3455,11 @@ export function createIntakeCollections(owner: {
               : selected();
         if ((data.legacyBridge || data.compactMetadata) && bridgeTransaction !== token)
           invalid('legacy bridge requires certified maintenance publication');
-        const retained = receipt(current.head, data.result.operationId, data.requestDigest);
+        const retained = data.logAppend
+          ? current.raw === data.after
+            ? receipt(current.head, data.result.operationId, data.requestDigest)
+            : undefined
+          : receipt(current.head, data.result.operationId, data.requestDigest);
         if (retained) {
           discard(prepared);
           return structuredClone(retained);
@@ -2861,6 +3483,7 @@ export function createIntakeCollections(owner: {
               const inserted = immutable(key, row.raw, INTAKE_TREE_PAGE_BYTES);
               if (get(key) !== row.raw) invalid('private envelope staged readback');
               if (inserted) {
+                freshRows.push({ key, value: row.raw });
                 recordIntakeWork('collectionNodesWritten');
                 recordIntakeWork('collectionWrittenBytes', Buffer.byteLength(row.raw));
               }
@@ -2875,6 +3498,7 @@ export function createIntakeCollections(owner: {
           const inserted = immutable(row.key, row.value, INTAKE_TREE_PAGE_BYTES);
           if (get(row.key) !== row.value) invalid('collection staged readback');
           if (inserted) {
+            freshRows.push(row);
             recordIntakeWork('collectionNodesWritten');
             recordIntakeWork('collectionWrittenBytes', Buffer.byteLength(row.value));
           }
@@ -2909,7 +3533,25 @@ export function createIntakeCollections(owner: {
         } finally {
           finishIntakeFrontierMetaWrite(db, expectedHead, headWritten);
         }
-        discard(prepared);
+        if (data.logAppend) {
+          const entry = completeLogs.get(db)?.get(prefix);
+          if (!entry) invalid('collection log staged reservation changed');
+          entry.pending = { append: data.logAppend, before: data.before };
+          freshRows.push({ key: headKey, value: data.after });
+          entry.pending.token = token;
+          entry.pending.publication = registerRecordIntakeLogPublication(db, {
+            identity,
+            beforeHead: data.before,
+            afterHead: data.after,
+            receipt: {
+              format: 'health-intake-state-receipt-v4',
+              requestDigest: data.requestDigest,
+              result: data.result,
+            },
+            writes: freshRows,
+          });
+        }
+        discard(prepared, true);
         return structuredClone(data.result);
       });
     },
@@ -3128,7 +3770,9 @@ export function createIntakeCollections(owner: {
       if (data.legacyBridge || data.compactMetadata)
         invalid('representation maintenance requires its specialized original proof');
       const current = run(() => selected()),
-        retained = receipt(current.head, data.result.operationId, data.requestDigest);
+        retained = data.logAppend
+          ? undefined
+          : receipt(current.head, data.result.operationId, data.requestDigest);
       if (retained) {
         discard(prepared);
         return structuredClone(retained);
@@ -3193,7 +3837,9 @@ export function createIntakeCollections(owner: {
             data.legacyBridge || data.compactMetadata
               ? { raw: get(headKey), head: undefined }
               : selected();
-        const retained = receipt(current.head, data.result.operationId, data.requestDigest);
+        const retained = data.logAppend
+          ? undefined
+          : receipt(current.head, data.result.operationId, data.requestDigest);
         if (retained) {
           discard(prepared);
           return structuredClone(retained);

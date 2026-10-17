@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { constants, type DatabaseSync } from 'node:sqlite';
+import { constants, DatabaseSync, StatementSync } from 'node:sqlite';
 import {
   managedDatabaseMethodEpoch,
   observeDatabaseClose,
@@ -46,6 +46,89 @@ export interface ProjectionWriteTicket {
   subkey?: string;
 }
 const witnesses = new WeakMap<DatabaseSync, Witness>();
+const verifiedProjectionChanges = new WeakMap<DatabaseSync, bigint>();
+const nativePrepare = DatabaseSync.prototype.prepare,
+  nativeRun = StatementSync.prototype.run,
+  nativeGet = StatementSync.prototype.get;
+const auxiliarySql = {
+  removeAuthority: {
+    sql: 'DELETE FROM temp.__intake_lookup_authorities WHERE source_id=?',
+    arity: 1,
+  },
+  insertAuthority: { sql: 'INSERT INTO temp.__intake_lookup_authorities VALUES(?,?)', arity: 2 },
+  removeDirty: { sql: 'DELETE FROM temp.__intake_lookup_dirty WHERE source_id=?', arity: 1 },
+  seedDirtySources: {
+    sql: 'INSERT OR IGNORE INTO temp.__intake_lookup_dirty SELECT id FROM main.source_files',
+    arity: 0,
+  },
+  seedDirtyProjected: {
+    sql: 'INSERT OR IGNORE INTO temp.__intake_lookup_dirty SELECT source_id FROM main.__record_intake_lookup_sources',
+    arity: 0,
+  },
+  clearAuthorities: { sql: 'DELETE FROM temp.__intake_lookup_authorities', arity: 0 },
+  seedAuthorities: {
+    sql: 'INSERT OR IGNORE INTO temp.__intake_lookup_authorities SELECT authority_key,source_id FROM main.__record_intake_lookup_sources WHERE authority_key IS NOT NULL',
+    arity: 0,
+  },
+} as const;
+/** Exact disposable reconciliation statements, with no caller SQL or callback. */
+export function runIntakeProjectionAuxiliary(
+  db: DatabaseSync,
+  statement: keyof typeof auxiliarySql,
+  values: readonly string[],
+): void {
+  if (
+    !Object.hasOwn(auxiliarySql, statement) ||
+    values.length !== auxiliarySql[statement].arity ||
+    values.some((value) => typeof value !== 'string')
+  )
+    throw Error('Invalid disposable lookup statement');
+  const witness = witnesses.get(db),
+    method = managedDatabaseMethodEpoch(db),
+    authorization = witness?.authorizationVersion,
+    inputVersion = witness?.inputVersion,
+    foreign = witness?.foreign;
+  const mainSchema = scalar(db, 'main.schema_version'),
+    tempSchema = scalar(db, 'temp.schema_version'),
+    peer = scalar(db, 'data_version');
+  const changes = () =>
+    BigInt(
+      String(
+        Reflect.apply(
+          nativeGet,
+          Reflect.apply(nativePrepare, db, ['SELECT total_changes() AS n']),
+          [],
+        ).n,
+      ),
+    );
+  const before = changes();
+  const result = Reflect.apply(
+    nativeRun,
+    Reflect.apply(nativePrepare, db, [auxiliarySql[statement].sql]),
+    [...values],
+  );
+  const schemasCurrent =
+    scalar(db, 'main.schema_version') === mainSchema &&
+    scalar(db, 'temp.schema_version') === tempSchema &&
+    scalar(db, 'data_version') === peer;
+  const after = changes();
+  if (
+    witness &&
+    schemasCurrent &&
+    after - before === BigInt(result.changes) &&
+    witnesses.get(db) === witness &&
+    !witness.functionReplaced &&
+    witness.authorizationVersion === authorization &&
+    witness.inputVersion === inputVersion &&
+    witness.foreign === foreign &&
+    managedDatabaseMethodEpoch(db) === method
+  )
+    verifiedProjectionChanges.set(db, readIntakeProjectionChanges(db) + after - before);
+}
+/** Disposable projection SQL is credited only by its exact lexical write owner. */
+export function readIntakeProjectionChanges(db: DatabaseSync): bigint {
+  return verifiedProjectionChanges.get(db) ?? 0n;
+}
 
 /** Read-only recognition; callers cannot enroll a callback or replace its body. */
 export function intakeProjectionTerminalEvent(db: DatabaseSync, callback: unknown): boolean {
@@ -263,6 +346,13 @@ export function ownedIntakeProjectionWrite<T>(
     throw Error('Nested intake projection write');
   }
   const active = { ...ticket, events: 0, invalid: false, method: managedDatabaseMethodEpoch(db) };
+  const mainSchema = scalar(db, 'main.schema_version'),
+    tempSchema = scalar(db, 'temp.schema_version'),
+    peer = scalar(db, 'data_version'),
+    authorization = witness.authorizationVersion,
+    inputVersion = witness.inputVersion,
+    foreign = witness.foreign;
+  const beforeChanges = BigInt(String(db.prepare('SELECT total_changes() AS n').get()!.n));
   witness.owned = active;
   try {
     const result = write();
@@ -282,6 +372,27 @@ export function ownedIntakeProjectionWrite<T>(
       witness.sealed = undefined;
       throw Error('Intake projection owned write diverged');
     }
+    const schemaCurrent =
+      scalar(db, 'main.schema_version') === mainSchema &&
+      scalar(db, 'temp.schema_version') === tempSchema &&
+      scalar(db, 'data_version') === peer;
+    const afterChanges = BigInt(String(db.prepare('SELECT total_changes() AS n').get()!.n));
+    if (
+      schemaCurrent &&
+      afterChanges - beforeChanges === BigInt(count) &&
+      !active.invalid &&
+      active.events === count &&
+      witnesses.get(db) === witness &&
+      witness.owned === active &&
+      witness.authorizationVersion === authorization &&
+      witness.inputVersion === inputVersion &&
+      witness.foreign === foreign &&
+      active.method === managedDatabaseMethodEpoch(db)
+    )
+      verifiedProjectionChanges.set(
+        db,
+        readIntakeProjectionChanges(db) + afterChanges - beforeChanges,
+      );
     return result;
   } catch (error) {
     witness.sealed = undefined;

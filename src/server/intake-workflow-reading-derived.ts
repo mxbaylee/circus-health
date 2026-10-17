@@ -88,7 +88,7 @@ export async function prepareWorkflowReadingDerived(
   };
   const name = 'workflow.reading.' + randomUUID(),
     pending = new Map<string, string | null>();
-  const commit = (changes: readonly IntakeCollectionChange[]) => {
+  const commit = async (changes: readonly IntakeCollectionChange[]) => {
     current();
     if (input.auxiliary) {
       input.auxiliary.apply(changes);
@@ -96,15 +96,19 @@ export async function prepareWorkflowReadingDerived(
     }
     const operationId = randomUUID();
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId,
-        requestDigest: createHash('sha256').update(operationId).digest('hex'),
-        domainVersion: before.logical.domainVersion,
-        changes,
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId,
+          requestDigest: createHash('sha256').update(operationId).digest('hex'),
+          domainVersion: before.logical.domainVersion,
+          changes,
+        },
+        current,
+      ),
     );
   };
-  commit([
+  await commit([
     {
       area: 'builds',
       collection: name,
@@ -124,7 +128,7 @@ export async function prepareWorkflowReadingDerived(
   };
   const flush = async () => {
     if (pending.size) {
-      commit(
+      await commit(
         Array.from(pending, ([key, value]) =>
           value === null
             ? { area: 'builds', collection: name, op: 'delete', key }

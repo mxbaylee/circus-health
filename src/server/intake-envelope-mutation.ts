@@ -75,23 +75,6 @@ export async function prepareIntakeEnvelopeMutation(
     old = collections.binding(originalView);
   if (!old || JSON.stringify(input.reader.logical) !== JSON.stringify(old.logical))
     throw Error('Stale envelope mutation view');
-  const replay = collections.replay(operation.operationId, operation.requestDigest);
-  if (replay) return { replay, prepared: undefined };
-  if (
-    typeof input.additionalLogicalChanges !== 'function' &&
-    input.additionalLogicalChanges?.some(
-      (change) => change.area !== 'logical' || change.collection.startsWith('envelope.'),
-    )
-  )
-    throw Error('Additional logical changes must belong to their domain');
-  if (
-    (typeof input.additionalLogicalChanges === 'function'
-      ? 0
-      : (input.additionalLogicalChanges?.length ?? 0)) +
-      1 >
-    64
-  )
-    throw Error('Envelope command requires bounded addressed changes');
   const pin = JSON.stringify(old.logical),
     assertCurrent = () => {
       input.assertRunning?.();
@@ -105,13 +88,33 @@ export async function prepareIntakeEnvelopeMutation(
       )
         throw Error('Stale envelope mutation source');
     };
-  const candidate = collections.createPrivateEnvelopeMutation(
-    originalView,
-    expectedSource,
-    operation,
-  );
   let transferred = false;
+  let provisional: ReturnType<typeof collections.createPrivateEnvelopeMutation> | undefined;
+  await collections.admitCurrentLogAsync(assertCurrent);
   try {
+    const replay = collections.replay(operation.operationId, operation.requestDigest);
+    if (replay) return { replay, prepared: undefined };
+    if (
+      typeof input.additionalLogicalChanges !== 'function' &&
+      input.additionalLogicalChanges?.some(
+        (change) => change.area !== 'logical' || change.collection.startsWith('envelope.'),
+      )
+    )
+      throw Error('Additional logical changes must belong to their domain');
+    if (
+      (typeof input.additionalLogicalChanges === 'function'
+        ? 0
+        : (input.additionalLogicalChanges?.length ?? 0)) +
+        1 >
+      64
+    )
+      throw Error('Envelope command requires bounded addressed changes');
+    const candidate = collections.createPrivateEnvelopeMutation(
+      originalView,
+      expectedSource,
+      operation,
+    );
+    provisional = candidate;
     const writer = createPrivateEnvelopeBuildWriter(
       db,
       source,
@@ -498,9 +501,10 @@ export async function prepareIntakeEnvelopeMutation(
       },
     };
   } finally {
-    if (!transferred) {
+    collections.releaseLogAdmission();
+    if (!transferred && provisional) {
       try {
-        collections.disposePrivateEnvelopeMutation(candidate);
+        collections.disposePrivateEnvelopeMutation(provisional);
       } catch {
         // Construction failed before transfer; preserve its original refusal.
       }

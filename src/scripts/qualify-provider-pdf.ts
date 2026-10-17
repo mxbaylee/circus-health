@@ -28,6 +28,7 @@ import {
   type QualificationFeedPage,
 } from './qualification-intake-read.ts';
 import type { IntakeBatch } from '../shared/intake-batch.ts';
+import type { SourceTextIssueList } from '../shared/intake-source-text.ts';
 import {
   runQualificationBatch,
   summarizeQualificationBatch,
@@ -36,15 +37,103 @@ import { gradeQualificationDelivery } from './provider-qualification-delivery.ts
 import { performQualificationAcceptance } from './provider-qualification-acceptance.ts';
 import { gradeDiagnosticLifecycle } from './provider-diagnostics-qualification.ts';
 import {
+  createContinuingApprovalQualifier,
+  type ContinuingApprovalResult,
+} from './provider-qualification-continuing-approval.ts';
+import {
+  observeQualificationRequestBudget,
+  prepareQualificationRequestBudget,
+  readQualificationRequestBudget,
+  retainQualificationRequestBudget,
+  qualificationRequestLimit,
+  type QualificationRequestBudget,
+} from './provider-qualification-request-budget.ts';
+import {
   gradeProviderQualification,
   qualificationPerson,
   qualificationBirthDate,
   writeProviderQualificationPdf,
 } from './provider-qualification-fixture.ts';
+import {
+  finalizeQualificationPrivateTraceReport,
+  prepareQualificationPrivateTrace,
+  prepareQualificationTraceProfile,
+  qualificationPrivateTraceReport,
+  qualificationPrivateTraceRequested,
+  retainQualificationPrivateTraceStatus,
+  revokeQualificationPrivateTraceForReport,
+} from './provider-qualification-private-trace.ts';
 
 const repository = fileURLToPath(new URL('../../', import.meta.url));
 function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw Error(message);
+}
+/** A continuing-approval run is one scoped experiment, never a comparison matrix. */
+export function assertContinuingApprovalMode(args: readonly string[], env: NodeJS.ProcessEnv) {
+  if (!args.includes('--continuing-approval')) return false;
+  check(
+    !args.includes('--deployment'),
+    'Choose either continuing approval or deployment qualification.',
+  );
+  for (const [name, expected] of [
+    ['CRS_QUALIFICATION_SCENARIO', 'continuing'],
+    ['CRS_QUALIFICATION_REPEAT', '1'],
+    ['CRS_QUALIFICATION_FORMAT', 'auto'],
+    ['CRS_QUALIFICATION_CACHE', 'configured'],
+  ])
+    check(
+      !env[name!] || env[name!] === expected,
+      `Continuing approval requires ${name}=${expected}.`,
+    );
+  check(
+    !env.CRS_QUALIFICATION_ACCEPT && !env.CRS_QUALIFICATION_DIAGNOSTICS,
+    'Continuing approval has its own scoped saves; full acceptance and diagnostics qualification must be separate.',
+  );
+  return true;
+}
+/** Retain the deliberately unfinished two-unit fixture without certifying full reading. */
+export async function captureContinuingReading(
+  request: <T>(path: string) => Promise<T>,
+  path: string,
+  intake: IntakeRead,
+  sourceHash: string,
+  retain: (page: SourceTextIssueList) => void,
+) {
+  check(isIntakeSummary(intake), 'Continuing qualification requires a bounded intake summary.');
+  const plan = intake.activePlan.state === 'exact' ? intake.activePlan.plan : null;
+  check(
+    intake.sha256 === sourceHash && plan?.pins.sourceHash === sourceHash && plan.unitCount === 2,
+    'Continuing qualification source or two-unit plan changed.',
+  );
+  const page = await request<SourceTextIssueList>(
+    path +
+      '/source-issues?' +
+      new URLSearchParams({
+        readerVersion: String(intake.version),
+        readerOffset: '0',
+        readerLimit: '50',
+      }),
+  );
+  retain(page);
+  check(
+    page.sourceHash === sourceHash &&
+      page.readerCoverage?.intakeVersion === intake.version &&
+      page.readerCoverage.offset === 0 &&
+      page.readerCoverage.nextOffset === null &&
+      page.readerCoverage.summary.units === 2 &&
+      page.readerCoverage.entries.length <= 2,
+    'Continuing qualification reading evidence is stale or incomplete.',
+  );
+  return {
+    passed: false as const,
+    scope: 'partial_continuing_reading_observation' as const,
+    intakeVersion: intake.version,
+    sourceHash,
+    planId: plan.id,
+    unitCount: plan.unitCount,
+    responsePages: 1,
+    summary: page.readerCoverage.summary,
+  };
 }
 /** Capability checks await inference; only host work gets a harness hang guard. */
 export function qualificationRequestSignal(
@@ -64,12 +153,113 @@ export function writeQualificationPrivateJson(path: string, value: unknown) {
 export async function captureQualificationEvidence(
   captures: readonly ((signal: AbortSignal) => Promise<boolean>)[],
   timeoutMs = 10_000,
+  signal = AbortSignal.timeout(timeoutMs),
 ) {
-  const signal = AbortSignal.timeout(timeoutMs);
-  const results = await Promise.allSettled(
-    captures.map((capture) => Promise.resolve().then(() => capture(signal))),
+  const outcomes = captures.map(() => false);
+  if (signal.aborted) return outcomes;
+  let finished = false;
+  let onAbort: () => void = () => {};
+  const deadline = new Promise<void>((resolve) => {
+    onAbort = resolve;
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  const pending = Promise.allSettled(
+    captures.map(async (capture, index) => {
+      const result = await capture(signal);
+      if (!finished && !signal.aborted) outcomes[index] = result === true;
+    }),
   );
-  return results.map((result) => result.status === 'fulfilled' && result.value);
+  try {
+    // An uncooperative capture must not keep an exhausted runtime alive.
+    await Promise.race([pending, deadline]);
+  } finally {
+    finished = true;
+    signal.removeEventListener('abort', onAbort);
+  }
+  return outcomes;
+}
+
+/** Share only an active capture and its accounting. Completed captures must not
+ * hide fresh state from a later run or a later capture in the same run. */
+export function shareQualificationEvidence(
+  captures: readonly ((signal: AbortSignal) => Promise<boolean>)[],
+  retain: (outcomes: readonly boolean[]) => void,
+) {
+  let pending: Promise<void> | undefined;
+  return {
+    capture(signal?: AbortSignal): Promise<void> {
+      if (pending) return pending;
+      // Sharing the entire promise also shares its deadline. An observer that
+      // arrives during normal capture cannot start a second evidence window.
+      const epoch = captureQualificationEvidence(captures, 10_000, signal)
+        .then(retain)
+        .finally(() => {
+          if (pending === epoch) pending = undefined;
+        });
+      pending = epoch;
+      return epoch;
+    },
+  };
+}
+
+/** Only a verified exhausted admission gate can leave the HTTP server alive for
+ * read-only evidence. Other failure reasons do not prove remaining slots closed. */
+export async function finishQualificationBudgetFailure(
+  snapshot: QualificationRequestBudget | null,
+  actions: {
+    abort(): void;
+    capture(signal?: AbortSignal): Promise<void>;
+    stop(): Promise<void>;
+  },
+  deadline?: AbortSignal,
+) {
+  actions.abort();
+  try {
+    if (
+      snapshot?.stopReason === 'completion_request_cap_reached' &&
+      snapshot.runtimeClaimed &&
+      snapshot.limit === qualificationRequestLimit &&
+      snapshot.admitted === snapshot.limit
+    ) {
+      await actions.capture(deadline);
+    }
+  } finally {
+    await actions.stop();
+  }
+}
+
+export function recordQualificationCleanupFailure(report: {
+  passed: boolean;
+  failure: string | null;
+  cleanupFailure: string | null;
+}) {
+  report.passed = false;
+  report.cleanupFailure = 'Qualification cleanup failed; inspect the isolated Compose project.';
+  report.failure ??= report.cleanupFailure;
+}
+
+/** A transport may ignore cancellation while returning headers or body bytes.
+ * Recheck before publishing cookies, diagnostics, or data to its caller. */
+export async function readQualificationResponse<T>(
+  response: Response,
+  signal: AbortSignal,
+  effects: {
+    cookie(value: string): void;
+    failure?: (status: number, body: string) => void;
+  },
+): Promise<T> {
+  signal.throwIfAborted();
+  const setCookie = response.headers.get('set-cookie');
+  if (setCookie) effects.cookie(setCookie.split(';')[0] ?? '');
+  if (!response.ok && effects.failure) {
+    const body = await response.text();
+    signal.throwIfAborted();
+    effects.failure(response.status, body.slice(0, 32_768));
+  }
+  check(response.ok, `Qualification HTTP request failed with status ${response.status}.`);
+  const result = (await response.json()) as { data: T };
+  signal.throwIfAborted();
+  return result.data;
 }
 function externalDirectory(path: string | undefined, label: string) {
   check(path && isAbsolute(path), `${label} must be an existing absolute directory outside Git.`);
@@ -109,7 +299,9 @@ interface QualificationRun {
   supersededReviewVersions: number;
   extractionComplete: boolean;
   readingAccounting: QualificationFeedPage['activity']['readingAccounting'] | null;
-  reading: Awaited<ReturnType<typeof readQualificationReading>>;
+  reading:
+    | Awaited<ReturnType<typeof readQualificationReading>>
+    | Awaited<ReturnType<typeof captureContinuingReading>>;
   remainingUnits: number | null;
   coordinator: ReturnType<typeof summarizeQualificationBatch>;
   reviewEvidenceFile: string;
@@ -260,6 +452,8 @@ export function summarizeQualificationDiagnostics(
 
 async function main() {
   const deployment = process.argv.includes('--deployment');
+  const continuing = assertContinuingApprovalMode(process.argv, process.env);
+  const privateTraceRequested = qualificationPrivateTraceRequested(continuing, process.env);
   check(
     process.argv.includes('--run') &&
       (deployment
@@ -287,10 +481,17 @@ async function main() {
       ['1', '2'].includes(process.env.CRS_QUALIFICATION_REPEAT),
     'CRS_QUALIFICATION_REPEAT must be 1 or 2.',
   );
-  const scenario = deployment ? 'tiny' : (process.env.CRS_QUALIFICATION_SCENARIO ?? 'quick');
+  const scenario = continuing
+    ? 'continuing'
+    : deployment
+      ? 'tiny'
+      : (process.env.CRS_QUALIFICATION_SCENARIO ?? 'quick');
   check(
-    scenario === 'tiny' || scenario === 'quick' || scenario === 'long',
-    'CRS_QUALIFICATION_SCENARIO must be tiny, quick or long.',
+    scenario === 'tiny' ||
+      scenario === 'quick' ||
+      scenario === 'long' ||
+      (continuing && scenario === 'continuing'),
+    'CRS_QUALIFICATION_SCENARIO must be tiny, quick or long; continuing requires --continuing-approval.',
   );
   const cacheMode = deployment
     ? 'configured'
@@ -313,7 +514,8 @@ async function main() {
     !process.env.CRS_QUALIFICATION_DIAGNOSTICS || diagnosticRequested,
     'CRS_QUALIFICATION_DIAGNOSTICS must be 1 when enabled.',
   );
-  const format = deployment ? 'auto' : (process.env.CRS_QUALIFICATION_FORMAT ?? 'both');
+  const format =
+    deployment || continuing ? 'auto' : (process.env.CRS_QUALIFICATION_FORMAT ?? 'both');
   if (diagnosticRequested)
     check(
       scenario === 'tiny' &&
@@ -344,6 +546,10 @@ async function main() {
   const fixtureFilename = `fictional-${scenario}-qualification.pdf`;
   const fixturePath = join(root, fixtureFilename);
   const fixture = writeProviderQualificationPdf(fixturePath, scenario);
+  const privateTrace = privateTraceRequested ? prepareQualificationPrivateTrace(root) : null;
+  const requestBudget = continuing
+    ? prepareQualificationRequestBudget(root, privateTrace ?? undefined)
+    : null;
   const reportPath = join(root, 'qualification.json');
   const project = 'circus-health-' + createHash('sha256').update(data).digest('hex').slice(0, 12);
   const socket = createServer();
@@ -367,6 +573,7 @@ async function main() {
     applicationImages: {} as Record<string, string>,
     diagnosticFiles: [] as string[],
     diagnosticCaptureFailures: 0,
+    cleanupFailure: null as string | null,
     recoveryFiles: [] as string[],
     reviewEvidenceFiles: [] as string[],
     reviewCaptureFailures: 0,
@@ -375,6 +582,12 @@ async function main() {
     formatPolicy: format,
     repetitions,
     acceptanceRequested: accept,
+    continuingApprovalRequested: continuing,
+    continuingApproval: null as ContinuingApprovalResult | null,
+    privateTrace: qualificationPrivateTraceReport(privateTraceRequested),
+    requestBudget: requestBudget
+      ? readQualificationRequestBudget(requestBudget.receipts)
+      : (null as QualificationRequestBudget | null),
     deploymentQualificationRequested: deployment,
     deployment: {
       stages: [] as unknown[],
@@ -387,13 +600,16 @@ async function main() {
     // Status GETs also flush the encrypted workspace. Leave room in the bounded
     // event log for provider and extraction work throughout a long import.
     statusPollIntervalMs: 5_000,
-    conversionDeadlineMs: deployment ? undefined : (scenario === 'long' ? 125 : 16) * 60_000,
-    conversionDeadlineInterpretation: deployment
-      ? 'No harness model-time deadline. Follow the application coordinator and its progress/terminal outcome; operator cancellation remains available.'
-      : 'The long harness wall bound allows the normal two-hour active-work budget plus five minutes for already-admitted work; it does not extend the application budget. Quick mode remains bounded at 16 minutes.',
+    conversionDeadlineMs:
+      deployment || continuing ? undefined : (scenario === 'long' ? 125 : 16) * 60_000,
+    conversionDeadlineInterpretation:
+      deployment || continuing
+        ? 'No harness model-time deadline. Follow the application coordinator and its progress/terminal outcome; operator cancellation remains available.'
+        : 'The long harness wall bound allows the normal two-hour active-work budget plus five minutes for already-admitted work; it does not extend the application budget. Quick mode remains bounded at 16 minutes.',
     manualResumeRequests: 0,
-    completionCriterion:
-      'One normal Import intake-batches create request, no harness convert or resume requests; the coordinator must finish without paused items or budget extensions and every extraction/delivery oracle must pass.',
+    completionCriterion: continuing
+      ? 'Observed approval during real continuing reading, stable approval after unrelated source clarification, exact save and replay, and refusal of the original approval after relevant clarification. Stop remaining reading once this scoped evidence is secured; this is not full-import qualification.'
+      : 'One normal Import intake-batches create request, no harness convert or resume requests; the coordinator must finish without paused items or budget extensions and every extraction/delivery oracle must pass.',
     cacheComparison: [] as ReturnType<typeof summarizeQualificationCache>,
     passed: false,
     stage: 'starting',
@@ -401,20 +617,32 @@ async function main() {
     failure: null as string | null,
     cacheInterpretation:
       'Paired mode uses off/on/on/off per format. Position and repeated-profile number are explicit, but actual cache temperature is unknown: capability probes, earlier formats, cross-profile provider cache, load, routing and time may confound results. No cache eviction is claimed. Provider-reported values stay null when missing; no causal savings claim.',
-    scope:
-      scenario === 'long'
+    scope: continuing
+      ? 'One three-page, four-observation fictional original, one profile and route, two source clarifications and two selected saves. No automatic reruns or format/cache matrix; no automatic capture-after-approval claim.'
+      : scenario === 'long'
         ? 'One 100-page mixed laboratory, medication-order and performed-imaging fixture; 400 records, alternating text/scanned pages. Autonomous continuation only; not exhaustive chart or clinical quality qualification.'
         : scenario === 'tiny'
           ? 'One page and four independently fictional observations for bounded diagnostics qualification; not representative clinical extraction.'
           : 'One 4-page, 64-row laboratory fixture; this is a quick gate, not representative long-chart qualification.',
   };
-  const save = () => writeQualificationPrivateJson(reportPath, report);
+  const save = () => {
+    if (requestBudget)
+      retainQualificationRequestBudget(
+        report,
+        readQualificationRequestBudget(requestBudget.receipts),
+      );
+    writeQualificationPrivateJson(reportPath, report);
+  };
   const controller = new AbortController();
   const abort = () => controller.abort();
   process.once('SIGINT', abort);
   process.once('SIGTERM', abort);
   let launcher: ChildProcess | undefined;
   let closed: Promise<void> | undefined;
+  let stopping: Promise<void> | undefined;
+  let budgetFailure: string | null = null;
+  let budgetCleanup: Promise<void> | undefined;
+  let stopBudgetObserver: (() => void) | undefined;
   let cookie = '';
   let activeDiagnostics: { prefix: string; filename: string } | null = null;
   let activeReview: {
@@ -425,7 +653,7 @@ async function main() {
     captures: number;
   } | null = null;
   const ownedProfiles = new Set<string>();
-  async function stop() {
+  async function stopInstallation() {
     if (!launcher) return;
     if (launcher.pid && launcher.exitCode === null && launcher.signalCode === null) {
       try {
@@ -451,6 +679,17 @@ async function main() {
       'The qualification Compose project was not fully removed.',
     );
   }
+  function stop() {
+    return (stopping ??= (async () => {
+      try {
+        if (privateTrace && !report.privateTrace.grantRevoked) {
+          revokeQualificationPrivateTraceForReport(privateTrace, report.privateTrace);
+        }
+      } finally {
+        await stopInstallation();
+      }
+    })());
+  }
   async function request<T>(
     path: string,
     input?: unknown,
@@ -459,6 +698,11 @@ async function main() {
     clientRequestId?: string,
     modelAwait = false,
   ): Promise<T> {
+    const requestSignal = qualificationRequestSignal(
+      signal,
+      (deployment || continuing) && modelAwait,
+    );
+    requestSignal.throwIfAborted();
     const response = await fetch(base + path, {
       method: input !== undefined || bytes ? 'POST' : 'GET',
       headers: {
@@ -478,25 +722,24 @@ async function main() {
         : input !== undefined
           ? { body: JSON.stringify(input) }
           : {}),
-      signal: qualificationRequestSignal(signal, deployment && modelAwait),
+      signal: requestSignal,
     });
-    const setCookie = response.headers.get('set-cookie');
-    if (setCookie) cookie = setCookie.split(';')[0] ?? '';
-    if (!response.ok && deployment) {
-      // Keep actionable local diagnostics only in this protected fictional
-      // attempt. Never include response/provider content in terminal output.
-      writeQualificationPrivateJson(
-        join(root, 'deployment-http-failure-' + randomUUID() + '.json'),
-        {
-          path,
-          status: response.status,
-          body: (await response.text()).slice(0, 32_768),
-        },
-      );
-    }
-    // Never include error bodies, model content or credentials in command output.
-    check(response.ok, `Qualification HTTP request failed with status ${response.status}.`);
-    return ((await response.json()) as { data: T }).data;
+    return readQualificationResponse<T>(response, requestSignal, {
+      cookie: (value) => {
+        cookie = value;
+      },
+      // Keep local diagnostics only in the protected fictional attempt.
+      ...(deployment
+        ? {
+            failure: (status: number, body: string) => {
+              writeQualificationPrivateJson(
+                join(root, 'deployment-http-failure-' + randomUUID() + '.json'),
+                { path, status, body },
+              );
+            },
+          }
+        : {}),
+    });
   }
   const reviewFeedClientRequestIds = new Set<string>();
   async function collectFeed(
@@ -515,21 +758,25 @@ async function main() {
     );
   }
   async function retainDiagnostics(signal = AbortSignal.timeout(10_000)) {
-    if (!activeDiagnostics) return true;
+    const active = activeDiagnostics;
+    if (!active) return true;
     try {
       const snapshot = await request<ImportDiagnosticExport>(
-        activeDiagnostics.prefix + '/import-diagnostics',
+        active.prefix + '/import-diagnostics',
         undefined,
         undefined,
         // After harness cancellation, allow one short read-only diagnostic
         // capture before stack teardown stops any remaining server work.
         signal,
       );
-      writeQualificationPrivateJson(join(root, activeDiagnostics.filename), snapshot);
-      if (!report.diagnosticFiles.includes(activeDiagnostics.filename))
-        report.diagnosticFiles.push(activeDiagnostics.filename);
+      signal.throwIfAborted();
+      retainQualificationPrivateTraceStatus(report.privateTrace, snapshot.privateTrace);
+      writeQualificationPrivateJson(join(root, active.filename), snapshot);
+      if (!report.diagnosticFiles.includes(active.filename))
+        report.diagnosticFiles.push(active.filename);
       return true;
     } catch {
+      if (!signal.aborted) retainQualificationPrivateTraceStatus(report.privateTrace, undefined);
       return false;
     }
   }
@@ -538,6 +785,7 @@ async function main() {
     if (!report.reviewEvidenceFiles.includes(filename)) report.reviewEvidenceFiles.push(filename);
   }
   async function retainReview(signal: AbortSignal) {
+    signal.throwIfAborted();
     const active = activeReview;
     if (!active?.originalId) return true;
     const captureStem = `${active.stem}-capture-${++active.captures}`;
@@ -558,7 +806,11 @@ async function main() {
       proposalContentLimitBytes: 32 * 1024 * 1024,
       failure: null as string | null,
     };
-    const persist = () => retainReviewFile(filename, receipt);
+    // The initial/progress receipts already say partial. Do not publish a late
+    // result after the shared evidence window has ended and teardown can start.
+    const persist = () => {
+      if (!signal.aborted) retainReviewFile(filename, receipt);
+    };
     persist();
     try {
       if (active.batch) {
@@ -568,6 +820,7 @@ async function main() {
           undefined,
           signal,
         );
+        signal.throwIfAborted();
         report.coordinator = summarizeQualificationBatch(receipt.batch);
         persist();
       }
@@ -577,11 +830,14 @@ async function main() {
         undefined,
         signal,
       );
+      signal.throwIfAborted();
       persist();
       const collected = await collectFeed(active.prefix, signal, (pages) => {
+        signal.throwIfAborted();
         receipt.pages = pages;
         persist();
       });
+      signal.throwIfAborted();
       // Preserve returned proposal bytes, not reconstructed expected answers.
       // Reads stay inside this freshly created profile and the shared capture
       // deadline; an interrupted capture is explicitly marked partial.
@@ -607,6 +863,7 @@ async function main() {
           base + active.prefix + `/sources/${encodeURIComponent(proposalId)}/content`,
           { headers: { Origin: base, Cookie: cookie }, signal },
         );
+        signal.throwIfAborted();
         check(response.ok && response.body, 'Proposal evidence was unavailable.');
         const reader = response.body.getReader();
         const chunks: Buffer[] = [];
@@ -614,6 +871,7 @@ async function main() {
         try {
           for (;;) {
             const next = await reader.read();
+            signal.throwIfAborted();
             if (next.done) break;
             bytes += next.value.byteLength;
             totalBytes += next.value.byteLength;
@@ -624,10 +882,12 @@ async function main() {
             chunks.push(Buffer.from(next.value));
           }
         } finally {
-          await reader.cancel().catch(() => {});
+          // A transport ignoring cancellation must not hold teardown open.
+          void reader.cancel().catch(() => {});
         }
         const content = Buffer.concat(chunks);
         const proposalFilename = `${captureStem}-proposal-${index + 1}.ndjson`;
+        signal.throwIfAborted();
         writeFileSync(join(root, proposalFilename), content, { mode: 0o600 });
         receipt.proposalContent.push({
           proposalId,
@@ -637,6 +897,7 @@ async function main() {
         });
         persist();
       }
+      signal.throwIfAborted();
       receipt.proposalContentComplete = true;
       receipt.partial = false;
     } catch {
@@ -647,16 +908,24 @@ async function main() {
     }
     return !receipt.partial;
   }
+  // The observer can fire while normal final evidence is already being read.
+  // Both paths share these exact requests and retain their outcomes only once.
+  // Each later capture acquires a fresh epoch after the previous one completes.
+  const finalEvidence = shareQualificationEvidence(
+    [retainDiagnostics, retainReview],
+    ([diagnostics, review]) => {
+      if (!diagnostics) {
+        report.diagnosticCaptureFailures++;
+        retainQualificationPrivateTraceStatus(report.privateTrace, undefined);
+      }
+      if (!review) report.reviewCaptureFailures++;
+    },
+  );
   async function retainPartialEvidence() {
     // One shared deadline, including after SIGINT/SIGTERM. This is read-only and
     // never resumes work or upgrades a failed qualification verdict. On failure
     // the caller immediately tears down any still-active provider work.
-    const [diagnostics, review] = await captureQualificationEvidence([
-      retainDiagnostics,
-      retainReview,
-    ]);
-    if (!diagnostics) report.diagnosticCaptureFailures++;
-    if (!review) report.reviewCaptureFailures++;
+    await finalEvidence.capture();
   }
   async function originalHash(prefix: string, originalId: string) {
     const response = await fetch(
@@ -713,17 +982,26 @@ async function main() {
           CRS_PROMPT_CACHE: cache === 'on' ? 'true' : 'false',
           CRS_IMAGES: 'true',
           CRS_IMPORT_DIAGNOSTICS: 'true',
+          ...(requestBudget ? { CRS_QUALIFICATION_REQUEST_OVERRIDE: requestBudget.override } : {}),
         });
         const log = deployment
           ? openSync(join(root, 'deployment-launcher.log'), 'a', 0o600)
           : undefined;
         try {
-          launcher = spawn(process.execPath, ['deploy/run.ts', 'run'], {
-            cwd: repository,
-            env,
-            detached: true,
-            stdio: log === undefined ? 'ignore' : ['ignore', log, log],
-          });
+          launcher = spawn(
+            process.execPath,
+            [
+              ...(requestBudget
+                ? ['src/scripts/provider-qualification-launcher.ts']
+                : ['deploy/run.ts', 'run']),
+            ],
+            {
+              cwd: repository,
+              env,
+              detached: true,
+              stdio: log === undefined ? 'ignore' : ['ignore', log, log],
+            },
+          );
         } finally {
           if (log !== undefined) closeSync(log);
         }
@@ -731,6 +1009,28 @@ async function main() {
           launcher!.once('close', () => done());
           launcher!.once('error', reject);
         });
+        stopping = undefined;
+        if (requestBudget)
+          stopBudgetObserver = observeQualificationRequestBudget(
+            requestBudget.receipts,
+            (snapshot) => {
+              budgetFailure = snapshot?.stopReason
+                ? `Qualification inconclusive: ${snapshot.stopReason}; the request budget cannot refill or rerun automatically.`
+                : 'Qualification inconclusive: request budget receipts could not be read.';
+              report.failure = budgetFailure;
+              report.passed = false;
+              // Admission remains fixed at sixteen. Only a verified cap denial
+              // permits one bounded read-only capture before runtime teardown.
+              budgetCleanup = finishQualificationBudgetFailure(snapshot, {
+                abort: () => controller.abort(),
+                capture: finalEvidence.capture,
+                stop,
+              });
+              void budgetCleanup.catch(() => {
+                /* The final block awaits this same promise and records cleanup failure. */
+              });
+            },
+          );
         // Build readiness is bounded separately from provider and conversion deadlines.
         const startupDeadline = Date.now() + 15 * 60_000;
         let ready = false;
@@ -749,6 +1049,13 @@ async function main() {
           await delay(500, undefined, { signal: controller.signal });
         }
         check(ready, 'Launcher did not become ready within 15 minutes.');
+        if (requestBudget) {
+          const snapshot = readQualificationRequestBudget(requestBudget.receipts);
+          check(
+            snapshot.runtimeClaimed && !snapshot.stopReason,
+            'Qualification runtime did not claim its request budget; no model probe may start.',
+          );
+        }
         const container = execFileSync(
           'docker',
           [
@@ -853,6 +1160,22 @@ async function main() {
           captures: 0,
         };
         report.coordinator = null;
+        if (privateTrace) {
+          stage('checking_private_trace');
+          const readiness = await prepareQualificationTraceProfile(
+            privateTrace,
+            profile.id,
+            ownedProfiles,
+            {
+              diagnostics: () => request<ImportDiagnosticExport>(prefix + '/import-diagnostics'),
+              requestBudget: () => readQualificationRequestBudget(requestBudget!.receipts),
+            },
+          );
+          report.privateTrace.readiness = readiness;
+          retainQualificationPrivateTraceStatus(report.privateTrace, readiness.status);
+          writeQualificationPrivateJson(join(root, 'private-trace-readiness.json'), readiness);
+          save();
+        }
         const connection = await verifyQualificationConnection(
           mode,
           (options) => {
@@ -900,6 +1223,21 @@ async function main() {
           uploadClientRequestId,
         );
         activeReview.originalId = uploaded.id;
+        const continuingApproval = continuing
+          ? createContinuingApprovalQualifier({
+              prefix,
+              profileId: profile.id,
+              originalId: uploaded.id,
+              expectedSha256: fixture.sha256,
+              ownedProfiles,
+              signal: controller.signal,
+              request,
+              collectFeed: (value) => collectFeed(value, controller.signal),
+              originalHash,
+              retain: (name, value) => retainReviewFile(activeReview!.stem + '-' + name, value),
+            })
+          : null;
+        let continuingStopRequested = false;
         stage('starting_batch');
         const coordinator = await runQualificationBatch({
           prefix,
@@ -908,13 +1246,30 @@ async function main() {
           timeoutMs: report.conversionDeadlineMs,
           signal: controller.signal,
           request: (path, input, signal) => request(path, input, undefined, signal),
-          onSnapshot: (batch) => {
+          onSnapshot: async (batch) => {
             activeReview!.batch = batch;
             report.coordinator = summarizeQualificationBatch(batch);
             if (report.stage.endsWith('_starting_batch')) stage('converting_batch');
             else save();
+            if (continuingApproval) {
+              try {
+                await continuingApproval.onSnapshot(batch);
+              } finally {
+                report.continuingApproval = continuingApproval.result();
+                save();
+              }
+              if (
+                !continuingStopRequested &&
+                batch.status === 'running' &&
+                ['passed', 'failed'].includes(report.continuingApproval.status)
+              ) {
+                continuingStopRequested = true;
+                await request(prefix + `/intake-batches/${encodeURIComponent(batch.id)}/stop`, {});
+              }
+            }
           },
         });
+        if (continuingApproval) report.continuingApproval = continuingApproval.result();
         stage('grading');
         const reviewEvidenceFile = activeReview.stem + '-extracted.json';
         const extracted = {
@@ -935,15 +1290,26 @@ async function main() {
         const detail = await request<IntakeRead>(prefix + `/intakes/${uploaded.id}`);
         extracted.intake = detail;
         retainReviewFile(reviewEvidenceFile, extracted);
-        const reading = await readQualificationReading(
-          request,
-          prefix + `/intakes/${uploaded.id}`,
-          detail,
-          fixture.sha256,
-          scenario === 'tiny' ? 1 : undefined,
-          (page, ordinal) =>
-            retainReviewFile(activeReview!.stem + '-reading-page-' + (ordinal + 1) + '.json', page),
-        );
+        const reading = continuing
+          ? await captureContinuingReading(
+              request,
+              prefix + `/intakes/${uploaded.id}`,
+              detail,
+              fixture.sha256,
+              (page) => retainReviewFile(activeReview!.stem + '-reading-page-1.json', page),
+            )
+          : await readQualificationReading(
+              request,
+              prefix + `/intakes/${uploaded.id}`,
+              detail,
+              fixture.sha256,
+              scenario === 'tiny' ? 1 : undefined,
+              (page, ordinal) =>
+                retainReviewFile(
+                  activeReview!.stem + '-reading-page-' + (ordinal + 1) + '.json',
+                  page,
+                ),
+            );
         retainReviewFile(activeReview.stem + '-reading.json', reading);
         extracted.intake = detail;
         extracted.supersededReviewVersions = collected.supersededReviewVersions;
@@ -997,10 +1363,11 @@ async function main() {
         runs.push(run);
         await retainPartialEvidence();
         save();
-        check(
-          run.acceptedClinicalRecords === 0 && !run.acceptedWrites,
-          'Conversion unexpectedly accepted clinical records.',
-        );
+        if (!continuing)
+          check(
+            run.acceptedClinicalRecords === 0 && !run.acceptedWrites,
+            'Conversion unexpectedly accepted clinical records.',
+          );
         if (
           accept &&
           run.coordinator.passed &&
@@ -1187,14 +1554,16 @@ async function main() {
       runs.length === repetitions * schedule.length &&
       runs.every(
         (run) =>
-          run.coordinator.passed &&
-          run.grade.passed &&
-          run.delivery.passed &&
-          (!accept || run.acceptance?.passed === true) &&
-          run.acceptedClinicalRecords === 0 &&
-          !run.acceptedWrites &&
-          run.reading.passed &&
-          run.remainingUnits === 0 &&
+          (continuing
+            ? report.continuingApproval?.passed === true
+            : run.coordinator.passed &&
+              run.grade.passed &&
+              run.delivery.passed &&
+              (!accept || run.acceptance?.passed === true) &&
+              run.acceptedClinicalRecords === 0 &&
+              !run.acceptedWrites &&
+              run.reading.passed &&
+              run.remainingUnits === 0) &&
           run.diagnostics.droppedEvents === 0 &&
           (!diagnosticRequested || run.diagnosticQualification?.passed === true) &&
           (run.mode === 'pdf'
@@ -1205,21 +1574,44 @@ async function main() {
     report.stage = 'complete';
     if (!report.passed) process.exitCode = 1;
   } catch (error) {
-    report.failure = controller.signal.aborted
-      ? 'Qualification cancelled.'
-      : error instanceof Error
-        ? error.message
-        : 'Qualification failed.';
+    report.failure =
+      budgetFailure ??
+      (controller.signal.aborted
+        ? 'Qualification cancelled.'
+        : error instanceof Error
+          ? error.message
+          : 'Qualification failed.');
     process.exitCode = 1;
     save();
   } finally {
     // Keep the same run's timeline and page attribution even when extraction
     // pauses or fails; never rerun a chart merely to recover its measurements.
-    await retainPartialEvidence();
     try {
-      await stop();
+      try {
+        if (!budgetCleanup) await retainPartialEvidence();
+      } finally {
+        // Recheck after capture: the observer may have taken ownership while
+        // that shared capture was pending.
+        if (budgetCleanup) await budgetCleanup;
+        else await stop();
+      }
     } catch {
-      report.failure = 'Qualification cleanup failed; inspect the isolated Compose project.';
+      recordQualificationCleanupFailure(report);
+      process.exitCode = 1;
+    }
+    stopBudgetObserver?.();
+    if (requestBudget) {
+      const snapshot = readQualificationRequestBudget(requestBudget.receipts);
+      retainQualificationRequestBudget(report, snapshot);
+      if (snapshot.stopReason) {
+        process.exitCode = 1;
+      }
+    }
+    finalizeQualificationPrivateTraceReport(report.privateTrace);
+    if (report.privateTrace.failure) {
+      report.passed = false;
+      report.failure ??=
+        'Qualification inconclusive: protected private trace evidence is unavailable or partial.';
       process.exitCode = 1;
     }
     save();

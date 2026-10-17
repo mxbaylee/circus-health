@@ -23,6 +23,10 @@ const primitiveTemplate = {
   selectedMetadataSqlReadBytes: 0,
 };
 const hostTemplate = {
+  graphScratchSeenReads: 0,
+  graphScratchSeenWrites: 0,
+  graphScratchNestedWrites: 0,
+  graphScratchCopyWrites: 0,
   clinicalSourceScopePrefixVerifiedGroups: 0,
   clinicalSourceScopePrefixRowsRead: 0,
   clinicalSourceScopePrefixMatchedGroups: 0,
@@ -208,6 +212,13 @@ const hostTemplate = {
   reportSnapshotCheckpointBatches: 0,
   packagePlanUnitIds: 0,
   packagePlanHashBytes: 0,
+  // Certificate-page counters are a visible SUBSET of the existing aggregate
+  // collection counters; growth checks keep counting both kinds of work.
+  vaultCertificatePageReads: 0,
+  vaultCertificatePageReadBytes: 0,
+  vaultCertificatePageCacheHits: 0,
+  vaultCertificatePagePreparedBytes: 0,
+  vaultCertificatePagePeakPreparedBytes: 0,
   collectionNodeReads: 0,
   collectionReadWitnessQueries: 0,
   collectionNodeCacheHits: 0,
@@ -329,6 +340,7 @@ export function recordIntakeWork(metric: keyof IntakeHostWork, amount = 1): void
 export function recordIntakePeak(
   metric:
     | 'collectionPeakPreparedBytes'
+    | 'vaultCertificatePagePeakPreparedBytes'
     | 'privateEnvelopePeakPartBytes'
     | 'jsonCanonicalPeakBufferBytes'
     | 'jsonCanonicalPeakChunkBytes'

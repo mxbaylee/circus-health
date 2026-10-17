@@ -1,14 +1,17 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { createMemoryRouter, RouterProvider } from 'react-router-dom';
+import { createMemoryRouter, MemoryRouter, RouterProvider } from 'react-router-dom';
 import { expect, it, vi } from 'vitest';
 import type {
   IntakeImportFeed,
+  IntakeReportAcceptanceRequest,
   IntakeReportQueueGroup,
   IntakeReportSourceReview,
 } from '../../shared/intake';
 import type { IntakeIdentityReview } from '../../shared/intake-identity';
 import { ImportPage } from '../../app/features/import/ImportPage';
+import type { CollectionImportFeed } from '../../shared/intake-clinical-pages';
+import { CollectionImportReview } from '../../app/features/import/CollectionImportReview';
 import { selectProfile } from '../../app/data/profile';
 
 vi.mock('../../app/features/import/ImportDetailReview', () => ({
@@ -296,6 +299,12 @@ it('saves good selections through ImportPage, then requires a fresh approval for
     'fetch',
     vi.fn(async (input, init) => {
       const url = String(input);
+      if (url.endsWith('/intakes/report-acceptance-plan'))
+        return response({
+          planId: 'fictional-mounted-plan',
+          chunks: [JSON.parse(String(init?.body)).blocks],
+          unsent: [],
+        });
       if (url.includes('/intakes/import-feed?')) return response(displayed);
       if (url.endsWith('/intakes/limits'))
         return response({ uploadBytes: 1024, extractionBytes: 1024 });
@@ -428,6 +437,338 @@ it('saves good selections through ImportPage, then requires a fresh approval for
   await waitFor(() => expect(posts).toBe(2));
   expect(await screen.findByText('1 saved')).toBeVisible();
 });
+
+it.each(['search', 'edited', 'search-unknown', 'native-path', 'native-plan-failure'] as const)(
+  'stops a clinical save after a committed %s filter change and return to the original view',
+  async (filter) => {
+    const profileId = `fictional-save-view-${filter}`;
+    selectProfile({ id: profileId, name: 'Fictional Self', placebo: true });
+    const records = [0, 1].map((index) => ({
+      feedKey: JSON.stringify([
+        'fictional-intake',
+        `fictional-candidate-${index}`,
+        `fictional-version-${index}`,
+      ]),
+      feedOrder: `000${index}`,
+      feedKind: 'test' as const,
+      id: `fictional-record-${index}`,
+      classification: 'addition' as const,
+      kind: 'observation' as const,
+      title: `Fictional marker ${index}`,
+      date: '2026-09-01',
+      provider: 'Fictional Clinic',
+      candidateId: `fictional-candidate-${index}`,
+      candidateVersionId: `fictional-version-${index}`,
+      selectionReviewToken: `fictional-token-${index}`,
+      reviewState: 'pending' as const,
+      confidence: 1,
+      uncertainties: [],
+      evidence: [],
+      mapping: {
+        kind: 'observation' as const,
+        subject: 'self',
+        testLabel: `Fictional marker ${index}`,
+        valueText: '7',
+      },
+      supportedFields: ['testLabel', 'valueText'],
+      queueState: 'pending' as const,
+      selectable: true,
+      manuallyEdited: false,
+    })) satisfies IntakeImportFeed['blocks'][number]['records'];
+    const displayed: IntakeImportFeed = {
+      ...feed,
+      groups: [{ ...group, source: 'Fictional Clinic', counts: { ...counts, pending: 2 } }],
+      blocks: [{ ...feed.blocks[0]!, records }],
+      totalRecords: 2,
+      counts: { ...counts, pending: 2 },
+      kindCounts: { ...feed.kindCounts, test: 2 },
+    };
+    const native = filter.startsWith('native');
+    const nativeFeed: CollectionImportFeed = {
+      ...displayed,
+      format: 'health-intake-import-feed-v2',
+      groups: [],
+      people: { ...displayed.people, groups: [] },
+      records: displayed.blocks.flatMap((part) =>
+        part.records.map((record) => ({
+          intakeId: part.intakeId,
+          groupId: part.groupId,
+          groupOrdinal: 0,
+          proposalId: part.proposalId,
+          intakeVersion: part.intakeVersion,
+          reviewToken: part.reviewToken,
+          feedKind: record.feedKind as 'test',
+          feedKey: record.feedKey,
+          feedOrder: record.feedOrder,
+          manuallyEdited: record.manuallyEdited,
+          detail: { kind: 'record' as const, record },
+        })),
+      ),
+      activity: {
+        format: 'activity',
+        binding: 'fictional',
+        runningFiles: 0,
+        pausedFiles: 0,
+        queuedFiles: 0,
+        filesAwaitingConversion: 0,
+        remainingUnits: { state: 'exact', value: 0 },
+        extractionUnknownFiles: 0,
+        extractionComplete: true,
+        allCurrentReportsReviewed: false,
+        readingAccounting: { state: 'referenced', scope: 'all', binding: 'fictional' },
+      },
+    };
+    const posts: IntakeReportAcceptanceRequest[] = [];
+    let recovered = false;
+    let originalReceipt!: () => Response;
+    let release!: () => void;
+    const fetcher = vi.fn(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/intakes/report-acceptance-plan')) {
+        if (filter === 'native-plan-failure')
+          return new Promise<Response>((resolve) => {
+            release = () =>
+              resolve(
+                Response.json(
+                  { error: { message: 'Fictional old-view planning refusal.' } },
+                  { status: 409 },
+                ),
+              );
+          });
+        const requested = (
+          JSON.parse(String(init?.body)) as { blocks: IntakeReportAcceptanceRequest['blocks'] }
+        ).blocks;
+        return response({
+          planId: 'fictional-view-plan',
+          chunks: requested.flatMap((part) =>
+            part.selections.map((selection) => [{ ...part, selections: [selection] }]),
+          ),
+          unsent: [],
+        });
+      }
+      if (url.includes('/intakes/import-feed?')) return response(native ? nativeFeed : displayed);
+      if (url.includes('/report-queue/'))
+        return response({
+          format: 'health-intake-report-detail-v2',
+          group: {
+            ...group,
+            groupOrdinal: 0,
+            sourceCoverage: { current: { total: 2, covered: 2, uncovered: 0 } },
+          },
+        });
+      if (url.includes('/review-record?')) {
+        const recordId = new URL(url, 'https://fictional.invalid').searchParams.get('recordId');
+        return response({
+          format: 'health-intake-clinical-record-v2',
+          context: {
+            intakeId: displayed.blocks[0]!.intakeId,
+            proposalId: null,
+            version: 1,
+            reviewToken: displayed.blocks[0]!.reviewToken,
+            sourceTextStale: false,
+          },
+          record: { kind: 'record', record: records.find((record) => record.id === recordId) },
+        });
+      }
+      if (url.endsWith('/intakes/limits'))
+        return response({ uploadBytes: 1024, extractionBytes: 1024 });
+      if (url.endsWith('/intake-batches')) return response([]);
+      if (url.includes('/identity-review'))
+        return response({
+          status: 'prior_confirmation',
+          blocking: false,
+          message: 'Fictional identity confirmed.',
+          scope: null,
+          evidencedIdentity: {},
+          self: {
+            noteId: 'person-note:self',
+            version: 1,
+            fullName: 'Fictional Self',
+            birthDate: null,
+          },
+          offeredSelfFields: {},
+          conflicts: [],
+        });
+      if (url.endsWith('/record-ownership/people')) return response([]);
+      if (url.includes('/record-owner?')) return response({ personId: 'patient' });
+      if (url.endsWith('/intakes/report-acceptance') && init?.method === 'POST') {
+        const request = JSON.parse(String(init.body));
+        posts.push(request);
+        const selected = request.blocks[0].selections[0];
+        const saved = {
+          intakeId: request.blocks[0].intakeId,
+          proposalId: request.blocks[0].proposalId,
+          intakeVersionBefore: 1,
+          intakeVersionAfter: 2,
+          reviewToken: 'fictional-review',
+          records: [
+            {
+              ...selected,
+              entityId: 'fictional-original-destination',
+              kind: 'observation',
+              title: 'Fictional original saved result',
+              optical: false,
+              outcome: 'added',
+            },
+          ],
+        };
+        const reply = () =>
+          response({
+            receipt: {
+              version: 1,
+              operationId: request.operationId,
+              status: 'completed',
+              atomic: false,
+              at: '2026-10-16',
+              selectedCount: 1,
+              acceptedCount: 1,
+              receipts: [saved],
+              items: [
+                {
+                  ...selected,
+                  intakeId: saved.intakeId,
+                  proposalId: saved.proposalId,
+                  reviewedSelectionHash: 'fictional-hash',
+                  operationId: request.operationId + '-item',
+                  personId: 'patient',
+                  status: 'saved',
+                  receipt: saved,
+                },
+              ],
+            },
+            replayed: false,
+            durability: { pending: false, mutationRevision: 1, persistedRevision: 1, error: null },
+          });
+        if (posts.length === 1) {
+          originalReceipt = reply;
+          return new Promise<Response>((resolve) => {
+            release = () =>
+              resolve(
+                filter === 'search-unknown'
+                  ? Response.json(
+                      { error: { message: 'Fictional lost acknowledgement' } },
+                      { status: 503 },
+                    )
+                  : reply(),
+              );
+          });
+        }
+        return reply();
+      }
+      if (url.includes('/intakes/report-acceptance/'))
+        return recovered
+          ? originalReceipt()
+          : Response.json({ error: { message: 'No receipt.' } }, { status: 404 });
+      throw new Error(`Unexpected fictional request: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const nativeView = (path: string) => (
+      <MemoryRouter>
+        <CollectionImportReview
+          initial={nativeFeed}
+          path={path}
+          firstPage={{ reload: vi.fn(), error: null }}
+          onChanged={vi.fn()}
+          sourceProps={{ onChanged: vi.fn() }}
+          onUpload={vi.fn()}
+          busy={false}
+          status=""
+          error=""
+        />
+      </MemoryRouter>
+    );
+    const originalPath = '/intakes/import-feed?view=active&state=pending&limit=40&bytes=65536';
+    const mounted = render(
+      native ? (
+        nativeView(originalPath)
+      ) : (
+        <RouterProvider
+          router={createMemoryRouter([{ path: '/import', element: <ImportPage /> }], {
+            initialEntries: ['/import'],
+          })}
+        />
+      ),
+    );
+    const user = userEvent.setup();
+    if (filter === 'native-plan-failure') {
+      await user.click((await screen.findAllByRole('button', { name: 'Review' }))[0]!);
+      expect(screen.getByRole('region', { name: 'Exact selected report' })).toBeVisible();
+    }
+    await user.click(await screen.findByRole('checkbox', { name: 'Select all shown' }));
+    await user.click(screen.getByRole('button', { name: 'Save 2 records' }));
+    await waitFor(() => expect(release).toBeTypeOf('function'));
+    if (native) {
+      mounted.rerender(nativeView(originalPath + '&groupId=fictional-other-window'));
+      mounted.rerender(nativeView(originalPath));
+      if (filter === 'native-plan-failure') {
+        const selection = screen.getByRole('checkbox', { name: 'Select Fictional marker 0' });
+        if (!(selection as HTMLInputElement).checked) await user.click(selection);
+        expect(selection).toBeChecked();
+      }
+    } else if (filter.startsWith('search')) {
+      const search = screen.getByRole('searchbox', { name: 'Search records' });
+      expect(search).toBeEnabled();
+      await user.type(search, 'm');
+      await waitFor(() =>
+        expect(fetcher.mock.calls.some(([input]) => String(input).includes('q=m'))).toBe(true),
+      );
+      await user.clear(await screen.findByRole('searchbox', { name: 'Search records' }));
+      await waitFor(() =>
+        expect(screen.getByRole('searchbox', { name: 'Search records' })).toHaveValue(''),
+      );
+    } else {
+      const edited = screen.getByRole('checkbox', { name: 'Manually edited' });
+      expect(edited).toBeEnabled();
+      await user.click(edited);
+      await waitFor(() =>
+        expect(fetcher.mock.calls.some(([input]) => String(input).includes('edited=true'))).toBe(
+          true,
+        ),
+      );
+      await user.click(await screen.findByRole('checkbox', { name: 'Manually edited' }));
+      await waitFor(() =>
+        expect(screen.getByRole('checkbox', { name: 'Manually edited' })).not.toBeChecked(),
+      );
+    }
+    await act(async () => release());
+    if (filter === 'native-plan-failure') {
+      expect(screen.getByRole('checkbox', { name: 'Select Fictional marker 0' })).toBeChecked();
+      expect(screen.queryByText('Review again, then approve.')).toBeNull();
+      expect(screen.getByRole('region', { name: 'Exact selected report' })).toBeVisible();
+      expect(screen.queryByText('Fictional old-view planning refusal.')).toBeNull();
+      expect(posts).toHaveLength(0);
+      expect(sessionStorage.getItem('circus-health:report-acceptance:' + profileId)).toBeNull();
+      return;
+    }
+    if (filter === 'search-unknown') {
+      expect(await screen.findByText('1 checking save status, 1 not sent')).toBeVisible();
+      expect(sessionStorage.getItem('circus-health:report-acceptance:' + profileId)).toBe(
+        posts[0]!.operationId,
+      );
+      recovered = true;
+      await user.click(await screen.findByRole('button', { name: 'Check save status' }));
+      expect(
+        fetcher.mock.calls
+          .map(([input]) => String(input))
+          .filter((url) => url.includes('/intakes/report-acceptance/')),
+      ).toEqual([
+        `/api/profiles/${profileId}/intakes/report-acceptance/${posts[0]!.operationId}`,
+        `/api/profiles/${profileId}/intakes/report-acceptance/${posts[0]!.operationId}`,
+      ]);
+    }
+    expect(await screen.findByText('1 saved, 1 not sent')).toBeVisible();
+    expect(posts).toHaveLength(1);
+    const outcomes = screen.getByRole('region', { name: 'Save outcomes' });
+    expect(
+      within(outcomes).getByRole('link', { name: /Fictional original saved result/ }),
+    ).toHaveAttribute('href', expect.stringContaining('fictional-original-destination'));
+    expect(
+      await screen.findByRole('checkbox', { name: 'Select Fictional marker 0' }),
+    ).toBeVisible();
+    expect(screen.queryByText(/Checked .* save groups/)).toBeNull();
+    expect(sessionStorage.getItem('circus-health:report-acceptance:' + profileId)).toBeNull();
+  },
+);
 
 it.each(['/import', '/import?q=fictional'])(
   'keeps %s on the overview even when an original-proposal report exists',

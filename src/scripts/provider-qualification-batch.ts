@@ -41,7 +41,7 @@ export async function runQualificationBatch(options: {
   timeoutMs?: number;
   signal: AbortSignal;
   request: <T>(path: string, input: unknown | undefined, signal: AbortSignal) => Promise<T>;
-  onSnapshot: (batch: IntakeBatch) => void;
+  onSnapshot: (batch: IntakeBatch) => void | Promise<void>;
   now?: () => number;
   wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 }) {
@@ -100,7 +100,8 @@ export async function runQualificationBatch(options: {
       invalidScope.length === 0,
       `Qualification batch scope changed: ${invalidScope.join(',')}.`,
     );
-    options.onSnapshot(batch);
+    await options.onSnapshot(batch);
+    signal.throwIfAborted();
     if (batch.status !== 'running') return summarizeQualificationBatch(batch);
     check(now() < deadline, 'Autonomous batch conversion did not complete within its bound.');
     await wait(Math.min(5_000, deadline - now()), signal);

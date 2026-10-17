@@ -1,3 +1,4 @@
+import { selectProfile } from '../../app/data/profile';
 import { useEffect } from 'react';
 import userEvent from '@testing-library/user-event';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
@@ -238,7 +239,14 @@ it('opens a saved Person only from its retained destination receipt', () => {
   );
 });
 
-it('labels provider documents honestly and keeps their saved links in Sources', () => {
+it('labels provider documents honestly and keeps their saved links in Sources', async () => {
+  selectProfile({ id: 'fictional-document-owner', name: 'Fictional Reader', placebo: true });
+  const fetcher = vi.fn(async (input) =>
+    Response.json({
+      data: String(input).includes('/record-owner?') ? { personId: 'patient' } : [],
+    }),
+  );
+  vi.stubGlobal('fetch', fetcher);
   render(
     <MemoryRouter>
       <ImportReviewPresentation
@@ -302,14 +310,17 @@ it('labels provider documents honestly and keeps their saved links in Sources', 
   expect(screen.queryByRole('tab', { name: /Historical notes/ })).toBeNull();
   expect(screen.getByRole('link', { name: 'Sources' })).toHaveAttribute('href', '#/sources');
   expect(screen.getByText(/Unsupported items stay with the original/)).toBeVisible();
-  expect(screen.getByRole('link', { name: /Fictional imaging report/ })).toHaveAttribute(
+  expect(await screen.findByRole('link', { name: /Fictional imaging report/ })).toHaveAttribute(
     'href',
     '/sources?document=fictional-imaging-entity',
   );
-  expect(screen.getByRole('link', { name: /Fictional clinician note/ })).toHaveAttribute(
+  expect(await screen.findByRole('link', { name: /Fictional clinician note/ })).toHaveAttribute(
     'href',
     '/sources?document=fictional-note-entity',
   );
+  expect(
+    fetcher.mock.calls.filter(([url]) => String(url).endsWith('/record-ownership/people')),
+  ).toHaveLength(1);
 });
 
 it('keeps an earlier confirmed Person destination when a later save has no receipt', () => {
@@ -493,7 +504,16 @@ it.each([
 
 it.each(['review', 'later', 'saved'] as const)(
   'shows a comparison task only for unfinished records, not an already-saved destination (%s)',
-  (view) => {
+  async (view) => {
+    selectProfile({ id: 'fictional-accepted-owner', name: 'Fictional Reader', placebo: true });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input) =>
+        Response.json({
+          data: String(input).includes('/record-owner?') ? { personId: 'patient' } : [],
+        }),
+      ),
+    );
     render(
       <ImportReviewPresentation
         model={{
@@ -541,7 +561,7 @@ it.each(['review', 'later', 'saved'] as const)(
     if (view === 'saved') {
       expect(screen.queryByText(/Possible match:/)).toBeNull();
       expect(screen.queryByRole('button', { name: /^Compare/ })).toBeNull();
-      expect(screen.getByRole('link', { name: /Saved fictional ferritin/ })).toHaveAttribute(
+      expect(await screen.findByRole('link', { name: /Saved fictional ferritin/ })).toHaveAttribute(
         'href',
         '/tests?result=fictional-accepted-entity&visibility=all',
       );

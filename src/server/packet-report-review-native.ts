@@ -1,3 +1,8 @@
+import {
+  packetReportPersonScope,
+  type PacketReportReviewContext,
+  type PendingPacketReportReview,
+} from './packet-report-person.ts';
 import { PacketOutputBudget } from './packet-output-budget.ts';
 import type { Database } from './database.ts';
 import {
@@ -29,22 +34,29 @@ export function* iterateNativePacketReportReview(
   db: Database,
   intakeId: string,
   included: ReadonlySet<string>,
+  personId: string,
+  context?: PacketReportReviewContext,
+  preparePending?: PendingPacketReportReview,
 ): Generator<PacketReportReview> {
   const view = openIntakeCollectionEnvelope(db, { id: intakeId }),
     intake = view.child(view.root(), 'intake'),
     workflow = intake && view.child(intake, 'workflow');
   if (!workflow) return;
   const catalog = createReportSnapshotCatalog(db, { id: intakeId }),
-    scratch = disposableSqlite('circus-packet-report-');
+    scratch = disposableSqlite('circus-packet-report-'),
+    scope = packetReportPersonScope(db, intakeId, true, context, preparePending);
   try {
-    scratch.db.exec('CREATE TABLE current(candidate TEXT PRIMARY KEY,accepted INTEGER NOT NULL)');
+    scratch.db.exec(
+      'CREATE TABLE current(candidate TEXT PRIMARY KEY,accepted INTEGER NOT NULL); CREATE TABLE members(candidate TEXT NOT NULL,version TEXT NOT NULL,PRIMARY KEY(candidate,version))',
+    );
+    const memberInsert = scratch.db.prepare('INSERT OR REPLACE INTO members VALUES(?,?)');
     const insert = scratch.db.prepare('INSERT OR IGNORE INTO current VALUES(?,?)');
     for (const group of intakeReviewChildren(view, workflow, 'reportGroups')) {
       if (field(view, group, 'basis') !== 'report_anchor') continue;
       const count = view.childCount(group, 'versions'),
         latest = count ? view.childAt(group, 'versions', count - 1) : undefined;
       if (!latest) continue;
-      scratch.db.exec('DELETE FROM current');
+      scratch.db.exec('DELETE FROM current; DELETE FROM members');
       let represented = false;
       const current = (candidateId: string, candidateVersionId: string) => {
         const candidate = view.find('candidate', workflow, candidateId, { match: 'last' }),
@@ -55,8 +67,22 @@ export function* iterateNativePacketReportReview(
           field(view, version, 'id') === candidateVersionId &&
           !field(view, version, 'sourceContext') &&
           !field(view, version, 'peopleOnly')
-        )
-          insert.run(candidateId, field(view, version, 'status') === 'accepted' ? 1 : 0);
+        ) {
+          const accepted = field(view, version, 'status') === 'accepted';
+          function* occurrences() {
+            for (const occurrence of intakeReviewChildren(view, version, 'occurrences'))
+              yield {
+                recordId: field<string>(view, occurrence, 'recordId')!,
+                proposalId: field<string | null>(view, occurrence, 'proposalId') ?? null,
+              };
+          }
+          if (
+            accepted
+              ? scope.accepted(occurrences(), personId)
+              : scope.pending(occurrences(), candidateId, candidateVersionId, personId)
+          )
+            insert.run(candidateId, accepted ? 1 : 0);
+        }
       };
       if (field(view, latest, 'format') === 'health-intake-report-group-version-v2') {
         const snapshot = openReportMemberSnapshot(
@@ -73,7 +99,7 @@ export function* iterateNativePacketReportReview(
                 break;
               }
             }
-          current(member.candidateId, member.candidateVersionId);
+          memberInsert.run(member.candidateId, member.candidateVersionId);
         }
       } else
         for (const member of intakeReviewChildren(view, latest, 'members')) {
@@ -83,11 +109,14 @@ export function* iterateNativePacketReportReview(
                 represented = true;
                 break;
               }
-          current(
+          memberInsert.run(
             field<string>(view, member, 'candidateId')!,
             field<string>(view, member, 'candidateVersionId')!,
           );
         }
+      if (!represented) continue;
+      for (const member of scratch.db.prepare('SELECT candidate,version FROM members').iterate())
+        current(String(member.candidate), String(member.version));
       const totals = scratch.db
         .prepare('SELECT count(*) total,coalesce(sum(accepted),0) saved FROM current')
         .get()!;
@@ -98,6 +127,8 @@ export function* iterateNativePacketReportReview(
       });
       if (scalar.kind !== 'string') throw Error('Invalid packet report title');
       yield {
+        personId,
+        countScope: 'current_person',
         intakeId,
         groupId: field<string>(view, group, 'id')!,
         title,
@@ -106,6 +137,7 @@ export function* iterateNativePacketReportReview(
       };
     }
   } finally {
+    scope.close();
     scratch.close();
   }
 }
@@ -114,10 +146,12 @@ export function nativePacketReportReview(
   db: Database,
   intakeId: string,
   included: ReadonlySet<string>,
+  personId: string,
+  context?: PacketReportReviewContext,
   budget = new PacketOutputBudget(),
 ): PacketReportReview[] {
   const reports: PacketReportReview[] = [];
-  for (const report of iterateNativePacketReportReview(db, intakeId, included)) {
+  for (const report of iterateNativePacketReportReview(db, intakeId, included, personId, context)) {
     budget.add(report, reports.length ? 1 : 0);
     reports.push(report);
   }

@@ -191,8 +191,8 @@ export function SourceRecordView({ record }: { record: SourceRecord | SourceReco
         </dl>
         <p className="helper-text">
           {SOURCE_SNAPSHOT_EXPLANATION}{' '}
-          <Link className="text-link" to="/import">
-            Open current Import review
+          <Link className="text-link" to="/sources">
+            Open Sources for current import review
           </Link>
           .
         </p>

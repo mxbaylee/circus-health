@@ -2,6 +2,27 @@
 
 Clinical review saves the valid, explicitly selected records and returns an exact outcome for every selection. A stale or invalid independent record does not undo another person's valid review work. A self-tracker should not repeat nine approvals because a tenth result changed; a caregiver must know which person's records actually saved.
 
+Packets disclose partly reviewed reports as “X of Y current report items reviewed
+and saved.” The implementation lead retained this policy on 2026-10-16 under the
+owner's delegated persona guidance. It lets the High-precision tracker finish
+independent approvals while telling the Receiving clinician that review remains
+incomplete. Counts stay within the selected person's relevant reports, protecting
+the Caregiver's attribution and the Privacy-sensitive patient's sharing choices.
+They describe source-report review, not packet membership, complete reading or
+source-text attestation. Sharing a report does not by itself couple every record
+into one save; shared clinical effects still require an atomic commit. Whole-panel
+coupling was considered and not adopted for otherwise independent records.
+
+Saved report items follow the current clinical record owner, including after an
+individual ownership correction. Pending items count only when the current
+clinical review unambiguously assigns them to the packet's person. Items assigned
+to someone else or with unresolved ownership are excluded from both counts;
+the resulting denominator does not establish whole-report completion. Packet
+evidence names the person and marks this as `countScope: "current_person"`.
+The server prepares represented native proposal scopes before taking a fresh
+snapshot. Direct host callers that need pending-report counts must supply the
+authorized storage context; missing context produces an explicit refusal.
+
 ## Approval authority and commit boundaries
 
 The browser opts into `mode: "partial-v1"`. Each selected occurrence carries the server's `selectionReviewToken`, its intake/proposal, record ID, candidate/version, reviewed mapping and comparison decisions. The UI retains that selection snapshot across background refreshes. Detail approval waits until its own answer/draft write has finished and the acknowledged review version is displayed. It cannot replace the person's approved values with a fresh server mapping. A changed draft, source interpretation, identity assignment, candidate or chosen comparison destination requires explicit review again.
@@ -24,6 +45,88 @@ Clinical rows, source occurrences, destination updates, identity attribution and
 
 Source-text approval and clinical acceptance remain separate assertions. Saving a record does not approve its text. Changed source dependencies require fresh interpretation/review. The source-text acceptance gate and any combined approval interaction remain tracked in [CRS-129](../todo/CRS-129.md).
 
+## Review token dependencies
+
+Tokens protect reviewed evidence, not just the text currently visible on screen.
+The inventory below distinguishes selective dependencies from deliberately broad
+guards:
+
+- **Clinical proposal review:** the base token binds original/proposal identity
+  and hashes, source version, active mapping rules, complete record reviews and
+  source context. A proposal with measured source dependencies and no existing
+  duplicate, comparison or unvisited comparison-page dependencies omits the
+  unrelated global clinical revision. Unknown-source and whole-source reviews,
+  and reviews involving existing destinations, retain that broad guard: a
+  destination ID or visible comparison page does not capture all provenance and
+  history. Both legacy and native wrappers still bind complete enriched records,
+  including drafts, questions, identity policy and comparison scopes.
+- **Individual clinical selection:** the token binds profile, original and
+  proposal hashes, measured proposal source dependencies, source-stale status and
+  the complete enriched record. Advisory comparison discovery and transport pins
+  are excluded; chosen comparisons are separately validated against exact durable
+  destination evidence during each atomic group. A refreshed display cannot
+  replace the person's approved mapping or choices.
+- **Proposal source validity:** measured page/span dependencies distinguish
+  unrelated capture from a relevant source change. Unmeasured or whole-source
+  proposals retain the source revision/dependency fallback. This mechanism does
+  not declare an unread page clinically complete.
+- **Identity review and People matching:** exact report/subject evidence,
+  historical membership, pending targets, questions, Self and current People
+  state remain protected. The native matching sessions retain global clinical
+  revision checks because competing subjects, aliases and remembered identity
+  decisions can change matching. A complete narrower dependency proof is not
+  available; these tokens are not relaxed merely because visible names match.
+- **Report source review:** exact report group/member, original hash, group
+  version, selected entries and source evidence remain protected. These scope
+  tokens do not include a global clinical revision to remove.
+- **Draft repair:** the selected edit proposal binds profile, intake version,
+  group, original hash, exact selected rows, permitted fields, before-values and
+  evidence locators. Its intake-version guard remains broad. Active mapping rules
+  also remain part of clinical review and final publication checks.
+
+The relevant owners are `clinical-import.ts`, `intake.ts`,
+`intake-review-collection-session.ts`, `intake-selection-authority.ts`, the
+source-dependency modules and the identity, People, report-source and draft-repair
+modules. Narrowing the base clinical token does not weaken those other owners.
+
+## Planning large selections
+
+The browser sends the exact retained approvals to the server's acceptance planner
+before saving. The planner groups shared source assertions, chosen comparison
+destinations, retained relationship decisions and automatic duplicate effects
+before assigning operations. If everything fits within 1000 selections,
+100 proposal blocks and 64 MiB of retained proposal/original bytes, it remains one
+operation. Otherwise the planner targets 200 selections per operation, keeping
+each coupled group intact even when that makes an operation larger than 200.
+Every admitted operation still obeys all three server limits.
+
+A coupled group that cannot fit is listed as not sent, with its reason;
+independent admitted groups can proceed. Missing dependency evidence is not
+evidence of independence: an incomplete dependency inventory refuses the
+selected scope. The plan is disposable admission state, not approval or recovery
+authority. Its exact selections remain bound to the current profile and source,
+and each save retains the normal current-evidence and authorization checks.
+Expired or evicted plans require another explicit review/save action for unsent
+work; an already issued operation is reconciled by its original operation ID.
+
+Before a new plan or direct partial save, older whole-value intakes are prepared
+using the existing V4 collection conversion. This can publish representation
+metadata, but does not save clinical records or replace the person's approved
+selection. Conversion finishes before planning captures its dependency checks;
+later groups cannot use conversion to reset those checks. Existing operation
+receipts are recovered before conversion work. Original files, public intake
+versions and approval tokens retain their meaning. Conversion and the combined
+first save must be counted separately from subsequent saves when measuring work.
+This adds no new retained storage format. Legacy atomic and single-proposal
+compatibility paths have separate preparation behavior.
+
+An adopted legacy draft keeps the original complete inline canonical input for
+its approval proof, even when the displayed draft uses paged history references.
+That input includes inactive resolutions, corrections and retained literal
+values; changing them still changes the proof. The native v2 draft's existing
+history-and-policy proof is unchanged. Presentation references do not authorize
+new values or silently refresh an earlier approval.
+
 ## Outcomes and recovery
 
 A version 1 partial receipt has `atomic: false`, `status: "completed"` and an immutable result per selected item:
@@ -35,11 +138,34 @@ A version 1 partial receipt has `atomic: false`, `status: "completed"` and an im
 
 Each item includes its original selection token, reviewed-selection hash, deterministic child operation ID and bounded optional record label, kind, assigned person ID and report name. The browser resolves the person's current name when displaying an outcome, so identical names also show distinguishing person details; older receipts use a neutral report fallback. The stable parent operation manifest is written once. Item results are separate bounded journaled records, committed alongside the affected clinical rows; children do not append a growing copy of the parent request or preceding results. SQLite is a rebuildable projection, not the recovery authority.
 
+New saves pack independent selections from the same proposal into clinical
+transactions of at most 200 items, including small selections. This avoids
+repeating a complete selected-proposal preparation for each item while retaining
+individual outcomes. Coupled groups keep their own atomic boundary. Recovery
+does not repack an older operation: its original child IDs and committed
+receipts remain authoritative, and interrupted items require a new explicit save.
+
+Saved lists share one People lookup. If person details fail to load, a retry
+refreshes those labels while preserving each exact record destination. Links
+remain unavailable until current record ownership resolves; an old receipt does
+not imply that a record still belongs to Self.
+
 A lost HTTP reply or ambiguous durable-head acknowledgement is **Checking save status**, not a final failure. Retain the original operation ID and reconcile its journal before retrying. A receipt lookup never performs new clinical acceptance. After recovery, interrupted uncommitted items become not attempted; they require a new explicit approval and operation. Replaying the original parent returns its completed results without duplicating publication, including after restart/rebuild. Changed content or changing between atomic and partial modes under the same operation ID conflicts. Lock and profile authorization apply to every call.
 
 The browser retains only an opaque operation ID in session storage; clinical request contents remain in memory. An absent receipt while the transport outcome is unknown does not authorize a fresh operation. On reload, saved manifest results can be recovered by the original ID. When no manifest is available, the UI keeps the uncertainty visible instead of guessing that the request failed.
 
-Only confirmed saved selections are removed. An expanded saved row closes after its own save settles and its current draft guard permits leaving; a newer unfinished edit or replacement editor remains open. A submitted item needing review loses its stale checkbox and approval snapshot, retains its editor, and needs a fresh explicit approval; a changed displayed token does the same. Items omitted from an operation are shown as not sent, with a reason, without being counted as saved. The overview sends more than 1000 selected records as sequential operations of at most 200 selections; a child with an unknown outcome stops later children. Confirmed child receipts combine into one summary, including a child reconciled later by its original ID. A background feed response describing an item as saved is not acknowledgement of a newer local edit. Receipt links refer to exact returned entity IDs; current ownership is resolved separately, because later ownership corrections do not rewrite historical receipts. People operations use their own outcomes and are submitted separately from clinical selection saves.
+Only confirmed saved selections are removed. An expanded saved row closes after its own save settles and its current draft guard permits leaving; a newer unfinished edit or replacement editor remains open. A submitted item needing review loses its stale checkbox and approval snapshot, retains its editor, and needs a fresh explicit approval; a changed displayed token does the same. Items omitted from an operation are shown as not sent, with a reason, without being counted as saved. Planned operations run sequentially; a child with an unknown outcome stops later children. The combined summary accounts for confirmed results, every selection in the unknown child and every unsent successor. Reconciliation by the original operation ID replaces that child's unknown status without automatically issuing its successors. A background feed response describing an item as saved is not acknowledgement of a newer local edit. Receipt links refer to exact returned entity IDs and visibly name the current owner, including distinguishing details for alike-named people. Until current ownership resolves, the destination stays neutral and is not a link; missing ownership never guesses Self. Later ownership corrections do not rewrite historical receipts. People operations use their own outcomes and are submitted separately from clinical selection saves.
+
+Import upload and review are entered from Sources. Sources remains selected in
+the sidebar while an import review is open; exact review and recovery routes
+remain available within that workflow. Planning and save responses are scoped
+to the active profile and view generation. Lock, profile changes or leaving and
+returning cannot let a late response submit successors or mark the new view saved.
+Within the same authorized profile, an issued operation's exact receipt or
+unknown status remains available after the review view changes. Recovering that
+evidence does not apply old selection marks or progress to the new view, and it
+does not resume unsent groups. Ordinary refreshes of the same review view retain
+its scope; changing a filter and returning starts a new view generation.
 
 Exact-record detail recovery matches the intake, proposal and record across all receipt blocks, including multiple saved siblings from one partial operation. A confirmed receipt hides repeat save controls for that exact candidate/version immediately, while refreshed review data is still arriving.
 
@@ -100,9 +226,19 @@ The native overview disables clinical and People save controls while a source op
 
 The shared person chooser retains the exact selected Person and keyboard focus through refresh. Duplicate names include birth date, relationship and stable identifiers. The same canonical Self-name and saved-alias rule prevents creating a second Self through report assignment or People proposal acceptance. Caregivers may still confirm current medication use for relatives; exact record/version and active-profile authorization apply. Relative records, counts and charts remain separate from Self.
 
-Current limitations, open in [CRS-141](../todo/CRS-141.md): above 1000 selections, a coupled group can be split across two operations; journaled bytes grow faster than the selection within one operation, and each sequential operation on a large intake costs more than the last; saved outcomes do not name the person.
+A coupled group that exceeds one operation’s limits remains unsent with an explanation. Planning cannot authorize splitting that group, and an unknown child outcome prevents later operations from starting. These admission and recovery limits apply even when other selected records are independent.
 
 ## Regression evidence and implementation boundaries
+
+Private candidate getters share one checked read scope for each synchronous
+`get`, bounded `range` or byte-chunk operation. Entry and exit verify the original
+source and selected authority, including a physical accepted-head check; the
+final witness must still match the original one. Every tree node retains its
+read, hash/reference validation and scratch-signature checks. Reentrant calls
+invalidate the scope, and failures revoke its scratch. Transactions, publication,
+finalization and roster iteration retain their separate checks. This reduces
+repeated authority checks within a getter; it does not establish bounded work for
+an entire bulk save.
 
 Native queue preparation retains ownership of its active disposable scratch
 database until it has rolled back or completed. Clearing the queue cache revokes
@@ -114,7 +250,16 @@ scratch. The focused `intake-queue-lifecycle.test.ts` covers profile closure and
 cache clearing with an open profile. This does not establish the cause of every
 browser connection reset or replace the complete Stop/reload/Resume journey.
 
-The implementation and independently fictional tests below cover the current contracts. Count tests measure one prepared original review context and journal writes, bytes and rows at 10, 50 and 200 selections; a separate multi-proposal test verifies one original context for three distinct proposal blocks. Each distinct proposal still requires its own retained-byte validation and exact review token. A 500-selection yielded save serves a read before completion. Real process-restart browser coverage replays the original operation. Person badge/list checks use mounted per-path API responses; they are not a full destination-page browser journey. The overview's approval state, outcome rendering, identity controls and source controls, plus the detail identity panel, are split into smaller modules. The detail record editor remains in its existing component.
+The independently fictional fixtures below exercise these contracts. Small count fixtures include initial V4 preparation in journal writes, bytes and rows at 10, 50 and 200 selections and distinguish it from later native review preparation. Preparation-call counts include initial review and selected commit projection; they are not complete-intake reread counts. The larger fixture measures actual 200-versus-800 saves and five successive 200-item saves, including accepted objects, heads, frames, receipts, every main SQL table, proposal-file work, intake processing and accepted-version serialization. It rejects missing SQL audit coverage and checks original bytes, exact values and reconstruction from durable records. A 500-selection yielded-save fixture checks foreground reads. The browser journey exercises two alike-named people, stale approval, lost-reply recovery, exact destinations and original-operation replay after a real process restart. The overview's approval state, outcome rendering, identity controls and source controls, plus the detail identity panel, are split into smaller modules. The detail record editor and its presentation helpers live in `ImportRecordDetail.tsx`; `ImportDetailReview.tsx` retains report coordination and the existing draft, scope and navigation guards.
+
+SQL mutation counts include speculative work that later rolls back. Their byte
+counts sum logical column values, not SQLite page, index or WAL sizes; accepted
+object, head and frame bytes are measured separately. Replacement preimages are
+read from the current database state so a rollback cannot leave a stale byte
+count. The special `__record_state` accounting follows its current `REPLACE`
+writer and must be revisited if that writer changes to ignored inserts or
+update-style upserts. Comparisons at two sizes and five equivalent chunks are
+evidence for those fixtures, not a proof for every intake shape.
 
 - Counts/links and owner interpretation (R19/R28): `PersonClinicalRecords`, the existing `/record-owner` resolver, shared `person-scope` helpers and `SavedRecordDestinations`; `clinical-person-ownership.test.ts`, `person-clinical-records.test.tsx`, `person-scope.test.ts` and `import-review-reliability.test.tsx`.
 - Caregiver medication activity (R20): existing `setMedicationCurrentStatus`/`appendMedicationPreference` behavior; `clinical-person-ownership.test.ts` and encrypted person-scope browser journeys.

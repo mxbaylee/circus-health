@@ -86,16 +86,28 @@ function context(host: NativeAssistantConversion, checkpoint: NativeAssistantChe
   )
     throw Error('Native attribution reference conflicts');
   checkpoint.attribution = reference;
-  const commit = (changes: readonly IntakeCollectionChange[]) => {
-    assertCurrent();
+  const commit = async (
+    changes: readonly IntakeCollectionChange[],
+    assertRunning: () => void = () => {},
+  ) => {
+    const guard = () => {
+      assertCurrent();
+      assertRunning();
+    };
+    guard();
     const operationId = randomUUID();
     store.commitMaintenance(
-      store.prepare(store.openView(), {
-        operationId,
-        requestDigest: hash(operationId),
-        domainVersion: intakeSourceVersion(host.db, host.id).rawVersion,
-        changes,
-      }),
+      await store.prepareAsync(
+        store.openView(),
+        {
+          operationId,
+          requestDigest: hash(operationId),
+          domainVersion: intakeSourceVersion(host.db, host.id).rawVersion,
+          changes,
+        },
+        guard,
+      ),
+      { assertCurrent: guard },
     );
   };
   const put = (key: string, value: unknown) => ({
@@ -157,20 +169,23 @@ export async function importNativeAttribution(
   await writer.put('legacyImported', 'true');
   await writer.flush();
   check();
-  ctx.commit([
-    {
-      area: 'builds',
-      collection: ctx.collection,
-      op: 'adoptCollection',
-      fromArea: 'builds',
-      fromCollection: attempt,
-    },
-  ]);
+  await ctx.commit(
+    [
+      {
+        area: 'builds',
+        collection: ctx.collection,
+        op: 'adoptCollection',
+        fromArea: 'builds',
+        fromCollection: attempt,
+      },
+    ],
+    check,
+  );
   checkpoint.attribution = reference;
 }
 /** One bounded legacy arithmetic object reuses its exact timing/read semantics.
  * It contains only the addressed scope/window, never the retained collections. */
-export function recordNativeAttributionRead(
+export async function recordNativeAttributionRead(
   host: NativeAssistantConversion,
   checkpoint: NativeAssistantCheckpoint,
   windowKey: string,
@@ -200,7 +215,7 @@ export function recordNativeAttributionRead(
       },
     };
   const result = recordAttributionRead(scratch, windowKey, scope, textLayerCharacters, durationMs);
-  ctx.commit([
+  await ctx.commit([
     ctx.put('reference', ctx.reference),
     ctx.put('window:' + hash(windowKey), scratch.attribution.windows[windowKey]),
     ...(result.scopeKey
@@ -209,7 +224,7 @@ export function recordNativeAttributionRead(
   ]);
   return result;
 }
-export function acknowledgeNativeAttributionRead(
+export async function acknowledgeNativeAttributionRead(
   host: NativeAssistantConversion,
   checkpoint: NativeAssistantCheckpoint,
   scopeKey: string,
@@ -235,7 +250,7 @@ export function acknowledgeNativeAttributionRead(
     },
   };
   acknowledgeAttributionRead(scratch, scopeKey);
-  ctx.commit([ctx.put('scope:' + scopeKey, target)]);
+  await ctx.commit([ctx.put('scope:' + scopeKey, target)]);
 }
 async function updateRequest(
   host: NativeAssistantConversion,
@@ -284,11 +299,11 @@ async function updateRequest(
     if (fits) {
       await setImmediate();
       check();
-      ctx.commit(changes);
+      await ctx.commit(changes, check);
       return scopes;
     }
   }
-  ctx.commit(
+  await ctx.commit(
     before === undefined
       ? [
           {
@@ -308,6 +323,7 @@ async function updateRequest(
             fromCollection: ctx.collection,
           },
         ],
+    check,
   );
   const writer = createEnvelopeBuildWriter(
     host.db,
@@ -319,15 +335,18 @@ async function updateRequest(
   for (const change of updated()) await writer.put(change.key, change.value);
   await writer.flush();
   check();
-  ctx.commit([
-    {
-      area: 'builds',
-      collection: ctx.collection,
-      op: 'adoptCollection',
-      fromArea: 'builds',
-      fromCollection: attempt,
-    },
-  ]);
+  await ctx.commit(
+    [
+      {
+        area: 'builds',
+        collection: ctx.collection,
+        op: 'adoptCollection',
+        fromArea: 'builds',
+        fromCollection: attempt,
+      },
+    ],
+    check,
+  );
   return scopes;
 }
 /** scopeKeys are the bounded current provider request's exposed host call IDs. */

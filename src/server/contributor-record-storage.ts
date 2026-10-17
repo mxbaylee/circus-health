@@ -127,6 +127,87 @@ interface ContributorOwnPublicationReceipt {
   overflow: boolean;
 }
 const readOwnerFactories = new WeakMap<object, ContributorReadOwner>();
+interface ContributorStorageWork {
+  reads: number;
+  readBytes: number;
+  immutableWrites: number;
+  immutableBytes: number;
+  headWrites: number;
+  headBytes: number;
+}
+interface ContributorStorageObservation {
+  work: ContributorStorageWork;
+  events: { name: string; bytes: number }[];
+  limit: number;
+  dropped: number;
+}
+const storageObservations = new WeakMap<object, ContributorStorageObservation>();
+/** Optional inert diagnostics for successful logical factory transport calls.
+ * Includes ordinary and private staged writes/installations and retained HEAD
+ * reads. Does not measure filesystem readback, hashing, certificate scans or
+ * physical I/O, including an installation that fails during readback. No
+ * callback runs inside a proof or publication boundary.
+ * Event retention is explicitly bounded; overflow invalidates attribution.
+ */
+export function observeContributorRecordStorageWork(storage: object, eventLimit = 0) {
+  const owner = readOwnerFactories.get(storage);
+  if (!owner || !readOwnerMethodsCurrent(owner)) fail('diagnostic factory unavailable');
+  if (!Number.isSafeInteger(eventLimit) || eventLimit < 0 || eventLimit > 1_000_000)
+    fail('diagnostic event bound');
+  if (storageObservations.has(storage)) fail('diagnostic already active');
+  const observation: ContributorStorageObservation = {
+    work: {
+      reads: 0,
+      readBytes: 0,
+      immutableWrites: 0,
+      immutableBytes: 0,
+      headWrites: 0,
+      headBytes: 0,
+    },
+    events: [],
+    limit: eventLimit,
+    dropped: 0,
+  };
+  storageObservations.set(storage, observation);
+  return {
+    snapshot() {
+      return { ...observation.work };
+    },
+    eventCount() {
+      return observation.events.length;
+    },
+    events(from = 0) {
+      if (!Number.isSafeInteger(from) || from < 0) fail('diagnostic event cursor');
+      return {
+        events: observation.events.slice(from).map((event) => ({ ...event })),
+        count: observation.events.length,
+        dropped: observation.dropped,
+      };
+    },
+    close() {
+      if (storageObservations.get(storage) === observation) storageObservations.delete(storage);
+    },
+  };
+}
+function observeStorageRead(storage: object, bytes: Buffer | null): void {
+  const observation = storageObservations.get(storage);
+  if (!observation) return;
+  observation.work.reads++;
+  observation.work.readBytes += bytes?.length ?? 0;
+}
+function observeStorageWrite(storage: object, name: string, bytes: number): void {
+  const observation = storageObservations.get(storage);
+  if (!observation) return;
+  if (name === 'head') {
+    observation.work.headWrites++;
+    observation.work.headBytes += bytes;
+  } else {
+    observation.work.immutableWrites++;
+    observation.work.immutableBytes += bytes;
+    if (observation.events.length < observation.limit) observation.events.push({ name, bytes });
+    else if (observation.limit) observation.dropped++;
+  }
+}
 const ownDescriptor = Object.getOwnPropertyDescriptor;
 declare const readOwnerBrand: unique symbol;
 export interface ContributorRecordReadOwner {
@@ -345,6 +426,7 @@ export function contributorRecordReadOwnerHeadBytes(
     readOwnerMethodsCurrent(owner);
   if (!selected()) fail('record read owner changed before retained HEAD read');
   const bytes = data!.physical.read(resolve(owner!.base, 'head'));
+  observeStorageRead(storage, bytes);
   if (!selected()) fail('record read owner changed after retained HEAD read');
   return bytes;
 }
@@ -438,6 +520,29 @@ export function contributorLegacyBridgeBackingScopeCurrent(
   );
 }
 
+/** Interval checks only: this does not authenticate physical paths or HEAD
+ * bytes. A fixed legacy verifier must enclose its native read with the genuine
+ * owner's full physical check and fresh retained HEAD read. */
+export function contributorLegacyBridgeBackingIntervalCurrent(
+  storage: object,
+  original: ContributorRecordReadOwner,
+  witness: ContributorLegacyBridgeBackingScope,
+): boolean {
+  const data = legacyBridgeScopes.get(witness),
+    read = readOwners.get(original);
+  return (
+    !!data &&
+    !!read &&
+    data.owner.storage === storage &&
+    data.original === original &&
+    read.owner === data.owner &&
+    read.selection === data.owner.selection() &&
+    readOwnerMethodsCurrent(data.owner) &&
+    data.owner.immutableSequence() === data.sequence &&
+    managedPhysicalScopeCurrent(data.scope)
+  );
+}
+
 declare const headPublicationBrand: unique symbol;
 export interface ContributorRecordHeadPublication {
   readonly [headPublicationBrand]: true;
@@ -473,6 +578,7 @@ export function prepareContributorRecordHeadPublication(
   const original = captureContributorRecordReadOwner(storage)!;
   try {
     const commit = readFile(resolve(owner.base, name));
+    observeStorageRead(storage, commit);
     if (
       !commit ||
       commit.length !== bytes ||
@@ -656,7 +762,9 @@ export function openContributorRecordStorage(
     };
     const storage: ContributorRecordStorage = {
       read(value) {
-        return readFile(name(value));
+        const bytes = readFile(name(value));
+        observeStorageRead(storage, bytes);
+        return bytes;
       },
       writeImmutable(value, bytes) {
         name(value);
@@ -674,12 +782,14 @@ export function openContributorRecordStorage(
           pendingOrdinaryOverflow = true;
           throw error;
         }
+        observeStorageWrite(storage, value, bytes.byteLength);
       },
       publishHead(bytes) {
         name('head');
         const previous = readFile(resolve(base, 'head'))?.toString('utf8') ?? null,
           head = Buffer.from(bytes).toString('utf8');
         write('head', bytes, false);
+        observeStorageWrite(storage, 'head', bytes.byteLength);
         selection = Object.freeze({});
         lastPublication = {
           selection,
@@ -707,6 +817,7 @@ export function openContributorRecordStorage(
       close() {
         if (closed) return;
         closed = true;
+        storageObservations.delete(storage);
         pendingOrdinaryWrites = [];
         lastPublication = undefined;
         const disposals = retainedDisposals.get(storage);
@@ -758,6 +869,7 @@ export function openContributorRecordStorage(
         lastPublication = undefined;
         name('head');
         write('head', bytes, false);
+        observeStorageWrite(storage, 'head', bytes.byteLength);
         selection = Object.freeze({});
       },
       stage: (value, bytes) => {
@@ -766,6 +878,7 @@ export function openContributorRecordStorage(
         name(value);
         immutableSequence++;
         if (!write(value, bytes, true)) fail('staged object was not newly created');
+        observeStorageWrite(storage, value, bytes.byteLength);
       },
     });
     return storage;

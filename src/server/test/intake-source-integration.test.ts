@@ -1,5 +1,7 @@
 import test from 'node:test';
-import type { Intake } from '../../shared/intake.ts';
+import type { Intake, IntakeProposal, IntakeReviewRecord } from '../../shared/intake.ts';
+import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
+import { readIntakeReviewValue } from '../intake-review-collection.ts';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,7 +13,7 @@ import { attachRecordDurability } from '../record-versions.ts';
 import * as intake from '../intake.ts';
 import { intakeSourceRoute } from '../intake-source-routes.ts';
 import { getIntakeSourceText, reviewIntakeSourceText } from '../intake-source-text.ts';
-import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
+import { acceptIntakeReportSelectionAsync } from '../intake-report-acceptance.ts';
 import { fictionalModel } from './fictional-model.ts';
 
 test('source corrections stale original/proposal review; identical fresh payload needs a new candidate review', async (t) => {
@@ -134,37 +136,63 @@ test('source corrections stale original/proposal review; identical fresh payload
   assert.throws(() => prepared.apply(before.version), /version|changed|reload/i);
   // A real source correction invalidates the earlier approval, even when its clinical
   // payload still looks identical. Transport refresh cannot grant new approval.
-  const partial = acceptIntakeReportSelection(db, root, profileId, {
-    operationId: randomUUID(),
-    mode: 'partial-v1',
-    blocks: [
-      {
-        intakeId: original.id,
-        proposalId,
-        intakeVersion: before.version,
-        reviewToken: before.reviewToken,
-        selections: before.records.map((record) => ({
-          recordId: record.id,
-          candidateId: record.candidateId!,
-          candidateVersionId: record.candidateVersionId!,
-          selectionReviewToken: record.selectionReviewToken,
-          mapping: record.mapping,
-        })),
-      },
-    ],
-  }).receipt;
+  const partial = (
+    await acceptIntakeReportSelectionAsync(db, root, profileId, {
+      operationId: randomUUID(),
+      mode: 'partial-v1',
+      blocks: [
+        {
+          intakeId: original.id,
+          proposalId,
+          intakeVersion: before.version,
+          reviewToken: before.reviewToken,
+          selections: before.records.map((record) => ({
+            recordId: record.id,
+            candidateId: record.candidateId!,
+            candidateVersionId: record.candidateVersionId!,
+            selectionReviewToken: record.selectionReviewToken,
+            mapping: record.mapping,
+          })),
+        },
+      ],
+    })
+  ).receipt;
   assert.equal(partial.atomic, false);
   if (partial.atomic) throw new Error('Expected partial receipt');
   assert.equal(partial.acceptedCount, 0);
   assert.equal(partial.items[0]!.status, 'needs_review');
   assert.equal(partial.items[0]!.reasonCode, 'SELECTION_REVIEW_CHANGED');
   assert.equal(db.prepare('SELECT COUNT(*) n FROM observations').get()!.n, 0);
+  const selectedReview = async (proposalId: string | null) => {
+    const read = await intake.reviewIntakeRead(db, root, profileId, original.id, proposalId, {
+      section: 'records',
+      items: 2,
+    });
+    assert.ok('format' in read && read.format === 'health-intake-clinical-review-page-v2');
+    if (!('items' in read)) throw Error('Expected a native clinical review page');
+    assert.equal(read.total, 1);
+    assert.equal(read.nextCursor, null);
+    const item = read.items[0]!;
+    assert.equal(item.kind, 'value');
+    if (item.kind !== 'value') throw Error('Fictional selected record must fit inline');
+    return { ...read, record: item.value as IntakeReviewRecord };
+  };
+  const latestProposal = () => {
+    const view = openIntakeCollectionEnvelope(db, { id: original.id });
+    const selected = view.child(view.root(), 'intake')!;
+    const proposal = view.childAt(
+      selected,
+      'proposals',
+      view.childCount(selected, 'proposals') - 1,
+    )!;
+    return readIntakeReviewValue<IntakeProposal>(view, proposal, 65536);
+  };
   for (const selected of [null, proposalId]) {
-    const stale = intake.reviewIntake(db, root, profileId, original.id, selected);
+    const stale = await selectedReview(selected);
     assert.equal(stale.sourceTextStale, true);
-    assert.throws(
+    await assert.rejects(
       () =>
-        intake.prepareIntakeImport(db, root, profileId, original.id, {
+        intake.importIntakeRead(db, root, profileId, original.id, {
           version: stale.version,
           proposalId: selected,
           reviewToken: stale.reviewToken,
@@ -173,26 +201,26 @@ test('source corrections stale original/proposal review; identical fresh payload
       { code: 'SOURCE_TEXT_CHANGED' },
     );
   }
-  original = intake.getIntake(db, root, profileId, original.id);
-  const fresh = intake.proposeConversion(
+  const current = intake.getIntakeRead(db, root, profileId, original.id);
+  await intake.proposeConversionRead(
     db,
     root,
     profileId,
     original.id,
     {
-      version: original.version,
+      version: current.version,
       jsonlText,
       summary: 'Fresh fictional review required',
     },
     { observedSourcePages: [{ intakeId: original.id, pages: [1] }] },
   );
-  const freshId = fresh.proposals.at(-1)!.id;
+  const freshId = latestProposal().id;
   assert.notEqual(freshId, proposalId);
-  const after = intake.reviewIntake(db, root, profileId, original.id, freshId);
+  const after = await selectedReview(freshId);
   assert.equal(after.sourceTextStale, false);
-  assert.notEqual(after.records[0]!.candidateVersionId, before.records[0]!.candidateVersionId);
-  assert.equal(after.records[0]!.reviewState, 'pending');
-  assert.equal(after.records[0]!.draft, null);
+  assert.notEqual(after.record.candidateVersionId, before.records[0]!.candidateVersionId);
+  assert.equal(after.record.reviewState, 'pending');
+  assert.equal(after.record.draft, null);
   assert.equal(
     intake.getIntakeOriginal(db, root, profileId, original.id).bytes.toString(),
     jsonlText,
@@ -228,19 +256,16 @@ test('source corrections stale original/proposal review; identical fresh payload
   assert.notEqual(noOp.revision!.id, firstConfirm.revision!.id);
   assert.equal(firstConfirm.revision!.parentRevisionId, corrected.revision!.id);
   assert.equal(noOp.revision!.parentRevisionId, firstConfirm.revision!.id);
-  const afterConfirm = intake.reviewIntake(db, root, profileId, original.id, freshId);
+  const afterConfirm = await selectedReview(freshId);
   assert.equal(afterConfirm.sourceTextStale, false);
   assert.equal(afterConfirm.reviewToken, after.reviewToken);
-  const latestOriginal = intake.getIntake(db, root, profileId, original.id);
-  const pinned = intake.proposeConversion(db, root, profileId, original.id, {
+  const latestOriginal = intake.getIntakeRead(db, root, profileId, original.id);
+  await intake.proposeConversionRead(db, root, profileId, original.id, {
     version: latestOriginal.version,
     jsonlText,
     summary: 'Fictional exact revision provenance',
   });
-  assert.equal(pinned.proposals.at(-1)!.sourceTextRevisionId, corrected.revision!.id);
-  assert.equal(
-    intake.reviewIntake(db, root, profileId, original.id, pinned.proposals.at(-1)!.id)
-      .sourceTextStale,
-    false,
-  );
+  const pinned = latestProposal();
+  assert.equal(pinned.sourceTextRevisionId, corrected.revision!.id);
+  assert.equal((await selectedReview(pinned.id)).sourceTextStale, false);
 });

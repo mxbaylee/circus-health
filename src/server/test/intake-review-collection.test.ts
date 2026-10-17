@@ -18,6 +18,7 @@ import { openDatabase, transaction } from '../database.ts';
 import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
 import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state-storage.ts';
 import { memoryRecordAuthority } from './helpers/intake-authority-fixture.ts';
+import { intakeNamespace } from '../intake-state-evidence.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { buildVerifiedWorkflowSummary } from '../intake-workflow-state.ts';
 import { openIntakeCollectionEnvelope } from '../intake-collection-envelope.ts';
@@ -111,7 +112,7 @@ async function fixture(
 ) {
   const root = mkdtempSync(join(tmpdir(), 'fictional-review-scope-'));
   const db = openDatabase(join(root, 'cache.sqlite'), 'fictional-profile');
-  memoryRecordAuthority(db);
+  const authority = memoryRecordAuthority(db);
   t.after(() => {
     clearIntakeStateCache(db);
     db.close();
@@ -169,7 +170,7 @@ async function fixture(
     t.after(() => scope.close?.());
     return scope;
   };
-  return { db, details, open, root };
+  return { db, details, open, root, authority };
 }
 function detailsFor() {
   const details: {
@@ -411,6 +412,239 @@ test('selected report headers reuse authenticated fields only within the supplie
   assert.deepEqual(scope.group(reference), first);
   assert.equal(pages - changedReference, referencePages);
 });
+
+test('native competing identity skips unrelated headers for complete unprinted boundaries beyond the header cache', async (t) => {
+  const count = 35;
+  const fallbackEntries = validateJSONL(
+    Buffer.from(
+      Array.from({ length: count }, (_, n) => {
+        const value = input('unprinted-' + n);
+        return JSON.stringify({ ...value, report: undefined });
+      }).join('\n'),
+    ),
+  ).entries!;
+  const f = await fixture(t, (details) => {
+    delete details.workflow;
+    recordCandidateVersions(file, details, fallbackEntries, proposalId);
+  });
+  let headerFields = 0,
+    groupPages = 0,
+    receiptPages = 0;
+  const scope = f.open(
+    undefined,
+    (view) => {
+      const field = view.field.bind(view),
+        children = view.children.bind(view);
+      view.field = (...args) => {
+        headerFields++;
+        return field(...args);
+      };
+      view.children = (...args) => {
+        if (args[1] === 'reportGroups') groupPages++;
+        if (args[1] === 'identityConfirmations') receiptPages++;
+        return children(...args);
+      };
+    },
+    () => reviewReadStamp(f.db),
+  );
+  const groups = Array.from(scope.groupRecords(), (record) => scope.groupHeader(record));
+  assert.equal(groups.length, count);
+  assert.ok(groups.every((group) => group.basis === 'candidate_fallback' && !group.report));
+  headerFields = groupPages = receiptPages = 0;
+  const before = intakeWorkCounters(f.db).warm;
+  withIntakeWork(f.db, 'warm', () => {
+    for (const group of groups)
+      assert.equal(
+        scope.competingBoundaryUnrepaired(group, undefined, {
+          candidateId: 'fictional-candidate',
+          candidateVersionId: 'fictional-version',
+          proposalId,
+          recordId: 'fictional-record',
+          title: 'Fictional',
+          issueId: 'identity',
+        }),
+        false,
+      );
+  });
+  const after = intakeWorkCounters(f.db).warm;
+  t.diagnostic(
+    JSON.stringify({
+      groups: count,
+      headerFields,
+      groupPages,
+      receiptPages,
+      nodeReads: after.collectionNodeReads - before.collectionNodeReads,
+      nodeHits: after.collectionNodeCacheHits - before.collectionNodeCacheHits,
+      witnessQueries: after.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
+    }),
+  );
+  assert.equal(headerFields, 0, 'unprinted selected boundaries do not decode unrelated headers');
+  assert.equal(groupPages, 0, 'unprinted selected boundaries do not enumerate report groups');
+  assert.equal(receiptPages, 0, 'unprinted selected boundaries need no identity receipt scan');
+  assert.ok(
+    after.collectionReadWitnessQueries - before.collectionReadWitnessQueries <= count * 32,
+    'entry and exit authority checks stay bounded per selected unprinted boundary',
+  );
+  assert.ok(
+    after.collectionNodeReads -
+      before.collectionNodeReads +
+      after.collectionNodeCacheHits -
+      before.collectionNodeCacheHits <=
+      count * 64,
+    'all authenticated tree visits stay bounded without enumerating other groups',
+  );
+});
+
+test('native competing identity uses the complete policy ineligible predicate without cache hooks', async (t) => {
+  const f = await fixture(t);
+  let reads = 0;
+  const scope = f.open(undefined, (view) => {
+    const children = view.children.bind(view);
+    view.children = (...args) => {
+      reads++;
+      return children(...args);
+    };
+  });
+  const group = scope.groupHeader(Array.from(scope.groupRecords())[0]!);
+  const target = {
+    candidateId: 'fictional-candidate',
+    candidateVersionId: 'fictional-version',
+    proposalId,
+    recordId: 'fictional-record',
+    title: 'Fictional',
+    issueId: 'identity',
+  };
+  reads = 0;
+  for (const report of [
+    null,
+    { ...group.report!, anchor: undefined },
+    { ...group.report!, subject: { locator: 'page 1', text: '  \n ' } },
+  ])
+    assert.equal(
+      scope.competingBoundaryUnrepaired(
+        { ...group, report: report as typeof group.report },
+        undefined,
+        target,
+      ),
+      false,
+    );
+  assert.equal(reads, 0, 'every policy-ineligible header skips unrelated collections');
+});
+
+for (const fault of ['source', 'physical-head', 'close', 'stamp'] as const)
+  test(`native unprinted competing identity refuses ${fault} from a selected header getter`, async (t) => {
+    const f = await fixture(t);
+    let stamp = 'fictional-original-stamp';
+    const scope = f.open(undefined, undefined, fault === 'stamp' ? () => stamp : undefined);
+    const group = scope.groupHeader(Array.from(scope.groupRecords())[0]!);
+    const physical = f.authority.storage.read('head')!;
+    let invoked = false;
+    const selected = {
+      ...group,
+      get report() {
+        invoked = true;
+        if (fault === 'source')
+          f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('e'.repeat(64), file.id);
+        if (fault === 'physical-head')
+          f.authority.objects.set('head', Buffer.from('fictional corrupt HEAD'));
+        if (fault === 'close') scope.close!();
+        if (fault === 'stamp') stamp = 'fictional-changed-stamp';
+        return null;
+      },
+    };
+    try {
+      assert.throws(() =>
+        scope.competingBoundaryUnrepaired(selected, undefined, {
+          candidateId: 'fictional-candidate',
+          candidateVersionId: 'fictional-version',
+          proposalId,
+          recordId: 'fictional-record',
+          title: 'Fictional',
+          issueId: 'identity',
+        }),
+      );
+      assert.equal(invoked, true, 'mutation actually runs inside the ineligible predicate');
+    } finally {
+      f.authority.objects.set('head', physical);
+    }
+  });
+
+for (const fault of ['method', 'registry'] as const)
+  test(`native unprinted competing identity freshly authenticates unchanged authority after ${fault} reset`, async (t) => {
+    const f = await fixture(t),
+      scope = f.open();
+    const group = { ...scope.groupHeader(Array.from(scope.groupRecords())[0]!), report: null };
+    const target = {
+      candidateId: 'fictional-candidate',
+      candidateVersionId: 'fictional-version',
+      proposalId,
+      recordId: 'fictional-record',
+      title: 'Fictional',
+      issueId: 'identity',
+    };
+    const physical = f.authority.storage.read('head')!,
+      functionMethod = f.db.function;
+    assert.equal(scope.competingBoundaryUnrepaired(group, undefined, target), false);
+    if (fault === 'method') f.db.function = new Proxy(functionMethod, {});
+    else f.authority.attach(f.db);
+    try {
+      assert.equal(
+        scope.competingBoundaryUnrepaired(group, undefined, target),
+        false,
+        'ordinary fresh read admission preserves the same behavior as eager traversal',
+      );
+      f.authority.objects.set('head', Buffer.from('fictional corrupt HEAD'));
+      assert.throws(() => scope.competingBoundaryUnrepaired(group, undefined, target));
+    } finally {
+      f.authority.objects.set('head', physical);
+      f.db.function = functionMethod;
+    }
+  });
+
+for (const fault of ['source', 'physical-head', 'selected-head', 'close'] as const)
+  test(`native unprinted competing identity refuses ${fault} at entry without cache hooks`, async (t) => {
+    const f = await fixture(t);
+    const scope = f.open();
+    const group = { ...scope.groupHeader(Array.from(scope.groupRecords())[0]!), report: null };
+    const target = {
+      candidateId: 'fictional-candidate',
+      candidateVersionId: 'fictional-version',
+      proposalId,
+      recordId: 'fictional-record',
+      title: 'Fictional',
+      issueId: 'identity',
+    };
+    assert.equal(scope.competingBoundaryUnrepaired(group, undefined, target), false);
+    const physical = f.authority.storage.read('head')!,
+      functionMethod = f.db.function;
+    const receipts = f.db.prepare('SELECT count(*) n FROM __record_transactions').get()!.n;
+    if (fault === 'source')
+      f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('e'.repeat(64), file.id);
+    if (fault === 'physical-head')
+      f.authority.objects.set('head', Buffer.from('fictional corrupt HEAD'));
+    if (fault === 'selected-head') {
+      const key =
+        intakeNamespace({
+          profileId: 'fictional-profile',
+          intakeId: file.id,
+          sourceHash: file.sha256,
+        }) + 'head';
+      const selected = JSON.parse(
+        String(f.db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)!.value),
+      );
+      selected.logical.domainVersion++;
+      f.db.prepare('UPDATE app_meta SET value=? WHERE key=?').run(JSON.stringify(selected), key);
+    }
+    if (fault === 'close') scope.close!();
+    try {
+      assert.throws(() => scope.competingBoundaryUnrepaired(group, undefined, target));
+    } finally {
+      f.authority.objects.set('head', physical);
+      f.db.function = functionMethod;
+    }
+    assert.equal(f.db.prepare('SELECT count(*) n FROM __record_transactions').get()!.n, receipts);
+    assert.deepEqual(f.authority.storage.read('head'), physical);
+  });
 
 test('selected clinical engine matches legacy full proposal while joins remain off-page and historical', async (t) => {
   const { details, open } = await fixture(t, (details) => {

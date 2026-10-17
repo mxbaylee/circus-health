@@ -234,12 +234,16 @@ export async function preparePagedPackageBatch(
     assertCurrent();
     const operationId = randomUUID();
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId,
-        requestDigest: createHash('sha256').update(operationId).digest('hex'),
-        domainVersion: before.rawVersion,
-        changes,
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId,
+          requestDigest: createHash('sha256').update(operationId).digest('hex'),
+          domainVersion: before.rawVersion,
+          changes,
+        },
+        assertCurrent,
+      ),
     );
     await input.onCheckpoint?.();
     await setImmediate();

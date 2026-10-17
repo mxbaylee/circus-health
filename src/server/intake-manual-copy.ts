@@ -36,8 +36,10 @@ import {
 } from './intake-copy-work.ts';
 import { createIntakeTree } from './intake-state-tree.ts';
 import { parseIntakeCollectionHistory } from './intake-state-collections.ts';
+import { intakeLogBaseHead } from './intake-state-log.ts';
 import {
   COLLECTION_FORMAT,
+  LOG_COLLECTION_FORMAT,
   HEAD_BYTES,
   decode,
   limits,
@@ -271,10 +273,19 @@ function* copyProposals(db: Database, source: IntakeEnvelopeSource) {
       rawHead = read(prefix + 'head'),
       header = decode(rawHead, HEAD_BYTES);
     let head;
-    if (Reflect.get(header as object, 'format') === COLLECTION_FORMAT) {
-      const selectedHead = parseIntakeCollectionHead(rawHead, identity)!,
-        tree = createIntakeTree(identity, (hash) => read(prefix + 'node:' + hash), new Map()),
-        first = tree.get(selectedHead.history, String(1).padStart(16, '0'));
+    if (
+      [COLLECTION_FORMAT, LOG_COLLECTION_FORMAT].includes(
+        String(Reflect.get(header as object, 'format')),
+      )
+    ) {
+      const selectedHead = parseIntakeCollectionHead(rawHead, identity)!;
+      const base =
+        selectedHead.format === LOG_COLLECTION_FORMAT
+          ? intakeLogBaseHead(selectedHead, identity, (hash) => read(prefix + 'node:' + hash))
+          : selectedHead;
+      if (!base) fail('missing manual legacy bridge');
+      const tree = createIntakeTree(identity, (hash) => read(prefix + 'node:' + hash), new Map()),
+        first = tree.get(base!.history, String(1).padStart(16, '0'));
       if (first === undefined) fail('missing manual legacy bridge');
       const history = parseIntakeCollectionHistory(first!, identity),
         previous = history.previous;

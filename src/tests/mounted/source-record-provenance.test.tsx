@@ -112,10 +112,9 @@ it('separates a reviewed record source from original and extraction file acquisi
   expect(
     screen.getByText(/historical extraction snapshot.*not its current Import review/i),
   ).toBeVisible();
-  expect(screen.getByRole('link', { name: 'Open current Import review' })).toHaveAttribute(
-    'href',
-    '/import',
-  );
+  expect(
+    screen.getByRole('link', { name: 'Open Sources for current import review' }),
+  ).toHaveAttribute('href', '/sources');
   expect(screen.queryByText('derived_proposal; unreviewed')).toBeNull();
   expect(screen.getByText(/Record source describes this retained occurrence/)).toBeVisible();
   expect(screen.getByText(/source record date is an optional summary/i)).toBeVisible();

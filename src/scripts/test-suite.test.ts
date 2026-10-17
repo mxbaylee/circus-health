@@ -38,6 +38,7 @@ test('routine child processes cannot inherit operator model credentials or exter
     CRS_RUNTIME_DIR: '/fictional/runtime',
     CRS_PDF_CONTROLLED_TEST: '1',
     CRS_INTAKE_MUTATION_QUALIFY: '1',
+    CRS_PARTIAL_ACCEPTANCE_QUALIFY: '1',
   };
   assert.deepEqual(testEnvironment(original, 'server'), {
     PATH: '/fictional/bin',
@@ -53,6 +54,12 @@ test('routine child processes cannot inherit operator model credentials or exter
     CRS_PDF_CONTROLLED_TEST: '0',
   });
   assert.equal(original.CRS_AI_API_KEY, 'fictional-key');
+  assert.equal(original.CRS_PARTIAL_ACCEPTANCE_QUALIFY, '1');
+  assert.equal(
+    { ...testEnvironment(original, 'server'), CRS_PARTIAL_ACCEPTANCE_QUALIFY: '1' }
+      .CRS_PARTIAL_ACCEPTANCE_QUALIFY,
+    '1',
+  );
 });
 
 test('serial history is required and all routine server files execute exactly once', () => {

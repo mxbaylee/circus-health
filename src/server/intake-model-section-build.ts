@@ -72,15 +72,19 @@ export async function buildModelIntakeSectionIndexes(
     )
       throw Error('Model section build source or mapping pins changed');
   };
-  const commit = (batch: IntakeCollectionChange[]) => {
+  const commit = async (batch: IntakeCollectionChange[]) => {
     assertCurrent();
     const operationId = randomUUID();
-    const prepared = collections.prepare(collections.openView(), {
-      operationId,
-      requestDigest: createHash('sha256').update(operationId).digest('hex'),
-      domainVersion: pins.domainVersion,
-      changes: batch,
-    });
+    const prepared = await collections.prepareAsync(
+      collections.openView(),
+      {
+        operationId,
+        requestDigest: createHash('sha256').update(operationId).digest('hex'),
+        domainVersion: pins.domainVersion,
+        changes: batch,
+      },
+      assertCurrent,
+    );
     collections.commitMaintenance(prepared);
   };
   const flush = async () => {
@@ -99,7 +103,7 @@ export async function buildModelIntakeSectionIndexes(
         entries,
       }),
     });
-    commit(batch);
+    await commit(batch);
     await options.onCheckpoint?.();
     await new Promise<void>((resolve) => setImmediate(resolve));
   };
@@ -175,6 +179,6 @@ export async function buildModelIntakeSectionIndexes(
       entries,
     }),
   });
-  commit(final);
+  await commit(final);
   return { state: 'complete' as const, reused: false, pins, entries, buildId };
 }

@@ -1,6 +1,5 @@
 import { retainedReportAcceptance, updateStoredIntakeDetails } from './intake-state-access.ts';
 import {
-  acceptPartialSelection,
   acceptPartialSelectionAsync,
   getPartialAcceptance,
   hasPartialAcceptance,
@@ -44,7 +43,10 @@ const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = (value: unknown): value is string =>
   typeof value === 'string' && !!value.trim() && value.length <= 2000;
-function request(value: unknown): IntakeReportAcceptanceRequest {
+export function reportAcceptanceRequest(
+  value: unknown,
+  planning = false,
+): IntakeReportAcceptanceRequest {
   if (
     !object(value) ||
     (value.mode !== undefined && value.mode !== 'partial-v1') ||
@@ -52,7 +54,14 @@ function request(value: unknown): IntakeReportAcceptanceRequest {
     !uuid.test(value.operationId) ||
     !Array.isArray(value.blocks) ||
     !value.blocks.length ||
-    value.blocks.length > 100
+    (!planning && value.blocks.length > 100) ||
+    (value.plan !== undefined &&
+      (value.mode !== 'partial-v1' ||
+        !object(value.plan) ||
+        typeof value.plan.id !== 'string' ||
+        !uuid.test(value.plan.id) ||
+        !Number.isSafeInteger(value.plan.chunk) ||
+        (value.plan.chunk as number) < 0))
   )
     throw new HttpError(
       400,
@@ -88,7 +97,7 @@ function request(value: unknown): IntakeReportAcceptanceRequest {
     blocks.add(key);
     for (const selection of block.selections) {
       if (
-        ++count > 1000 ||
+        (++count > 1000 && !planning) ||
         !object(selection) ||
         !text(selection.recordId) ||
         (value.mode === 'partial-v1' && !text(selection.selectionReviewToken)) ||
@@ -202,10 +211,12 @@ export async function acceptIntakeReportSelectionAsync(
   root: string,
   profileId: string,
   input: unknown,
+  options: { assertRunning?: () => void } = {},
 ): Promise<IntakeReportAcceptanceResult> {
   acceptanceOwner(db, profileId);
-  const selected = request(input);
+  const selected = reportAcceptanceRequest(input);
   if (
+    selected.mode !== 'partial-v1' &&
     !hasNativeAcceptanceBlock(db, selected) &&
     selected.blocks.some((block) =>
       block.selections.some((selection) => selection.useRetainedDecision),
@@ -244,14 +255,22 @@ export async function acceptIntakeReportSelectionAsync(
     }
     return applyNativeAcceptanceGroup(db, root, profileId, selected, fingerprint);
   }
-  if (!hasNativeAcceptanceBlock(db, selected) && retained(db, selected.operationId))
+  const fingerprint = createHash('sha256').update(canonicalLiteral(selected)).digest('hex');
+  if (hasPartialAcceptance(db, selected.operationId))
+    return acceptPartialSelectionAsync(db, root, profileId, selected, fingerprint, options);
+  await prepareIntakeLookupIndices(db, {
+    assertRunning() {
+      options.assertRunning?.();
+      acceptanceOwner(db, profileId);
+    },
+  });
+  if (retained(db, selected.operationId))
     throw new HttpError(
       409,
       'OPERATION_CONFLICT',
       'Operation ID already belongs to a different acceptance mode.',
     );
-  const fingerprint = createHash('sha256').update(canonicalLiteral(selected)).digest('hex');
-  return acceptPartialSelectionAsync(db, root, profileId, selected, fingerprint);
+  return acceptPartialSelectionAsync(db, root, profileId, selected, fingerprint, options);
 }
 function acceptIntakeReportSelectionInternal(
   db: DatabaseSync,
@@ -260,7 +279,7 @@ function acceptIntakeReportSelectionInternal(
   input: unknown,
 ): IntakeReportAcceptanceResult {
   acceptanceOwner(db, profileId);
-  const selected = request(input),
+  const selected = reportAcceptanceRequest(input),
     fingerprint = createHash('sha256').update(canonicalLiteral(selected)).digest('hex');
   const previous = retained(db, selected.operationId);
   if (
@@ -273,7 +292,11 @@ function acceptIntakeReportSelectionInternal(
       'Operation ID already belongs to a different acceptance mode.',
     );
   if (selected.mode === 'partial-v1')
-    return acceptPartialSelection(db, root, profileId, selected, fingerprint);
+    throw new HttpError(
+      400,
+      'REPORT_ACCEPTANCE_INPUT',
+      'Partial saves require the asynchronous acceptance entry point',
+    );
   if (previous) {
     if (previous.fingerprint !== fingerprint)
       throw new HttpError(
@@ -290,6 +313,29 @@ function acceptIntakeReportSelectionInternal(
   return applyAcceptanceGroup(db, root, profileId, selected, fingerprint);
 }
 
+/** The same retained-byte admission applies to native, legacy and partial entry points. */
+export function assertAcceptanceBytes(db: DatabaseSync, selected: IntakeReportAcceptanceRequest) {
+  let bytes = 0;
+  for (const id of new Set(selected.blocks.map((block) => block.proposalId || block.intakeId))) {
+    const row = db.prepare('SELECT bytes FROM source_files WHERE id=?').get(id);
+    if (!row) throw new HttpError(404, 'NOT_FOUND', 'Selected proposal or original is unavailable');
+    const size = Number(row.bytes);
+    if (!Number.isSafeInteger(size) || size < 0)
+      throw new HttpError(
+        409,
+        'REPORT_ACCEPTANCE_LIMIT',
+        'Retained proposal size is unavailable; review the original before saving.',
+      );
+    bytes += size;
+    if (bytes > 64 * 1024 * 1024)
+      throw new HttpError(
+        413,
+        'REPORT_ACCEPTANCE_LIMIT',
+        'Select proposal blocks totaling at most 64 MiB per atomic acceptance',
+      );
+  }
+}
+
 export function applyAcceptanceGroup(
   db: DatabaseSync,
   root: string,
@@ -298,6 +344,7 @@ export function applyAcceptanceGroup(
   fingerprint: string,
   retainResult?: (receipt: IntakeAtomicAcceptanceReceipt) => void,
   reviewed?: Map<string, IntakeReview | null>,
+  beforeTransaction?: () => void,
 ): IntakeReportAcceptanceResult {
   const receipt = measureImportPhase(
     'review_acceptance_transaction',
@@ -305,29 +352,26 @@ export function applyAcceptanceGroup(
       intakeTransaction(
         db,
         () => {
+          beforeTransaction?.();
           // Bound retained proposal memory before preparing every block at once.
-          let reviewBytes = 0;
+          assertAcceptanceBytes(db, selected);
+          const originals = new Map<string, ReturnType<typeof getIntake>>();
           for (const block of selected.blocks) {
-            const original = getIntake(db, root, profileId, block.intakeId);
+            let original = originals.get(block.intakeId);
+            if (!original)
+              originals.set(
+                block.intakeId,
+                (original = getIntake(db, root, profileId, block.intakeId)),
+              );
             if (
               block.proposalId &&
               !original.proposals.some((proposal) => proposal.id === block.proposalId)
             )
               throw new HttpError(404, 'NOT_FOUND', 'Proposal does not belong to this delivery');
-            const inputFile = db
-              .prepare('SELECT bytes FROM source_files WHERE id=?')
-              .get(block.proposalId || block.intakeId) as { bytes: number } | undefined;
-            reviewBytes += inputFile?.bytes || 0;
-            if (reviewBytes > 64 * 1024 * 1024)
-              throw new HttpError(
-                413,
-                'REPORT_ACCEPTANCE_LIMIT',
-                'Select proposal blocks totaling at most 64 MiB per atomic acceptance',
-              );
           }
           // All tokens and mappings are prepared against one unchanged profile revision.
           const prepared = selected.blocks.map((block) => {
-            const intake = getIntake(db, root, profileId, block.intakeId);
+            const intake = originals.get(block.intakeId)!;
             if (intake.archived)
               throw new HttpError(
                 409,

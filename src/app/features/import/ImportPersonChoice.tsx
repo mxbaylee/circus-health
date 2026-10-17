@@ -1,3 +1,4 @@
+import { importPersonLabel } from './import-person-label';
 import { useRef } from 'react';
 import { matchesSelfIdentityName } from '../../../shared/self-identity';
 import {
@@ -120,21 +121,7 @@ export function ImportPersonChoice({
                 )
               }
             >
-              {person.fullName}
-              {choices.filter(
-                (item) => item.fullName.toLowerCase() === person.fullName.toLowerCase(),
-              ).length > 1
-                ? ' · ' +
-                  [
-                    person.birthDate ? 'DOB ' + person.birthDate : 'DOB not saved',
-                    person.relationship,
-                    person.personId,
-                  ]
-                    .filter(Boolean)
-                    .join(' · ')
-                : person.birthDate
-                  ? ' · DOB ' + person.birthDate
-                  : ''}
+              {importPersonLabel(person, choices)}
             </option>
           ))}
           <option value="new">Add a new person</option>

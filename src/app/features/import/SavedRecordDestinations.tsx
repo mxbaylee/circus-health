@@ -3,6 +3,9 @@ import { clinicalPersonQuery } from '../../../shared/person-scope';
 import { Check, ExternalLink } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { Intake, IntakeAcceptedRecord } from '../../../shared/intake';
+import type { IntakeIdentityPerson } from '../../../shared/intake-identity';
+import { importPersonLabel } from './import-person-label';
+import { createContext, useContext, type ReactNode } from 'react';
 import {
   isIntakeSummary,
   type IntakePublicRead,
@@ -34,6 +37,42 @@ export type AcceptedRecordScope = {
   proposalId: string | null;
   recordIds: Iterable<string>;
 };
+
+const SavedPeopleContext = createContext<IntakeIdentityPerson[] | null>(null);
+/** One current People read serves all exact destination links in a rendered list. */
+export function SavedRecordPeople({
+  children,
+  people: supplied,
+  error: suppliedError,
+  onRetry,
+}: {
+  children: ReactNode;
+  people?: IntakeIdentityPerson[];
+  error?: boolean;
+  onRetry?: () => void;
+}) {
+  const people = useResource<IntakeIdentityPerson[]>(supplied ? null : '/record-ownership/people');
+  const failed = supplied ? suppliedError : !!people.error;
+  return (
+    <SavedPeopleContext value={supplied ?? (Array.isArray(people.data) ? people.data : [])}>
+      {failed && <PeopleLookupRetry onRetry={supplied ? onRetry : people.reload} />}
+      {children}
+    </SavedPeopleContext>
+  );
+}
+
+function PeopleLookupRetry({ onRetry }: { onRetry?: () => void }) {
+  return (
+    <p role="alert">
+      Person details could not be loaded.{' '}
+      {onRetry && (
+        <button type="button" className="text-link" onClick={onRetry}>
+          Retry person details
+        </button>
+      )}
+    </p>
+  );
+}
 
 function destinationForOwner(record: IntakeAcceptedRecord, currentPersonId?: string | null) {
   const id = encodeURIComponent(record.entityId);
@@ -126,19 +165,32 @@ export function SavedRecordDestinationLink({ record }: { record: IntakeAcceptedR
   const owner = useResource<{ personId: string | null }>(
     '/record-owner?' + queryString({ type: record.kind, id: record.entityId }),
   );
-  const destination = destinationForOwner(record, owner.data?.personId ?? 'patient');
+  const sharedPeople = useContext(SavedPeopleContext);
+  const people = useResource<IntakeIdentityPerson[]>(
+    sharedPeople === null ? '/record-ownership/people' : null,
+  );
+  const resolved = typeof owner.data?.personId === 'string' && !!owner.data.personId;
+  const personId = resolved ? owner.data!.personId! : undefined;
+  const currentPeople = sharedPeople ?? (Array.isArray(people.data) ? people.data : []);
+  const person = currentPeople.find((entry) => entry.personId === personId);
+  const personLabel = !resolved
+    ? owner.error
+      ? 'Person unavailable'
+      : 'Checking person'
+    : personId === 'patient'
+      ? 'Self'
+      : person
+        ? importPersonLabel(person, currentPeople)
+        : 'Person details unavailable';
+  const destination = destinationForOwner(record, personId);
   // Receipt entity IDs remain exact. Current ownership is resolved independently
   // because a later coupled ownership correction never rewrites old receipts.
-  return (
-    <Link
-      className="import-detail-record-link"
-      to={destination.to}
-      data-saved-record-id={record.recordId}
-    >
+  const contents = (
+    <>
       <span>
         <strong>{displayTitle(record, destination.label)}</strong>
         <small>
-          {destination.label} ·{' '}
+          {personLabel} · {destination.label} ·{' '}
           {record.outcome === 'matched'
             ? 'Existing record linked'
             : record.outcome === 'updated'
@@ -147,7 +199,28 @@ export function SavedRecordDestinationLink({ record }: { record: IntakeAcceptedR
         </small>
       </span>
       <ExternalLink size={16} aria-hidden="true" />
-    </Link>
+    </>
+  );
+  return resolved ? (
+    <>
+      <Link
+        className="import-detail-record-link"
+        to={destination.to}
+        data-saved-record-id={record.recordId}
+      >
+        {contents}
+      </Link>
+      {sharedPeople === null && people.error && <PeopleLookupRetry onRetry={people.reload} />}
+    </>
+  ) : (
+    <span className="import-detail-record-link" data-saved-record-id={record.recordId}>
+      {contents}
+      {owner.error && (
+        <button type="button" className="text-link" onClick={owner.reload}>
+          Retry person
+        </button>
+      )}
+    </span>
   );
 }
 
@@ -228,14 +301,16 @@ export function SavedRecordDestinations({
         </p>
       )}
       <p>Open the exact profile records created or linked by this reviewed save.</p>
-      <div className="import-detail-records">
-        {records.map((record) => (
-          <SavedRecordDestinationLink
-            record={record}
-            key={`${record.recordId}:${record.entityId}`}
-          />
-        ))}
-      </div>
+      <SavedRecordPeople>
+        <div className="import-detail-records">
+          {records.map((record) => (
+            <SavedRecordDestinationLink
+              record={record}
+              key={`${record.recordId}:${record.entityId}`}
+            />
+          ))}
+        </div>
+      </SavedRecordPeople>
       {activationAvailable && (
         <div className="import-saved-activation">
           <span>New prescriptions start Inactive until you choose the ones you still take.</span>

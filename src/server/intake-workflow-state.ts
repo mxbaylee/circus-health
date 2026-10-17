@@ -195,16 +195,20 @@ export async function buildVerifiedWorkflowSummary(
     )
       throw Error('Workflow summary source or policy pins changed');
   };
-  const commit = (batch: IntakeCollectionChange[]) => {
+  const commit = async (batch: IntakeCollectionChange[]) => {
     current();
     const operationId = randomUUID();
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId,
-        requestDigest: hash(operationId),
-        domainVersion: pins.domainVersion,
-        changes: batch,
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId,
+          requestDigest: hash(operationId),
+          domainVersion: pins.domainVersion,
+          changes: batch,
+        },
+        current,
+      ),
     );
   };
   const checkpoint = async () => {
@@ -227,11 +231,11 @@ export async function buildVerifiedWorkflowSummary(
       key: buildId,
       value: marker,
     });
-    if (batch.length > 1) commit(batch);
+    if (batch.length > 1) await commit(batch);
     else {
       current();
       if (collections.get(collections.openView(), 'builds', 'workflow.builds', buildId) !== marker)
-        commit(batch);
+        await commit(batch);
     }
     lastYieldSize = 0;
     await options.onCheckpoint?.();
@@ -336,7 +340,7 @@ export async function buildVerifiedWorkflowSummary(
       if (checkpointOrYieldDue()) await checkpointOrYield();
     }
     await checkpoint();
-    commit([
+    await commit([
       {
         area: 'builds',
         collection: indexCollection,
@@ -454,7 +458,7 @@ export async function buildVerifiedWorkflowSummary(
     root: descriptor.root.hash,
     count: factCount,
   };
-  commit([
+  await commit([
     {
       area: 'builds',
       collection: 'workflow.dependencies',

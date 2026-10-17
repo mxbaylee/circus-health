@@ -170,7 +170,7 @@ function clearIntakeCaches(
   clearPreparedClinicalReviewRead(db);
   clearCollectionQueueReviews(db);
   if (releaseReviewScratch) clearReviewIssueScratch(db);
-  clearIntakeCollectionCache(db);
+  clearIntakeCollectionCache(db, preparedToken);
   clearIntakeMaintenancePublications(db, preparedToken);
   clearIntakeLegacyBridgeProofs(db);
   const cache = caches.get(db);

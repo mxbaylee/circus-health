@@ -285,6 +285,11 @@ export function useReportAcceptance(
       send(request, false, diagnosticOperationId),
     retry: () => (pending ? send(pending, true) : Promise.resolve(null)),
     checkReceipt,
+    hasUnconfirmedOperation: (operationId?: string) => {
+      const retainedId =
+        storedOperation(profileId) || pendingRequests.get(profileId)?.request.operationId;
+      return operationId ? retainedId === operationId : !!retainedId;
+    },
     clearError: () => setError(''),
   };
 }

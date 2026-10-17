@@ -249,12 +249,16 @@ export function createOwnershipSourceSnapshotPreparation(
       assertCurrent();
       const operationId = randomUUID(),
         changes = await catalog.finalChanges();
-      const prepared = collections.prepare(collections.openView(), {
-        operationId,
-        requestDigest: createHash('sha256').update(operationId).digest('hex'),
-        domainVersion: version,
-        changes,
-      });
+      const prepared = await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId,
+          requestDigest: createHash('sha256').update(operationId).digest('hex'),
+          domainVersion: version,
+          changes,
+        },
+        assertCurrent,
+      );
       let disposed = false;
       return {
         assertCurrent,

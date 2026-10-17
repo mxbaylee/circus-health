@@ -53,11 +53,17 @@ interface ExpectedWrite {
   seen: number;
 }
 
-type AuxiliaryKind = 'ownership' | 'clinical-source' | 'duplicate-evidence';
+type AuxiliaryKind = 'ownership' | 'clinical-source' | 'duplicate-evidence' | 'queue-transition';
 interface AuxiliaryPreparation {
   readonly kind: AuxiliaryKind;
   readonly beforeAttempts: number;
-  readonly mainSchema: number | bigint;
+  beforeChanges: bigint;
+  mainSchema: number | bigint;
+  dataVersion: number | bigint;
+  readonly methods: object | undefined;
+  readonly observer?: Observer;
+  dispose: () => void;
+  valid: boolean;
   statement: boolean;
   ddl: boolean;
 }
@@ -208,6 +214,13 @@ export interface IntakeFrontierAttemptSnapshot {
 }
 
 const observers = new WeakMap<DatabaseSync, Observer>();
+const verifiedAuxiliaryChanges = new WeakMap<DatabaseSync, bigint>();
+const auxiliaryPreparations = new WeakMap<DatabaseSync, AuxiliaryPreparation>();
+/** Only completed, authorizer-checked disposable builders contribute here.
+ * This read-only count cannot settle an arbitrary caller's SQL attempts. */
+export function readIntakeFrontierAuxiliaryChanges(db: DatabaseSync): bigint {
+  return verifiedAuxiliaryChanges.get(db) ?? 0n;
+}
 const blockedReadmissions = new WeakSet<DatabaseSync>();
 const nativePrepare = DatabaseSync.prototype.prepare,
   nativeGet = StatementSync.prototype.get,
@@ -344,7 +357,9 @@ const auxiliaryPrefix = (kind: AuxiliaryKind) =>
     ? '__ownership_decision_index'
     : kind === 'clinical-source'
       ? '__clinical_source_fingerprint'
-      : '__duplicate_evidence_';
+      : kind === 'queue-transition'
+        ? '__intake_queue_transitions'
+        : '__duplicate_evidence_';
 
 function tempSchema(db: DatabaseSync): number | bigint {
   const value = terminalStatement(db, 'PRAGMA temp.schema_version').get()?.schema_version;
@@ -1715,27 +1730,95 @@ export function beginIntakeFrontierAuxiliaryPreparation(
   kind: AuxiliaryKind,
 ): AuxiliaryPreparation | undefined {
   const observer = observers.get(db);
-  if (
-    !observer ||
-    observer.revoked ||
-    observer.expected ||
-    observer.auxiliary ||
-    observer.activeToken ||
-    db.isTransaction ||
-    protectedIntakeLookupTempShadow(db) ||
-    !settleUnrelatedChanges(db, observer)
-  ) {
-    return undefined;
-  }
-  const preparation = {
+  if (!db.isOpen || db.isTransaction || auxiliaryPreparations.has(db)) return undefined;
+  const source =
+    observer &&
+    !observer.revoked &&
+    !observer.expected &&
+    !observer.auxiliary &&
+    !observer.activeToken &&
+    !protectedIntakeLookupTempShadow(db) &&
+    settleUnrelatedChanges(db, observer)
+      ? observer
+      : undefined;
+  const preparation: AuxiliaryPreparation = {
     kind,
-    beforeAttempts: observer.attempts,
-    mainSchema: mainSchema(db),
+    beforeAttempts: source?.attempts ?? 0,
+    beforeChanges: 0n,
+    mainSchema: 0,
+    dataVersion: 0,
+    methods: managedDatabaseMethodEpoch(db),
+    observer: source,
+    dispose: () => {},
+    valid: true,
     statement: false,
     ddl: false,
   };
-  observer.auxiliary = preparation;
-  if (!rearmManagedDatabaseAuthorization(db)) revoke(observer, 'auxiliary authorizer');
+  // This short witness covers only disposable SQL. A revoked source frontier
+  // stays revoked; it cannot be rehabilitated by rebuilding an auxiliary index.
+  const invalidate = () => {
+    preparation.valid = false;
+  };
+  const dispose = observeManagedDatabaseAuthorization(
+    db,
+    (action, name, _column, database) => {
+      if (
+        action === constants.SQLITE_PRAGMA ||
+        action === constants.SQLITE_TRANSACTION ||
+        action === constants.SQLITE_SAVEPOINT ||
+        action === constants.SQLITE_ATTACH ||
+        action === constants.SQLITE_DETACH
+      ) {
+        // The host's own read-only schema/data-version probes are permitted.
+        if (
+          action !== constants.SQLITE_PRAGMA ||
+          !['schema_version', 'data_version'].includes(name ?? '') ||
+          _column !== null
+        )
+          invalidate();
+        return;
+      }
+      if (!writeActions.has(action) && !schemaActions.has(action)) return;
+      const prefix = auxiliaryPrefix(kind);
+      const allowedName =
+        name?.startsWith(prefix) || name?.startsWith('sqlite_autoindex_' + prefix);
+      if (
+        managedDatabaseAuthorizationNestedCallbackActive(db) ||
+        !preparation.statement ||
+        !(
+          (database === 'temp' &&
+            (allowedName || (preparation.ddl && name === 'sqlite_temp_master'))) ||
+          (database === 'main' && preparation.ddl && name === 'sqlite_master')
+        )
+      )
+        invalidate();
+    },
+    invalidate,
+  );
+  const disposeFunction = observeManagedDatabaseFunctionRegistration(db, invalidate);
+  preparation.dispose = () => {
+    disposeFunction?.();
+    dispose?.();
+  };
+  if (!dispose || !disposeFunction) preparation.valid = false;
+  auxiliaryPreparations.set(db, preparation);
+  if (source) source.auxiliary = preparation;
+  if (!rearmManagedDatabaseAuthorization(db)) preparation.valid = false;
+  // Install observation before any callback-bearing baseline probes. The last
+  // probe defines the counted interval; changes before it stay uncredited.
+  try {
+    preparation.mainSchema = mainSchema(db);
+    preparation.dataVersion = dataVersion(db);
+    preparation.beforeChanges = totalChanges(db);
+    if (
+      auxiliaryPreparations.get(db) !== preparation ||
+      db.isTransaction ||
+      managedDatabaseMethodEpoch(db) !== preparation.methods
+    )
+      preparation.valid = false;
+  } catch {
+    preparation.valid = false;
+  }
   return preparation;
 }
 
@@ -1745,11 +1828,11 @@ function auxiliaryStatement<T>(
   fn: () => T,
   ddl = false,
 ): T {
-  const observer = observers.get(db);
-  if (!preparation || !observer || observer.auxiliary !== preparation || observer.revoked)
-    return fn();
+  const observer = preparation?.observer;
+  if (!preparation || auxiliaryPreparations.get(db) !== preparation) return fn();
   if (preparation.statement || db.isTransaction) {
-    revoke(observer, 'auxiliary statement overlap');
+    preparation.valid = false;
+    if (observer) revoke(observer, 'auxiliary statement overlap');
     return fn();
   }
   preparation.statement = true;
@@ -1757,12 +1840,16 @@ function auxiliaryStatement<T>(
   try {
     return fn();
   } catch (error) {
-    revoke(observer, 'auxiliary statement failed');
+    preparation.valid = false;
+    if (observer) revoke(observer, 'auxiliary statement failed');
     throw error;
   } finally {
     preparation.statement = false;
     preparation.ddl = false;
-    if (!rearmManagedDatabaseAuthorization(db)) revoke(observer, 'auxiliary rearm');
+    if (!rearmManagedDatabaseAuthorization(db)) {
+      preparation.valid = false;
+      if (observer) revoke(observer, 'auxiliary rearm');
+    }
   }
 }
 
@@ -1797,23 +1884,55 @@ export function finishIntakeFrontierAuxiliaryPreparation(
   complete: boolean,
 ): boolean {
   if (!preparation) return false;
-  const observer = observers.get(db);
-  if (!observer || observer.auxiliary !== preparation) return false;
-  observer.auxiliary = undefined;
-  if (
-    !complete ||
-    observer.revoked ||
-    preparation.statement ||
-    observer.attempts !== preparation.beforeAttempts ||
-    mainSchema(db) !== preparation.mainSchema ||
-    db.isTransaction ||
-    protectedIntakeLookupTempShadow(db) ||
-    !rearmManagedDatabaseAuthorization(db)
-  ) {
-    revoke(observer, 'auxiliary completion');
+  if (auxiliaryPreparations.get(db) !== preparation) return false;
+  const observer = preparation.observer;
+  if (observer?.auxiliary === preparation) observer.auxiliary = undefined;
+  let verified = false,
+    changes = preparation.beforeChanges;
+  try {
+    verified =
+      complete &&
+      preparation.valid &&
+      !preparation.statement &&
+      db.isOpen &&
+      !db.isTransaction &&
+      managedDatabaseMethodEpoch(db) === preparation.methods &&
+      mainSchema(db) === preparation.mainSchema &&
+      dataVersion(db) === preparation.dataVersion &&
+      !protectedIntakeLookupTempShadow(db) &&
+      rearmManagedDatabaseAuthorization(db);
+    if (verified) changes = totalChanges(db);
+    // Every SQL probe above may invoke policy callbacks. Close with checks
+    // that cannot run SQL before granting any credit.
+    verified =
+      verified &&
+      preparation.valid &&
+      auxiliaryPreparations.get(db) === preparation &&
+      !preparation.statement &&
+      !preparation.ddl &&
+      db.isOpen &&
+      !db.isTransaction &&
+      managedDatabaseMethodEpoch(db) === preparation.methods;
+  } finally {
+    try {
+      preparation.dispose();
+    } catch {
+      verified = false;
+    }
+    auxiliaryPreparations.delete(db);
+  }
+  if (!verified) {
+    if (observer) revoke(observer, 'auxiliary completion');
     return false;
   }
-  observer.settledChanges = totalChanges(db);
-  observer.auxiliarySequence++;
-  return true;
+  verifiedAuxiliaryChanges.set(
+    db,
+    readIntakeFrontierAuxiliaryChanges(db) + changes - preparation.beforeChanges,
+  );
+  if (observer && !observer.revoked && observer.attempts === preparation.beforeAttempts) {
+    observer.settledChanges = changes;
+    observer.auxiliarySequence++;
+    return true;
+  }
+  return false;
 }

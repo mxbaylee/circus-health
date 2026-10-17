@@ -351,6 +351,8 @@ export function vaultRecordCertificates(
         return raw;
       },
       new Map(),
+      undefined,
+      'vault-certificates',
     );
   const get = (
     root: IntakeTreeRoot,
@@ -417,6 +419,7 @@ export function vaultRecordCertificates(
                 throw Error('Vault private certificate read expired');
             },
           },
+          'vault-certificates',
         );
         return requests.map(({ entity, recordId, key: selectedKey }) => {
           const digest = pages.get(selected, selectedKey);

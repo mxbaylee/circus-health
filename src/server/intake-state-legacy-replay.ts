@@ -1,5 +1,6 @@
-/** Private disk replay for legacy contributions. Scratch cannot select or recover
- * accepted authority; every source frame and every version is authenticated. */
+/** Private bounded replay for legacy contributions. Default scratch remains disk
+ * based; encrypted scratch is an explicit opt-in. Scratch cannot select accepted
+ * authority; every source frame and every version is authenticated. */
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, openSync, closeSync, readSync, writeSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,6 +15,8 @@ import {
 import { ChatDecodeLimitError, type ChatDecodeBudget } from './chat-journal-codec.ts';
 import {
   prepareIntakeJsonCanonicalSteps,
+  createEncryptedIntakeJsonCanonicalScratch,
+  type IntakeJsonCanonicalScratch,
   type PreparedIntakeJsonCanonical,
   type PreparedIntakeJsonTree,
   type IntakeJsonCanonicalHandle,
@@ -55,6 +58,15 @@ import { schemaKey } from './intake-envelope-schema.ts';
 import { finishIntakeCopySteps } from './intake-copy-work.ts';
 import { recordIntakeWork } from './intake-work-accounting.ts';
 import { prepareIntakeLegacyDeltaTreeSteps } from './intake-legacy-delta-tree.ts';
+import {
+  createIntakeLegacyEncryptedScratch,
+  type IntakeLegacyEncryptedScratchOptions,
+} from './intake-state-legacy-encrypted.ts';
+import type {
+  LegacyIndex,
+  LegacyNode as Node,
+  LegacyEntry as Entry,
+} from './intake-state-legacy-index.ts';
 
 const MAX_DEPTH = 64,
   MAX_ITEMS = 1_000_000,
@@ -105,6 +117,12 @@ export function* prepareIntakeLegacyReplaySteps(
   options: {
     checkpoint?: () => void;
     onVersion?: (version: number, fingerprint: string, pieces: () => Iterable<string>) => void;
+    /** Replay owns two private encrypted invocations (legacy index + canonical).
+     * Identity is the validated scope above; HEAD/current are required bindings.
+     * HEAD is the caller's exact outer selected authority bytes; it can select
+     * the legacy ancestor being replayed through a later V4/V5 anchor.
+     * Capacity applies to each invocation; immutable pages remain until close. */
+    encryptedScratch?: Omit<IntakeLegacyEncryptedScratchOptions, 'identity'>;
   } = {},
 ): Generator<void, PreparedIntakeLegacyReplay> {
   const identity = validateIntakeIdentity(scope),
@@ -123,35 +141,116 @@ export function* prepareIntakeLegacyReplaySteps(
       nativeDeltaPreparations: 0,
       fallbackDeltaPreparations: 0,
     },
-    state = new DiskIntakeValue(checkpoint, work),
-    db = state.db;
+    state = new DiskIntakeValue(
+      checkpoint,
+      work,
+      options.encryptedScratch && { ...options.encryptedScratch, identity },
+    ),
+    db = state.db!,
+    index = state.index;
   let closed = false,
     complete = false,
+    failed = false,
     rebindInFlight = false;
   const close = () => {
-    if (closed) return;
+    if (closed) {
+      if (index) state.close();
+      return;
+    }
     closed = true;
     state.close();
   };
   const current = () => {
     if (closed) invalid('closed legacy replay');
-    checkpoint();
+    try {
+      state.checkpoint();
+    } catch (error) {
+      if (index) {
+        try {
+          close();
+        } catch {}
+      }
+      throw error;
+    }
   };
+  const revoke = () => {
+    if (index) {
+      try {
+        close();
+      } catch {}
+    }
+  };
+  const ownedValue = <T>(read: () => T): T => {
+    try {
+      current();
+      const value = read();
+      if (index) current();
+      return value;
+    } catch (error) {
+      revoke();
+      throw error;
+    }
+  };
+  /** Failure poisons this replay, including a failure caught by a reentrant
+   * caller. Normal iterator return only closes its delegated reader/preparation. */
+  function* ownedSteps<T, R>(
+    source: Iterator<T, R>,
+    recoverable: (error: unknown) => boolean = () => false,
+  ): Generator<T, R> {
+    let failed = false,
+      poisoned = false;
+    try {
+      current();
+      for (;;) {
+        const next = source.next();
+        current();
+        if (next.done) return next.value;
+        yield next.value;
+        current();
+      }
+    } catch (error) {
+      failed = true;
+      poisoned = !recoverable(error) || closed;
+      if (poisoned) revoke();
+      throw error;
+    } finally {
+      try {
+        source.return?.(undefined as R);
+      } catch (error) {
+        if (!failed) {
+          poisoned = true;
+          revoke();
+          throw error;
+        }
+      } finally {
+        // The delegated parser may have owned a busy canonical preparation.
+        // Retry only after its return/finally releases that preparation.
+        if (poisoned) revoke();
+      }
+    }
+  }
   try {
     Object.freeze(head.usage);
     Object.freeze(head.tip);
     Object.freeze(head);
-    db.exec(
-      'CREATE TABLE frames(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE,raw TEXT NOT NULL,sha TEXT NOT NULL); CREATE TABLE consumed(key TEXT PRIMARY KEY); CREATE TABLE receipts(id TEXT PRIMARY KEY,raw TEXT NOT NULL); CREATE TABLE copied_operations(id TEXT PRIMARY KEY,target TEXT UNIQUE NOT NULL);',
-    );
-    const mark = (key: string) => db.prepare('INSERT OR IGNORE INTO consumed VALUES(?)').run(key);
+    if (!index)
+      db.exec(
+        'CREATE TABLE frames(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE,raw TEXT NOT NULL,sha TEXT NOT NULL); CREATE TABLE consumed(key TEXT PRIMARY KEY); CREATE TABLE receipts(id TEXT PRIMARY KEY,raw TEXT NOT NULL); CREATE TABLE copied_operations(id TEXT PRIMARY KEY,target TEXT UNIQUE NOT NULL);',
+      );
+    const mark = (key: string) =>
+      index ? index.consume(key) : db.prepare('INSERT OR IGNORE INTO consumed VALUES(?)').run(key);
     mark(prefix + 'head');
     let ref: Reference | null = head.tip;
     let physicalBytes = 0;
     while (ref) {
       current();
       yield;
-      if (work.frames >= caps.frames || db.prepare('SELECT 1 FROM frames WHERE id=?').get(ref.id))
+      if (
+        work.frames >= caps.frames ||
+        (index
+          ? index.frameSeen(ref.id)
+          : db.prepare('SELECT 1 FROM frames WHERE id=?').get(ref.id))
+      )
         invalid('duplicate/frames limit');
       const key = prefix + 'frame:' + ref.id,
         raw = get(key);
@@ -218,12 +317,14 @@ export function* prepareIntakeLegacyReplaySteps(
       const bytesValue = Buffer.from(frame.data as string, 'base64');
       if (bytesValue.length > CHUNK_BYTES || bytesValue.toString('base64') !== frame.data)
         invalid('base64');
-      db.prepare('INSERT INTO frames VALUES(?,?,?,?)').run(
-        frame.sequence as number,
-        frame.id as string,
-        text,
-        ref.sha256,
-      );
+      if (index) index.putFrame(frame.sequence as number, frame.id as string, text, ref.sha256);
+      else
+        db.prepare('INSERT INTO frames VALUES(?,?,?,?)').run(
+          frame.sequence as number,
+          frame.id as string,
+          text,
+          ref.sha256,
+        );
       mark(key);
       work.frames++;
       ref = frame.previous as unknown as Reference | null;
@@ -242,7 +343,9 @@ export function* prepareIntakeLegacyReplaySteps(
     while (offset < work.frames) {
       current();
       const first = decode(
-        db.prepare('SELECT raw FROM frames WHERE sequence=?').get(offset + 1)!.raw,
+        (index
+          ? index.frame(offset + 1)
+          : db.prepare('SELECT raw FROM frames WHERE sequence=?').get(offset + 1))!.raw,
         FRAME_BYTES,
       ) as Frame;
       if (first.version !== ++version || first.chunk !== 0 || first.chunks > work.frames - offset)
@@ -253,9 +356,9 @@ export function* prepareIntakeLegacyReplaySteps(
         const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
         for (let chunk = 0; chunk < first.chunks; chunk++) {
           current();
-          const row = db
-            .prepare('SELECT raw,sha FROM frames WHERE sequence=?')
-            .get(offset + chunk + 1)!;
+          const row = index
+            ? index.frame(offset + chunk + 1)!
+            : db.prepare('SELECT raw,sha FROM frames WHERE sequence=?').get(offset + chunk + 1)!;
           if (digest(String(row.raw)) !== row.sha) invalid('legacy frame scratch changed');
           const frame = decode(row.raw, FRAME_BYTES) as Frame;
           if (
@@ -277,15 +380,20 @@ export function* prepareIntakeLegacyReplaySteps(
         const tail = decoder.decode();
         if (tail) yield tail;
       };
-      const changes = yield* prepareIntakeLegacyDeltaTreeSteps(pieces(), current, (native) => {
-        if (native) {
-          work.nativeDeltaPreparations++;
-          recordIntakeWork('evidenceReplayNativeDeltas');
-        } else {
-          work.fallbackDeltaPreparations++;
-          recordIntakeWork('evidenceReplayFallbackDeltas');
-        }
-      });
+      const changes = yield* prepareIntakeLegacyDeltaTreeSteps(
+        pieces(),
+        current,
+        (native) => {
+          if (native) {
+            work.nativeDeltaPreparations++;
+            recordIntakeWork('evidenceReplayNativeDeltas');
+          } else {
+            work.fallbackDeltaPreparations++;
+            recordIntakeWork('evidenceReplayFallbackDeltas');
+          }
+        },
+        { scratch: state.canonicalScratch },
+      );
       let changed = 0;
       const remaining = budget(caps, used);
       try {
@@ -323,11 +431,15 @@ export function* prepareIntakeLegacyReplaySteps(
       used.bytes += Buffer.byteLength(receiptRaw as string);
       usage(used, caps);
       mark(receiptKey);
-      db.prepare('INSERT INTO receipts VALUES(?,?)').run(first.operationId, receiptRaw as string);
+      if (index) index.receipt(first.operationId, receiptRaw as string);
+      else
+        db.prepare('INSERT INTO receipts VALUES(?,?)').run(first.operationId, receiptRaw as string);
       work.versions++;
       work.inputBytes += payloadBytes;
       work.serializedBytes += semanticBytes;
-      options.onVersion?.(version, fingerprint, () => state.pieces());
+      options.onVersion?.(version, fingerprint, () =>
+        index ? ownedSteps(state.pieces()) : state.pieces(),
+      );
       offset += first.chunks;
     }
     if (version !== head.version || JSON.stringify(used) !== JSON.stringify(head.usage))
@@ -339,108 +451,180 @@ export function* prepareIntakeLegacyReplaySteps(
       semanticBytes,
       work: Object.freeze({ ...work }),
       pieces() {
-        current();
-        return state.pieces();
+        return ownedValue(() => (index ? ownedSteps(state.pieces()) : state.pieces()));
       },
       envelopePieces() {
-        current();
-        return state.envelopePieces();
+        return ownedValue(() => {
+          const pieces = state.envelopePieces();
+          return index ? ownedSteps(pieces[Symbol.iterator]()) : pieces;
+        });
       },
       *consumed() {
-        current();
-        for (const row of db.prepare('SELECT key FROM consumed ORDER BY key').iterate()) {
+        const source = (function* () {
           current();
-          yield String(row.key);
-        }
+          for (const row of index
+            ? (function* () {
+                for (const key of index.consumed()) yield { key };
+              })()
+            : db.prepare('SELECT key FROM consumed ORDER BY key').iterate()) {
+            current();
+            yield String(row.key);
+          }
+        })();
+        yield* index ? ownedSteps(source) : source;
       },
       domainVersion() {
-        current();
-        return finishIntakeCopySteps(state.domainVersionSteps());
+        return ownedValue(() =>
+          finishIntakeCopySteps(
+            index ? ownedSteps(state.domainVersionSteps()) : state.domainVersionSteps(),
+          ),
+        );
       },
       domainVersionSteps() {
-        current();
-        return state.domainVersionSteps();
+        return ownedValue(() =>
+          index ? ownedSteps(state.domainVersionSteps()) : state.domainVersionSteps(),
+        );
       },
       validateEnvelope(detailsJson: string | IntakeCopyPieceSource) {
-        current();
-        return finishIntakeCopySteps(state.validateEnvelopeSteps(detailsJson));
+        return ownedValue(() =>
+          finishIntakeCopySteps(
+            index
+              ? ownedSteps(state.validateEnvelopeSteps(detailsJson))
+              : state.validateEnvelopeSteps(detailsJson),
+          ),
+        );
       },
       validateEnvelopeSteps(detailsJson: string | IntakeCopyPieceSource) {
-        current();
-        return state.validateEnvelopeSteps(detailsJson);
+        return ownedValue(() =>
+          index
+            ? ownedSteps(state.validateEnvelopeSteps(detailsJson))
+            : state.validateEnvelopeSteps(detailsJson),
+        );
       },
       rebind(target: IntakeStateIdentity, write: (key: string, value: string) => void) {
         return finishIntakeCopySteps(this.rebindSteps(target, write));
       },
       *rebindSteps(target: IntakeStateIdentity, write: (key: string, value: string) => void) {
         if (rebindInFlight) invalid('legacy rebind already in flight');
-        rebindInFlight = true;
-        try {
-          current();
-          const checked = validateIntakeIdentity(target);
-          if (checked.intakeId !== identity.intakeId || checked.sourceHash !== identity.sourceHash)
-            invalid('copy legacy identity');
-          const targetPrefix = intakeNamespace(checked);
-          let previous: Reference | null = null,
-            bytes = 0;
-          db.exec('DELETE FROM copied_operations');
-          for (const row of db.prepare('SELECT id FROM receipts ORDER BY id').iterate()) {
+        let writerFailed = false,
+          writerError: unknown;
+        const sink = index
+          ? (key: string, value: string) => {
+              try {
+                write(key, value);
+              } catch (error) {
+                writerFailed = true;
+                writerError = error;
+                throw error;
+              }
+            }
+          : write;
+        const source = (function* () {
+          rebindInFlight = true;
+          try {
             current();
-            yield;
-            db.prepare('INSERT INTO copied_operations VALUES(?,?)').run(row.id, randomUUID());
+            const checked = validateIntakeIdentity(target);
+            if (
+              checked.intakeId !== identity.intakeId ||
+              checked.sourceHash !== identity.sourceHash
+            )
+              invalid('copy legacy identity');
+            const targetPrefix = intakeNamespace(checked);
+            let previous: Reference | null = null,
+              bytes = 0;
+            if (index) index.clearCopies();
+            else db.exec('DELETE FROM copied_operations');
+            for (const row of index
+              ? index.receipts()
+              : db.prepare('SELECT id FROM receipts ORDER BY id').iterate()) {
+              current();
+              yield;
+              if (index) index.copy(String(row.id), randomUUID());
+              else
+                db.prepare('INSERT INTO copied_operations VALUES(?,?)').run(row.id, randomUUID());
+            }
+            for (const row of index
+              ? index.frames()
+              : db.prepare('SELECT raw,sha FROM frames ORDER BY sequence').iterate()) {
+              current();
+              yield;
+              if (digest(String(row.raw)) !== row.sha) invalid('legacy frame scratch changed');
+              const frame = decode(row.raw, FRAME_BYTES) as Frame,
+                operationId = index
+                  ? index.copied(frame.operationId)
+                  : db
+                      .prepare('SELECT target FROM copied_operations WHERE id=?')
+                      .get(frame.operationId)?.target;
+              if (typeof operationId !== 'string') invalid('copy legacy operation identity');
+              const id = randomUUID(),
+                copied: string = JSON.stringify({
+                  ...frame,
+                  ...checked,
+                  id,
+                  operationId,
+                  previous,
+                });
+              if (Buffer.byteLength(copied) > FRAME_BYTES) invalid('frame bound');
+              bytes += Buffer.byteLength(copied);
+              const key = targetPrefix + 'frame:' + id;
+              sink(key, copied);
+              previous = { id, sequence: frame.sequence, sha256: digest(copied) };
+            }
+            for (const row of index
+              ? (function* () {
+                  for (const receipt of index.receipts())
+                    yield { raw: receipt.raw, target: index.copied(receipt.id) };
+                })()
+              : db
+                  .prepare(
+                    'SELECT raw,target FROM receipts JOIN copied_operations USING(id) ORDER BY id',
+                  )
+                  .iterate()) {
+              current();
+              yield;
+              const receipt = decode(row.raw, HEAD_BYTES) as {
+                  fingerprint: string;
+                  result: IntakeStateResult;
+                },
+                copied = JSON.stringify({
+                  ...receipt,
+                  result: { ...receipt.result, operationId: row.target },
+                });
+              if (Buffer.byteLength(copied) > HEAD_BYTES) invalid('copy legacy receipt bound');
+              bytes += Buffer.byteLength(copied);
+              sink(targetPrefix + 'operation:' + row.target, copied);
+            }
+            const rebound: Head = {
+              ...head,
+              ...checked,
+              tip: previous!,
+              usage: { ...head.usage, bytes },
+            };
+            usage(rebound.usage, caps);
+            return rebound;
+          } finally {
+            rebindInFlight = false;
           }
-          for (const row of db.prepare('SELECT raw,sha FROM frames ORDER BY sequence').iterate()) {
-            current();
-            yield;
-            if (digest(String(row.raw)) !== row.sha) invalid('legacy frame scratch changed');
-            const frame = decode(row.raw, FRAME_BYTES) as Frame,
-              operationId = db
-                .prepare('SELECT target FROM copied_operations WHERE id=?')
-                .get(frame.operationId)?.target;
-            if (typeof operationId !== 'string') invalid('copy legacy operation identity');
-            const id = randomUUID(),
-              copied: string = JSON.stringify({ ...frame, ...checked, id, operationId, previous });
-            if (Buffer.byteLength(copied) > FRAME_BYTES) invalid('frame bound');
-            bytes += Buffer.byteLength(copied);
-            const key = targetPrefix + 'frame:' + id;
-            write(key, copied);
-            previous = { id, sequence: frame.sequence, sha256: digest(copied) };
-          }
-          for (const row of db
-            .prepare('SELECT raw,target FROM receipts JOIN copied_operations USING(id) ORDER BY id')
-            .iterate()) {
-            current();
-            yield;
-            const receipt = decode(row.raw, HEAD_BYTES) as {
-                fingerprint: string;
-                result: IntakeStateResult;
-              },
-              copied = JSON.stringify({
-                ...receipt,
-                result: { ...receipt.result, operationId: row.target },
-              });
-            if (Buffer.byteLength(copied) > HEAD_BYTES) invalid('copy legacy receipt bound');
-            bytes += Buffer.byteLength(copied);
-            write(targetPrefix + 'operation:' + row.target, copied);
-          }
-          const rebound: Head = {
-            ...head,
-            ...checked,
-            tip: previous!,
-            usage: { ...head.usage, bytes },
-          };
-          usage(rebound.usage, caps);
-          return rebound;
-        } finally {
-          rebindInFlight = false;
-        }
+        })();
+        return yield* index
+          ? ownedSteps(source, (error) => writerFailed && error === writerError && !closed)
+          : source;
       },
       close,
     });
     complete = true;
     return result;
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    if (!complete) close();
+    if (!complete) {
+      try {
+        close();
+      } catch (error) {
+        if (!failed || !index) throw error;
+      }
+    }
   }
 }
 function validKey(value: string): string {
@@ -472,19 +656,6 @@ function* numberValueSteps(
   return result as number;
 }
 
-interface Node {
-  id: number;
-  kind: string;
-  value: string | null;
-  start: number;
-  units: number;
-}
-interface Entry {
-  ordinal: number;
-  key: string | null;
-  numeric: number | null;
-  child: number;
-}
 interface RawMember {
   nameStart: number;
   nameEnd: number;
@@ -521,10 +692,13 @@ const SCALAR_BUFFER = 4096;
 class DiskIntakeValue {
   readonly checkpoint: () => void;
   readonly work: IntakeLegacyReplayWork;
-  readonly scratch: ReturnType<typeof disposableSqlite>;
-  readonly db: ReturnType<typeof disposableSqlite>['db'];
-  readonly directory: string;
-  readonly fd: number;
+  readonly scratch?: ReturnType<typeof disposableSqlite>;
+  readonly db?: ReturnType<typeof disposableSqlite>['db'];
+  readonly directory?: string;
+  readonly fd?: number;
+  readonly index?: LegacyIndex;
+  readonly canonicalScratch?: IntakeJsonCanonicalScratch;
+  private encrypted?: ReturnType<typeof createIntakeLegacyEncryptedScratch>;
   root: number | undefined;
   private units = 0;
   // Units not yet on disk, at most SCALAR_BUFFER bytes, starting at `flushed`.
@@ -536,9 +710,45 @@ class DiskIntakeValue {
   // its own statement, so an outer iteration is never reset by an inner one.
   private statements = new Map<string, StatementSync>();
   private iterating = new Map<string, StatementSync[]>();
-  constructor(checkpoint: () => void, work: IntakeLegacyReplayWork) {
+  constructor(
+    checkpoint: () => void,
+    work: IntakeLegacyReplayWork,
+    encrypted?: IntakeLegacyEncryptedScratchOptions,
+  ) {
     this.checkpoint = checkpoint;
     this.work = work;
+    if (encrypted) {
+      if (
+        typeof encrypted.assertCurrent !== 'function' ||
+        typeof encrypted.selectedHead !== 'string' ||
+        !encrypted.selectedHead
+      )
+        throw Error('Encrypted legacy scratch requires selected HEAD and current scope');
+      const assertCurrent = encrypted.assertCurrent;
+      this.checkpoint = () => {
+        try {
+          assertCurrent();
+          checkpoint();
+        } catch (error) {
+          try {
+            this.close();
+          } catch {}
+          throw error;
+        }
+      };
+      const options = { ...encrypted, assertCurrent: this.checkpoint };
+      this.encrypted = createIntakeLegacyEncryptedScratch(options);
+      this.index = this.encrypted.index;
+      try {
+        this.canonicalScratch = createEncryptedIntakeJsonCanonicalScratch(options);
+      } catch (error) {
+        try {
+          this.encrypted.close();
+        } catch {}
+        throw error;
+      }
+      return;
+    }
     this.scratch = disposableSqlite('intake-legacy-values-');
     this.db = this.scratch.db;
     let directory: string | undefined, fd: number | undefined;
@@ -567,25 +777,33 @@ class DiskIntakeValue {
     }
   }
   close() {
+    if (this.encrypted) {
+      try {
+        this.canonicalScratch!.close();
+      } finally {
+        this.encrypted.close();
+      }
+      return;
+    }
     try {
-      closeSync(this.fd);
+      closeSync(this.fd!);
     } finally {
       try {
-        this.scratch.close();
+        this.scratch!.close();
       } finally {
-        rmSync(this.directory, { recursive: true, force: true });
+        rmSync(this.directory!, { recursive: true, force: true });
       }
     }
   }
   private stmt(sql: string): StatementSync {
     let statement = this.statements.get(sql);
-    if (!statement) this.statements.set(sql, (statement = this.db.prepare(sql)));
+    if (!statement) this.statements.set(sql, (statement = this.db!.prepare(sql)));
     return statement;
   }
   private *rows(sql: string, ...args: (string | number | null)[]) {
     const pool = this.iterating.get(sql) ?? [];
     this.iterating.set(sql, pool);
-    const statement = pool.pop() ?? this.db.prepare(sql);
+    const statement = pool.pop() ?? this.db!.prepare(sql);
     try {
       yield* statement.iterate(...args);
     } finally {
@@ -593,14 +811,25 @@ class DiskIntakeValue {
     }
   }
   node(id: number): Node {
-    const row = this.stmt('SELECT * FROM nodes WHERE id=?').get(id);
+    const row = this.index
+      ? this.index.node(id)
+      : this.stmt('SELECT * FROM nodes WHERE id=?').get(id);
     if (!row) invalid('missing replay node');
     return row as unknown as Node;
   }
   count(id: number): number {
+    if (this.index) return this.index.count(id);
     return Number(this.stmt('SELECT count(*) n FROM entries WHERE parent=?').get(id)!.n);
   }
   *entries(id: number, array = this.node(id).kind === 'array'): Generator<Entry> {
+    if (this.index) {
+      let visits = 0;
+      for (const entry of this.index.entries(id, array)) {
+        if (++visits % 64 === 0) this.checkpoint();
+        yield entry;
+      }
+      return;
+    }
     const sql = array
       ? 'SELECT ordinal,key,numeric,child FROM entries WHERE parent=? ORDER BY ordinal'
       : 'SELECT ordinal,key,numeric,child FROM entries WHERE parent=? ORDER BY numeric IS NULL,numeric,ordinal';
@@ -612,6 +841,15 @@ class DiskIntakeValue {
   }
   private write(text: string) {
     this.work.peakScalarBufferBytes = Math.max(this.work.peakScalarBufferBytes, SCALAR_BUFFER);
+    if (this.encrypted) {
+      const before = Math.floor(this.encrypted.units.length() / SCALAR_BUFFER);
+      this.encrypted.units.appendBytes(Buffer.from(text, 'utf16le'));
+      this.work.scalarScratchWrites +=
+        Math.floor(this.encrypted.units.length() / SCALAR_BUFFER) - before;
+      this.units += text.length;
+      this.work.scalarScratchBytes += text.length * 2;
+      return;
+    }
     let at = 0;
     while (at < text.length) {
       if (this.pendingBytes === SCALAR_BUFFER) this.flush();
@@ -629,7 +867,13 @@ class DiskIntakeValue {
     if (!this.pendingBytes) return;
     let at = 0;
     while (at < this.pendingBytes) {
-      const n = writeSync(this.fd, this.pending, at, this.pendingBytes - at, this.flushed * 2 + at);
+      const n = writeSync(
+        this.fd!,
+        this.pending,
+        at,
+        this.pendingBytes - at,
+        this.flushed * 2 + at,
+      );
       if (!n) invalid('legacy scalar scratch write stalled');
       at += n;
     }
@@ -638,6 +882,16 @@ class DiskIntakeValue {
     this.pendingBytes = 0;
   }
   *text(node: Node, start = 0, end = node.units): Generator<string> {
+    if (this.encrypted) {
+      this.work.peakScalarBufferBytes = Math.max(this.work.peakScalarBufferBytes, SCALAR_BUFFER);
+      while (start < end) {
+        this.checkpoint();
+        const count = Math.min(SCALAR_BUFFER / 2, end - start);
+        yield this.encrypted.units.read((node.start + start) * 2, count * 2).toString('utf16le');
+        start += count;
+      }
+      return;
+    }
     // Only detached strings escape; a suspended reader never retains this buffer.
     const bytes = this.readBuffer;
     this.work.peakScalarBufferBytes = Math.max(this.work.peakScalarBufferBytes, bytes.length);
@@ -650,7 +904,7 @@ class DiskIntakeValue {
         written = Math.max(0, Math.min(count, this.flushed - from));
       let read = 0;
       while (read < written * 2) {
-        const n = readSync(this.fd, bytes, read, written * 2 - read, from * 2 + read);
+        const n = readSync(this.fd!, bytes, read, written * 2 - read, from * 2 + read);
         if (!n) invalid('truncated legacy scalar scratch');
         read += n;
       }
@@ -684,6 +938,7 @@ class DiskIntakeValue {
     return { id: 0, kind: 'string', value: null, start, units: this.units - start };
   }
   private insertNode(node: Omit<Node, 'id'>): number {
+    if (this.index) return this.index.insertNode(node);
     return Number(
       this.stmt('INSERT INTO nodes(kind,value,start,units) VALUES(?,?,?,?)').run(
         node.kind,
@@ -694,6 +949,15 @@ class DiskIntakeValue {
     );
   }
   private add(parent: number, ordinal: number, child: number, key: string | null = null) {
+    if (this.index) {
+      this.index.add(parent, {
+        ordinal,
+        child,
+        key,
+        numeric: key === null ? null : numericKey(key),
+      });
+      return;
+    }
     this.stmt('INSERT INTO entries VALUES(?,?,?,?,?)').run(
       parent,
       ordinal,
@@ -748,10 +1012,12 @@ class DiskIntakeValue {
     const node = this.node(id);
     if (node.kind === 'array') {
       const ordinal = arrayIndex(key);
+      if (this.index) return this.index.entry(id, ordinal)?.child;
       return this.stmt('SELECT child FROM entries WHERE parent=? AND ordinal=?').get(id, ordinal)
         ?.child as number | undefined;
     }
     if (node.kind !== 'object') invalid('legacy delta parent');
+    if (this.index) return this.index.named(id, key)?.child;
     return this.stmt('SELECT child FROM entries WHERE parent=? AND key=?').get(id, key)?.child as
       number | undefined;
   }
@@ -772,6 +1038,7 @@ class DiskIntakeValue {
         count = this.count(parent);
       if (ordinal > count) invalid('legacy array set index');
       if (ordinal === count) this.add(parent, ordinal, child);
+      else if (this.index) this.index.replace(parent, this.index.entry(parent, ordinal)!, child);
       else
         this.stmt('UPDATE entries SET child=? WHERE parent=? AND ordinal=?').run(
           child,
@@ -781,28 +1048,51 @@ class DiskIntakeValue {
     } else {
       if (node.kind !== 'object') invalid('legacy delta parent');
       if (this.child(parent, key) === undefined) {
-        const next = Number(
-          this.stmt('SELECT coalesce(max(ordinal)+1,0) n FROM entries WHERE parent=?').get(parent)!
-            .n,
-        );
+        const next = this.index
+          ? this.index.nextOrdinal(parent)
+          : Number(
+              this.stmt('SELECT coalesce(max(ordinal)+1,0) n FROM entries WHERE parent=?').get(
+                parent,
+              )!.n,
+            );
         this.add(parent, next, child, key);
-      } else
-        this.stmt('UPDATE entries SET child=? WHERE parent=? AND key=?').run(child, parent, key);
+      } else if (this.index) this.index.replace(parent, this.index.named(parent, key)!, child);
+      else this.stmt('UPDATE entries SET child=? WHERE parent=? AND key=?').run(child, parent, key);
     }
   }
   private reordered(entry: Entry) {
+    if (this.index) {
+      this.index.reorder(entry);
+      return;
+    }
     this.stmt('INSERT INTO reordered(key,numeric,child) VALUES(?,?,?)').run(
       entry.key,
       entry.numeric,
       entry.child,
     );
   }
-  private finishOrder(parent: number) {
+  private *finishOrder(parent: number): Generator<void> {
+    if (this.index) {
+      yield* this.index.finishOrderSteps(parent);
+      return;
+    }
     this.stmt('DELETE FROM entries WHERE parent=?').run(parent);
     this.stmt(
       'INSERT INTO entries SELECT ?,position-1,key,numeric,child FROM reordered ORDER BY position',
     ).run(parent);
-    this.db.exec('DELETE FROM reordered');
+    this.db!.exec('DELETE FROM reordered');
+  }
+  private *insertedRows(): Generator<{ child: unknown }> {
+    if (this.index) {
+      for (const child of this.index.inserted()) yield { child };
+    } else
+      yield* this.rows('SELECT child FROM inserted ORDER BY position') as Generator<{
+        child: unknown;
+      }>;
+  }
+  private clearInserted() {
+    if (this.index) this.index.clearInserted();
+    else this.db!.exec('DELETE FROM inserted');
   }
   *applySteps(
     tree: PreparedIntakeJsonTree,
@@ -860,13 +1150,15 @@ class DiskIntakeValue {
       const parent = this.target(path.slice(0, -1));
       if (this.node(parent).kind !== 'object' || this.child(parent, path.at(-1)!) === undefined)
         invalid('legacy object removal');
-      this.stmt('DELETE FROM entries WHERE parent=? AND key=?').run(parent, path.at(-1)!);
+      if (this.index) this.index.remove(parent, this.index.named(parent, path.at(-1)!)!);
+      else this.stmt('DELETE FROM entries WHERE parent=? AND key=?').run(parent, path.at(-1)!);
     } else if (op === 'truncate') {
       const target = this.target(path),
         length = natural(yield* numberValueSteps(tree, required('length')));
       if (this.node(target).kind !== 'array' || length >= this.count(target))
         invalid('legacy array truncate');
-      this.stmt('DELETE FROM entries WHERE parent=? AND ordinal>=?').run(target, length);
+      if (this.index) yield* this.index.truncateSteps(target, length);
+      else this.stmt('DELETE FROM entries WHERE parent=? AND ordinal>=?').run(target, length);
     } else if (op === 'splice') {
       const target = this.node(this.target(path)),
         offset = natural(yield* numberValueSteps(tree, required('offset'))),
@@ -920,9 +1212,12 @@ class DiskIntakeValue {
       const count = this.count(target);
       if (count > MAX_ITEMS) invalid('legacy object items');
       charge(budget, 'operations', 1 + path.length + count);
-      const moved = this.stmt(
-        'SELECT ordinal,key,numeric,child FROM entries WHERE parent=? AND key=?',
-      ).get(target, key!) as unknown as Entry;
+      const moved = this.index
+        ? this.index.named(target, key!)!
+        : (this.stmt('SELECT ordinal,key,numeric,child FROM entries WHERE parent=? AND key=?').get(
+            target,
+            key!,
+          ) as unknown as Entry);
       for (const entry of this.entries(target)) {
         yield;
         if (entry.key === key) continue;
@@ -930,7 +1225,7 @@ class DiskIntakeValue {
         this.reordered(entry);
       }
       if (before === null) this.reordered(moved);
-      this.finishOrder(target);
+      yield* this.finishOrder(target);
     } else {
       const target = this.target(path),
         count = this.count(target);
@@ -940,9 +1235,11 @@ class DiskIntakeValue {
           to = natural(yield* numberValueSteps(tree, required('to')));
         if (from >= count || to >= count || from === to) invalid('legacy array move');
         charge(budget, 'operations', 1 + path.length + 2 * count);
-        const moved = this.stmt(
-          'SELECT ordinal,key,numeric,child FROM entries WHERE parent=? AND ordinal=?',
-        ).get(target, from) as unknown as Entry;
+        const moved = this.index
+          ? this.index.entry(target, from)!
+          : (this.stmt(
+              'SELECT ordinal,key,numeric,child FROM entries WHERE parent=? AND ordinal=?',
+            ).get(target, from) as unknown as Entry);
         let at = 0;
         for (const entry of this.entries(target)) {
           yield;
@@ -951,7 +1248,7 @@ class DiskIntakeValue {
           this.reordered(entry);
         }
         if (to === count - 1) this.reordered(moved);
-        this.finishOrder(target);
+        yield* this.finishOrder(target);
       } else {
         const offset = natural(yield* numberValueSteps(tree, required('offset'))),
           remove = natural(yield* numberValueSteps(tree, required('remove'))),
@@ -967,24 +1264,24 @@ class DiskIntakeValue {
           invalid('legacy array splice');
         charge(budget, 'operations', 1 + path.length + count + inserted);
         for (const item of tree.arrayItems(values)) {
-          this.stmt('INSERT INTO inserted(child) VALUES(?)').run(
-            yield* this.cloneSteps(tree, item, path.length + 1, budget),
-          );
+          const child = yield* this.cloneSteps(tree, item, path.length + 1, budget);
+          if (this.index) this.index.insert(child);
+          else this.stmt('INSERT INTO inserted(child) VALUES(?)').run(child);
         }
         if (offset === count && remove === 0) {
           let ordinal = count;
-          for (const row of this.rows('SELECT child FROM inserted ORDER BY position')) {
+          for (const row of this.insertedRows()) {
             this.add(target, ordinal++, Number(row.child));
             yield;
           }
-          this.db.exec('DELETE FROM inserted');
+          this.clearInserted();
           return;
         }
         for (const entry of this.entries(target)) {
           if (entry.ordinal < offset) this.reordered(entry);
           yield;
         }
-        for (const row of this.rows('SELECT child FROM inserted ORDER BY position')) {
+        for (const row of this.insertedRows()) {
           this.reordered({ ordinal: 0, key: null, numeric: null, child: Number(row.child) });
           yield;
         }
@@ -992,8 +1289,8 @@ class DiskIntakeValue {
           if (entry.ordinal >= offset + remove) this.reordered(entry);
           yield;
         }
-        this.finishOrder(target);
-        this.db.exec('DELETE FROM inserted');
+        yield* this.finishOrder(target);
+        this.clearInserted();
       }
     }
   }
@@ -1004,6 +1301,11 @@ class DiskIntakeValue {
   /** Members with their child rows, in the same order and checkpoint cadence
    * as entries(): one joined read per member instead of a read per child. */
   private *entryNodes(node: Node): Generator<Entry & { node: Node }> {
+    if (this.index) {
+      for (const entry of this.entries(node.id, node.kind === 'array'))
+        yield { ...entry, node: this.node(entry.child) };
+      return;
+    }
     const sql =
       node.kind === 'array'
         ? 'SELECT e.ordinal,e.key,e.numeric,e.child,n.kind,n.value,n.start,n.units FROM entries e LEFT JOIN nodes n ON n.id=e.child WHERE e.parent=? ORDER BY e.ordinal'
@@ -1115,6 +1417,7 @@ class DiskIntakeValue {
         tree = yield* prepareIntakeJsonCanonicalSteps(this.text(node), {
           preserveNumbers: true,
           mode: 'stringify',
+          scratch: this.canonicalScratch,
         });
         if (tree.kind(tree.root) !== 'object') invalid('legacy envelope');
         const intake = tree.field(tree.root, 'intake');
@@ -1256,6 +1559,7 @@ class DiskIntakeValue {
   ): Generator<void, { domainVersion: number }> {
     const projection = yield* prepareIntakeEnvelopeProjectionSteps(
       intakeCopySourcePieces(detailsJson),
+      { scratch: this.canonicalScratch },
     );
     let rawTree: PreparedIntakeJsonCanonical | undefined;
     try {
@@ -1270,6 +1574,7 @@ class DiskIntakeValue {
         rawTree = yield* prepareIntakeJsonCanonicalSteps(this.text(node), {
           mode: 'stringify',
           preserveNumbers: true,
+          scratch: this.canonicalScratch,
         });
         domainVersion = yield* this.canonicalEnvelopeSteps(rawTree);
         projected = this.rawMetadataPieces(node, projection.format);

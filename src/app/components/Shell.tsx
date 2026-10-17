@@ -6,7 +6,7 @@ import { StorageNotice } from './StorageNotice';
 import { useEffect, useState } from 'react';
 import type { IntakeBatch } from '../../shared/intake-batch';
 import { api } from '../data/api';
-import { NavLink, Outlet, useLocation } from 'react-router-dom';
+import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 import * as Dialog from '@radix-ui/react-dialog';
 import {
   FlaskConical,
@@ -18,7 +18,6 @@ import {
   Link2,
   Menu,
   X,
-  Upload,
 } from 'lucide-react';
 import { Brand, HarlequinAccent } from './Brand';
 import { ThemeToggle } from './ThemeToggle';
@@ -33,13 +32,13 @@ const navigation = [
   { label: 'Procedures', icon: Bandage, href: '/procedures' },
   { label: 'Notes', icon: BookHeart, href: '/notes' },
   { label: 'People', icon: UsersRound, href: '/people' },
-  { label: 'Import', icon: Upload, href: '/import' },
   { label: 'Sources', icon: Link2, href: '/sources' },
 ];
 
 function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const profile = useProfile();
   const location = useLocation();
+  const sourcesSelected = ['/sources', '/import'].includes(location.pathname);
   const selfSelected =
     location.pathname === '/' ||
     (location.pathname === '/people' &&
@@ -50,6 +49,19 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
     <nav className="navigation" aria-label="Main navigation">
       {navigation.map(({ label: defaultLabel, icon: Icon, href, profileLabel }) => {
         const label = profileLabel ? profile?.name || 'Self' : defaultLabel;
+        if (href === '/sources')
+          return (
+            <Link
+              key={defaultLabel}
+              to={href}
+              onClick={onNavigate}
+              aria-current={sourcesSelected ? 'page' : undefined}
+              className={`nav-item ${sourcesSelected ? 'active' : ''}`}
+            >
+              <Icon size={21} strokeWidth={1.6} />
+              <span className="nav-label">{label}</span>
+            </Link>
+          );
         return href ? (
           <NavLink
             aria-label={profileLabel ? `${label} Self` : undefined}

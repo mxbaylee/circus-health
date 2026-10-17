@@ -107,7 +107,7 @@ export function createIntakeTree(
     certificate: IntakeTreeReadCertificate;
     check: () => void;
   },
-  accounting?: 'private-envelope',
+  accounting?: 'private-envelope' | 'vault-certificates',
 ) {
   const pending = new Map<string, { raw: string; node: IntakeTreeNode }>();
   let preparedBytes = 0;
@@ -126,10 +126,17 @@ export function createIntakeTree(
           cached.certificate.registry === certificate.registry &&
           cached.certificate.epoch === certificate.epoch));
     const raw = reusable ? cached.raw : read(ref.hash);
-    if (reusable) recordIntakeWork('collectionNodeCacheHits');
-    else {
+    if (reusable) {
+      recordIntakeWork('collectionNodeCacheHits');
+      if (accounting === 'vault-certificates') recordIntakeWork('vaultCertificatePageCacheHits');
+    } else {
       recordIntakeWork('collectionNodeReads');
-      if (typeof raw === 'string') recordIntakeWork('collectionReadBytes', Buffer.byteLength(raw));
+      if (accounting === 'vault-certificates') recordIntakeWork('vaultCertificatePageReads');
+      if (typeof raw === 'string') {
+        recordIntakeWork('collectionReadBytes', Buffer.byteLength(raw));
+        if (accounting === 'vault-certificates')
+          recordIntakeWork('vaultCertificatePageReadBytes', Buffer.byteLength(raw));
+      }
     }
     readProof?.check();
     if (cached && cached.raw === raw) {
@@ -178,6 +185,10 @@ export function createIntakeTree(
       }
       recordIntakeWork('collectionPreparedBytes', Buffer.byteLength(raw));
       recordIntakePeak('collectionPeakPreparedBytes', preparedBytes);
+      if (accounting === 'vault-certificates') {
+        recordIntakeWork('vaultCertificatePagePreparedBytes', Buffer.byteLength(raw));
+        recordIntakePeak('vaultCertificatePagePeakPreparedBytes', preparedBytes);
+      }
     }
     return ref;
   };

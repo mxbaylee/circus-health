@@ -125,6 +125,68 @@ test('tiny diagnostics fixture has one page and four literal fictional observati
   }
 });
 
+test('continuing fixture has two clinical page scopes, four observations and an administrative middle page', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fictional-continuing-fixture-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = join(root, 'continuing.pdf');
+  const receipt = writeProviderQualificationPdf(path, 'continuing');
+  assert.equal(receipt.pages, 3);
+  assert.equal(receipt.expectedRecords, 4);
+  const answers = answersForQualification('continuing');
+  assert.deepEqual(
+    answers.map((answer) => [answer.page, answer.marker]),
+    [
+      [1, 'FXP1R01'],
+      [1, 'FXP1R02'],
+      [3, 'FXP3R01'],
+      [3, 'FXP3R02'],
+    ],
+  );
+  const task = getDocument({
+    data: Uint8Array.from(readFileSync(path)),
+    standardFontDataUrl: fileURLToPath(
+      new URL('../../node_modules/pdfjs-dist/standard_fonts/', import.meta.url),
+    ),
+  });
+  try {
+    const document = await task.promise;
+    assert.equal(document.numPages, 3);
+    for (const number of [1, 3]) {
+      const page = await document.getPage(number);
+      const content = (await page.getTextContent()).items
+        .flatMap((item) => ('str' in item ? [item.str] : []))
+        .join(' ');
+      for (const answer of answers.filter((answer) => answer.page === number))
+        assert.ok(content.includes(answer.marker));
+      assert.doesNotMatch(content, new RegExp(`FXP${number === 1 ? 3 : 1}R`));
+    }
+    const administrative = await document.getPage(2);
+    assert.equal(
+      (await administrative.getTextContent()).items.length,
+      0,
+      'middle page is independently rendered pixels',
+    );
+    assert.ok((await administrative.getOperatorList()).fnArray.includes(OPS.paintImageXObject));
+    const records = answers.map((answer) => ({
+      id: answer.marker,
+      kind: answer.kind,
+      mapping: { ...answer.fields },
+      evidence: [
+        {
+          label: 'Original source',
+          locator: `page ${answer.page}`,
+          contentUrl: `/api/sources/${originalId}/content`,
+        },
+      ],
+    }));
+    assert.equal(gradeProviderQualification(records, originalId, 'continuing').passed, true);
+    records[0]!.mapping.valueText = '999';
+    assert.equal(gradeProviderQualification(records, originalId, 'continuing').passed, false);
+  } finally {
+    await task.destroy();
+  }
+});
+
 test('qualification oracle rejects omissions, duplicate rows, hallucinations and literal-field errors', () => {
   assert.equal(gradeProviderQualification(exactRecords(), originalId).passed, true);
   const incorrect = exactRecords();

@@ -933,7 +933,33 @@ export function captureVaultRecordStaging(
     resolve(owner.directory, 'vault'),
     resolve(owner.directory, 'vault/versions'),
   ].map(recordParent);
-  if (!recordStagingMethodsCurrent(owner) || !managedPhysicalEpochCurrent(originalEpoch))
+  const methods = managedDatabaseMethodEpoch(db),
+    retained = owner.backingFrontier;
+  // A function registered before this new operation can retire an idle cache,
+  // but cannot renew an existing staging proof. Only a methods-only mismatch
+  // qualifies: every other retained frontier gate must still match. The new
+  // operation then proves its complete original backing from durable evidence.
+  if (
+    methods &&
+    retained &&
+    owner.stagingWitnesses.size === 0 &&
+    retained.methods !== methods &&
+    retained.db === db &&
+    owner.head() === Buffer.from(retained.head).toString('base64') &&
+    managedPhysicalEpochCurrent(retained.epoch) &&
+    retained.sequence === managedPhysicalMutationSequence() &&
+    retained.workspaceEpoch === owner.workspaceEpoch() &&
+    recordParentsCurrent(retained.parents)
+  ) {
+    owner.backingFrontier = undefined;
+    retained.backing.close();
+    recordVersionWork('vaultBackingRejectedMethods');
+  }
+  if (
+    !recordStagingMethodsCurrent(owner) ||
+    !managedPhysicalEpochCurrent(originalEpoch) ||
+    managedDatabaseMethodEpoch(db) !== methods
+  )
     throw Error('Immutable record staging interval changed');
   const witness = Object.freeze({}) as VaultRecordStagingWitness;
   recordStagingWitnesses.set(witness, {

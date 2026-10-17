@@ -10,7 +10,7 @@ export const qualificationPerson = 'Fictional Qualification Person';
 export const qualificationBirthDate = '1982-04-17';
 export const qualificationSourceSystem = 'Fictional Qualification System';
 export type QualificationStage = 'extracted' | 'accepted';
-export type QualificationScenario = 'tiny' | 'quick' | 'long';
+export type QualificationScenario = 'tiny' | 'quick' | 'long' | 'continuing';
 export interface QualificationAnswer {
   page: number;
   format: 'dense' | 'scan';
@@ -22,10 +22,13 @@ export function answersForQualification(
   scenario: QualificationScenario,
 ): readonly QualificationAnswer[] {
   return Array.from(
-    { length: scenario === 'tiny' ? 4 : scenario === 'quick' ? 64 : 400 },
+    {
+      length:
+        scenario === 'tiny' || scenario === 'continuing' ? 4 : scenario === 'quick' ? 64 : 400,
+    },
     (_, index) => {
-      const rows = scenario === 'quick' ? 16 : 4;
-      const page = Math.floor(index / rows) + 1;
+      const rows = scenario === 'quick' ? 16 : scenario === 'continuing' ? 2 : 4;
+      const page = scenario === 'continuing' ? (index < 2 ? 1 : 3) : Math.floor(index / rows) + 1;
       const row = index % rows;
       const marker = `FXP${page}R${String(row + 1).padStart(2, '0')}`;
       const date = `2026-${String(Math.floor((page - 1) / 28) + 1).padStart(2, '0')}-${String(((page - 1) % 28) + 1).padStart(2, '0')}`;
@@ -138,7 +141,14 @@ export function writeProviderQualificationPdf(
         9,
       ],
     ];
-    if (scenario !== 'long') {
+    if (scenario === 'continuing' && !rows.length) {
+      lines.push([
+        'Administrative routing sheet. No clinical assertions on this page.',
+        30,
+        626,
+        9,
+      ]);
+    } else if (scenario !== 'long') {
       lines.push(
         [
           'No external patient/record IDs or terminology codes supplied. FX markers are labels only.',

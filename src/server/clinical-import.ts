@@ -1093,8 +1093,18 @@ export function* buildClinicalReviewWork(
     unsupported: records.filter((r) => r.classification === 'unsupported').length,
     uncertain: records.filter((r) => r.uncertainties.length).length,
   };
+  // A measured proposal with no existing destination dependencies is completely
+  // represented here. Unrelated clinical publication must not revoke that
+  // review. Duplicate/comparison and unknown-source reviews retain their broad
+  // guard: an ID or a paginated discovery page is not a complete dependency set.
+  const measuredIndependent =
+    reviewTokenVersion !== undefined &&
+    records.every(
+      (record) =>
+        !record.duplicateOf && !record.comparisons.length && !record.comparisonPage?.hasMore,
+    );
   const reviewToken = hash([
-    clinicalReviewRevision(db),
+    ...(measuredIndependent ? [] : [clinicalReviewRevision(db)]),
     file.id,
     inputFile.sha256,
     reviewTokenVersion ?? version,

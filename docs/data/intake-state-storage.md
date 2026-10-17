@@ -1,6 +1,6 @@
 # Incremental intake state primitive
 
-The internal `createIntakeStateStorage` API stores JSON state using changed-content contributions in ordinary durable `app_meta` records. Production intake uses it through the [selected envelope authority](intake-envelope-authority.md) and [operational access boundary](../import/intake-state-access.md). The source row retains validated compact metadata; selected accepted evidence owns the complete envelope. The owner supports the retained V3 codec and the V4 collection representation described below. This primitive does not establish large-import qualification.
+The internal `createIntakeStateStorage` API stores JSON state using changed-content contributions in ordinary durable `app_meta` records. Production intake uses it through the [selected envelope authority](intake-envelope-authority.md) and [operational access boundary](../import/intake-state-access.md). The source row retains validated compact metadata; selected accepted evidence owns the complete envelope. The owner supports the retained V3 codec, V4 collections and the V5 collection operation log described below. This primitive does not establish large-import qualification.
 
 ## Authority and identity
 
@@ -24,6 +24,79 @@ Cold reads validate exact schemas, primitive identities, hashes, predecessor seq
 ## V4 collections and selected publication
 
 The same owner exposes `.collections`; this is an extension of intake-state storage, not a second authority. A `health-intake-state-v4` head binds identity, storage sequence, logical root/domain version, receipts root, history root and incomplete-build root. Roots are fixed-size authenticated references. Domain version retains the existing public intake version meaning. Storage sequence advances for a new receipt, including a semantic no-op or auxiliary checkpoint; auxiliary churn does not change logical cursors or clinical review pins. V3 receipt/result versions retain their original interpretation.
+
+### V5 operation log and compatibility
+
+New collection checkpoints select a `health-intake-state-v5` head. Logical and
+incomplete-build collections retain their authenticated tree representation.
+Receipts and predecessor transitions append to immutable log leaves, with merge
+and peak nodes representing the ordered suffix. This avoids copying a receipt
+tree and history tree path on every checkpoint. The head retains fixed-size
+references and counters. The first checkpoint after retained V4 state anchors
+that exact V4 head; earlier receipts and history remain readable through the
+anchor and are not rewritten. The outer accepted-record and encrypted archive
+formats are unchanged, but a build without the V5 decoder cannot read a selected
+V5 intake. Preserve a checked backup before updating; do not downgrade an archive
+that has acquired V5 checkpoints to a V4-only build.
+
+Cold log admission is explicit and cooperative. It validates the complete
+selected suffix and constructs a bounded RAM-only operation index; it never
+silently substitutes disk scratch. Synchronous collection preparation requires
+that admission first. Async producers use `prepareAsync` or an explicitly owned
+admission scope and retain their original source, session and cancellation
+checks across yields. The index is disposable, not recovery authority. A codec
+proof alone grants neither original/source authority nor permission to publish.
+
+Process-wide derivative budgets allow 256 MiB of active SQLite index pages and
+128 MiB of cached pages, at most 128 active and 64 cached indices, and 1,024
+outstanding admission leases. These are page and resource bounds, not total
+process RAM bounds. Overlapping readers retain separate idempotent release
+leases; releasing a child preserves its parent. Idle continuation metadata is
+bounded to 64 entries per database. Eviction preserves registered immutable
+preparations and accepted receipts; a later reader can reconstruct the index.
+Resource exhaustion refuses new admission without changing accepted evidence.
+
+Historical collection graph traversal uses authenticated, invocation-local
+encrypted scratch for visited summaries, nested work and copy dependencies.
+Canonical anchored history and receipts provide historical agreement checks.
+Live validation checks current authority around each fixed synchronous summary
+operation, rather than repeating that proof for every internal encrypted page.
+No such interval crosses a caller callback or generator yield. Reentry through
+any data method poisons the interval; source reads receive their own closing
+check before their bytes are consumed. Generic inspection and copy retain
+their per-page checkpoint behavior.
+Graph validation also selects encrypted legacy replay and canonical JSON scratch
+when traversing a retained V3 ancestor. All three scopes bind the outer selected
+HEAD, even when that HEAD differs from the replayed ancestor. Scratch keys and
+roots remain in memory; completion, cancellation, generator return and terminal
+replay failures close the owned scopes and erase their keys. External
+representation callbacks receive a closing authority check before validation
+returns or copy continues.
+
+Each primitive scope retains at most 128 decoded pages; a graph with legacy
+replay can own three such scopes, plus the canonical engine's separate fixed
+caches. Capacity accounting is per scope, not a combined installation budget.
+Immutable temporary ciphertext retention is O(M log M); this does not establish
+linear scratch-space use. Other legacy/canonical callers and copy manifests
+retain separate plaintext scratch paths. This graph integration does not
+establish encryption of the complete bootstrap, migration or manual-copy
+operation.
+
+Only the actual accepted-record owner can confirm a pending log publication.
+It binds the selected predecessor and successor heads, exact receipt and complete
+fresh row set to the validated transaction. Prepared confirmation requires actual
+transaction replay. Merely staging SQL rows or registering an intent does not
+confirm acceptance. Confirmation is one use; every pending log row must match.
+If the optional derivative proof exceeds its resource budget or cannot be reused,
+the accepted evidence remains authoritative and requires fresh admission.
+
+Recovery and copy follow the complete V4 anchor and V5 suffix, including retained
+historical external references. They reject missing or extra selected evidence.
+For a V5 selection, copy preserves anchored and suffix receipt identities while
+rebinding the graph to its destination. The retained V4-only copy path still
+creates fresh replay operations.
+Component tests do not establish large-save proportionality or complete import
+qualification; those remain measured against the integrated candidate.
 
 Immutable AVL nodes authenticate their exact identity, key/value, children, ordered bounds, height and safe counts. A node is at most 32 KiB. Ordinary values at most 8 KiB stay inline; larger text uses checked 4 KiB byte chunks and an immutable attachment reference. These are representation units, not limits on a legal filename or record. Map point/rank/predecessor reads and path-local writes traverse authenticated paths. Sequence ranges and byte ranges have explicit item/byte budgets. Corrupt, foreign, missing and stale references refuse rather than becoming empty data.
 
@@ -319,7 +392,15 @@ retained row and performs the same reference, hash, historical-coverage and sche
 checks. Statement reuse does not cache evidence values, bypass cold validation
 or survive disposal of the private manifest.
 
-The cold historical-graph walk also prepares its fixed scratch membership, visited-row, receipt, history and sequence-summary statements once per graph invocation, after creating its private tables. It still decodes every incoming reference before checking the visited index and executes every lookup, disagreement check and write. No evidence value, validation result or cursor is cached by the statement set; another namespace or invocation uses a new set. The existing 4/16-record recovery fixture separately counts statement compilation and actual graph executions, then verifies the complete source snapshot, lexical representation, accepted replay and lookup preparation. These small host tests do not replace the full HTTP acceptance/encrypted recovery scenario.
+The cold historical-graph walk uses typed encrypted summary and work indexes
+instead of SQL scratch tables. It decodes incoming references before checking
+the summary index, preserves disagreement checks and follows canonical anchored
+history and receipts. Another namespace or invocation receives fresh keys and
+indexes. The 4/16-record recovery fixture counts typed summary reads and writes
+separately from authority checks, then verifies the complete source snapshot,
+lexical representation, accepted replay and lookup preparation. A completed
+small diagnostic does not qualify the larger case or replace full HTTP
+acceptance and encrypted recovery coverage.
 
 ### Prefix-scoped lexical order reads
 

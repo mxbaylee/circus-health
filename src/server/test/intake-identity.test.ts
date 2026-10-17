@@ -23,7 +23,10 @@ import {
   modelBirthDateWarnings,
   printedIdentityName,
 } from '../intake-identity-policy.ts';
-import { acceptIntakeReportSelection } from '../intake-report-acceptance.ts';
+import {
+  acceptIntakeReportSelection,
+  acceptIntakeReportSelectionAsync,
+} from '../intake-report-acceptance.ts';
 import { listIntakeImportFeed } from '../intake-report-queue.ts';
 import { getNote, saveNote } from '../notes.ts';
 import { createBackup } from '../recovery.ts';
@@ -3210,45 +3213,58 @@ test('pending report can be reassigned Self to family and back without losing al
     personSelection: { newPerson: { fullName: 'Fictional Alternative Person' } },
   });
   // Moving this report to a different Person cannot reuse an approval of Self.
-  const partial = acceptIntakeReportSelection(f.db, f.root, f.profileId, {
-    operationId: randomUUID(),
-    mode: 'partial-v1',
-    blocks: [
-      {
-        intakeId: f.item.id,
-        proposalId: approved.proposalId,
-        intakeVersion: approved.version,
-        reviewToken: approved.reviewToken,
-        selections: approved.records.map((record) => ({
-          recordId: record.id,
-          candidateId: record.candidateId!,
-          candidateVersionId: record.candidateVersionId!,
-          selectionReviewToken: record.selectionReviewToken,
-          mapping: record.mapping,
-        })),
-      },
-    ],
-  }).receipt;
+  const partial = (
+    await acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, {
+      operationId: randomUUID(),
+      mode: 'partial-v1',
+      blocks: [
+        {
+          intakeId: f.item.id,
+          proposalId: approved.proposalId,
+          intakeVersion: approved.version,
+          reviewToken: approved.reviewToken,
+          selections: approved.records.map((record) => ({
+            recordId: record.id,
+            candidateId: record.candidateId!,
+            candidateVersionId: record.candidateVersionId!,
+            selectionReviewToken: record.selectionReviewToken,
+            mapping: record.mapping,
+          })),
+        },
+      ],
+    })
+  ).receipt;
   assert.equal(partial.atomic, false);
   if (partial.atomic) throw new Error('Expected partial receipt');
   assert.equal(partial.acceptedCount, 0);
   assert.equal(partial.items[0]!.status, 'needs_review');
   assert.equal(partial.items[0]!.reasonCode, 'SELECTION_REVIEW_CHANGED');
-  scope = await f.preview();
-  await confirmIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
-    ...request(scope, 'reassign-self-final'),
-    attestation: 'confirmed_displayed_identity_questions',
-  });
-  const review = intake.reviewIntake(
+  // Partial acceptance adopts native authority. Continue with its exact bounded
+  // identity scope rather than attempting to rematerialize the legacy workflow.
+  const nativeScope = await getAnyIntakeIdentityScope(
     f.db,
     f.root,
     f.profileId,
     f.item.id,
-    proposed.proposals.at(-1)!.id,
+    scope.groupId,
   );
-  assert.equal(review.records[0]!.mapping.subject, 'self');
-  assert.equal(review.records[0]!.mapping.personId, undefined);
-  assert.equal(review.records[0]!.identityReview!.blocking, false);
+  assert.equal('format' in nativeScope, true);
+  await confirmAnyIntakeIdentityScope(f.db, f.root, f.profileId, f.item.id, {
+    version: nativeScope.intakeVersion,
+    operationId: 'reassign-self-final',
+    scope: nativeScope,
+    outcome: 'this_is_me',
+    attestation: 'confirmed_displayed_identity_questions',
+  });
+  const read = await intake.readIntakeReviewRecord(f.db, f.root, f.profileId, f.item.id, {
+    proposalId: approved.proposalId,
+    recordId: approved.records[0]!.id,
+  });
+  assert.equal(read.record.kind, 'record');
+  if (read.record.kind !== 'record') throw Error('Fictional selected record must fit inline');
+  assert.equal(read.record.record.mapping.subject, 'self');
+  assert.equal(read.record.record.mapping.personId, undefined);
+  assert.equal(read.record.record.identityReview!.blocking, false);
   assert.deepEqual(getNote(f.db, 'person-note:self').person.knownNames, ['Fictional Iris Meadow']);
   assert.equal(f.db.prepare('SELECT COUNT(*) n FROM observations').get()!.n, 0);
 });

@@ -222,12 +222,16 @@ export async function prepareCollectionReviewMembershipDerived(
       if (input.auxiliary) input.auxiliary.apply(changes);
       else
         collections.commitMaintenance(
-          collections.prepare(collections.openView(), {
-            operationId,
-            requestDigest: workflowHash(operationId),
-            domainVersion: before.logical.domainVersion,
-            changes,
-          }),
+          await collections.prepareAsync(
+            collections.openView(),
+            {
+              operationId,
+              requestDigest: workflowHash(operationId),
+              domainVersion: before.logical.domainVersion,
+              changes,
+            },
+            current,
+          ),
         );
     }
     await input.onCheckpoint?.();
@@ -499,21 +503,25 @@ export async function prepareCollectionReviewMembership(
         assertCurrent();
         const operationId = randomUUID();
         store.commitMaintenance(
-          store.prepare(store.openView(), {
-            operationId,
-            requestDigest: workflowHash(operationId),
-            domainVersion: current.rawVersion,
-            changes: [
-              {
-                area: 'builds',
-                collection: name,
-                op: 'putCollection',
-                key: '$version:' + address,
-                fromArea: 'builds',
-                fromCollection: versionName,
-              },
-            ],
-          }),
+          await store.prepareAsync(
+            store.openView(),
+            {
+              operationId,
+              requestDigest: workflowHash(operationId),
+              domainVersion: current.rawVersion,
+              changes: [
+                {
+                  area: 'builds',
+                  collection: name,
+                  op: 'putCollection',
+                  key: '$version:' + address,
+                  fromArea: 'builds',
+                  fromCollection: versionName,
+                },
+              ],
+            },
+            assertCurrent,
+          ),
         );
       }
       groupOrdinal++;

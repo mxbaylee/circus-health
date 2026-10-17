@@ -69,12 +69,16 @@ export async function prepareIntakeCompactMetadata(
         return { changed: false };
       parseSchemaControl(control);
       const operationId = randomUUID(),
-        prepared = collections.prepare(view, {
-          operationId,
-          requestDigest: createHash('sha256').update(operationId).digest('hex'),
-          domainVersion: head.logical.domainVersion,
-          changes: [],
-        });
+        prepared = await collections.prepareAsync(
+          view,
+          {
+            operationId,
+            requestDigest: createHash('sha256').update(operationId).digest('hex'),
+            domainVersion: head.logical.domainVersion,
+            changes: [],
+          },
+          assertRunning,
+        );
       try {
         if (
           !(await collections.certifyCompactMetadataAsync(prepared, {

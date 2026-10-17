@@ -141,13 +141,15 @@ test('original bridge record owner binds genuine database, methods and transacti
   }
 });
 
-test('one bridge assertion checks its original physical owner once per enclosing seal', (t) => {
+test('one bridge assertion checks its physical entry and retains the HEAD read seals', (t) => {
   const f = fixture(t),
     owner = captureContributorLegacyBridgeRecordOwner(f.db)!,
     work = createRecordVersionWorkCounters();
   t.after(() => closeRecordReadOwner(owner));
   withRecordVersionWork(work, () => assertContributorLegacyBridgeRecordOwner(f.db, owner));
-  assert.equal(work.operation.contributorReadOwnerCurrentChecks, 2);
+  // One explicit full owner check precedes the native status read; the fresh
+  // retained HEAD read supplies its own physical checks before and after bytes.
+  assert.equal(work.operation.contributorReadOwnerCurrentChecks, 1);
 });
 
 test('genuine owner rereads retained HEAD bytes and refuses method, HEAD and close changes', (t) => {

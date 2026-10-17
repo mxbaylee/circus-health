@@ -352,7 +352,7 @@ export async function prepareWorkflowProposalDerived(
     )
       throw Error('Workflow update source or policy pins changed');
   };
-  const commit = (changes: IntakeCollectionChange[]) => {
+  const commit = async (changes: IntakeCollectionChange[]) => {
     current();
     if (input.auxiliary) {
       input.auxiliary.apply(changes);
@@ -360,15 +360,19 @@ export async function prepareWorkflowProposalDerived(
     }
     const id = randomUUID();
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId: id,
-        requestDigest: hash(id),
-        domainVersion: before.logical.domainVersion,
-        changes,
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId: id,
+          requestDigest: hash(id),
+          domainVersion: before.logical.domainVersion,
+          changes,
+        },
+        current,
+      ),
     );
   };
-  commit([
+  await commit([
     {
       area: 'builds',
       collection: indexes,
@@ -418,7 +422,7 @@ export async function prepareWorkflowProposalDerived(
   };
   const flush = async () => {
     if (pending.length) {
-      commit(pending);
+      await commit(pending);
       pending = [];
     }
     await input.onCheckpoint?.();

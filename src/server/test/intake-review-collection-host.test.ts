@@ -3,6 +3,7 @@ import { readPreparedCollectionClinicalReview } from '../intake-review-collectio
 import nodeFs, { readdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
+import { spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { intakeNamespace } from '../intake-state-evidence.ts';
 import { profileOriginal } from '../profile-storage.ts';
@@ -53,7 +54,7 @@ import {
   prepareCollectionClinicalReviewDependencies,
 } from '../intake-review-collection-host.ts';
 import { intakeEnvelopeAuthorityBinding } from '../intake-authority.ts';
-import { intakeWorkCounters } from '../intake-work-accounting.ts';
+import { intakeWorkCounters, withIntakeWork } from '../intake-work-accounting.ts';
 import { listIntakeReportQueue, getIntakeReportQueueGroup } from '../intake-report-queue.ts';
 import { readCollectionIntakeReportRecords } from '../intake-report-queue-collection.ts';
 import { prepareCollectionPeopleIndex } from '../intake-people-collection.ts';
@@ -291,6 +292,158 @@ test('native clinical host preserves complete legacy review and selection tokens
   assert.equal(fileWork.streamHashBytes, 0);
   assert.ok(fileWork.verificationCacheHits > 0);
 });
+
+function compareNativeReviewWithEager(
+  t: test.TestContext,
+  root: string,
+  profileId: string,
+  intakeId: string,
+  kind: 'identity' | 'inline-source',
+) {
+  // Separate processes read the same prepared archive. The eager child restores
+  // only the targeted previous selection entry, before importing the host.
+  // No product hook, authority bypass or alternate fixture data is involved.
+  const scopeUrl = new URL(
+    kind === 'identity' ? '../intake-review-collection.ts' : '../intake-review-collection-host.ts',
+    import.meta.url,
+  ).href;
+  const production = readFileSync(new URL(scopeUrl), 'utf8');
+  let currentEntry: string, eagerEntry: string;
+  if (kind === 'identity') {
+    const entry = '*competingBoundaryUnrepairedWork(group, operationId, target) {';
+    const begin = production.indexOf(entry),
+      end = production.indexOf('      if (state !== competingState)', begin);
+    assert.ok(begin >= 0 && end > begin);
+    currentEntry = production.slice(begin, end);
+    assert.ok(currentEntry.includes('const state = receiptState();'));
+    eagerEntry = entry + '\n      const state = input.readCacheState?.();\n';
+  } else {
+    currentEntry =
+      '            if (version && lastVersion && view.address(version) === view.address(lastVersion))';
+    eagerEntry = `            if (
+              version &&
+              lastVersion &&
+              view.address(version) === view.address(lastVersion) &&
+              field<string>(view, version, 'format', metadataBytes) ===
+                'health-intake-report-group-version-v2'
+            )`;
+  }
+  const runner = join(root, 'compare-unprinted-review.mjs');
+  writeFileSync(
+    runner,
+    `import assert from 'node:assert/strict';
+import { registerHooks } from 'node:module';
+import { createHash } from 'node:crypto';
+const [mode,root,profileId,intakeId]=process.argv.slice(2);
+let transformed=false, sourceSha256;
+registerHooks({load(url,context,nextLoad){
+  const result=nextLoad(url,context);
+  if(url===${JSON.stringify(scopeUrl)}){
+    let source=String(result.source);
+    const currentEntry=${JSON.stringify(currentEntry)}, eagerEntry=${JSON.stringify(eagerEntry)};
+    assert.equal(source.split(currentEntry).length,2);
+    if(mode==='eager'){
+      source=source.replace(currentEntry,eagerEntry);
+      transformed=true;
+    }
+    sourceSha256=createHash('sha256').update(source).digest('hex');
+    return {...result,source};
+  }
+  return result;
+}});
+const {openDatabase}=await import(${JSON.stringify(new URL('../database.ts', import.meta.url).href)});
+const {attachPersonalDurability}=await import(${JSON.stringify(new URL('../portable.ts', import.meta.url).href)});
+const {ensureProfileDirectories}=await import(${JSON.stringify(new URL('../profile-storage.ts', import.meta.url).href)});
+const {intakeEnvelopeAuthorityBinding}=await import(${JSON.stringify(new URL('../intake-authority.ts', import.meta.url).href)});
+const {prepareCollectionClinicalReview}=await import(${JSON.stringify(new URL('../intake-review-collection-host.ts', import.meta.url).href)});
+const {collectionClinicalProjectionContext}=await import(${JSON.stringify(new URL('../intake-review-collection-session.ts', import.meta.url).href)});
+const {intakeWorkCounters,withIntakeWork}=await import(${JSON.stringify(new URL('../intake-work-accounting.ts', import.meta.url).href)});
+const db=openDatabase(ensureProfileDirectories(root,profileId).database,profileId);
+try {
+  attachPersonalDurability(db,{root,profileId});
+  const file=db.prepare('SELECT * FROM source_files WHERE id=?').get(intakeId);
+  const before=intakeEnvelopeAuthorityBinding(db,file);
+  const result=prepareCollectionClinicalReview(db,root,profileId,intakeId);
+  assert.equal(result.status,'ready');
+  try {
+    const beforeWork=intakeWorkCounters(db).warm;
+    const pair=withIntakeWork(db,'warm',()=>collectionClinicalProjectionContext(result.session).selected.pairSource(result.session.review.records[0],null));
+    const afterWork=intakeWorkCounters(db).warm;
+    const work={items:afterWork.collectionItemsRead-beforeWork.collectionItemsRead,witnessQueries:afterWork.collectionReadWitnessQueries-beforeWork.collectionReadWitnessQueries};
+    const after=intakeEnvelopeAuthorityBinding(db,file);
+    process.stdout.write(JSON.stringify({transformed,sourceSha256,before,after,pair,work,review:result.session.review}));
+  } finally {result.session.close();}
+} finally {db.close();}
+`,
+  );
+  const read = (mode: 'eager' | 'current') => {
+    const child = spawnSync(process.execPath, [runner, mode, root, profileId, intakeId], {
+      env: process.env,
+      encoding: 'utf8',
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 30000,
+    });
+    assert.equal(child.status, 0, child.stderr);
+    return JSON.parse(child.stdout);
+  };
+  const eager = read('eager'),
+    current = read('current');
+  assert.equal(eager.transformed, true);
+  assert.equal(current.transformed, false);
+  assert.deepEqual(eager.before, eager.after);
+  assert.deepEqual(current.before, eager.after, 'both children use the same selected authority');
+  assert.deepEqual(current.after, eager.after);
+  assert.deepEqual(current.review, eager.review, 'complete review including every token is exact');
+  assert.deepEqual(
+    current.pair,
+    eager.pair,
+    'exact selected pair-source commitments are unchanged',
+  );
+  if (kind === 'inline-source') {
+    assert.ok(
+      current.work.items < eager.work.items,
+      'same-authority selected inline work avoids unrelated history enumeration',
+    );
+    assert.ok(
+      current.work.witnessQueries < eager.work.witnessQueries,
+      'same-authority selected inline work avoids repeated historical authentication',
+    );
+  }
+  assert.ok(current.review.reviewToken);
+  assert.ok(
+    current.review.records.every((record: IntakeReviewRecord) => record.selectionReviewToken),
+  );
+  t.diagnostic(
+    JSON.stringify({
+      eagerSourceSha256: eager.sourceSha256,
+      currentSourceSha256: current.sourceSha256,
+      eagerPairWork: eager.work,
+      currentPairWork: current.work,
+    }),
+  );
+  return current.review as import('../../shared/intake.ts').IntakeReview;
+}
+
+test('unprinted native complete review exactly matches eager identity traversal on the same accepted authority', async (t) => {
+  const { db, root, profileId } = fixture(t);
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional-unprinted-equivalence.jsonl',
+    bytes: Buffer.from(
+      Array.from({ length: 4 }, (_, n) => JSON.stringify(envelope('unprinted-' + n))).join('\n'),
+    ),
+    newProviderName: 'Fictional clinic',
+  });
+  await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
+  const warm = await prepareCollectionClinicalReviewAsync(db, root, profileId, source.id);
+  assert.equal(warm.status, 'ready');
+  if (warm.status !== 'ready') throw Error('Expected complete native review');
+  warm.session.close();
+  db.close();
+
+  const current = compareNativeReviewWithEager(t, root, profileId, source.id, 'identity');
+  assert.equal(current.records.length, 4);
+});
+
 test('native clinical page returns fragments for large rows and refuses cross-profile cursors', async (t) => {
   const { db, root, profileId } = fixture(t);
   const item = envelope('one', 'Fictional ' + '🩺'.repeat(2000));
@@ -452,6 +605,208 @@ test('native host preserves linked context and suggested-source pair commitments
   if (oracle.sourceTextStale === undefined) delete native.sourceTextStale;
   assert.deepEqual(native, oracle);
 });
+
+test('adopted inline suggested sources avoid unrelated history and preserve complete eager tokens', async (t) => {
+  const { db, root, profileId } = fixture(t);
+  const report = {
+    key: 'fictional-inline-source',
+    title: 'Fictional inline report',
+    anchor: { locator: 'page 1', text: 'Report F27' },
+    subject: null,
+  };
+  const clinical = { ...envelope('inline-clinical'), contextId: 'shared', report };
+  const context = {
+    ...envelope('inline-context'),
+    kind: 'context',
+    clinical: undefined,
+    contextId: 'shared',
+    report,
+    payload: {
+      branding: 'Fictional Suggested Clinic',
+      text: 'Fictional Suggested Clinic\nReport F27',
+    },
+  };
+  const source = uploadIntake(db, root, profileId, {
+    filename: 'fictional-inline-source.jsonl',
+    newProviderName: 'Fictional acquisition',
+    bytes: Buffer.from([clinical, context].map((value) => JSON.stringify(value)).join('\n')),
+  });
+  const retained = JSON.parse(readIntakeEnvelopeText(db, { id: source.id }));
+  const first = retained.intake.workflow.reportGroups[0];
+  assert.equal(first.versions[0].format, undefined, 'upload retains genuine inline V1 members');
+  for (let n = 1; n < 35; n++) {
+    const other = structuredClone(first);
+    other.id = 'fictional-unrelated-inline-' + n;
+    other.basis = 'candidate_fallback';
+    other.report = null;
+    for (const version of other.versions) {
+      version.id = 'fictional-unrelated-inline-version-' + n;
+      version.context = null;
+      version.contextState = 'none';
+      version.members = [];
+    }
+    retained.intake.workflow.reportGroups.push(other);
+  }
+  writeIntakeFixtureEnvelope(db, source.id, retained);
+  const oracle = reviewIntake(db, root, profileId, source.id);
+  await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
+  const ready = await prepareCollectionClinicalReviewAsync(db, root, profileId, source.id);
+  assert.equal(ready.status, 'ready');
+  if (ready.status !== 'ready') throw Error('Expected inline native review');
+  try {
+    const native = { ...ready.session.review };
+    if (oracle.sourceTextStale === undefined) delete native.sourceTextStale;
+    assert.deepEqual(native, oracle);
+    assert.equal(native.records.length, 1);
+    const record = native.records[0]!,
+      projection = collectionClinicalProjectionContext(ready.session);
+    const before = intakeWorkCounters(db).warm;
+    const pair = withIntakeWork(db, 'warm', () => projection.selected.pairSource(record, null));
+    const after = intakeWorkCounters(db).warm;
+    assert.ok(pair?.confirmationHash);
+    assert.equal(
+      projection.selected.reportSource(record, null)?.confirmation.source,
+      'Fictional Suggested Clinic',
+    );
+    t.diagnostic(
+      JSON.stringify({
+        unrelatedGroups: 34,
+        items: after.collectionItemsRead - before.collectionItemsRead,
+        nodeReads: after.collectionNodeReads - before.collectionNodeReads,
+        nodeHits: after.collectionNodeCacheHits - before.collectionNodeCacheHits,
+        witnessQueries: after.collectionReadWitnessQueries - before.collectionReadWitnessQueries,
+      }),
+    );
+    const lookups = () => intakeWorkCounters(db).warm.collectionSuggestedSourceLookups;
+    const cached = lookups();
+    assert.deepEqual(projection.selected.pairSource(record, null), pair);
+    assert.equal(lookups(), cached);
+    clearIntakeStateCache(db);
+    assert.deepEqual(projection.selected.pairSource(record, null), pair);
+    assert.equal(lookups(), cached + 1, 'registry reset refreshes the complete unique match proof');
+    assert.equal(
+      projection.selected.pairSource(
+        {
+          ...record,
+          reportGroups: [{ groupId: 'fictional-missing', groupVersionId: 'fictional-missing' }],
+        },
+        null,
+      ),
+      null,
+      'missing reference retains complete fallback semantics',
+    );
+    assert.equal(
+      projection.selected.pairSource(
+        {
+          ...record,
+          reportGroups: [
+            {
+              ...selectedReportGroupAt(record.reportGroups, 0)!,
+              groupVersionId: 'fictional-missing',
+            },
+          ],
+        },
+        null,
+      ),
+      null,
+      'missing version within an existing group retains complete fallback semantics',
+    );
+  } finally {
+    ready.session.close();
+  }
+  db.close();
+  const current = compareNativeReviewWithEager(t, root, profileId, source.id, 'inline-source');
+  assert.ok(current.records[0]!.selectionReviewToken);
+});
+
+function inlineSourceFixture(t: test.TestContext) {
+  const f = fixture(t);
+  const report = {
+    key: 'fictional-inline-precedence',
+    title: 'Fictional inline precedence',
+    anchor: { locator: 'page 1', text: 'Report F27' },
+    subject: null,
+  };
+  const source = uploadIntake(f.db, f.root, f.profileId, {
+    filename: 'fictional-inline-precedence.jsonl',
+    newProviderName: 'Fictional acquisition',
+    bytes: Buffer.from(
+      [
+        { ...envelope('inline-precedence-clinical'), contextId: 'shared', report },
+        {
+          ...envelope('inline-precedence-context'),
+          kind: 'context',
+          clinical: undefined,
+          contextId: 'shared',
+          report,
+          payload: {
+            branding: 'Fictional First Clinic',
+            text: 'Fictional First Clinic\nReport F27',
+          },
+        },
+      ]
+        .map((value) => JSON.stringify(value))
+        .join('\n'),
+    ),
+  });
+  return { ...f, source };
+}
+
+for (const mixed of [false, true])
+  test(`adopted inline duplicate versions retain reverse precedence with mixed=${mixed}`, async (t) => {
+    const { db, root, profileId, source } = inlineSourceFixture(t);
+    const retained = JSON.parse(readIntakeEnvelopeText(db, { id: source.id }));
+    const group = retained.intake.workflow.reportGroups[0];
+    const later = structuredClone(group.versions[0]);
+    assert.equal(later.format, undefined);
+    later.context.sourceSuggestion.value = 'Fictional Later Clinic';
+    if (mixed) later.contextState = 'mixed';
+    group.versions.push(later);
+    writeIntakeFixtureEnvelope(db, source.id, retained);
+    const oracle = reviewIntake(db, root, profileId, source.id);
+    await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
+    const ready = await prepareCollectionClinicalReviewAsync(db, root, profileId, source.id);
+    assert.equal(ready.status, 'ready');
+    if (ready.status !== 'ready') throw Error('Expected inline duplicate review');
+    try {
+      const native = { ...ready.session.review };
+      if (oracle.sourceTextStale === undefined) delete native.sourceTextStale;
+      assert.deepEqual(native, oracle, 'duplicate fallback preserves complete review and tokens');
+      const projection = collectionClinicalProjectionContext(ready.session);
+      assert.equal(
+        projection.selected.reportSource(native.records[0]!, null)?.confirmation.source,
+        mixed ? 'Fictional First Clinic' : 'Fictional Later Clinic',
+      );
+    } finally {
+      ready.session.close();
+    }
+  });
+
+for (const fault of ['source', 'physical-head'] as const)
+  test(`cached adopted inline source refuses ${fault} drift`, async (t) => {
+    const { db, root, profileId, source } = inlineSourceFixture(t);
+    await prepareCollectionClinicalReviewDependencies(db, root, profileId, source.id);
+    const ready = await prepareCollectionClinicalReviewAsync(db, root, profileId, source.id);
+    assert.equal(ready.status, 'ready');
+    if (ready.status !== 'ready') throw Error('Expected inline source review');
+    const physical = join(ensureProfileDirectories(root, profileId).records, 'head');
+    const originalHead = readFileSync(physical);
+    try {
+      const projection = collectionClinicalProjectionContext(ready.session);
+      const read = () => projection.selected.pairSource(ready.session.review.records[0]!, null);
+      assert.ok(read()?.confirmationHash, 'first lookup populates the unique inline proof');
+      assert.ok(read()?.confirmationHash, 'unchanged cached proof remains available');
+      if (fault === 'source')
+        db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run('e'.repeat(64), source.id);
+      else writeFileSync(physical, 'fictional corrupt accepted HEAD');
+      assert.throws(read, 'cached lookup must retain source and physical authority checks');
+    } finally {
+      if (fault === 'source')
+        db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run(source.sha256, source.id);
+      else writeFileSync(physical, originalHead);
+      ready.session.close();
+    }
+  });
 
 // Complete 96-group history publication, cold native review and transaction/rollback proofs share this fixture.
 test(

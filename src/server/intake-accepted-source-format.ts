@@ -315,6 +315,8 @@ async function captureAcceptedNativeIntakeSourceFormat(
   }
   let reader: ReturnType<typeof openRecordCommittedColumnReader> | undefined;
   let accepted: Awaited<ReturnType<typeof captureRecordAcceptedSourceRead>> | undefined;
+  let logAccepted: ReturnType<typeof borrowRecordAcceptedIntakeHeadRead> | undefined;
+  let releaseLog: (() => void) | undefined;
   let admitted = false;
   let terminal = false;
   let terminalVerified = false;
@@ -504,6 +506,15 @@ async function captureAcceptedNativeIntakeSourceFormat(
     }
     reader?.close();
     reader = undefined;
+    if (format === 'referenced' && pairRequest) {
+      logAccepted = borrowRecordAcceptedIntakeHeadRead(db, held, pairRequest.identity, pairRequest);
+      const { createIntakeStateStorage } = await import('./intake-state-storage.ts');
+      releaseLog = await createIntakeStateStorage(
+        db,
+        pairRequest.identity,
+      ).collections.admitLogAsync(original, logAccepted, readerCurrent);
+      readerCurrent();
+    }
     let closed = false;
     admitted = true;
     return Object.freeze({
@@ -548,6 +559,16 @@ async function captureAcceptedNativeIntakeSourceFormat(
         if (closed || terminal) throw Error('Accepted intake source terminal read expired');
         readerCurrent();
         terminal = true;
+        // The internal log borrow serves the consumer lifetime. Release only
+        // this owned borrow before the source owner's terminal no-borrows gate;
+        // leaked consumer/child borrows must still make that gate refuse.
+        try {
+          if (logAccepted) closeRecordAcceptedIntakeHeadRead(logAccepted);
+          logAccepted = undefined;
+        } finally {
+          releaseLog?.();
+          releaseLog = undefined;
+        }
         await verifyRecordAcceptedSourceReadTerminal(db, held, profileId);
         readerCurrent();
         terminalVerified = true;
@@ -572,12 +593,17 @@ async function captureAcceptedNativeIntakeSourceFormat(
               // replay: it may be retained, and every reuse is gated again by
               // the adapter's frontier checks and a complete acquire. A failed
               // or skipped terminal proof never retains.
+              if (logAccepted) closeRecordAcceptedIntakeHeadRead(logAccepted);
               closeRecordAcceptedSourceRead(
                 held,
                 terminalVerified ? !aborted : aborted && !terminal,
               );
             } finally {
-              disposeIntakeLegacyBridgeReadWitness(original);
+              try {
+                disposeIntakeLegacyBridgeReadWitness(original);
+              } finally {
+                releaseLog?.();
+              }
             }
           }
           closeFailed = false;
@@ -625,6 +651,7 @@ async function captureAcceptedNativeIntakeSourceFormat(
         if (reader) reader.close();
       } finally {
         try {
+          if (logAccepted) closeRecordAcceptedIntakeHeadRead(logAccepted);
           if (accepted) {
             if (retainRefusedBackend) {
               try {
@@ -636,7 +663,11 @@ async function captureAcceptedNativeIntakeSourceFormat(
             closeRecordAcceptedSourceRead(accepted, retainRefusedBackend);
           }
         } finally {
-          disposeIntakeLegacyBridgeReadWitness(original);
+          try {
+            disposeIntakeLegacyBridgeReadWitness(original);
+          } finally {
+            releaseLog?.();
+          }
         }
       }
     }

@@ -6,6 +6,7 @@ import {
   type IntakeJsonCanonicalHandle,
   type IntakeJsonCanonicalKind,
   type IntakeJsonCanonicalWork,
+  type IntakeJsonCanonicalScratch,
 } from './intake-json-canonical.ts';
 
 export const LEGACY_NATIVE_DELTA_BYTES = 131072;
@@ -19,6 +20,7 @@ export function* prepareIntakeLegacyDeltaTreeSteps(
   pieces: Iterable<string>,
   checkpoint: () => void,
   selected: (native: boolean) => void,
+  options: { scratch?: IntakeJsonCanonicalScratch } = {},
 ): Generator<void, PreparedIntakeJsonTree> {
   const iterator = pieces[Symbol.iterator](),
     prefix: string[] = [];
@@ -143,6 +145,7 @@ export function* prepareIntakeLegacyDeltaTreeSteps(
     })();
     return yield* prepareIntakeJsonTreeSteps(fallback, {
       preserveNumbers: true,
+      scratch: options.scratch,
     });
   } finally {
     close();

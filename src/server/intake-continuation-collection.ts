@@ -976,22 +976,26 @@ async function updateCollectionConversionRead(
     if (collections.collection(collections.openView(), 'builds', selected)?.root?.hash !== oldRoot)
       throw Error('Reading ledger changed during preparation');
   };
-  const commit = (changes: Parameters<typeof collections.prepare>[1]['changes']) => {
+  const commit = async (changes: Parameters<typeof collections.prepare>[1]['changes']) => {
     current();
     const id = randomUUID();
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId: id,
-        requestDigest: hash(id),
-        domainVersion: intakeSourceVersion(db, scope.intakeId).rawVersion,
-        changes,
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId: id,
+          requestDigest: hash(id),
+          domainVersion: intakeSourceVersion(db, scope.intakeId).rawVersion,
+          changes,
+        },
+        current,
+      ),
     );
   };
   const deferredAdoption = oldRoot && !options.onCheckpoint ? selected : undefined;
   if (deferredAdoption) current();
   else if (oldRoot)
-    commit([
+    await commit([
       {
         area: 'builds',
         collection: build,
@@ -1166,7 +1170,7 @@ async function updateCollectionConversionRead(
       if (!checked) throw Error('Retained descendant reading authority is unavailable');
       checked.assertCurrent();
     }
-    commit([...(pending ?? []), ...(legacyFinal?.pending ?? []), ...selection]);
+    await commit([...(pending ?? []), ...(legacyFinal?.pending ?? []), ...selection]);
     const selectedRoot = collections.collection(collections.openView(), 'builds', selected)?.root
       ?.hash;
     pendingIndex?.finish(selectedRoot ?? '');

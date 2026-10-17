@@ -366,7 +366,23 @@ export function intakeSourceVersion(db: DatabaseSync, id: string) {
   const binding = intakeEnvelopeAuthorityBinding(db, selected);
   const rawVersion =
     binding.logicalHead === undefined
-      ? requireStoredIntakeDetails(db, selected).version
+      ? (() => {
+          // The selected immutable view performs the same current-authority
+          // checks as the mutable DTO reader, without cloning retained history
+          // merely to check one stale-tab scalar.
+          const envelope = readIntakeEnvelopeMaterialized(db, selected).value;
+          if (!object(envelope) || !object(envelope.intake))
+            throw Error('Intake source metadata is incomplete');
+          const details = envelope.intake;
+          if (
+            Object.hasOwn(details, 'workflow') &&
+            details.workflow !== undefined &&
+            !object(details.workflow)
+          )
+            throw Error('Intake workflow is incomplete');
+          if (typeof details.version !== 'number') throw Error('Intake version is invalid');
+          return details.version;
+        })()
       : (JSON.parse(binding.head!) as { logical: { domainVersion: number } }).logical.domainVersion;
   const sourcePin = readIntakeSourcePin(db, id);
   const version = rawVersion + (sourcePin?.version ?? 0);

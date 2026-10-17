@@ -11,7 +11,11 @@ import {
   assertClinicalOperation,
   currentClinicalOperation,
 } from '../clinical-operation.ts';
-import { captureManagedPhysicalEpoch } from '../clinical-review-physical-epoch.ts';
+import {
+  captureManagedPhysicalEpoch,
+  withManagedPhysicalMutation,
+} from '../clinical-review-physical-epoch.ts';
+import { createRecordVersionWorkCounters, withRecordVersionWork } from '../record-version-work.ts';
 import { freshKey } from '../vault-crypto.ts';
 import {
   openVault,
@@ -20,7 +24,96 @@ import {
   assertVaultRecordTransactionPrior,
   finishVaultRecordStagingPreparation,
   discardVaultRecordStaging,
+  captureVaultRecordReadOwner,
+  captureVaultRecordAcceptedSourceRead,
+  closeVaultRecordAcceptedSourceRead,
 } from '../vault-store.ts';
+
+for (const registration of [
+  'before capture',
+  'after capture',
+  'after capture then another capture',
+  'with physical drift',
+] as const)
+  test(`fresh vault staging retires only an idle methods-only cache: ${registration}`, async (t) => {
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'fictional-backing-methods-'))),
+      profileId = 'fictional-backing-methods',
+      key = freshKey(),
+      db = openDatabase(':memory:', profileId),
+      vault = openVault({ directory: root, profileId, key, initialize: true }),
+      storage = vault.recordStorage();
+    t.after(() => {
+      vault.close();
+      db.close();
+      key.fill(0);
+      rmSync(root, { recursive: true, force: true });
+    });
+    attachRecordDurability(db, { profileId, storage });
+    transaction(db, () =>
+      db
+        .prepare('INSERT INTO people(id,display_name) VALUES(?,?)')
+        .run('fictional-person', 'Fictional Person'),
+    );
+    const selectedHead = storage.read('head')!.toString('utf8');
+    await runExclusiveClinicalOperation(db, async () => {
+      const operation = currentClinicalOperation(db)!,
+        current = () => assertClinicalOperation(db, operation),
+        original = captureVaultRecordReadOwner(storage)!;
+      const read = await captureVaultRecordAcceptedSourceRead(
+        db,
+        storage,
+        original,
+        selectedHead,
+        current,
+      );
+      closeVaultRecordAcceptedSourceRead(read);
+      const register = () => db.function('fictional_late_function', () => 1),
+        late = registration.startsWith('after capture');
+      if (!late) register();
+      if (registration === 'with physical drift') withManagedPhysicalMutation(() => undefined);
+      const work = createRecordVersionWorkCounters();
+      await withRecordVersionWork(work, async () => {
+        const witness = captureVaultRecordStaging(db, storage, captureManagedPhysicalEpoch()!);
+        assert.ok(witness);
+        if (late) register();
+        if (registration === 'after capture then another capture') {
+          const another = captureVaultRecordStaging(db, storage, captureManagedPhysicalEpoch()!);
+          assert.ok(another);
+          discardVaultRecordStaging(another);
+        }
+        try {
+          if (registration === 'before capture') {
+            await prepareVaultRecordTransactionBacking(witness, selectedHead, current);
+            await finishVaultRecordStagingPreparation(witness);
+            assert.equal(
+              work.operation.vaultBackingColdReplays,
+              1,
+              'fresh admission proves all backing',
+            );
+          } else {
+            await assert.rejects(
+              prepareVaultRecordTransactionBacking(witness, selectedHead, current),
+              /original frontier changed/,
+            );
+            await assert.rejects(
+              prepareVaultRecordTransactionBacking(witness, selectedHead, current),
+              /recovery required/,
+            );
+            assert.equal(
+              work.operation.vaultBackingColdReplays,
+              0,
+              'a refused operation cannot renew',
+            );
+          }
+          assert.equal(work.operation.vaultBackingRejectedMethods, 1);
+          assert.equal(storage.read('head')!.toString('utf8'), selectedHead);
+          assert.equal(db.isTransaction, false);
+        } finally {
+          discardVaultRecordStaging(witness);
+        }
+      });
+    });
+  });
 
 for (const fault of [undefined, 'version', 'preimage', 'absence', 'deleted'] as const)
   test(`record-only vault backing authenticates nonmetadata priors and absence without a dummy source${fault ? `: ${fault} disagreement` : ''}`, async (t) => {

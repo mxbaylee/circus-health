@@ -4032,7 +4032,7 @@ export function createAssistant({
           const native =
             isNativeAssistantCheckpoint(state.checkpoint) &&
             isNativeAssistantConversion(attributionHost);
-          const { priorReads, scopeKey } = (
+          const { priorReads, scopeKey } = await (
             native
               ? (...args: Parameters<typeof recordAttributionRead>) =>
                   recordNativeAttributionRead(
@@ -4074,7 +4074,7 @@ export function createAssistant({
                 isNativeAssistantCheckpoint(state.checkpoint) &&
                 isNativeAssistantConversion(attributionHost)
               )
-                acknowledgeNativeAttributionRead(attributionHost, state.checkpoint, scopeKey);
+                await acknowledgeNativeAttributionRead(attributionHost, state.checkpoint, scopeKey);
               else if (!isNativeAssistantCheckpoint(state.checkpoint))
                 acknowledgeAttributionRead(state.checkpoint, scopeKey);
               state.attributionCalls.get(attributionCallId)!.acknowledged = true;
@@ -5251,7 +5251,7 @@ export function createAssistant({
                         if (isNativeAssistantCheckpoint(checkpoint)) {
                           const host = conversionIntake(profileId, chat);
                           if (isNativeAssistantConversion(host))
-                            acknowledgeNativeAttributionRead(
+                            await acknowledgeNativeAttributionRead(
                               host,
                               checkpoint,
                               attribution.scopeKey,

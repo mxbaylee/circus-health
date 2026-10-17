@@ -95,12 +95,16 @@ export async function prepareCollectionModelDerived(
       if (input.auxiliary) input.auxiliary.apply(changes);
       else
         collections.commitMaintenance(
-          collections.prepare(collections.openView(), {
-            operationId: id,
-            requestDigest: createHash('sha256').update(id).digest('hex'),
-            domainVersion: before.logical.domainVersion,
-            changes,
-          }),
+          await collections.prepareAsync(
+            collections.openView(),
+            {
+              operationId: id,
+              requestDigest: createHash('sha256').update(id).digest('hex'),
+              domainVersion: before.logical.domainVersion,
+              changes,
+            },
+            current,
+          ),
         );
       changes = [];
     }

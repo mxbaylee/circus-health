@@ -6,7 +6,7 @@ import {
 import { hostGroundedIdentity } from './identity-grounding';
 import { CollectionEvidenceWindow } from '../intake/CollectionEvidenceWindow';
 export { CollectionEvidenceWindow } from '../intake/CollectionEvidenceWindow';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentProps, ReactNode } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import type {
@@ -23,13 +23,12 @@ import type {
   Intake,
   IntakeReportAcceptanceRequest,
   IntakeReportAcceptanceBlock,
-  IntakeReportAcceptanceReceipt,
   IntakeDraftRepairUpdate,
   IntakeDraftRepairSelection,
   IntakeDraftRepairField,
 } from '../../../shared/intake';
 import { readSelectedClinicalReview } from '../../data/intake-clinical-review';
-import { useReportAcceptance } from '../intake/useReportAcceptance';
+import { usePlannedReportAcceptance } from './usePlannedReportAcceptance';
 import { initialDraft } from '../intake/useReviewDrafts';
 import { sameReviewValue } from '../intake/review-draft-pair-scope';
 import { ImportSaveStatus } from './ImportSaveStatus';
@@ -60,6 +59,7 @@ import { useCollectionBulkActions, type CollectionDisposition } from './useColle
 import { ReviewNavigationGuard } from '../intake/ReviewWorkspace';
 import {
   SavedPersonDestinations,
+  SavedRecordPeople,
   appendSavedPersonDestination,
   type SavedPersonDestination,
 } from './SavedRecordDestinations';
@@ -160,7 +160,6 @@ export function CollectionImportReview({
   // A click admitted by an enabled control but refused by a live gate is reported,
   // never dropped silently: the control re-enables and the user retries explicitly.
   const [actionRefusal, setActionRefusal] = useState('');
-  const [receipt, setReceipt] = useState<IntakeReportAcceptanceReceipt | null>(null);
   const [confirmedSavedIds, setConfirmedSavedIds] = useState<string[]>([]);
   const [recentPeople, setRecentPeople] = useState<SavedPersonDestination[]>([]);
   const [pendingSources, setPendingSources] = useState<Set<string>>(() => new Set());
@@ -230,6 +229,16 @@ export function CollectionImportReview({
       ? initial
       : null);
   const activeScope = JSON.stringify([profile?.id, ownPath]);
+  // Object ownership prevents an old save becoming current after a same-path return.
+  const committedClinicalReview = useRef<object | null>(null);
+  useLayoutEffect(() => {
+    const owner = {};
+    committedClinicalReview.current = owner;
+    setSaveNotice('');
+    return () => {
+      if (committedClinicalReview.current === owner) committedClinicalReview.current = null;
+    };
+  }, [activeScope]);
   const active = useRef(activeScope);
   active.current = activeScope;
   useEffect(
@@ -270,7 +279,6 @@ export function CollectionImportReview({
     identityRefreshes.current.clear();
     setIdentities(new Map());
     setRecentPeople([]);
-    setReceipt(null);
     setConfirmedSavedIds([]);
   }, [identityProfile]);
   useEffect(() => {
@@ -388,9 +396,10 @@ export function CollectionImportReview({
     }
     peoplePage.reload();
   };
-  const acceptance = useReportAcceptance(profile?.id || '', (result) => {
-    setReceipt(result.receipt);
-    setConfirmedSavedIds(confirmedSelectionIds(result.receipt));
+  const acceptance = usePlannedReportAcceptance(profile?.id || '', (result) => {
+    setConfirmedSavedIds((prior) => [
+      ...new Set([...prior, ...confirmedSelectionIds(result.receipt)]),
+    ]);
     setSaveNotice(
       `${result.receipt.acceptedCount} records saved. Any remaining records still need review.`,
     );
@@ -501,6 +510,8 @@ export function CollectionImportReview({
     if (active.current === activeScope) setActionRefusal(actionRefusedMessage);
   }
   async function saveRows(rows: CollectionFeedRecord[], approvals: IntakeReportAcceptanceBlock[]) {
+    const owner = committedClinicalReview.current;
+    const current = () => committedClinicalReview.current === owner;
     if (mutationPending || sourcePending || authorityUnavailable || !rows.length) {
       if (rows.length) refuseAction();
       return { savedIds: [] };
@@ -528,7 +539,7 @@ export function CollectionImportReview({
           shown.recordId,
           shown.candidateVersionId,
         );
-        if (active.current !== activeScope) return { savedIds: [] };
+        if (!current()) return { savedIds: [] };
         const editor = inlineApproval.current;
         const editorOwnsRecord =
           editor?.intakeId === row.intakeId &&
@@ -579,17 +590,17 @@ export function CollectionImportReview({
         block.selections.push(editorApproval?.selections[0] || shown);
         blocks.set(key, block);
       }
-      const result = await acceptance.submit({
-        mode: 'partial-v1',
-        operationId: crypto.randomUUID(),
-        blocks: [...blocks.values()],
+      const results = await acceptance.save([...blocks.values()], {
+        current,
       });
+      if (!current()) return { savedIds: [], rejectedIds: [] };
       return {
-        savedIds: result ? confirmedSelectionIds(result.receipt) : [],
-        rejectedIds: result ? rejectedSelectionIds(result.receipt) : [],
+        savedIds: results.flatMap((result) => confirmedSelectionIds(result.receipt)),
+        rejectedIds: results.flatMap((result) => rejectedSelectionIds(result.receipt)),
       };
     } catch (cause) {
-      if (active.current === activeScope) setSaveError(message(cause));
+      if (!current()) return { savedIds: [], rejectedIds: [] };
+      setSaveError(message(cause));
       return { savedIds: [], rejectedIds: rows.map((row) => row.feedKey) };
     } finally {
       // This flag means "my save request is in flight". It must clear even when
@@ -810,7 +821,11 @@ export function CollectionImportReview({
         </button>
       )}
       <SavedPersonDestinations destinations={recentPeople} />
-      <ImportAcceptanceOutcomes receipt={receipt} />
+      <ImportAcceptanceOutcomes
+        receipt={acceptance.receipt}
+        unsent={acceptance.unsent}
+        unknown={acceptance.unknown}
+      />
       <ImportSaveStatus
         pendingOperation={!!acceptance.recoveryOperationId}
         saving={acceptance.busy}
@@ -1592,21 +1607,24 @@ export function CollectionReportReview({
                   Saved records on the displayed report page. Use the report page controls to
                   inspect additional records.
                 </p>
-                {data.records.records
-                  .filter((row) => row.queueState === 'accepted')
-                  .map((row) => {
-                    const recordId = row.kind === 'record' ? row.record.id : row.selection.recordId;
-                    return (
-                      <CollectionRecordDestination
-                        key={`${row.proposalId}:${recordId}`}
-                        intakeId={data.records.intakeId}
-                        groupId={row.groupId}
-                        proposalId={row.proposalId}
-                        recordId={recordId}
-                        intakeVersion={data.records.version}
-                      />
-                    );
-                  })}
+                <SavedRecordPeople>
+                  {data.records.records
+                    .filter((row) => row.queueState === 'accepted')
+                    .map((row) => {
+                      const recordId =
+                        row.kind === 'record' ? row.record.id : row.selection.recordId;
+                      return (
+                        <CollectionRecordDestination
+                          key={`${row.proposalId}:${recordId}`}
+                          intakeId={data.records.intakeId}
+                          groupId={row.groupId}
+                          proposalId={row.proposalId}
+                          recordId={recordId}
+                          intakeVersion={data.records.version}
+                        />
+                      );
+                    })}
+                </SavedRecordPeople>
               </section>
             )}
             {data.records.nextCursor && (

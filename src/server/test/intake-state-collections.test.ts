@@ -1,17 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { DatabaseSync, StatementSync } from 'node:sqlite';
-import { openDatabase, transaction, clinicalReviewRevision, type Database } from '../database.ts';
-import {
-  attachRecordDurability,
-  rebuildRecordDatabase,
-  recordDurabilityStatus,
-  type RecordStorage,
-} from '../record-versions.ts';
+import { transaction, clinicalReviewRevision } from '../database.ts';
+import { recordDurabilityStatus } from '../record-versions.ts';
 import {
   ensureIntakeFrontierObserver,
   intakeFrontierAttemptCounts,
@@ -22,86 +14,32 @@ import {
   type IntakeCollectionChange,
   type PreparedIntakeCollectionMutation,
 } from '../intake-state-storage.ts';
-import { intakeNamespace } from '../intake-state-evidence.ts';
+import {
+  intakeNamespace,
+  COLLECTION_FORMAT,
+  type IntakeCollectionHead,
+} from '../intake-state-evidence.ts';
+import { readIntakeLogSequence } from '../intake-state-log.ts';
 import { intakeWorkCounters } from '../intake-work-accounting.ts';
 import { setImmediate } from 'node:timers/promises';
 import {
   prepareInitialIntakeEnvelope,
   readIntakeEnvelopeMaterialized,
 } from '../intake-authority.ts';
+import {
+  intakeCollectionsContributorFixture as fixture,
+  mutateCollection as mutate,
+  prepareCollectionMutation,
+  withCollectionAdmission,
+  collectionStoreWithMetaReadProbe,
+} from './helpers/intake-collections-contributor-fixture.ts';
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
-function fixture(t: test.TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-collection-state-'));
-  const objects = new Map<string, Buffer>();
-  let ambiguous = false;
-  const storage: RecordStorage = {
-    read: (name) => (objects.has(name) ? Buffer.from(objects.get(name)!) : null),
-    writeImmutable: (name, bytes) => {
-      assert.equal(objects.has(name), false);
-      objects.set(name, Buffer.from(bytes));
-    },
-    publishHead: (bytes) => {
-      objects.set('head', Buffer.from(bytes));
-      if (ambiguous) throw Error('fictional ambiguous publication');
-    },
-  };
-  const identity = {
-    profileId: 'fictional-collections',
-    intakeId: 'fictional-package',
-    sourceHash: '2'.repeat(64),
-  };
-  const db = openDatabase(join(root, 'current.sqlite'), identity.profileId);
-  const dbs: Database[] = [db];
-  db.prepare(
-    'INSERT INTO source_files(id,path,sha256,bytes,kind,details_json) VALUES(?,?,?,?,?,?)',
-  ).run(identity.intakeId, 'fictional.zip', identity.sourceHash, 0, 'intake_original', '{}');
-  attachRecordDurability(db, { profileId: identity.profileId, storage });
-  const rebuild = () => {
-    const path = join(root, randomUUID() + '.sqlite');
-    rebuildRecordDatabase(path, { profileId: identity.profileId, storage });
-    const next = openDatabase(path, identity.profileId);
-    attachRecordDurability(next, { profileId: identity.profileId, storage });
-    dbs.push(next);
-    return next;
-  };
-  t.after(() => {
-    for (const item of dbs) {
-      clearIntakeStateCache(item);
-      if (item.isOpen) item.close();
-    }
-    rmSync(root, { recursive: true, force: true });
-  });
-  return {
-    db,
-    identity,
-    rebuild,
-    acceptedHead: () => objects.get('head'),
-    ambiguous: () => {
-      ambiguous = true;
-    },
-  };
-}
-function mutate(
-  db: Database,
-  store: ReturnType<typeof createIntakeStateStorage>['collections'],
-  changes: IntakeCollectionChange[],
-  version: number,
-  id = randomUUID(),
-) {
-  const prepared = store.prepare(store.openView(), {
-    operationId: id,
-    requestDigest: digest(id),
-    domainVersion: version,
-    changes,
-  });
-  return transaction(db, () => store.stage(prepared));
-}
 
 test('retained byte consumption refuses a changed logical generation even when its bytes remain selected', async (t) => {
   const { db, identity } = fixture(t),
     store = createIntakeStateStorage(db, identity).collections,
     expected = Buffer.alloc(3 * 4096, 'f');
-  mutate(
+  await mutate(
     db,
     store,
     [
@@ -127,7 +65,7 @@ test('retained byte consumption refuses a changed logical generation even when i
   const first = store.readBytes(value, { items: 1, bytes: 4096 });
   assert.deepEqual(first.chunks, [expected.subarray(0, 4096)]);
   await setImmediate();
-  mutate(
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'summary', op: 'put', key: 'status', value: 'reviewed' }],
@@ -154,12 +92,12 @@ test('retained byte consumption refuses a changed logical generation even when i
 });
 
 for (const change of ['auxiliary', 'cache', 'close', 'foreign', 'forged', 'reentrant'] as const)
-  test(`byte consumption preserves owner and lifetime checks: ${change}`, (t) => {
+  test(`byte consumption preserves owner and lifetime checks: ${change}`, async (t) => {
     const { db, identity } = fixture(t),
       storage = createIntakeStateStorage(db, identity),
       store = storage.collections,
       expected = Buffer.alloc(4096, 'f');
-    mutate(
+    await mutate(
       db,
       store,
       [
@@ -180,7 +118,7 @@ for (const change of ['auxiliary', 'cache', 'close', 'foreign', 'forged', 'reent
     if (change === 'auxiliary') {
       const id = randomUUID();
       store.commitMaintenance(
-        store.prepare(store.openView(), {
+        await prepareCollectionMutation(store, store.openView(), {
           operationId: id,
           requestDigest: digest(id),
           domainVersion: 1,
@@ -209,6 +147,15 @@ for (const change of ['auxiliary', 'cache', 'close', 'foreign', 'forged', 'reent
     } else if (change === 'forged') {
       assert.throws(() => store.readBytes({ ...value }, { items: 1, bytes: 4096 }), /foreign/);
     } else {
+      const operationId = randomUUID();
+      const reentrant = await prepareCollectionMutation(store, store.openView(), {
+        operationId,
+        requestDigest: digest(operationId),
+        domainVersion: 2,
+        changes: [
+          { area: 'logical', collection: 'summary', op: 'put', key: 'status', value: 'changed' },
+        ],
+      });
       let changed = false;
       assert.throws(
         () =>
@@ -216,20 +163,7 @@ for (const change of ['auxiliary', 'cache', 'close', 'foreign', 'forged', 'reent
             get items() {
               if (!changed) {
                 changed = true;
-                mutate(
-                  db,
-                  store,
-                  [
-                    {
-                      area: 'logical',
-                      collection: 'summary',
-                      op: 'put',
-                      key: 'status',
-                      value: 'changed',
-                    },
-                  ],
-                  2,
-                );
+                transaction(db, () => store.stage(reentrant));
               }
               return 1;
             },
@@ -241,10 +175,10 @@ for (const change of ['auxiliary', 'cache', 'close', 'foreign', 'forged', 'reent
   });
 
 for (const unrelated of [0, 80])
-  test(`bounded byte consumption counts only selected chunks: ${unrelated} unrelated entries`, (t) => {
+  test(`bounded byte consumption counts only selected chunks: ${unrelated} unrelated entries`, async (t) => {
     const { db, identity } = fixture(t),
       store = createIntakeStateStorage(db, identity).collections;
-    mutate(
+    await mutate(
       db,
       store,
       [
@@ -266,7 +200,7 @@ for (const unrelated of [0, 80])
       1,
     );
     for (let offset = 0; offset < unrelated; offset += 40)
-      mutate(
+      await mutate(
         db,
         store,
         Array.from({ length: Math.min(40, unrelated - offset) }, (_, n) => ({
@@ -320,7 +254,7 @@ for (const unrelated of [0, 80])
     );
   });
 
-test('immutable staging makes one bounded collision read and one bounded readback per new node', (t) => {
+test('immutable staging makes one bounded collision read and one bounded readback per new node', async (t) => {
   const { db, identity } = fixture(t);
   const nodePrefix = intakeNamespace(identity) + 'node:';
   const boundedReads = new Map<string, number>();
@@ -329,7 +263,7 @@ test('immutable staging makes one bounded collision read and one bounded readbac
   const nativePrepare = db.prepare.bind(db);
   const nativeGet = StatementSync.prototype.get;
   let staging = false;
-  t.mock.method(StatementSync.prototype, 'get', function (this: StatementSync, ...args: unknown[]) {
+  const observedGet = function (this: StatementSync, ...args: unknown[]) {
     const sql = this.sourceSQL;
     if (
       sql.startsWith('SELECT length(CAST(value AS BLOB))') ||
@@ -343,9 +277,14 @@ test('immutable staging makes one bounded collision read and one bounded readbac
         reads.set(key, (reads.get(key) ?? 0) + 1);
     }
     return Reflect.apply(nativeGet, this, args);
-  });
+  };
   t.mock.method(db, 'prepare', (sql: string) => {
     const statement = nativePrepare(sql);
+    Object.defineProperty(statement, 'get', {
+      configurable: true,
+      writable: true,
+      value: (...args: unknown[]) => Reflect.apply(observedGet, statement, args),
+    });
     if (sql === 'INSERT INTO app_meta(key,value) VALUES(?,?)') {
       const run = statement.run;
       statement.run = (...args) => {
@@ -357,15 +296,15 @@ test('immutable staging makes one bounded collision read and one bounded readbac
     }
     return statement;
   });
-  const store = createIntakeStateStorage(db, identity).collections;
-  mutate(
+  const store = collectionStoreWithMetaReadProbe(t, db, identity, observedGet);
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'fictional', op: 'put', key: 'first', value: 'before' }],
     1,
   );
   const operationId = randomUUID();
-  const prepared = store.prepare(store.openView(), {
+  const prepared = await prepareCollectionMutation(store, store.openView(), {
     operationId,
     requestDigest: digest(operationId),
     domainVersion: 2,
@@ -393,10 +332,13 @@ test('immutable staging makes one bounded collision read and one bounded readbac
   }
   assert.equal(intakeWorkCounters(db).warm.collectionNodesWritten - before, inserted.size);
   assert.equal(store.get(store.openView(), 'logical', 'fictional', 'second'), 'fictional');
-  assert.deepEqual(store.replay(operationId, digest(operationId)), result);
+  assert.deepEqual(
+    await withCollectionAdmission(store, () => store.replay(operationId, digest(operationId))),
+    result,
+  );
 });
 
-test('immutable staging reuses an existing equal node without counting a new write', (t) => {
+test('immutable staging reuses an existing equal node without counting a new write', async (t) => {
   const { db, identity, rebuild } = fixture(t);
   const nodePrefix = intakeNamespace(identity) + 'node:';
   const rolledBack = new Map<string, string>();
@@ -406,7 +348,7 @@ test('immutable staging reuses an existing equal node without counting a new wri
   let equalKey = '';
   let equalReads = 0;
   const nativeGet = StatementSync.prototype.get;
-  t.mock.method(StatementSync.prototype, 'get', function (this: StatementSync, ...args: unknown[]) {
+  const observedGet = function (this: StatementSync, ...args: unknown[]) {
     if (
       this.sourceSQL.startsWith('SELECT length(CAST(value AS BLOB))') &&
       phase === 'second' &&
@@ -414,9 +356,14 @@ test('immutable staging reuses an existing equal node without counting a new wri
     )
       equalReads++;
     return Reflect.apply(nativeGet, this, args);
-  });
+  };
   t.mock.method(db, 'prepare', (sql: string) => {
     const statement = nativePrepare(sql);
+    Object.defineProperty(statement, 'get', {
+      configurable: true,
+      writable: true,
+      value: (...args: unknown[]) => Reflect.apply(observedGet, statement, args),
+    });
     if (sql === 'INSERT INTO app_meta(key,value) VALUES(?,?)') {
       const run = statement.run;
       statement.run = (...args) => {
@@ -431,8 +378,8 @@ test('immutable staging reuses an existing equal node without counting a new wri
     }
     return statement;
   });
-  const store = createIntakeStateStorage(db, identity).collections;
-  mutate(
+  const store = collectionStoreWithMetaReadProbe(t, db, identity, observedGet);
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'fictional', op: 'put', key: 'first', value: 'before' }],
@@ -443,14 +390,14 @@ test('immutable staging reuses an existing equal node without counting a new wri
   const changes: IntakeCollectionChange[] = [
     { area: 'logical', collection: 'fictional', op: 'put', key: 'first', value: 'after' },
   ];
-  const candidate = () =>
-    store.prepare(store.openView(), {
+  const candidate = async () =>
+    await prepareCollectionMutation(store, store.openView(), {
       operationId,
       requestDigest: digest(operationId),
       domainVersion: 2,
       changes,
     });
-  const first = candidate();
+  const first = await candidate();
   assert.throws(
     () =>
       transaction(db, () => {
@@ -471,7 +418,7 @@ test('immutable staging reuses an existing equal node without counting a new wri
     db.prepare('INSERT INTO app_meta(key,value) VALUES(?,?)').run(equalKey, equalValue);
   });
   assert.deepEqual(store.binding(store.openView()), selectedBefore);
-  const second = candidate();
+  const second = await candidate();
   const before = intakeWorkCounters(db).warm.collectionNodesWritten;
   const result = transaction(db, () => {
     phase = 'second';
@@ -487,7 +434,10 @@ test('immutable staging reuses an existing equal node without counting a new wri
   assert.equal(store.get(store.openView(), 'logical', 'fictional', 'first'), 'after');
   const selectedAfter = store.binding(store.openView());
   const writesAfter = intakeWorkCounters(db).warm.collectionNodesWritten;
-  assert.deepEqual(store.replay(operationId, digest(operationId)), result);
+  assert.deepEqual(
+    await withCollectionAdmission(store, () => store.replay(operationId, digest(operationId))),
+    result,
+  );
   assert.deepEqual(store.binding(store.openView()), selectedAfter);
   assert.equal(intakeWorkCounters(db).warm.collectionNodesWritten, writesAfter);
   const recovered = createIntakeStateStorage(rebuild(), identity).collections;
@@ -499,7 +449,7 @@ for (const failure of [
   'different collision row',
   'changed readback',
 ] as const)
-  test(`immutable staging refuses ${failure} without publishing a head`, (t) => {
+  test(`immutable staging refuses ${failure} without publishing a head`, async (t) => {
     const { db, identity } = fixture(t);
     const nodePrefix = intakeNamespace(identity) + 'node:';
     const inserted = new Set<string>();
@@ -507,34 +457,35 @@ for (const failure of [
     const nativeGet = StatementSync.prototype.get;
     let staging = false;
     let injected = false;
-    t.mock.method(
-      StatementSync.prototype,
-      'get',
-      function (this: StatementSync, ...args: unknown[]) {
-        const row = Reflect.apply(nativeGet, this, args);
-        if (!this.sourceSQL.startsWith('SELECT length(CAST(value AS BLOB))')) return row;
-        const key = args.at(-1);
-        if (!staging || injected || typeof key !== 'string' || !key.startsWith(nodePrefix))
-          return row;
-        if (failure === 'oversized collision row' && row === undefined) {
-          assert.equal(args[0], 32 * 1024);
-          injected = true;
-          return { bytes: 32 * 1024 + 1, value: undefined };
-        }
-        if (failure === 'different collision row' && row === undefined) {
-          assert.equal(args[0], 32 * 1024);
-          injected = true;
-          return { bytes: 19, value: 'different fictional' };
-        }
-        if (failure === 'changed readback' && inserted.has(key) && row) {
-          injected = true;
-          return { ...row, value: 'tampered fictional node' };
-        }
+    const observedGet = function (this: StatementSync, ...args: unknown[]) {
+      const row = Reflect.apply(nativeGet, this, args);
+      if (!this.sourceSQL.startsWith('SELECT length(CAST(value AS BLOB))')) return row;
+      const key = args.at(-1);
+      if (!staging || injected || typeof key !== 'string' || !key.startsWith(nodePrefix))
         return row;
-      },
-    );
+      if (failure === 'oversized collision row' && row === undefined) {
+        assert.equal(args[0], 32 * 1024);
+        injected = true;
+        return { bytes: 32 * 1024 + 1, value: undefined };
+      }
+      if (failure === 'different collision row' && row === undefined) {
+        assert.equal(args[0], 32 * 1024);
+        injected = true;
+        return { bytes: 19, value: 'different fictional' };
+      }
+      if (failure === 'changed readback' && inserted.has(key) && row) {
+        injected = true;
+        return { ...row, value: 'tampered fictional node' };
+      }
+      return row;
+    };
     t.mock.method(db, 'prepare', (sql: string) => {
       const statement = nativePrepare(sql);
+      Object.defineProperty(statement, 'get', {
+        configurable: true,
+        writable: true,
+        value: (...args: unknown[]) => Reflect.apply(observedGet, statement, args),
+      });
       if (sql === 'INSERT INTO app_meta(key,value) VALUES(?,?)') {
         const run = statement.run;
         statement.run = (...args) => {
@@ -546,8 +497,8 @@ for (const failure of [
       }
       return statement;
     });
-    const store = createIntakeStateStorage(db, identity).collections;
-    mutate(
+    const store = collectionStoreWithMetaReadProbe(t, db, identity, observedGet);
+    await mutate(
       db,
       store,
       [{ area: 'logical', collection: 'fictional', op: 'put', key: 'first', value: 'before' }],
@@ -555,7 +506,7 @@ for (const failure of [
     );
     const before = store.binding(store.openView());
     const operationId = randomUUID();
-    const prepared = store.prepare(store.openView(), {
+    const prepared = await prepareCollectionMutation(store, store.openView(), {
       operationId,
       requestDigest: digest(operationId),
       domainVersion: 2,
@@ -582,14 +533,17 @@ for (const failure of [
     assert.equal(injected, true);
     assert.deepEqual(store.binding(store.openView()), before);
     assert.equal(store.get(store.openView(), 'logical', 'fictional', 'first'), 'before');
-    assert.equal(store.replay(operationId, digest(operationId)), undefined);
+    assert.equal(
+      await withCollectionAdmission(store, () => store.replay(operationId, digest(operationId))),
+      undefined,
+    );
   });
 
-test('v4 selected maps, sequences and byte chunks survive accepted-journal rebuild without v3 hydration', (t) => {
+test('v4 selected maps, sequences and byte chunks survive accepted-journal rebuild without v3 hydration', async (t) => {
   const { db, identity, rebuild } = fixture(t);
   const store = createIntakeStateStorage(db, identity).collections;
   const id = randomUUID();
-  const first = mutate(
+  const first = await mutate(
     db,
     store,
     [
@@ -613,15 +567,36 @@ test('v4 selected maps, sequences and byte chunks survive accepted-journal rebui
   );
   assert.equal(first.storageSequence, 1);
   const before = store.binding(store.openView())!;
-  const noop = mutate(db, store, [], 1);
+  const noop = await mutate(db, store, [], 1);
   assert.equal(noop.changed, false);
   assert.equal(noop.storageSequence, 2);
   const after = store.binding(store.openView())!;
   assert.deepEqual(after.logical, before.logical);
-  assert.notDeepEqual(after.receipts, before.receipts);
-  assert.notDeepEqual(after.history, before.history);
-  assert.deepEqual(store.replay(id, digest(id)), first);
-  assert.throws(() => store.replay(id, digest('conflict')), /replay conflict/);
+  if (after.format === COLLECTION_FORMAT && before.format === COLLECTION_FORMAT) {
+    assert.notDeepEqual(after.receipts, before.receipts);
+    assert.notDeepEqual(after.history, before.history);
+  } else {
+    assert.equal(after.format, 'health-intake-state-v5');
+    assert.equal(before.format, 'health-intake-state-v5');
+    const evidence = (head: IntakeCollectionHead) =>
+      readIntakeLogSequence(
+        JSON.stringify(head),
+        identity,
+        (hash) =>
+          db
+            .prepare('SELECT value FROM app_meta WHERE key=?')
+            .get(intakeNamespace(identity) + 'node:' + hash)?.value,
+        head.storageSequence,
+        { assertCurrent() {} },
+      );
+    // V5 co-locates these exact roles in one authenticated carry forest.
+    assert.notDeepEqual(evidence(after).receipt, evidence(before).receipt);
+    assert.notDeepEqual(evidence(after).transition, evidence(before).transition);
+  }
+  assert.deepEqual(await withCollectionAdmission(store, () => store.replay(id, digest(id))), first);
+  await withCollectionAdmission(store, () =>
+    assert.throws(() => store.replay(id, digest('conflict')), /replay conflict/),
+  );
   const next = rebuild(),
     recovered = createIntakeStateStorage(next, identity).collections;
   const view = recovered.openView();
@@ -638,17 +613,20 @@ test('v4 selected maps, sequences and byte chunks survive accepted-journal rebui
   const rawChunk = recovered.get(view, 'builds', 'raw', '0000000000000000');
   assert.equal(typeof rawChunk, 'string');
   assert.equal(Buffer.from(rawChunk as string, 'base64').toString(), 'fictional bytes\0🌿');
-  assert.deepEqual(recovered.replay(id, digest(id)), first);
+  assert.deepEqual(
+    await withCollectionAdmission(recovered, () => recovered.replay(id, digest(id))),
+    first,
+  );
   const work = intakeWorkCounters(next);
   assert.equal(work.warm.envelopeHydrations, 0);
   assert.equal(work.warm.materializationReads, 0);
   assert.equal(work.warm.evidenceReplayVersions, 0);
 });
 
-test('unchanged collection reads authenticate selected roots once per SQLite state', (t) => {
+test('unchanged collection reads authenticate selected roots once per SQLite state', async (t) => {
   const { db, identity } = fixture(t),
     store = createIntakeStateStorage(db, identity).collections;
-  mutate(
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'small', op: 'put', key: 'key', value: 'fictional' }],
@@ -656,7 +634,7 @@ test('unchanged collection reads authenticate selected roots once per SQLite sta
   );
   const operationId = randomUUID();
   store.commitMaintenance(
-    store.prepare(store.openView(), {
+    await prepareCollectionMutation(store, store.openView(), {
       operationId,
       requestDigest: digest(operationId),
       domainVersion: 1,
@@ -691,10 +669,10 @@ test('unchanged collection reads authenticate selected roots once per SQLite sta
   );
 });
 
-test('selected root memo refuses local, external and rolled-back corruption without explicit cache clearing', (t) => {
+test('selected root memo refuses local, external and rolled-back corruption without explicit cache clearing', async (t) => {
   const { db, identity } = fixture(t),
     store = createIntakeStateStorage(db, identity).collections;
-  mutate(
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'small', op: 'put', key: 'key', value: 'first' }],
@@ -704,7 +682,7 @@ test('selected root memo refuses local, external and rolled-back corruption with
     firstHead = String(
       db.prepare('SELECT value FROM app_meta WHERE key=?').get(prefix + 'head')!.value,
     );
-  mutate(
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'small', op: 'put', key: 'key', value: 'second' }],
@@ -712,7 +690,7 @@ test('selected root memo refuses local, external and rolled-back corruption with
   );
   const operationId = randomUUID();
   store.commitMaintenance(
-    store.prepare(store.openView(), {
+    await prepareCollectionMutation(store, store.openView(), {
       operationId,
       requestDigest: digest(operationId),
       domainVersion: 2,
@@ -726,8 +704,11 @@ test('selected root memo refuses local, external and rolled-back corruption with
   for (const root of [
     selected.logical.root,
     selected.builds,
-    selected.history,
-    selected.receipts,
+    ...(selected.format === COLLECTION_FORMAT
+      ? [selected.history, selected.receipts]
+      : // V5 receipts and transitions share one selected peak commitment.
+        // Corrupt that actual root once; V4 retains both independent roots.
+        [selected.peaks].map((hash) => (hash ? { hash } : null))),
   ]) {
     assert.ok(root);
     db.exec('SAVEPOINT fictional_corrupt_root');
@@ -735,7 +716,7 @@ test('selected root memo refuses local, external and rolled-back corruption with
       change.run('{}', prefix + 'node:' + root.hash);
       assert.throws(
         read,
-        /schema|tree|collection/,
+        /schema|tree|collection|log/,
         'even an unrelated selected root is revalidated after a write',
       );
     } finally {
@@ -760,11 +741,14 @@ test('selected root memo refuses local, external and rolled-back corruption with
   }
   assert.equal(read(), 'second');
   const peer = new DatabaseSync(String(db.prepare('PRAGMA database_list').get()!.file)),
-    key = prefix + 'node:' + selected.receipts!.hash,
+    key =
+      prefix +
+      'node:' +
+      (selected.format === COLLECTION_FORMAT ? selected.receipts!.hash : selected.peaks!),
     original = String(db.prepare('SELECT value FROM app_meta WHERE key=?').get(key)!.value);
   try {
     peer.prepare('UPDATE app_meta SET value=? WHERE key=?').run('{}', key);
-    assert.throws(read, /schema|tree|collection/, 'external corruption changes data_version');
+    assert.throws(read, /schema|tree|collection|log/, 'external corruption changes data_version');
     peer.prepare('UPDATE app_meta SET value=? WHERE key=?').run(original, key);
     assert.equal(read(), 'second');
     for (const oversized of ['f'.repeat(32769), '🌿'.repeat(9000)]) {
@@ -787,7 +771,7 @@ test('selected root memo refuses local, external and rolled-back corruption with
     assert.equal(db.prepare('SELECT total_changes() AS count').get()!.count, changes);
     assert.throws(
       read,
-      /schema|tree|collection/,
+      /schema|tree|collection|log/,
       'rollback must not reuse transaction-authenticated roots',
     );
   } finally {
@@ -802,10 +786,10 @@ test('selected root memo refuses local, external and rolled-back corruption with
   assert.equal(reopened.get(reopened.openView(), 'logical', 'small', 'key'), 'second');
 });
 
-test('selected incomplete chunks publish without clinical invalidation and promote atomically as large values', (t) => {
+test('selected incomplete chunks publish without clinical invalidation and promote atomically as large values', async (t) => {
   const { db, identity, rebuild } = fixture(t);
   const store = createIntakeStateStorage(db, identity).collections;
-  mutate(
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'summary', op: 'put', key: 'status', value: 'pending' }],
@@ -816,7 +800,7 @@ test('selected incomplete chunks publish without clinical invalidation and promo
   const expected = Buffer.alloc(24 * 1024, 'f');
   for (let offset = 0; offset < expected.length; offset += 4096) {
     const id = randomUUID();
-    const prepared = store.prepare(store.openView(), {
+    const prepared = await prepareCollectionMutation(store, store.openView(), {
       operationId: id,
       requestDigest: digest(id),
       domainVersion: 1,
@@ -835,7 +819,7 @@ test('selected incomplete chunks publish without clinical invalidation and promo
   }
   // Attach a snapshot, then append another build chunk in the same preparation.
   // Both roots must remain reachable without copying the selected byte payload.
-  mutate(
+  await mutate(
     db,
     store,
     [
@@ -889,11 +873,11 @@ test('selected incomplete chunks publish without clinical invalidation and promo
   );
 });
 
-test('v4 mutations remain path-local, ranges are bounded, unchanged puts preserve logical roots', (t) => {
+test('v4 mutations remain path-local, ranges are bounded, unchanged puts preserve logical roots', async (t) => {
   const { db, identity } = fixture(t);
   const store = createIntakeStateStorage(db, identity).collections;
   for (let start = 0; start < 512; start += 32)
-    mutate(
+    await mutate(
       db,
       store,
       Array.from({ length: 32 }, (_, offset) => ({
@@ -920,7 +904,7 @@ test('v4 mutations remain path-local, ranges are bounded, unchanged puts preserv
   assert.equal(page.count, 512);
   assert.equal(page.complete, false);
   const basis = store.binding(view)!;
-  const noop = mutate(
+  const noop = await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'members', op: 'put', key: '00255', value: 'fictional-255' }],
@@ -928,7 +912,7 @@ test('v4 mutations remain path-local, ranges are bounded, unchanged puts preserv
   );
   assert.equal(noop.changed, false);
   assert.deepEqual(store.binding(store.openView())!.logical, basis.logical);
-  const restored = mutate(
+  const restored = await mutate(
     db,
     store,
     [
@@ -940,7 +924,7 @@ test('v4 mutations remain path-local, ranges are bounded, unchanged puts preserv
   assert.equal(restored.changed, false);
   assert.deepEqual(store.binding(store.openView())!.logical, basis.logical);
   const baseline = intakeWorkCounters(db).warm;
-  mutate(
+  await mutate(
     db,
     store,
     [
@@ -965,21 +949,21 @@ test('v4 mutations remain path-local, ranges are bounded, unchanged puts preserv
   );
 });
 
-test('v4 preparation ownership, expiry, stale bases and rollback cannot select candidate state', (t) => {
+test('v4 preparation ownership, expiry, stale bases and rollback cannot select candidate state', async (t) => {
   const { db, identity } = fixture(t),
     other = fixture(t);
   const store = createIntakeStateStorage(db, identity).collections;
-  const prepare = (value: string) =>
-    store.prepare(store.openView(), {
+  const prepare = async (value: string) =>
+    await prepareCollectionMutation(store, store.openView(), {
       operationId: randomUUID(),
       requestDigest: digest(value),
       domainVersion: 1,
       changes: [{ area: 'logical', collection: 'members', op: 'put', key: 'one', value }],
     });
-  const first = prepare('original');
+  const first = await prepare('original');
   assert.throws(() => store.stage(first), /requires application transaction/);
   assert.throws(() => transaction(db, () => store.stage(first)), /expired/);
-  const pending = prepare('rolled back');
+  const pending = await prepare('rolled back');
   assert.throws(
     () =>
       transaction(db, () => {
@@ -989,7 +973,7 @@ test('v4 preparation ownership, expiry, stale bases and rollback cannot select c
     /fictional rollback/,
   );
   assert.equal(store.binding(store.openView()), undefined);
-  const next = prepare('retained');
+  const next = await prepare('retained');
   assert.throws(
     () =>
       transaction(other.db, () =>
@@ -998,18 +982,18 @@ test('v4 preparation ownership, expiry, stale bases and rollback cannot select c
     /foreign or expired/,
   );
   transaction(db, () => store.stage(next));
-  const stale = store.prepare(store.openView(), {
+  const stale = await prepareCollectionMutation(store, store.openView(), {
     operationId: randomUUID(),
     requestDigest: digest('stale'),
     domainVersion: 2,
     changes: [{ area: 'logical', collection: 'members', op: 'put', key: 'two', value: 'second' }],
   });
-  mutate(db, store, [], 1);
+  await mutate(db, store, [], 1);
   assert.throws(() => transaction(db, () => store.stage(stale)), /stale collection preparation/);
   const many: PreparedIntakeCollectionMutation[] = [];
   for (let index = 0; index < 9; index++)
     many.push(
-      store.prepare(store.openView(), {
+      await prepareCollectionMutation(store, store.openView(), {
         operationId: randomUUID(),
         requestDigest: digest(String(index)),
         domainVersion: 1,
@@ -1019,11 +1003,11 @@ test('v4 preparation ownership, expiry, stale bases and rollback cannot select c
   assert.throws(() => store.inspectPrepared(many[0]!), /expired/);
 });
 
-test('v4 rejects missing/forged pages and v3/v4 access is explicit', (t) => {
+test('v4 rejects missing/forged pages and v3/v4 access is explicit', async (t) => {
   const { db, identity, rebuild } = fixture(t);
   const full = createIntakeStateStorage(db, identity),
     store = full.collections;
-  mutate(
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'members', op: 'put', key: 'one', value: 'fictional' }],
@@ -1049,16 +1033,16 @@ test('v4 rejects missing/forged pages and v3/v4 access is explicit', (t) => {
   assert.deepEqual(v3.read(), { retained: 'v3' });
 });
 
-test('v4 uncertain durable publication clears preparations and rebuild follows selected evidence', (t) => {
+test('v4 uncertain durable publication clears preparations and rebuild follows selected evidence', async (t) => {
   const { db, identity, rebuild, ambiguous } = fixture(t);
   const store = createIntakeStateStorage(db, identity).collections;
-  mutate(
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'members', op: 'put', key: 'one', value: 'first' }],
     1,
   );
-  const prepared = store.prepare(store.openView(), {
+  const prepared = await prepareCollectionMutation(store, store.openView(), {
     operationId: randomUUID(),
     requestDigest: digest('second'),
     domainVersion: 2,
@@ -1071,10 +1055,10 @@ test('v4 uncertain durable publication clears preparations and rebuild follows s
   assert.equal(selected.get(selected.openView(), 'logical', 'members', 'one'), 'second');
 });
 
-test('oversized inline metadata refuses before serialization and escaped overflow leaves selected state intact', (t) => {
+test('oversized inline metadata refuses before serialization and escaped overflow leaves selected state intact', async (t) => {
   const { db, identity } = fixture(t);
   const store = createIntakeStateStorage(db, identity).collections;
-  mutate(
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'members', op: 'put', key: 'one', value: 'fictional' }],
@@ -1090,6 +1074,7 @@ test('oversized inline metadata refuses before serialization and escaped overflo
     return Reflect.apply(stringify, JSON, args);
   });
   for (const value of ['f'.repeat(100_000), '\0'.repeat(2000)]) {
+    await store.admitCurrentLogAsync();
     assert.throws(
       () =>
         store.prepare(store.openView(), {
@@ -1100,13 +1085,14 @@ test('oversized inline metadata refuses before serialization and escaped overflo
         }),
       /requires byte chunks/,
     );
+    store.releaseLogAdmission();
     assert.deepEqual(store.binding(store.openView()), before);
   }
   assert.equal(oversizedSerializations, 0);
 });
 
 for (const raw of [false, true]) {
-  test(`supported v3 ${raw ? 'raw duplicate' : 'normalized unknown'} evidence bridges without changing clinical revision or legacy reads`, (t) => {
+  test(`supported v3 ${raw ? 'raw duplicate' : 'normalized unknown'} evidence bridges without changing clinical revision or legacy reads`, async (t) => {
     const { db, identity, rebuild, acceptedHead } = fixture(t);
     const full = createIntakeStateStorage(db, identity),
       store = full.collections;
@@ -1180,7 +1166,7 @@ for (const raw of [false, true]) {
     const work = intakeWorkCounters(db).reconstruction;
     for (let index = 0; index < 3; index++) {
       const id = randomUUID();
-      const prepared = store.prepare(store.openView(), {
+      const prepared = await prepareCollectionMutation(store, store.openView(), {
         operationId: id,
         requestDigest: digest(id),
         domainVersion: 7,
@@ -1206,10 +1192,10 @@ for (const raw of [false, true]) {
   });
 }
 
-test('nested snapshots preserve immutable contents, reject ordinary reads and bind capabilities to selected logical state', (t) => {
+test('nested snapshots preserve immutable contents, reject ordinary reads and bind capabilities to selected logical state', async (t) => {
   const { db, identity, rebuild } = fixture(t);
   const store = createIntakeStateStorage(db, identity).collections;
-  mutate(
+  await mutate(
     db,
     store,
     [
@@ -1242,7 +1228,7 @@ test('nested snapshots preserve immutable contents, reject ordinary reads and bi
   cap = store.getCollectionReference(store.openView(), 'logical', 'catalog', 'version-1')!;
   const id = randomUUID();
   store.commitMaintenance(
-    store.prepare(store.openView(), {
+    await prepareCollectionMutation(store, store.openView(), {
       operationId: id,
       requestDigest: digest(id),
       domainVersion: 1,
@@ -1251,7 +1237,7 @@ test('nested snapshots preserve immutable contents, reject ordinary reads and bi
   );
   assert.equal(store.getReferenced(cap, 'second'), undefined);
   assert.equal(store.getReferenced(cap, 'first'), 'retained');
-  mutate(
+  await mutate(
     db,
     store,
     [
@@ -1295,10 +1281,10 @@ test('nested snapshots preserve immutable contents, reject ordinary reads and bi
   assert.throws(() => store.getReferenced(next, 'first'), /foreign, stale or expired/);
 });
 
-test('live collection views survive unrelated reader churn and still expire at authority boundaries', (t) => {
+test('live collection views survive unrelated reader churn and still expire at authority boundaries', async (t) => {
   const { db, identity } = fixture(t);
   const store = createIntakeStateStorage(db, identity).collections;
-  mutate(
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'members', op: 'put', key: 'one', value: 'first' }],
@@ -1312,7 +1298,7 @@ test('live collection views survive unrelated reader churn and still expire at a
     assert.equal(other.get(other.openView(), 'logical', 'members', 'one'), 'first');
   }
   assert.equal(store.get(selected, 'logical', 'members', 'one'), 'first');
-  mutate(
+  await mutate(
     db,
     store,
     [{ area: 'logical', collection: 'members', op: 'put', key: 'one', value: 'second' }],
@@ -1330,7 +1316,7 @@ test('live collection views survive unrelated reader churn and still expire at a
   assert.equal(reopened.get(reopened.openView(), 'logical', 'members', 'one'), 'second');
 });
 
-test('prefix-scoped collection ranges preserve page boundaries and reject foreign cursors', (t) => {
+test('prefix-scoped collection ranges preserve page boundaries and reject foreign cursors', async (t) => {
   const { db, identity } = fixture(t);
   const store = createIntakeStateStorage(db, identity).collections;
   const changes: IntakeCollectionChange[] = [
@@ -1349,7 +1335,7 @@ test('prefix-scoped collection ranges preserve page boundaries and reject foreig
       value: 'unrelated'.repeat(800),
     },
   ];
-  mutate(db, store, changes, 1);
+  await mutate(db, store, changes, 1);
   const view = store.openView();
   const first = store.range(view, 'logical', 'scoped', {
     after: 'h:',
@@ -1418,12 +1404,12 @@ test('prefix-scoped collection ranges preserve page boundaries and reject foreig
 });
 
 for (const history of [0, 128])
-  test(`bounded map preparation shares paths for one 64-change run: ${history} retained entries`, (t) => {
+  test(`bounded map preparation shares paths for one 64-change run: ${history} retained entries`, async (t) => {
     const { db, identity, rebuild } = fixture(t);
     const store = createIntakeStateStorage(db, identity).collections;
     let version = 0;
     for (let offset = 0; offset < history; offset += 64)
-      mutate(
+      await mutate(
         db,
         store,
         Array.from({ length: 64 }, (_, i) => ({
@@ -1444,6 +1430,7 @@ for (const history of [0, 128])
     }));
     const id = randomUUID(),
       view = store.openView();
+    await store.admitCurrentLogAsync();
     const before = { ...intakeWorkCounters(db).warm };
     const prepared = store.prepare(view, {
       operationId: id,
@@ -1451,6 +1438,7 @@ for (const history of [0, 128])
       domainVersion: ++version,
       changes,
     });
+    store.releaseLogAdmission();
     const after = { ...intakeWorkCounters(db).warm };
     const measured = {
       reads: after.collectionNodeReads - before.collectionNodeReads,
@@ -1491,16 +1479,22 @@ for (const history of [0, 128])
       return rows;
     };
     assert.deepEqual(readAll(store), expected);
-    assert.deepEqual(store.replay(id, digest(id)), result);
+    assert.deepEqual(
+      await withCollectionAdmission(store, () => store.replay(id, digest(id))),
+      result,
+    );
     const cold = createIntakeStateStorage(rebuild(), identity).collections;
     assert.deepEqual(readAll(cold), expected);
-    assert.deepEqual(cold.replay(id, digest(id)), result);
+    assert.deepEqual(
+      await withCollectionAdmission(cold, () => cold.replay(id, digest(id))),
+      result,
+    );
   });
 
-test('map batching stops at reference, adoption and delete barriers and preserves exact no-op replay', (t) => {
+test('map batching stops at reference, adoption and delete barriers and preserves exact no-op replay', async (t) => {
   const { db, identity, rebuild } = fixture(t),
     store = createIntakeStateStorage(db, identity).collections;
-  mutate(
+  await mutate(
     db,
     store,
     [
@@ -1541,7 +1535,7 @@ test('map batching stops at reference, adoption and delete barriers and preserve
   inspect(store);
   const id = randomUUID();
   const before = store.binding(store.openView())!.logical;
-  const result = mutate(
+  const result = await mutate(
     db,
     store,
     [
@@ -1553,35 +1547,53 @@ test('map batching stops at reference, adoption and delete barriers and preserve
   );
   assert.equal(result.changed, false);
   assert.deepEqual(store.binding(store.openView())!.logical, before);
-  assert.deepEqual(store.replay(id, digest(id)), result);
+  assert.deepEqual(
+    await withCollectionAdmission(store, () => store.replay(id, digest(id))),
+    result,
+  );
   const cold = createIntakeStateStorage(rebuild(), identity).collections;
   inspect(cold);
-  assert.deepEqual(cold.replay(id, digest(id)), result);
+  assert.deepEqual(await withCollectionAdmission(cold, () => cold.replay(id, digest(id))), result);
 });
 
 for (const inTransaction of [false, true])
   for (const unrelated of [0, 80])
-    test(`collection preparation ${inTransaction ? 'retains raw transaction reads' : 'authenticates unchanged pages once within its own seal'}: ${unrelated}`, (t) => {
+    test(`collection preparation ${inTransaction ? 'retains raw transaction reads' : 'authenticates unchanged pages once within its own seal'}: ${unrelated}`, async (t) => {
       const { db, identity } = fixture(t);
       const prefix = intakeNamespace(identity) + 'node:';
       let probing = false;
       const reads = new Map<string, number>();
       const nativeGet = StatementSync.prototype.get;
-      t.mock.method(
-        StatementSync.prototype,
-        'get',
-        function (this: StatementSync, ...args: unknown[]) {
-          if (this.sourceSQL.startsWith('SELECT length(CAST(value AS BLOB))')) {
-            const key = args.at(-1);
-            if (probing && typeof key === 'string' && key.startsWith(prefix))
-              reads.set(key, (reads.get(key) ?? 0) + 1);
-          }
-          return Reflect.apply(nativeGet, this, args);
-        },
-      );
-      const store = createIntakeStateStorage(db, identity).collections;
+      const observedGet = function (this: StatementSync, ...args: unknown[]) {
+        const row = Reflect.apply(nativeGet, this, args);
+        if (this.sourceSQL.startsWith('SELECT length(CAST(value AS BLOB))')) {
+          const key = args.at(-1);
+          // The namespace also contains V5 carry nodes. This oracle measures
+          // the unchanged collection AVL pages counted by collectionNodeReads.
+          if (
+            probing &&
+            typeof key === 'string' &&
+            key.startsWith(prefix) &&
+            typeof row?.value === 'string' &&
+            JSON.parse(row.value).format === 'health-intake-node-v4'
+          )
+            reads.set(key, (reads.get(key) ?? 0) + 1);
+        }
+        return row;
+      };
+      const nativePrepare = db.prepare.bind(db);
+      t.mock.method(db, 'prepare', (sql: string) => {
+        const statement = nativePrepare(sql);
+        Object.defineProperty(statement, 'get', {
+          configurable: true,
+          writable: true,
+          value: (...args: unknown[]) => Reflect.apply(observedGet, statement, args),
+        });
+        return statement;
+      });
+      const store = collectionStoreWithMetaReadProbe(t, db, identity, observedGet);
       for (let start = 0; start < 64 + unrelated; start += 64)
-        mutate(
+        await mutate(
           db,
           store,
           Array.from({ length: Math.min(64, 64 + unrelated - start) }, (_, n) => ({
@@ -1595,9 +1607,12 @@ for (const inTransaction of [false, true])
         );
       const operationId = randomUUID(),
         view = store.openView();
-      let nodeReads = 0;
+      await store.admitCurrentLogAsync();
+      let nodeReads = 0,
+        aggregateNodeReads = 0,
+        certificateNodeReads = 0;
       const prepareMeasured = () => {
-        const before = intakeWorkCounters(db).warm.collectionNodeReads;
+        const before = intakeWorkCounters(db).warm;
         probing = true;
         try {
           return store.prepare(view, {
@@ -1613,8 +1628,15 @@ for (const inTransaction of [false, true])
             })),
           });
         } finally {
-          nodeReads = intakeWorkCounters(db).warm.collectionNodeReads - before;
+          const after = intakeWorkCounters(db).warm;
+          aggregateNodeReads = after.collectionNodeReads - before.collectionNodeReads;
+          certificateNodeReads = after.vaultCertificatePageReads - before.vaultCertificatePageReads;
+          // Genuine accepted authority also reads its private certificate tree.
+          // Preserve full aggregate accounting; reconcile this selected-page
+          // SQL oracle with the independently exposed certificate subset removed.
+          nodeReads = aggregateNodeReads - certificateNodeReads;
           probing = false;
+          store.releaseLogAdmission();
         }
       };
       const result = inTransaction
@@ -1631,6 +1653,8 @@ for (const inTransaction of [false, true])
           reads: [...reads.values()].reduce((a, b) => a + b, 0),
           maxReads: Math.max(...reads.values()),
           nodeReads,
+          aggregateNodeReads,
+          certificateNodeReads,
         }),
       );
       for (let n = 0; n < 64 + unrelated; n++)
@@ -1638,7 +1662,10 @@ for (const inTransaction of [false, true])
           store.get(store.openView(), 'logical', 'values', String(n).padStart(3, '0')),
           n < 32 ? `changed-${n}` : `fictional-${n}`,
         );
-      assert.deepEqual(store.replay(operationId, digest(operationId)), result);
+      assert.deepEqual(
+        await withCollectionAdmission(store, () => store.replay(operationId, digest(operationId))),
+        result,
+      );
       assert.ok(reads.size > 0, 'the preparation authenticates actual retained pages');
       assert.equal(
         [...reads.values()].reduce((sum, n) => sum + n, 0),

@@ -60,18 +60,22 @@ export async function prepareIntakeFilenameSummary(
           throw Error('The selected filename authority changed during preparation');
       };
       const build = 'filename.facts.' + randomUUID();
-      const prepare = (changes: Parameters<typeof collections.prepare>[1]['changes']) => {
+      const prepare = async (changes: Parameters<typeof collections.prepare>[1]['changes']) => {
         assertCurrent();
         const operationId = randomUUID();
-        return collections.prepare(collections.openView(), {
-          operationId,
-          requestDigest: createHash('sha256').update(operationId).digest('hex'),
-          domainVersion: view.logical.domainVersion,
-          changes,
-        });
+        return await collections.prepareAsync(
+          collections.openView(),
+          {
+            operationId,
+            requestDigest: createHash('sha256').update(operationId).digest('hex'),
+            domainVersion: view.logical.domainVersion,
+            changes,
+          },
+          assertCurrent,
+        );
       };
       collections.commitMaintenance(
-        prepare([
+        await prepare([
           {
             area: 'builds',
             collection: build,
@@ -100,7 +104,7 @@ export async function prepareIntakeFilenameSummary(
         cells.return(undefined);
       }
       await writer.flush();
-      const prepared = prepare([
+      const prepared = await prepare([
         {
           area: 'logical',
           collection: 'envelope.data',

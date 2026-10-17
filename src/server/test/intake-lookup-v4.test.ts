@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { constants, DatabaseSync, StatementSync } from 'node:sqlite';
 import { setImmediate } from 'node:timers';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -32,10 +32,10 @@ test.after(() => {
   DatabaseSync.prototype.prepare = originalNativePrepare;
 });
 
-const { openDatabase, transaction, json } = await import('../database.ts');
+const { transaction, json } = await import('../database.ts');
 const { recordDurabilityStatus } = await import('../record-versions.ts');
-const { memoryRecordAuthority, registerRawIntakeFixture } =
-  await import('./helpers/intake-authority-fixture.ts');
+const { intakeLookupContributorFixture, registerLookupOriginal: registerRawIntakeFixture } =
+  await import('./helpers/intake-lookup-contributor-fixture.ts');
 const { buildIntakeCollectionEnvelope } = await import('../intake-envelope-build.ts');
 const { buildVerifiedWorkflowSummary } = await import('../intake-workflow-state.ts');
 const {
@@ -483,13 +483,7 @@ for (const mode of ['native-only', 'mixed'] as const)
 
 for (const count of [1, 8])
   test(`warm lookup preparation reads only changed retained sources among ${count} originals`, async (t) => {
-    const root = mkdtempSync(join(tmpdir(), 'fictional-lookup-scope-'));
-    const db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
-    const authority = memoryRecordAuthority(db);
-    t.after(() => {
-      db.close();
-      rmSync(root, { recursive: true, force: true });
-    });
+    const { db, authority } = intakeLookupContributorFixture(t);
     for (let index = 0; index < count; index++) {
       const id = `fictional-source-${index}`;
       const raw = JSON.stringify({
@@ -519,7 +513,7 @@ for (const count of [1, 8])
     });
     const beforeWork = { ...intakeWorkCounters(db).warm };
     const beforeLookup = { ...intakeLookupCounters(db) };
-    const beforeObjects = authority.objects.size;
+    const beforeObjects = authority.objectCount();
     const beforeSequence = recordDurabilityStatus(db)?.sequence;
     const beforeTransactions = Number(
       db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n,
@@ -588,7 +582,7 @@ for (const count of [1, 8])
     );
     assert.equal(result.prepared, 0);
     assert.equal(afterLookup.projectionWrites, beforeLookup.projectionWrites);
-    assert.equal(authority.objects.size, beforeObjects);
+    assert.equal(authority.objectCount(), beforeObjects);
     assert.equal(recordDurabilityStatus(db)?.sequence, beforeSequence);
     assert.equal(
       Number(db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n),
@@ -640,7 +634,7 @@ for (const count of [1, 8])
       }),
     );
     assert.equal(intakeLookupCounters(db).projectionWrites, beforeLookup.projectionWrites);
-    assert.equal(authority.objects.size, beforeObjects);
+    assert.equal(authority.objectCount(), beforeObjects);
     assert.equal(recordDurabilityStatus(db)?.sequence, beforeSequence);
     assert.equal(
       Number(db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n),
@@ -654,13 +648,7 @@ for (const count of [1, 8])
       );
   });
 async function fixture(t: test.TestContext, raw: string) {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-native-lookup-'));
-  const db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
-  t.after(() => {
-    db.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  const authority = memoryRecordAuthority(db);
+  const { db, authority } = intakeLookupContributorFixture(t);
   registerRawIntakeFixture(db, 'original', raw);
   const source = { id: 'original' };
   const selected = db.prepare('SELECT sha256 FROM source_files WHERE id=?').get(source.id)!;
@@ -938,7 +926,7 @@ test('unrelated SQL recertification does not traverse retained acceptance bodies
     const cold = await countAcceptanceIdentityGets(f.db, () => prepareIntakeLookupIndices(f.db));
     assert.equal(cold.gets, count);
     assert.equal(cold.result.prepared, 0);
-    const beforeObjects = f.authority.objects.size;
+    const beforeObjects = f.authority.objectCount();
     const beforeSequence = recordDurabilityStatus(f.db)?.sequence;
     f.db.prepare('INSERT INTO app_meta VALUES(?,?)').run('fictional-recertification', count);
     const beforeLookup = { ...intakeLookupCounters(f.db) };
@@ -961,7 +949,7 @@ test('unrelated SQL recertification does not traverse retained acceptance bodies
     );
     assert.equal(renewed.result.prepared, 0);
     assert.equal(intakeLookupCounters(f.db).projectionWrites, beforeLookup.projectionWrites);
-    assert.equal(f.authority.objects.size, beforeObjects);
+    assert.equal(f.authority.objectCount(), beforeObjects);
     assert.equal(recordDurabilityStatus(f.db)?.sequence, beforeSequence);
     assert.equal(
       Number(f.db.prepare('SELECT COUNT(*) AS n FROM __record_transactions').get()!.n),
@@ -1115,13 +1103,7 @@ test('native catalog prunes a removed original without retaining its acceptance'
 
 for (const prepared of [false, true])
   test(`mixed legacy and native acceptance order survives ${prepared ? 'prepared' : 'synchronous'} lookup`, async (t) => {
-    const root = mkdtempSync(join(tmpdir(), 'fictional-mixed-lookup-'));
-    const db = openDatabase(join(root, 'cache.sqlite'), 'fictional');
-    memoryRecordAuthority(db);
-    t.after(() => {
-      db.close();
-      rmSync(root, { recursive: true, force: true });
-    });
+    const { db } = intakeLookupContributorFixture(t);
     registerRawIntakeFixture(
       db,
       'fictional-legacy',
@@ -1416,7 +1398,7 @@ test('maintenance-only native head rewrites renew lookup without scanning origin
   assert.equal(preparedIntakeLookupReadToken(f.db), undefined);
   assert.equal(nativeIntakeLookupCatalogHeadBindingsEqual(f.db, token, [f.source.id]), true);
   assert.equal(preparedIntakeDiscoveryRevision(f.db), before.discoveryRevision);
-  const objects = f.authority.objects.size;
+  const objects = f.authority.objectCount();
   assert.equal(
     await lookupSourceRows(f.db, async () => {
       assert.deepEqual(await prepareIntakeLookupIndices(f.db), {
@@ -1428,7 +1410,7 @@ test('maintenance-only native head rewrites renew lookup without scanning origin
     0,
   );
   assert.notEqual(preparedIntakeLookupReadToken(f.db), token);
-  assert.equal(f.authority.objects.size, objects);
+  assert.equal(f.authority.objectCount(), objects);
   assert.equal(maximumIntakeDiscoveryOrder(f.db), 7);
   assert.deepEqual(retainedIntakeAcceptance(f.db, 'fictional-proof'), {
     receipt: { operationId: 'fictional-proof' },
@@ -1836,7 +1818,7 @@ for (const change of [
 
 test('warm lookup preparation checks cancellation and callback changes before reuse', async (t) => {
   const f = await lookupProofFixture(t);
-  const objects = f.authority.objects.size;
+  const objects = f.authority.objectCount();
   await assert.rejects(
     prepareIntakeLookupIndices(f.db, {
       assertRunning: () => {
@@ -1857,7 +1839,7 @@ test('warm lookup preparation checks cancellation and callback changes before re
       }),
     )) >= 2,
   );
-  assert.equal(f.authority.objects.size, objects);
+  assert.equal(f.authority.objectCount(), objects);
 });
 
 for (const change of ['sql', 'collection-registry', 'lookup-registry'] as const)
@@ -1934,10 +1916,10 @@ test('warm lookup preparation retains detached results and refuses accepted-head
     reused: 1,
     discoveryRevision: expected,
   });
-  const head = f.authority.objects.get('head')!;
-  f.authority.objects.delete('head');
+  const head = readFileSync(f.authority.headPath);
+  unlinkSync(f.authority.headPath);
   await assert.rejects(prepareIntakeLookupIndices(f.db), /recovery|authority|head/i);
-  f.authority.objects.set('head', head);
+  writeFileSync(f.authority.headPath, head);
   await prepareIntakeLookupIndices(f.db);
   f.db.prepare("UPDATE app_meta SET value='foreign-profile' WHERE key='owner_profile_id'").run();
   await assert.rejects(prepareIntakeLookupIndices(f.db));

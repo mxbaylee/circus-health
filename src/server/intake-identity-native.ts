@@ -2644,12 +2644,16 @@ async function getNativeIntakeIdentityReviewInner(
         operationId = randomUUID();
       assertRunning();
       if (changes.length) {
-        const prepared = collections.prepare(collections.openView(), {
-          operationId,
-          requestDigest: hash(operationId),
-          domainVersion: context.before.rawVersion,
-          changes,
-        });
+        const prepared = await collections.prepareAsync(
+          collections.openView(),
+          {
+            operationId,
+            requestDigest: hash(operationId),
+            domainVersion: context.before.rawVersion,
+            changes,
+          },
+          assertRunning,
+        );
         try {
           await verifiedIdentityPublication(
             context,

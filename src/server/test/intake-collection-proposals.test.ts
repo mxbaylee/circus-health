@@ -4,6 +4,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setImmediate } from 'node:timers';
 import { openDatabase, transaction } from '../database.ts';
 import { prepareInitialIntakeEnvelope } from '../intake-authority.ts';
 import { createIntakeStateStorage, clearIntakeStateCache } from '../intake-state-storage.ts';
@@ -28,7 +29,7 @@ function fixture(t: test.TestContext, retained?: Record<string, unknown>) {
       sourceHash: 'c'.repeat(64),
     },
     db = openDatabase(join(root, 'cache.sqlite'), identity.profileId);
-  memoryRecordAuthority(db);
+  const authority = memoryRecordAuthority(db);
   t.after(() => {
     clearIntakeStateCache(db);
     db.close();
@@ -54,6 +55,7 @@ function fixture(t: test.TestContext, retained?: Record<string, unknown>) {
   });
   return {
     db,
+    authority,
     identity,
     source: { id: identity.intakeId, sha256: identity.sourceHash },
     file: { id: identity.intakeId, sha256: identity.sourceHash, mime_type: 'application/pdf' },
@@ -340,3 +342,234 @@ test('native proposal migrates legacy cumulative members with duplicate identiti
     canonicalLiteral(member.section || null),
   );
 });
+
+async function coldOccurrenceFixture(t: test.TestContext, count = 1) {
+  const entries = validateJSONL(
+      Buffer.from(JSON.stringify(envelope('cold', 'current locator'))),
+    ).entries!,
+    file = { id: 'fictional-source', sha256: 'c'.repeat(64), mime_type: 'application/pdf' },
+    retained: {
+      version: number;
+      originalName: string;
+      proposals: { id: string }[];
+      workflow?: ReturnType<typeof import('../intake-workflow.ts').intakeWorkflow>;
+    } = {
+      version: 1,
+      originalName: 'fictional.pdf',
+      proposals: [],
+    };
+  recordCandidateVersions(file, retained, entries, null);
+  const original = retained.workflow!.candidates[0]!.versions[0]!.occurrences[0]!;
+  Object.assign(original, {
+    locator: 'different retained locator',
+    unknown: 'preserved source field',
+  });
+  if (count > 1)
+    retained.workflow!.candidates[0]!.versions[0]!.occurrences.push({
+      ...original,
+      recordId: 'other-retained-record',
+    });
+  const f = fixture(t, { intake: retained });
+  await buildIntakeCollectionEnvelope(f.db, f.source);
+  const store = createIntakeStateStorage(f.db, f.identity).collections;
+  const prepare = (
+    options: { batchId?: string; onCheckpoint?: () => void; assertRunning?: () => void } = {},
+  ) => {
+    const id = randomUUID();
+    return prepareIntakeCollectionProposal(f.db, f.source, {
+      reader: openIntakeCollectionEnvelope(f.db, f.source),
+      file,
+      proposalId: null,
+      entries,
+      operationId: id,
+      requestDigest: createHash('sha256').update(id).digest('hex'),
+      domainVersion: store.binding(store.openView())!.logical.domainVersion + 1,
+      createdAt: '2026-09-17T12:00:00Z',
+      reportEvidence: {
+        packageEvidence: false,
+        hasMember: () => false,
+        contextLookup: { contexts: () => [] },
+      },
+      nextDiscoveryOrder: () => {
+        throw Error('Retained group must keep discovery order');
+      },
+      ...options,
+    });
+  };
+  const candidates = () =>
+    (
+      JSON.parse([...iterateIntakeEnvelopeText(f.db, f.source)].join('')) as {
+        intake: typeof retained;
+      }
+    ).intake.workflow!.candidates;
+  return {
+    ...f,
+    prepare,
+    store,
+    candidates,
+    originalCandidates: structuredClone(retained.workflow!.candidates),
+    occurrenceIndex() {
+      const reader = openIntakeCollectionEnvelope(f.db, f.source),
+        intake = reader.child(reader.root(), 'intake')!,
+        workflow = reader.child(intake, 'workflow')!,
+        candidate = reader.find('candidate', workflow, retained.workflow!.candidates[0]!.id)!,
+        version = reader.find(
+          'version',
+          candidate,
+          retained.workflow!.candidates[0]!.versions[0]!.id,
+        )!;
+      return createReportSnapshotCatalog(f.db, f.source).open(
+        'candidate-occurrences:' +
+          reader.address(version) +
+          ':' +
+          reader.childCount(version, 'occurrences'),
+      );
+    },
+  };
+}
+
+for (const observed of [false, true])
+  test(`cold singleton compiler retains exact duplicate semantics and observer barriers observed=${observed}`, async (t) => {
+    const f = await coldOccurrenceFixture(t),
+      before = intakeWorkCounters(f.db).warm;
+    let observations = 0;
+    const prepared = await f.prepare(
+        observed
+          ? {
+              onCheckpoint: () => {
+                observations++;
+              },
+            }
+          : {},
+      ),
+      after = intakeWorkCounters(f.db).warm;
+    assert.equal(
+      after.reportSnapshotCheckpointBatches - before.reportSnapshotCheckpointBatches,
+      observed ? 7 : 4,
+    );
+    if (observed)
+      assert.ok(observations >= 7, 'original eager checkpoint callbacks remain observable');
+    transaction(f.db, () => f.store.stage(prepared.prepared!));
+    assert.deepEqual(
+      f.candidates(),
+      f.originalCandidates,
+      'same recordId/batchId remains duplicate despite differing locator/unknown source fields',
+    );
+    assert.equal(
+      !!f.occurrenceIndex(),
+      observed,
+      'only the observer path materializes the duplicate index',
+    );
+    const secondBefore = intakeWorkCounters(f.db).warm.reportSnapshotCheckpointBatches,
+      second = await f.prepare();
+    assert.equal(
+      intakeWorkCounters(f.db).warm.reportSnapshotCheckpointBatches,
+      secondBefore,
+      'retained duplicates require no later derived publication',
+    );
+    transaction(f.db, () => f.store.stage(second.prepared!));
+    assert.deepEqual(f.candidates(), f.originalCandidates);
+  });
+
+for (const scenario of ['different-key', 'multiple-occurrences'] as const)
+  test(`cold singleton compiler keeps original fallback for ${scenario}`, async (t) => {
+    const f = await coldOccurrenceFixture(t, scenario === 'multiple-occurrences' ? 2 : 1);
+    if (scenario === 'different-key') {
+      const duplicate = await f.prepare();
+      transaction(f.db, () => f.store.stage(duplicate.prepared!));
+      assert.equal(f.occurrenceIndex(), undefined, 'duplicate proof leaves the index deferred');
+    }
+    const prepared = await f.prepare(scenario === 'different-key' ? { batchId: 'new-batch' } : {});
+    transaction(f.db, () => f.store.stage(prepared.prepared!));
+    const actual = f.candidates()[0]!.versions[0]!.occurrences,
+      old = f.originalCandidates[0]!.versions[0]!.occurrences;
+    assert.deepEqual(actual.slice(0, old.length), old);
+    assert.equal(actual.length, scenario === 'different-key' ? 2 : 2);
+    if (scenario === 'different-key') assert.equal(actual[1]!.batchId, 'new-batch');
+    else assert.deepEqual(f.candidates(), f.originalCandidates);
+  });
+
+for (const drift of ['source', 'physical-head'] as const)
+  test(`cold duplicate refuses ${drift} drift across its cooperative yield`, async (t) => {
+    const f = await coldOccurrenceFixture(t),
+      originalHead = Buffer.from(f.authority.objects.get('head')!);
+    let directChecks = 0,
+      scheduled = false,
+      changed = false;
+    const before = intakeWorkCounters(f.db).warm.reportSnapshotCheckpointBatches;
+    const outcome = await f
+      .prepare({
+        assertRunning: () => {
+          const stack = new Error().stack ?? '';
+          // Exclude the nested catalog.open check; queue a real mutation before the compiler yields.
+          if (
+            /at Object\.assertCurrent[^\n]*\n\s+at Object\.changes \(/.test(stack) &&
+            ++directChecks === 2
+          ) {
+            scheduled = true;
+            setImmediate(() => {
+              changed = true;
+              if (drift === 'source')
+                f.db
+                  .prepare('UPDATE source_files SET sha256=? WHERE id=?')
+                  .run('d'.repeat(64), f.source.id);
+              else {
+                const ref = JSON.parse(originalHead.toString()) as { sha256: string };
+                ref.sha256 = ref.sha256 === '0'.repeat(64) ? '1'.repeat(64) : '0'.repeat(64);
+                f.authority.objects.set('head', Buffer.from(JSON.stringify(ref)));
+              }
+            });
+          }
+        },
+      })
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    assert.equal(scheduled, true, 'mutation was scheduled at the real pre-yield currentness check');
+    assert.equal(changed, true, 'cooperative yield ran the queued source/HEAD mutation');
+    assert.ok(outcome instanceof Error, 'the authenticated preparation refuses the drift');
+    assert.match(
+      outcome.message,
+      drift === 'source'
+        ? /missing selected intake head|Stale report snapshot source or logical state/
+        : /requires configured current accepted authority/,
+    );
+    assert.equal(intakeWorkCounters(f.db).warm.reportSnapshotCheckpointBatches, before);
+    if (drift === 'source')
+      f.db.prepare('UPDATE source_files SET sha256=? WHERE id=?').run(f.source.sha256, f.source.id);
+    else f.authority.objects.set('head', originalHead);
+    f.authority.attach(f.db);
+    clearIntakeStateCache(f.db);
+    assert.deepEqual(f.candidates(), f.originalCandidates);
+  });
+
+for (const point of ['before', 'after'] as const)
+  test(`cold duplicate contribution-index ${point} HEAD failure leaves clinical state unchanged and retries exactly`, async (t) => {
+    const f = await coldOccurrenceFixture(t),
+      original = f.authority.objects.set;
+    let injected = false;
+    f.authority.objects.set = function (name, value) {
+      if (name === 'head' && !injected) {
+        injected = true;
+        if (point === 'after') original.call(this, name, value);
+        throw Error('Fictional cold singleton ' + point + ' HEAD fault');
+      }
+      return original.call(this, name, value);
+    };
+    try {
+      await assert.rejects(
+        f.prepare(),
+        new RegExp('Fictional cold singleton ' + point + ' HEAD fault'),
+      );
+    } finally {
+      f.authority.objects.set = original;
+    }
+    assert.equal(injected, true);
+    f.authority.attach(f.db);
+    clearIntakeStateCache(f.db);
+    assert.deepEqual(f.candidates(), f.originalCandidates);
+    const prepared = await f.prepare();
+    transaction(f.db, () => f.store.stage(prepared.prepared!));
+    assert.deepEqual(f.candidates(), f.originalCandidates);
+  });

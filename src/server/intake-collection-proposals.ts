@@ -1,5 +1,6 @@
 /** Native proposal persistence: addressed records and shared report member snapshots. */
 import { createHash } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 import type { Database } from './database.ts';
 import { HttpError } from './database.ts';
 import type { IntakeEnvelopeSource } from './intake-authority.ts';
@@ -364,43 +365,66 @@ export function createIntakeCollectionProposalChanges(
         batchId: input.batchId ?? null,
         locator: entry.value.provenance.locator,
       };
-      const count = view.childCount(version, 'occurrences'),
-        snapshotId = 'candidate-occurrences:' + view.address(version) + ':' + count,
-        key = schemaKey(occurrence.recordId, occurrence.batchId);
+      let count = view.childCount(version, 'occurrences'),
+        snapshotId = 'candidate-occurrences:' + view.address(version) + ':' + count;
+      const key = schemaKey(occurrence.recordId, occurrence.batchId);
       let index = catalog.open(snapshotId),
         writer: ReportSnapshotMapWriter | undefined,
         singleton: ReportSnapshotSingleton | undefined,
         seeded = false;
-      if (!index) {
-        seeded = count === 0;
-        if (seeded && catalog.prepareSingleton)
-          singleton = await catalog.prepareSingleton(key, '1');
-        else {
-          writer = await catalog.fork(undefined, seeded ? [{ key, value: '1' }] : undefined);
-          if (!seeded)
-            for (const old of children(view, version, 'occurrences'))
-              await writer.put(
-                schemaKey(field(view, old, 'recordId'), field(view, old, 'batchId')),
-                '1',
-              );
-          index = writer;
+      retainOccurrence: {
+        if (!index && count === 1 && !input.onCheckpoint) {
+          const old = view.childAt(version, 'occurrences', 0);
+          if (old && schemaKey(field(view, old, 'recordId'), field(view, old, 'batchId')) === key) {
+            // Retained evidence can prove this duplicate without a derived map.
+            // Recheck after yielding; no remembered membership crosses the boundary.
+            catalog.assertCurrent();
+            await setImmediate();
+            catalog.assertCurrent();
+            count = view.childCount(version, 'occurrences');
+            const current = count === 1 ? view.childAt(version, 'occurrences', 0) : undefined;
+            if (
+              current &&
+              schemaKey(field(view, current, 'recordId'), field(view, current, 'batchId')) === key
+            ) {
+              catalog.assertCurrent();
+              break retainOccurrence;
+            }
+            snapshotId = 'candidate-occurrences:' + view.address(version) + ':' + count;
+            index = catalog.open(snapshotId);
+          }
         }
+        if (!index) {
+          seeded = count === 0;
+          if (seeded && catalog.prepareSingleton)
+            singleton = await catalog.prepareSingleton(key, '1');
+          else {
+            writer = await catalog.fork(undefined, seeded ? [{ key, value: '1' }] : undefined);
+            if (!seeded)
+              for (const old of children(view, version, 'occurrences'))
+                await writer.put(
+                  schemaKey(field(view, old, 'recordId'), field(view, old, 'batchId')),
+                  '1',
+                );
+            index = writer;
+          }
+        }
+        if (seeded || index!.get(key) === undefined) {
+          if (!singleton) {
+            writer ??= await catalog.fork(snapshotId);
+            if (!seeded) await writer.put(key, '1');
+          }
+          yield {
+            op: 'append',
+            record: version,
+            field: 'occurrences',
+            jsonText: JSON.stringify(occurrence),
+          };
+          const nextSnapshot = 'candidate-occurrences:' + view.address(version) + ':' + (count + 1);
+          if (singleton) await singleton.publish(nextSnapshot);
+          else await catalog.publish(nextSnapshot, writer!);
+        } else if (writer) await catalog.publish(snapshotId, writer);
       }
-      if (seeded || index!.get(key) === undefined) {
-        if (!singleton) {
-          writer ??= await catalog.fork(snapshotId);
-          if (!seeded) await writer.put(key, '1');
-        }
-        yield {
-          op: 'append',
-          record: version,
-          field: 'occurrences',
-          jsonText: JSON.stringify(occurrence),
-        };
-        const nextSnapshot = 'candidate-occurrences:' + view.address(version) + ':' + (count + 1);
-        if (singleton) await singleton.publish(nextSnapshot);
-        else await catalog.publish(nextSnapshot, writer!);
-      } else if (writer) await catalog.publish(snapshotId, writer);
       contributions.push({ entry, candidateId, versionId, occurrence });
       const clinical = clinicalMappingEnvelope(entry.value);
       for (const uncertainty of Array.isArray(clinical.uncertainties)
@@ -596,17 +620,21 @@ export function createIntakeCollectionProposalChanges(
           priorReference ? undefined : { member: firstMember, value: firstItem.occurrence },
         ),
         prior = priorReference ? openReportMemberSnapshot(catalog, priorReference) : undefined;
-      for (
-        let ordinal = memberWriter.seededFirstOccurrence ? 1 : 0;
-        ordinal < items.length;
-        ordinal++
-      ) {
-        const item = items[ordinal]!;
-        await memberWriter.includeOrdinaryOccurrence(
-          ordinal === 0 ? firstMember : memberInput(item),
-          item.occurrence,
-        );
-      }
+      const discoveries = function* () {
+        for (
+          let ordinal = memberWriter.seededFirstOccurrence ? 1 : 0;
+          ordinal < items.length;
+          ordinal++
+        ) {
+          const item = items[ordinal]!;
+          yield { member: ordinal === 0 ? firstMember : memberInput(item), value: item.occurrence };
+        }
+      };
+      if (input.onCheckpoint) {
+        // A checkpoint observer retains the original eager per-item read barriers.
+        for (const { member, value } of discoveries())
+          await memberWriter.includeOrdinaryOccurrence(member, value);
+      } else await memberWriter.includeOrdinaryOccurrences(discoveries());
       const snapshot = memberWriter.reader(),
         hash = createHash('sha256');
       withIntakeWork(db, 'warm', () => {

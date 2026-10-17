@@ -155,6 +155,7 @@ import {
   captureContributorLegacyBridgeBackingScopeForStorage,
   bindContributorLegacyBridgeBackingScope,
   contributorLegacyBridgeBackingScopeCurrent,
+  contributorLegacyBridgeBackingIntervalCurrent,
   type ContributorLegacyBridgeBackingScope,
   closeContributorRecordHeadPublication,
   type ContributorRecordHeadPublication,
@@ -192,6 +193,8 @@ import {
   type TerminalTransactionCallbacks,
   transaction,
   transactionDurabilityParticipantCurrent,
+  prepareManagedDatabaseCallbackBarrier,
+  withoutManagedDatabaseCallbacks,
 } from './database.ts';
 import { createTransactionOutcomeIssuer } from './transaction-observer-issuer.ts';
 const sourceDeltaOutcomes = createTransactionOutcomeIssuer();
@@ -440,6 +443,359 @@ const ordinarySourceDeltaPending = new WeakMap<
 >();
 const ordinarySourceDeltaStops = new WeakMap<Database, () => void>();
 const recordParticipants = new WeakMap<Database, TransactionDurabilityHooks<RecordCapture>>();
+declare const intakeLogPublicationBrand: unique symbol;
+/** An intent is not publication authority. Only this record owner can mark its
+ * exact changed-row footprint accepted, after the real final transaction outcome. */
+export interface RecordIntakeLogPublication {
+  readonly [intakeLogPublicationBrand]: true;
+}
+export interface RecordIntakeLogPublicationBinding {
+  identity: IntakeStateIdentity;
+  beforeHead: string | undefined;
+  afterHead: string;
+  receipt: unknown;
+  writes: readonly { key: string; value: string }[];
+}
+interface IntakeLogPublicationData {
+  db: Database;
+  config: RecordConfig;
+  methods: object;
+  token: object;
+  namespace: string;
+  identity: string;
+  beforeHead: string | undefined;
+  afterHead: string;
+  receipt: string;
+  rows: Map<string, { hash: string; bytes: number }>;
+  pendingLogRows: Set<string>;
+  remaining: Set<string>;
+  valid: boolean;
+  validated: boolean;
+  accepted: boolean;
+}
+const intakeLogPublications = new WeakMap<RecordIntakeLogPublication, IntakeLogPublicationData>();
+const pendingIntakeLogPublications = new WeakMap<
+  Database,
+  Map<object, RecordIntakeLogPublication[]>
+>();
+const logValueDigest = (value: string) => {
+  const bytes = Buffer.from(value);
+  return { hash: digest(bytes), bytes: bytes.length };
+};
+function logDataField(value: unknown, key: string): unknown {
+  if (!value || typeof value !== 'object') fail('log publication data object');
+  const field = Object.getOwnPropertyDescriptor(value, key);
+  if (!field || !('value' in field)) fail('log publication requires inert data fields');
+  return field!.value;
+}
+/** Detach the small receipt without calling accessors or custom serialization. */
+function logReceiptJson(value: unknown): string {
+  let remaining = 8192,
+    nodes = 0;
+  const copy = (input: unknown, depth: number): unknown => {
+    if (++nodes > 1024 || depth > 16) fail('log publication receipt structure');
+    if (
+      input === null ||
+      typeof input === 'boolean' ||
+      typeof input === 'number' ||
+      typeof input === 'string'
+    ) {
+      if (typeof input === 'number' && !Number.isFinite(input))
+        fail('log publication receipt number');
+      if (typeof input === 'string' && input.length > remaining)
+        fail('log publication receipt bytes');
+      remaining -= Buffer.byteLength(JSON.stringify(input));
+      if (remaining < 0) fail('log publication receipt bytes');
+      return input;
+    }
+    if (
+      !input ||
+      typeof input !== 'object' ||
+      ![Object.prototype, null, Array.prototype].includes(Object.getPrototypeOf(input))
+    )
+      fail('log publication receipt data');
+    const keys = Object.keys(input);
+    if (keys.length > 64) fail('log publication receipt fields');
+    if (
+      Array.isArray(input) &&
+      (input.length > 64 ||
+        input.length !== keys.length ||
+        keys.some((key, index) => key !== String(index)))
+    )
+      fail('log publication receipt array');
+    remaining -= keys.length + 2;
+    const result: Record<string, unknown> | unknown[] = Array.isArray(input)
+      ? []
+      : Object.create(null);
+    for (const key of keys) {
+      if (key.length > remaining) fail('log publication receipt bytes');
+      remaining -= Buffer.byteLength(JSON.stringify(key)) + 1;
+      if (remaining < 0) fail('log publication receipt bytes');
+      Object.defineProperty(result, key, {
+        value: copy(logDataField(input, key), depth + 1),
+        enumerable: true,
+      });
+    }
+    return result;
+  };
+  const raw = JSON.stringify(copy(value, 0));
+  if (Buffer.byteLength(raw) > 8192) fail('log publication receipt bytes');
+  return raw;
+}
+function logPublicationHeader(input: RecordIntakeLogPublicationBinding) {
+  const rawIdentity = logDataField(input, 'identity');
+  const identity = validateIntakeIdentity({
+    profileId: logDataField(rawIdentity, 'profileId') as string,
+    intakeId: logDataField(rawIdentity, 'intakeId') as string,
+    sourceHash: logDataField(rawIdentity, 'sourceHash') as string,
+  });
+  const beforeHead = logDataField(input, 'beforeHead') as string | undefined;
+  const afterHead = logDataField(input, 'afterHead') as string;
+  if (
+    typeof afterHead !== 'string' ||
+    afterHead.length > 4096 ||
+    (beforeHead !== undefined && (typeof beforeHead !== 'string' || beforeHead.length > 4096))
+  )
+    fail('log publication head bytes');
+  const writes = logDataField(input, 'writes');
+  if (!Array.isArray(writes)) fail('log publication row roster');
+  return {
+    identity,
+    beforeHead,
+    afterHead,
+    receipt: logReceiptJson(logDataField(input, 'receipt')),
+    writes: writes as readonly { key: string; value: string }[],
+  };
+}
+/** Called inside the staging transaction with freshly inserted rows and HEAD.
+ * Descriptor bounds discard this optional accelerator; they do not cap a save.
+ * Inputs are detached before registration; no caller callbacks survive here. */
+export function registerRecordIntakeLogPublication(
+  db: Database,
+  input: RecordIntakeLogPublicationBinding,
+): RecordIntakeLogPublication | undefined {
+  const token = currentTransactionToken(db),
+    config = state.get(db);
+  if (
+    !token ||
+    !db.isTransaction ||
+    !config ||
+    !transactionDurabilityParticipantCurrent(db, recordParticipants.get(db))
+  )
+    fail('log publication requires its active record owner');
+  const methods = managedDatabaseMethodEpoch(db);
+  if (!methods) fail('log publication requires managed database methods');
+  const binding = logPublicationHeader(input),
+    identity = binding.identity;
+  if (identity.profileId !== config!.profileId) fail('foreign log publication profile');
+  const namespace = intakeNamespace(identity);
+  const after = parseIntakeCollectionHead(binding.afterHead, identity);
+  if (after?.format !== 'health-intake-state-v5') fail('log publication requires a V5 head');
+  if (binding.beforeHead !== undefined) parseIntakeCollectionHead(binding.beforeHead, identity);
+  const receipt = binding.receipt;
+  if (binding.writes.length > 100_000) return undefined;
+  let pending = pendingIntakeLogPublications.get(db);
+  if (!pending) pendingIntakeLogPublications.set(db, (pending = new Map()));
+  let candidates = pending.get(token!);
+  if (!candidates) pending.set(token!, (candidates = []));
+  if (candidates.length >= 64) return undefined;
+  const rows = new Map<string, { hash: string; bytes: number }>();
+  const pendingLogRows = new Set<string>();
+  let descriptorBytes = 0,
+    matchingReceipts = 0,
+    payloadBytes = 0;
+  for (let index = 0; index < binding.writes.length; index++) {
+    const raw = logDataField(binding.writes, String(index));
+    const row = {
+      key: logDataField(raw, 'key') as string,
+      value: logDataField(raw, 'value') as string,
+    };
+    if (typeof row.key !== 'string' || typeof row.value !== 'string' || rows.has(row.key))
+      fail('log publication duplicate or malformed row');
+    const head = row.key === namespace + 'head';
+    const hash = row.key.slice((namespace + 'node:').length);
+    if (!head && (!row.key.startsWith(namespace + 'node:') || !/^[a-f0-9]{64}$/.test(hash)))
+      fail('log publication foreign row');
+    if (
+      row.value.length > (head ? 4096 : 32768) ||
+      Buffer.byteLength(row.value) > (head ? 4096 : 32768)
+    )
+      fail('log publication row bytes');
+    const value = logValueDigest(row.value);
+    payloadBytes += value.bytes;
+    if (payloadBytes > 256 * 1024 * 1024) return undefined;
+    if (head ? row.value !== binding.afterHead : value.hash !== hash)
+      fail('log publication row binding');
+    if (!head) {
+      const node = JSON.parse(row.value) as Record<string, unknown>;
+      if (node.format === 'health-intake-state-log-node-v1' && node.kind !== 'anchor')
+        pendingLogRows.add(row.key);
+      if (node.format === 'health-intake-state-log-node-v1' && node.kind === 'leaf') {
+        const event = node.event as { receipt?: unknown } | undefined;
+        if (JSON.stringify(event?.receipt) === receipt) matchingReceipts++;
+      }
+    }
+    descriptorBytes += Buffer.byteLength(row.key) + 80;
+    if (descriptorBytes > 32 * 1024 * 1024) return undefined;
+    rows.set(row.key, value);
+  }
+  if (!rows.has(namespace + 'head') || matchingReceipts !== 1)
+    fail('log publication missing selected head or receipt leaf');
+  if (
+    !db.isOpen ||
+    !db.isTransaction ||
+    currentTransactionToken(db) !== token ||
+    state.get(db) !== config ||
+    managedDatabaseMethodEpoch(db) !== methods ||
+    !transactionDurabilityParticipantCurrent(db, recordParticipants.get(db))
+  )
+    fail('log publication owner changed during binding');
+  const candidate = Object.freeze({}) as RecordIntakeLogPublication;
+  intakeLogPublications.set(candidate, {
+    db,
+    config: config!,
+    methods: methods!,
+    token: token!,
+    namespace,
+    identity: JSON.stringify(identity),
+    beforeHead: binding.beforeHead,
+    afterHead: binding.afterHead,
+    receipt,
+    rows,
+    pendingLogRows,
+    remaining: new Set(rows.keys()),
+    valid: true,
+    validated: false,
+    accepted: false,
+  });
+  candidates.push(candidate);
+  return candidate;
+}
+function observeIntakeLogPublicationVersion(
+  candidates: readonly RecordIntakeLogPublication[] | undefined,
+  version: DurableRecordVersion,
+  previous: CurrentVersionRow | undefined,
+): void {
+  if (version.entity !== 'app_meta' || typeof version.contents.key !== 'string') return;
+  for (const candidate of candidates ?? []) {
+    const data = intakeLogPublications.get(candidate);
+    if (!data?.valid || !version.contents.key.startsWith(data.namespace)) continue;
+    const key = version.contents.key,
+      expected = data.rows.get(key);
+    if (
+      !expected ||
+      !data.remaining.delete(key) ||
+      version.deleted ||
+      typeof version.contents.value !== 'string'
+    ) {
+      data.valid = false;
+      continue;
+    }
+    const actual = logValueDigest(version.contents.value);
+    if (actual.hash !== expected.hash || actual.bytes !== expected.bytes) data.valid = false;
+    if (key === data.namespace + 'head') {
+      const old =
+        previous && !previous.deleted
+          ? parseRecordJson<Record<string, unknown>>(previous.contents_json)
+          : undefined;
+      if (data.beforeHead === undefined ? previous !== undefined : old?.value !== data.beforeHead)
+        data.valid = false;
+    } else if (previous) data.valid = false;
+  }
+}
+function finishIntakeLogPublicationIndex(
+  candidates: readonly RecordIntakeLogPublication[] | undefined,
+): void {
+  for (const candidate of candidates ?? []) {
+    const data = intakeLogPublications.get(candidate);
+    if (data) data.validated = data.valid && data.remaining.size === 0;
+  }
+}
+function finishIntakeLogPublicationOutcome(
+  db: Database,
+  candidates: readonly RecordIntakeLogPublication[] | undefined,
+  outcome: TransactionOutcome | undefined,
+  originalToken: object | undefined,
+  publishedToken: object | undefined,
+): void {
+  for (const candidate of candidates ?? []) {
+    const data = intakeLogPublications.get(candidate);
+    if (!data) continue;
+    if (
+      data.db === db &&
+      data.token === originalToken &&
+      outcome?.token === publishedToken &&
+      data.config === state.get(db) &&
+      data.validated &&
+      outcome?.committed &&
+      outcome.succeeded
+    )
+      data.accepted = true;
+    else intakeLogPublications.delete(candidate);
+  }
+}
+/** Destructive verification by the codec itself. This proves the exact owned
+ * publication, not current source/storage authority; the caller admits that
+ * separately. A caller-supplied boolean or a fabricated object cannot pass. */
+export function consumeAcceptedRecordIntakeLogPublication(
+  db: Database,
+  candidate: RecordIntakeLogPublication,
+  input: RecordIntakeLogPublicationBinding,
+): boolean {
+  const data = intakeLogPublications.get(candidate);
+  intakeLogPublications.delete(candidate);
+  if (
+    !data ||
+    !data.accepted ||
+    data.db !== db ||
+    !db.isOpen ||
+    db.isTransaction ||
+    state.get(db) !== data.config ||
+    managedDatabaseMethodEpoch(db) !== data.methods
+  )
+    return false;
+  let binding: ReturnType<typeof logPublicationHeader>;
+  try {
+    binding = logPublicationHeader(input);
+  } catch {
+    return false;
+  }
+  if (
+    JSON.stringify(binding.identity) !== data.identity ||
+    binding.beforeHead !== data.beforeHead ||
+    binding.afterHead !== data.afterHead ||
+    binding.receipt !== data.receipt ||
+    binding.writes.length > data.rows.size
+  )
+    return false;
+  const seen = new Set<string>();
+  for (let index = 0; index < binding.writes.length; index++) {
+    let row: { key: string; value: string };
+    try {
+      const raw = logDataField(binding.writes, String(index));
+      row = {
+        key: logDataField(raw, 'key') as string,
+        value: logDataField(raw, 'value') as string,
+      };
+    } catch {
+      return false;
+    }
+    const expected = data.rows.get(row.key);
+    if (!expected || seen.has(row.key) || typeof row.value !== 'string' || row.value.length > 32768)
+      return false;
+    seen.add(row.key);
+    const value = logValueDigest(row.value);
+    if (value.hash !== expected.hash || value.bytes !== expected.bytes) return false;
+  }
+  return (
+    [...data.pendingLogRows].every((key) => seen.has(key)) &&
+    db.isOpen &&
+    !db.isTransaction &&
+    state.get(db) === data.config &&
+    managedDatabaseMethodEpoch(db) === data.methods &&
+    transactionDurabilityParticipantCurrent(db, recordParticipants.get(db))
+  );
+}
 declare const transactionPreparationBrand: unique symbol;
 export interface RecordTransactionPreparation {
   readonly [transactionPreparationBrand]: true;
@@ -471,6 +827,7 @@ interface TransactionPreparationData {
   valueChecks?: ReturnType<typeof createRecordPreparedIndex>;
   backingRows?: ReturnType<typeof createRecordPreparedIndex>;
   sourceDeltaRows?: readonly RecordAcceptedSourceDeltaRow[];
+  intakeLogPublications?: readonly RecordIntakeLogPublication[];
   backingPlan?: RecordTransactionBackingPlan;
   indexBookkeeping?: RecordBookkeeping;
   indexWrites?: bigint;
@@ -1074,6 +1431,9 @@ export function recordPreparedMaintenanceReplayVerified(
   );
 }
 function discardPreparedPublicationObservers(proof: TransactionPreparationData): void {
+  for (const candidate of proof.intakeLogPublications ?? [])
+    intakeLogPublications.delete(candidate);
+  proof.intakeLogPublications = undefined;
   if (proof.token) preparedPublicationTokens.delete(proof.token);
   const observers = proof.observers;
   proof.observers = undefined;
@@ -2145,6 +2505,7 @@ export async function stageRecordTransactionPreparation(
         previous = validateVersion(db, proof.config, commit, version, identities),
         { contents, ...metadata } = version,
         contentsJson = await stringifyPreparedRecordContents(contents, check);
+      observeIntakeLogPublicationVersion(proof.intakeLogPublications, version, previous);
       const sourceFields: { name: string; hash: string; bytes: number }[] = [];
       if (version.entity === 'source_files' && !version.deleted)
         for (const name of ['id', 'kind', 'path', 'sha256', 'bytes']) {
@@ -2345,6 +2706,7 @@ export async function stageRecordTransactionPreparation(
     }
     await valueChecks.seal();
     await backingRows.seal();
+    finishIntakeLogPublicationIndex(proof.intakeLogPublications);
     proof.sourceDeltaRows = sourceDeltaOverflow ? undefined : Object.freeze(sourceDeltaRows);
     check();
     await indexRows.seal();
@@ -2638,6 +3000,14 @@ export async function commitRecordTransactionPreparation<T>(
     // The real final outcome is observable only after the finite scope expires.
     // A failed selection retains existing uncertain-durability semantics.
     const outcome = notifyRecordReplay(db, replay);
+    finishIntakeLogPublicationOutcome(
+      db,
+      admitted.intakeLogPublications,
+      outcome,
+      admitted.token,
+      admitted.replayToken,
+    );
+    admitted.intakeLogPublications = undefined;
     if (outcome?.committed && outcome.succeeded) {
       originals.expectedHead = stringifyRecordJson(plan.ref);
       originals.expectedSequence = plan.commit.sequence;
@@ -3493,6 +3863,9 @@ function indexTransaction(
   { ref, commit, versions }: IndexedTransaction,
   prior?: SourcePriorData,
 ): RecordBookkeeping {
+  const logPublications = [
+    ...(pendingIntakeLogPublications.get(db)?.get(currentTransactionToken(db)!) ?? []),
+  ];
   const bookkeeping: RecordBookkeeping = {
     writes: 0n,
     metadataKeys: new Set(),
@@ -3536,6 +3909,7 @@ function indexTransaction(
     for (const version of versions) {
       recordVersionWork('indexedVersionAttempts');
       const previous = validateVersion(db, config, commit, version, identities, prior);
+      observeIntakeLogPublicationVersion(logPublications, version, previous);
       const implicitFields = implicitInitialMetadataFields(version);
       const { contents, ...metadata } = version;
       const contentsJson = stringifyRecordJson(contents);
@@ -3683,6 +4057,7 @@ function indexTransaction(
   } finally {
     identities.close();
   }
+  finishIntakeLogPublicationIndex(logPublications);
   const transactionWrite = terminalStatement(
     db,
     'INSERT INTO __record_transactions VALUES(?,?,?,?,?)',
@@ -4448,6 +4823,8 @@ function completeRecordAttach(db: Database, config: RecordConfig): RecordDurabil
           managedDatabaseMethodEpoch(db) !== preparation.methods
         )
           fail('record tentative-row preparation changed');
+        preparation.intakeLogPublications = pendingIntakeLogPublications.get(db)?.get(token!);
+        pendingIntakeLogPublications.get(db)?.delete(token!);
         const names = new Set([
           ...config.schema.map((table) => table.name.toLowerCase()),
           '__record_changed',
@@ -4685,10 +5062,14 @@ function completeRecordAttach(db: Database, config: RecordConfig): RecordDurabil
   ordinarySourceDeltaStops.get(db)?.();
   ordinarySourceDeltaStops.delete(db);
   ordinarySourceDeltaPending.delete(db);
+  pendingIntakeLogPublications.delete(db);
   recordParticipants.set(db, participant);
   registerTransactionDurability(db, participant);
   const stopSourceDeltaOutcome = sourceDeltaOutcomes.observe(db, (outcome) => {
     if (recordParticipants.get(db) !== participant) return;
+    const logPublications = pendingIntakeLogPublications.get(db)?.get(outcome.token);
+    pendingIntakeLogPublications.get(db)?.delete(outcome.token);
+    finishIntakeLogPublicationOutcome(db, logPublications, outcome, outcome.token, outcome.token);
     const pending = ordinarySourceDeltaPending.get(db),
       candidate = pending?.get(outcome.token);
     pending?.delete(outcome.token);
@@ -4708,6 +5089,7 @@ function completeRecordAttach(db: Database, config: RecordConfig): RecordDurabil
     if (ordinarySourceDeltaStops.get(db) === stopSourceDeltaOutcome)
       ordinarySourceDeltaStops.delete(db);
     ordinarySourceDeltaPending.delete(db);
+    pendingIntakeLogPublications.delete(db);
   });
   const status = recordDurabilityStatus(db)!;
   // Only this successfully attached accepted-record owner may relax cache sync.
@@ -6488,6 +6870,9 @@ export function assertRecordReadOwnerTerminal(db: Database, owner: RecordReadOwn
 export function closeRecordReadOwner(owner: RecordReadOwner): void {
   const proof = recordReadOwners.get(owner);
   recordReadOwners.delete(owner);
+  const fixed = legacyFixedReads.get(owner);
+  if (fixed) fixed.head.fill(0);
+  legacyFixedReads.delete(owner);
   if (!proof) return;
   try {
     if (proof.vault) closeVaultRecordReadOwner(proof.vault);
@@ -7454,6 +7839,15 @@ export function captureContributorLegacyBridgeRecordOwner(
   const scope =
     captureContributorLegacyBridgeBackingScopeForStorage(config.storage) ??
     fail('original contributor backing scope unavailable');
+  let fixedNativeRead = false;
+  try {
+    // Arm before capture compiles its fixed status statement. Auto-reprepare
+    // must refuse before an installed policy can enter the finite verifier.
+    prepareManagedDatabaseCallbackBarrier(db);
+    fixedNativeRead = true;
+  } catch {
+    // Unwrapped scalar registrations retain the original conservative path.
+  }
   const owner = captureRecordReadOwner(db, config.profileId);
   try {
     const proof =
@@ -7462,12 +7856,66 @@ export function captureContributorLegacyBridgeRecordOwner(
     if (!bindContributorLegacyBridgeBackingScope(config.storage, contributor, scope))
       fail('original contributor backing scope changed during capture');
     proof.legacyBridgeScope = scope;
+    if (fixedNativeRead) {
+      const row = withoutManagedDatabaseCallbacks(db, () =>
+        Reflect.apply(readmissionGet, proof.status, []),
+      );
+      const status = legacyStatusSnapshot(row);
+      recordVersionWork('headReadCalls');
+      const head = contributorRecordReadOwnerHeadBytes(config.storage, contributor);
+      // Capture exact original bytes, after validating their reference against
+      // the original indexed state. No decoded/re-encoded bytes supply proof.
+      if (stringifyRecordJson(row) !== proof.row || !eq(parseHeadBinding(head).head, proof.head))
+        fail('original contributor record authority changed');
+      if (status)
+        legacyFixedReads.set(owner, {
+          status,
+          head: Buffer.from(head),
+          active: false,
+          poisoned: false,
+        });
+    }
     assertContributorLegacyBridgeRecordOwner(db, owner);
     return owner;
   } catch (error) {
     closeRecordReadOwner(owner);
     throw error;
   }
+}
+type LegacyStatusValue = string | number | bigint | null;
+const legacyFixedReads = new WeakMap<
+  RecordReadOwner,
+  {
+    status: Readonly<Record<string, LegacyStatusValue>>;
+    head: Buffer;
+    active: boolean;
+    poisoned: boolean;
+  }
+>();
+function legacyStatusSnapshot(
+  row: unknown,
+): Readonly<Record<string, LegacyStatusValue>> | undefined {
+  if (!row || typeof row !== 'object') return undefined;
+  const values: Record<string, LegacyStatusValue> = Object.create(null);
+  for (const key of Reflect.ownKeys(row)) {
+    if (typeof key !== 'string') return undefined;
+    const descriptor = ownDescriptor(row, key);
+    if (!descriptor || !('value' in descriptor)) return undefined;
+    const value: unknown = descriptor.value;
+    if (value !== null && !['string', 'number', 'bigint'].includes(typeof value)) return undefined;
+    values[key] = value as LegacyStatusValue;
+  }
+  return Object.freeze(values);
+}
+function legacyStatusMatches(row: unknown, expected: Readonly<Record<string, LegacyStatusValue>>) {
+  if (!row || typeof row !== 'object') return false;
+  const keys = Reflect.ownKeys(row);
+  if (keys.length !== Object.keys(expected).length) return false;
+  return keys.every((key) => {
+    if (typeof key !== 'string' || !Object.hasOwn(expected, key)) return false;
+    const descriptor = ownDescriptor(row, key);
+    return !!descriptor && 'value' in descriptor && Object.is(descriptor.value, expected[key]);
+  });
 }
 /** Original contributor HEAD and indexed state, including inside the exact
  * maintenance transaction. The bridge separately seals its SQL write interval. */
@@ -7477,6 +7925,62 @@ export function assertContributorLegacyBridgeRecordOwner(
   token?: object,
 ): void {
   const proof = recordReadOwners.get(owner);
+  const fixed = legacyFixedReads.get(owner);
+  if (fixed) {
+    if (proof?.db !== db) fail('original contributor record authority changed');
+    if (fixed.active) fixed.poisoned = true;
+    if (fixed.poisoned) fail('original contributor record authority changed');
+    fixed.active = true;
+    const interval = () => {
+      const read = proof && ownDescriptor(proof.config.storage, 'read');
+      return (
+        !fixed.poisoned &&
+        recordReadOwners.get(owner) === proof &&
+        !!proof?.contributor &&
+        !proof.vault &&
+        proof.db === db &&
+        db.isOpen &&
+        (token ? db.isTransaction && currentTransactionToken(db) === token : !db.isTransaction) &&
+        state.get(db) === proof.config &&
+        managedDatabaseMethodEpoch(db) === proof.methods &&
+        !!read &&
+        'value' in read &&
+        read.value === proof.read &&
+        !!proof.legacyBridgeScope &&
+        contributorLegacyBridgeBackingIntervalCurrent(
+          proof.config.storage,
+          proof.contributor,
+          proof.legacyBridgeScope,
+        ) &&
+        !fixed.poisoned &&
+        recordReadOwners.get(owner) === proof
+      );
+    };
+    try {
+      if (
+        !interval() ||
+        !contributorRecordReadOwnerCurrent(proof!.config.storage, proof!.contributor!)
+      )
+        fail('original contributor record authority changed');
+      withoutManagedDatabaseCallbacks(db, () => {
+        if (!legacyStatusMatches(Reflect.apply(readmissionGet, proof!.status, []), fixed.status))
+          fail('original contributor record authority changed');
+      });
+      // The retained read seals physical paths before and after the fresh FD
+      // bytes, after the final native SQL access. No callback follows this seal.
+      recordVersionWork('headReadCalls');
+      const head = contributorRecordReadOwnerHeadBytes(proof!.config.storage, proof!.contributor!);
+      recordVersionWork('headReadBytes', head.length);
+      if (!head.equals(fixed.head) || !interval())
+        fail('original contributor record authority changed');
+      return;
+    } catch (error) {
+      fixed.poisoned = true;
+      throw error;
+    } finally {
+      fixed.active = false;
+    }
+  }
   const current = () => {
     const read = proof && ownDescriptor(proof.config.storage, 'read');
     return (

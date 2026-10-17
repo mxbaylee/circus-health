@@ -33,6 +33,9 @@ import { attachPersonalDurability } from '../portable.ts';
 import type { ManualSourceRecordRequest } from '../../shared/intake-manual-source-record.ts';
 import { buildIntakeCollectionEnvelope } from '../intake-envelope-build.ts';
 import { iterateIntakeEnvelopeText } from '../intake-collection-envelope.ts';
+import { createIntakeStateStorage } from '../intake-state-storage.ts';
+import { digest, intakeNamespace } from '../intake-state-evidence.ts';
+import { ensureIntakeFrontierObserver } from '../intake-lookup-frontier-observer.ts';
 
 const proofs = (db: Database) =>
   db
@@ -209,6 +212,107 @@ test(
     assert.equal(proofs(target).length, 1);
   },
 );
+
+test('actual manual copy preserves a V5 anchored legacy receipt through cache-loss recovery', async (t) => {
+  const f = await fixture(t);
+  const identity = {
+    profileId: f.source.id,
+    intakeId: f.original.id,
+    sourceHash: f.original.sha256,
+  };
+  const collections = createIntakeStateStorage(f.db, identity).collections;
+  const before = readIntakeEnvelopeText(f.db, { id: f.original.id });
+  const version = JSON.parse(before).intake.version as number;
+  assert.ok(Number.isSafeInteger(version));
+  ensureIntakeFrontierObserver(f.db);
+  const bridgeId = randomUUID();
+  collections.commitMaintenance(
+    collections.prepareLegacyBridge({
+      operationId: bridgeId,
+      requestDigest: digest(bridgeId),
+      domainVersion: version,
+    }),
+  );
+  const checkpointId = randomUUID();
+  const checkpoint = await collections.prepareAsync(collections.openView(), {
+    operationId: checkpointId,
+    requestDigest: digest(checkpointId),
+    domainVersion: version,
+    changes: [
+      {
+        area: 'builds',
+        collection: 'fictional.copy-checkpoint',
+        op: 'put',
+        key: 'progress',
+        value: 'fictional',
+      },
+    ],
+  });
+  collections.commitMaintenance(checkpoint);
+  const head = JSON.parse(
+    String(
+      f.db
+        .prepare('SELECT value FROM app_meta WHERE key=?')
+        .get(intakeNamespace(identity) + 'head')!.value,
+    ),
+  );
+  assert.equal(head.format, 'health-intake-state-v5');
+  assert.ok(head.base, 'the legacy V4 bridge remains anchored');
+  assert.equal(readIntakeEnvelopeText(f.db, { id: f.original.id }), before);
+  const copied = await f.copy();
+  const target = f.databases.get(copied.id)!;
+  const checkCopiedLog = async (db: Database) => {
+    const copiedIdentity = { ...identity, profileId: copied.id };
+    const raw = db
+      .prepare('SELECT value FROM app_meta WHERE key=?')
+      .get(intakeNamespace(copiedIdentity) + 'head')!.value;
+    const selected = JSON.parse(String(raw));
+    assert.equal(selected.format, 'health-intake-state-v5');
+    assert.ok(selected.base);
+    const copiedCollections = createIntakeStateStorage(db, copiedIdentity).collections;
+    await copiedCollections.admitCurrentLogAsync();
+    try {
+      for (const operationId of [bridgeId, checkpointId])
+        assert.equal(
+          copiedCollections.replay(operationId, digest(operationId))?.operationId,
+          operationId,
+        );
+    } finally {
+      copiedCollections.releaseLogAdmission();
+    }
+  };
+  await checkCopiedLog(target);
+  const accepted = proofs(target);
+  assert.equal(accepted.length, 1);
+  assert.equal(readIntakeEnvelopeText(target, { id: f.original.id }), before);
+  const receipt = f.manual.intake.proposals[0]!.manualSourceRecord!;
+  assert.equal(receipt.profileId, f.source.id);
+  const scope = {
+    profileId: copied.id,
+    intakeId: f.original.id,
+    sourceHash: f.original.sha256,
+    proposalId: f.manual.proposalId,
+    proposalHash: String(
+      target.prepare('SELECT sha256 FROM source_files WHERE id=?').get(f.manual.proposalId)!.sha256,
+    ),
+  };
+  assert.equal(copiedManualSourceRecordApplies(target, scope, receipt), true);
+  target.close();
+  const path = profilePaths(f.root, copied.id).database;
+  for (const suffix of ['', '-wal', '-shm']) rmSync(path + suffix, { force: true });
+  rebuildContributorDatabase(path, f.root, copied.id);
+  const rebuilt = openDatabase(path, copied.id);
+  attachPersonalDurability(rebuilt, { root: f.root, profileId: copied.id, initialize: false });
+  f.databases.set(copied.id, rebuilt);
+  await checkCopiedLog(rebuilt);
+  assert.deepEqual(proofs(rebuilt), accepted);
+  assert.equal(readIntakeEnvelopeText(rebuilt, { id: f.original.id }), before);
+  assert.equal(copiedManualSourceRecordApplies(rebuilt, scope, receipt), true);
+  const replay = createManualSourceRecord(rebuilt, f.root, copied.id, f.original.id, f.request);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.proposalId, f.manual.proposalId);
+  assert.deepEqual(proofs(rebuilt), accepted, 'replay creates no duplicate manual copy proof');
+});
 
 test('genuine contributor manual copy preserves exact receipt, review and replay and supports new acceptance and nested authorship', async (t) => {
   const f = await fixture(t);

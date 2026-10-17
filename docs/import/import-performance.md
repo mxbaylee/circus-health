@@ -198,6 +198,93 @@ Whole-page text-layer character counts and host-read timing aggregates are retai
 
 ## Representative provider qualification
 
+### Continuing approval during real reading
+
+With the same explicit provider opt-in and external configuration paths shown
+below, `node src/scripts/qualify-provider-pdf.ts --run --continuing-approval`
+selects one three-page, four-observation fictional PDF, one fresh encrypted
+profile, automatic PDF/PNG selection and the configured cache policy. It refuses
+repeated runs, format/cache matrices, the separate deployment mode and the
+ordinary full-acceptance/diagnostics modes. It has no harness model-time deadline;
+operator cancellation remains available. The source fixture and exact clinical
+evidence stay in the protected external attempt directory.
+
+This mode also caps the attempt at 16 application-to-LiteLLM completion requests,
+including capability probes, retries and failed requests. A qualification-only
+runtime preloader reserves each request before forwarding it and refuses a
+second runtime for the same attempt. Reaching the cap without completing the
+check produces an inconclusive result and stops the test installation; it never
+automatically starts another allowance. The retained receipt records admissions
+and refusals without request contents. This is a request cap, not a token or
+billing estimate. The supported proxy configuration disables LiteLLM/router
+retries and fallback routes. Ordinary application reading policy is unchanged.
+
+After a verified cap refusal with all 16 admissions reserved, the harness aborts
+its workflow and allows one read-only evidence capture before teardown. That
+capture shares a ten-second host cleanup deadline with finalization; it cannot
+admit another completion request. Unreadable receipts or other admission-integrity
+failures stop the installation immediately. Late responses cannot publish report
+changes or artifact files after the capture deadline. A cleanup failure makes the
+qualification fail and is recorded separately without replacing its original
+failure reason. These cleanup checks do not establish provider qualification.
+
+For protected import payload tracing on this fictional continuing-approval run,
+also set `CRS_IMPORT_PRIVATE_TRACE=contains-health-data`. The harness uses the
+existing server trace writer with fresh owner-only directories inside the
+external attempt; it refuses caller-supplied trace paths or retention overrides.
+Its qualification-only Compose override mounts the payload directory read/write
+and the grant directory read-only. Standard Compose configuration is unchanged.
+
+After creating the fictional profile, the harness publishes one exact-profile
+grant and checks the server's trace status before any model request is admitted.
+The existing limits are 512 MiB total uncompressed JSON, 24 MiB per entry and
+8,192 entries. The grant expires after 23 hours 59 minutes and is revoked before
+runtime teardown; it is never renewed automatically. This is trace authorization
+expiry, not a model-speed target. Failed readiness prevents probes. Missing,
+expired, omitted or truncated trace evidence makes the requested qualification
+inconclusive without erasing an earlier failure.
+
+Raw payload files remain protected outside Git. The qualification report retains
+only trace status, limits and the last completed snapshot before revocation.
+Capability-probe payloads have no import context and are not traced, although
+their requests consume the same sixteen-request budget. In-flight completion
+and shutdown tails may fall outside that snapshot. An enabled trace and zero
+omissions do not prove complete request-stream coverage or a successful import.
+
+Tool payloads and their matching start/completion events use the bridge's explicit
+import context, including when no request context is inherited. The private
+payload's trace ID links it to the corresponding scoped diagnostic event; the
+existing profile grant, redaction and retention limits still apply.
+
+A fictional loopback HTTP regression exercises encrypted profile setup, grant
+readiness, probe exclusion, a successful intake-read tool, import-bound model and
+tool payloads, revocation and cleanup under the sixteen-request cap. Its scripted
+upstream does not qualify a real provider, the complete Compose installation or
+the in-flight and shutdown tails excluded above.
+
+The controller must observe exact selectable records while the actual provider
+chat is still running with unread work. It retains the original approvals, adds
+an attributed clarification to an unrelated page and verifies those approvals
+remain unchanged. One original approval must then save exactly once with the
+right person, value and provenance, including operation-ID lookup and exact
+replay. A clarification to the reviewed page must invalidate the other original
+approval; that selection must require review without adding a second clinical
+record. There are at most two source publications and two distinct acceptance
+operations. Count actual requests, retries and retained usage separately; these
+structural limits are not a fixed provider-request ceiling.
+
+Once the scoped check passes or fails, the harness stops remaining reading and
+retains its partial reading observations and diagnostics. That deliberate stop
+does not pass full-import reading, extraction or delivery qualification. If the
+provider finishes before an intermediate review and both source-publication
+checks can be observed, the attempt remains inconclusive and is not automatically
+rerun. Current automatic source capture drains before clinical conversion; this
+check observes source clarification during genuine continuing model reading,
+not automatic page capture after approval. A passing harness test is not a live
+provider receipt; a real candidate-scoped run is still required.
+
+### Full fixture and diagnostics qualification
+
 For a bounded diagnostics exercise on a real adopted route, use `CRS_QUALIFICATION_SCENARIO=tiny`, `CRS_QUALIFICATION_FORMAT=auto`, `CRS_QUALIFICATION_REPEAT=1`, `CRS_QUALIFICATION_ACCEPT=1` and `CRS_QUALIFICATION_DIAGNOSTICS=1` with the same opt-in and external paths shown below. The fixture has one PDF page with four independently fictional observations. After a complete normal Import batch and exact review, the harness accepts only oracle-exact rows, captures the diagnostics export before lock/recovery, and checks durable acceptance and cache-loss recovery. Its diagnostics grade requires untruncated detailed and recent-operation evidence; model requests, active work and original-page reads correlated in order; the tagged upload's original-publication and retained-import events joined through their shared curation span; import-correlated acceptance phases after reading; and absence of the fixture's patient name, DOB, source system and row markers from the metadata export. The tagged review-feed query is an ordered profile-wide witness; the export does not give it an import ID, so exact report review rests on the separate acceptance oracle. A canary check establishes only that these known strings are absent. The recent-operation timeline has a 256-event detail bound and can report dropped events even for a one-page route; this grade rejects that incomplete evidence. A passing tiny run does not qualify representative clinical accuracy, browser download behavior, arbitrary private content or a future provider complaint. The remaining diagnostic complaint gate is tracked in [CRS-154](../todo/CRS-154.md).
 
 Runtime fictional capability checks occur before first model work on the selected route after startup/configuration changes. They establish basic tool/PDF/image acceptance, not extraction accuracy or cache savings. Readiness/boot checks do not incur inference. Native PDF remains preferred after successful proof; lossless PNG preserves small text on unsupported or unsafe native pages.

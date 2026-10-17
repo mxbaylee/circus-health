@@ -1,5 +1,10 @@
-/** Cold, bounded-memory validation/rebinding for the existing v4 selected graph. */
+/** Cold, bounded-memory validation/rebinding for selected collection graphs. */
 import { randomUUID } from 'node:crypto';
+import {
+  createIntakeGraphScratch,
+  type IntakeGraphKind as Kind,
+  type IntakeGraphCopyKind as CopyKind,
+} from './intake-state-graph-scratch.ts';
 import { IntakeStateManifest } from './intake-state-manifest.ts';
 import { validateIntakeLegacyBridgeControl } from './intake-state-migration.ts';
 import {
@@ -8,6 +13,7 @@ import {
 } from './intake-state-legacy-replay.ts';
 import {
   COLLECTION_FORMAT,
+  LOG_COLLECTION_FORMAT,
   FRAME_BYTES,
   HEAD_BYTES,
   limits,
@@ -18,8 +24,10 @@ import {
   invalid,
   intakeNamespace,
   parseIntakeCollectionHead,
+  parseIntakeCollectionHeadV4,
   uuid,
   type IntakeCollectionHead,
+  type IntakeCollectionHeadV4,
   type IntakeStateIdentity,
 } from './intake-state-evidence.ts';
 import { INTAKE_TREE_PAGE_BYTES } from './intake-state-tree.ts';
@@ -37,14 +45,47 @@ import {
   type IntakeTreeRef,
 } from './intake-state-tree.ts';
 import { finishIntakeCopySteps } from './intake-copy-work.ts';
+import {
+  CAPS as LOG_CAPS,
+  intakeLogBaseHead,
+  rebuildIntakeLogSnapshotSteps,
+  disposeIntakeLogSnapshot,
+  rebindIntakeLogSteps,
+} from './intake-state-log.ts';
 
-type Kind = 'directory' | 'map' | 'sequence' | 'bytes' | 'receipts' | 'history';
-type CopyKind = Kind | 'inventory' | 'build-directory';
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const ordered = (n: number) => String(n).padStart(16, '0');
+type GraphManifest = Pick<IntakeStateManifest, 'sourceValue' | 'put'> &
+  Partial<Pick<IntakeStateManifest, 'db'>>;
+
+/** Live cold admission uses invocation-local authenticated encrypted graph work.
+ * Copy/recovery also validate exact namespace membership through their manifest.
+ */
+export function* validateIntakeCollectionGraphSteps(
+  identity: IntakeStateIdentity,
+  rawHead: string,
+  read: (key: string, maxBytes: number) => string | undefined,
+  checkpoint: () => void,
+): Generator<void, void> {
+  const manifest: GraphManifest = {
+    sourceValue(key, maxBytes) {
+      checkpoint();
+      const raw = read(key, maxBytes);
+      checkpoint();
+      if (raw !== undefined && Buffer.byteLength(raw) > maxBytes)
+        invalid('selected graph value bytes');
+      return raw;
+    },
+    put() {
+      invalid('live graph validation cannot prepare copy evidence');
+    },
+  };
+  yield* inspectGraphSteps(true, manifest, identity, rawHead, undefined, checkpoint);
+  checkpoint();
+}
 
 export function inspectIntakeCollectionGraph(
-  manifest: IntakeStateManifest,
+  manifest: GraphManifest,
   identity: IntakeStateIdentity,
   rawHead: string,
   targetProfileId?: string,
@@ -73,7 +114,7 @@ export function inspectIntakeCollectionGraph(
 }
 
 export function* inspectIntakeCollectionGraphSteps(
-  manifest: IntakeStateManifest,
+  manifest: GraphManifest,
   identity: IntakeStateIdentity,
   rawHead: string,
   targetProfileId?: string,
@@ -89,52 +130,71 @@ export function* inspectIntakeCollectionGraphSteps(
     rebindDescriptor: (descriptor: IntakeCollectionDescriptor) => IntakeCollectionDescriptor,
   ) => string,
 ): Generator<void, void> {
+  yield* inspectGraphSteps(
+    false,
+    manifest,
+    identity,
+    rawHead,
+    targetProfileId,
+    checkpoint,
+    validateRepresentation,
+    copyInventory,
+  );
+}
+
+/** Only live admission coalesces private fixed summary work. Generic inspect
+ * and copy retain their original per-cell cancellation/progress schedule. */
+function* inspectGraphSteps(
+  liveSummaryChecks: boolean,
+  ...args: Parameters<typeof inspectIntakeCollectionGraphSteps>
+): Generator<void, void> {
+  const [
+    manifest,
+    identity,
+    rawHead,
+    targetProfileId,
+    checkpoint = () => {},
+    validateRepresentation,
+    copyInventory,
+  ] = args;
   const db = manifest.db,
     prefix = intakeNamespace(identity);
   let legacyReplay: PreparedIntakeLegacyReplay | undefined;
+  const scratch = createIntakeGraphScratch(identity, rawHead, checkpoint, { liveSummaryChecks });
+  let failed = false;
   try {
-    db.exec(`DROP TABLE IF EXISTS graph_seen; DROP TABLE IF EXISTS graph_heads;
-    DROP TABLE IF EXISTS graph_receipts; DROP TABLE IF EXISTS graph_history;
-    DROP TABLE IF EXISTS graph_copy;
-    DROP TABLE IF EXISTS graph_nested; DROP TABLE IF EXISTS graph_copy_stack;
-    CREATE TABLE graph_seen(hash TEXT,kind TEXT,ref TEXT,bytes INTEGER,max_sequence INTEGER,PRIMARY KEY(hash,kind));
-    CREATE TABLE graph_heads(sequence INTEGER PRIMARY KEY,raw TEXT NOT NULL,done INTEGER DEFAULT 0);
-    CREATE INDEX graph_heads_pending ON graph_heads(done,sequence);
-    CREATE TABLE graph_receipts(id TEXT PRIMARY KEY,value TEXT NOT NULL);
-    CREATE TABLE graph_history(sequence INTEGER PRIMARY KEY,value TEXT NOT NULL);
-    CREATE TABLE graph_copy(hash TEXT,kind TEXT,ref TEXT NOT NULL,bytes INTEGER NOT NULL,PRIMARY KEY(hash,kind));`);
-    db.exec(`CREATE TABLE graph_nested(hash TEXT,kind TEXT,ref TEXT NOT NULL,bytes INTEGER NOT NULL,done INTEGER DEFAULT 0,PRIMARY KEY(hash,kind));
-    CREATE INDEX graph_nested_pending ON graph_nested(done);
-    CREATE TABLE graph_copy_stack(position INTEGER PRIMARY KEY,hash TEXT,kind TEXT,ref TEXT NOT NULL,UNIQUE(hash,kind));`);
-    // Only the compiled fixed SQL belongs to this invocation. Each incoming
-    // reference is still decoded before its scratch lookup; no source row,
-    // validation result or query cursor is retained by these statements. The
-    // manifest owns this disposable connection, and a later namespace/invocation
-    // prepares fresh statements after recreating its scratch tables.
-    const scratch = {
-      readHead: db.prepare('SELECT raw FROM graph_heads WHERE sequence=?'),
-      insertHead: db.prepare('INSERT OR IGNORE INTO graph_heads(sequence,raw) VALUES(?,?)'),
-      markVisited: db.prepare('INSERT OR IGNORE INTO visited VALUES(?)'),
-      readSeen: db.prepare('SELECT ref,bytes FROM graph_seen WHERE hash=? AND kind=?'),
-      readNested: db.prepare('SELECT ref,bytes FROM graph_nested WHERE hash=? AND kind=?'),
-      insertNested: db.prepare(
-        'INSERT INTO graph_nested(hash,kind,ref,bytes) VALUES(?,?,?,?) ON CONFLICT(hash,kind) DO NOTHING',
-      ),
-      readReceipt: db.prepare('SELECT value FROM graph_receipts WHERE id=?'),
-      insertReceipt: db.prepare('INSERT OR IGNORE INTO graph_receipts VALUES(?,?)'),
-      readHistory: db.prepare('SELECT value FROM graph_history WHERE sequence=?'),
-      insertHistory: db.prepare('INSERT OR IGNORE INTO graph_history VALUES(?,?)'),
-      readMaxSequence: db.prepare('SELECT max_sequence FROM graph_seen WHERE hash=? AND kind=?'),
-      insertSeen: db.prepare('INSERT INTO graph_seen VALUES(?,?,?,?,?)'),
-    };
+    const markStatement = db?.prepare('INSERT OR IGNORE INTO visited VALUES(?)');
+    const markVisited = (key: string) => markStatement?.run(key);
     const source = (sha: string) =>
       manifest.sourceValue(prefix + 'node:' + sha, INTAKE_TREE_PAGE_BYTES);
     const selected = parseIntakeCollectionHead(rawHead, identity)!;
-    function enqueue(head: IntakeCollectionHead): void {
-      const raw = JSON.stringify(head);
-      const previous = scratch.readHead.get(head.storageSequence);
-      if (previous && previous.raw !== raw) invalid('conflicting historical selection');
-      scratch.insertHead.run(head.storageSequence, raw);
+    const logSource = (sha: string) => {
+      const key = prefix + 'node:' + sha;
+      markVisited(key);
+      return manifest.sourceValue(key, LOG_CAPS.nodeBytes);
+    };
+    const base =
+      selected.format === LOG_COLLECTION_FORMAT
+        ? intakeLogBaseHead(selected, identity, logSource)
+        : selected;
+    // The immutable anchor already authenticates the complete canonical indexes.
+    // Look up historical agreement/absence there instead of retaining duplicate
+    // heads, receipts and transition inventories in disposable storage.
+    const canonical = createIntakeTree(identity, source, new Map());
+    const canonicalHistory = (sequence: number) =>
+      base ? canonical.get(base.history, ordered(sequence)) : undefined;
+    const canonicalReceipt = (operationId: string) =>
+      base ? canonical.get(base.receipts, operationId) : undefined;
+    function headAt(sequence: number): IntakeCollectionHeadV4 {
+      if (!base || sequence < 1 || sequence > base.storageSequence)
+        invalid('historical head sequence');
+      if (sequence === base.storageSequence) return base;
+      const next = canonicalHistory(sequence + 1);
+      if (!next) invalid('missing historical transition');
+      const previous = parseIntakeCollectionHistory(next, identity).previous;
+      const head = parseIntakeCollectionHeadV4(JSON.stringify(previous), identity)!;
+      if (head.storageSequence !== sequence) invalid('conflicting historical selection');
+      return head;
     }
     let legacyHead: Head | undefined;
     let legacyDomainVersion: number | undefined;
@@ -157,10 +217,18 @@ export function* inspectIntakeCollectionGraphSteps(
         limits(),
         head,
         (key) => manifest.sourceValue(key, key.includes(':frame:') ? FRAME_BYTES : HEAD_BYTES),
-        { checkpoint },
+        {
+          // Live replay's encrypted owner already supplies this exact full
+          // policy at every state/per-cell boundary. Generic copy keeps its
+          // separate checkpoint/progress schedule unchanged.
+          checkpoint: liveSummaryChecks ? undefined : checkpoint,
+          // The legacy ancestor is evidence beneath this exact outer V4/V5
+          // selection. All transitive replay/canonical scratch shares its seal.
+          encryptedScratch: { selectedHead: rawHead, assertCurrent: checkpoint },
+        },
       );
       for (const key of legacyReplay.consumed()) {
-        scratch.markVisited.run(key);
+        markVisited(key);
         yield;
       }
       legacyDomainVersion = yield* legacyReplay.domainVersionSteps();
@@ -176,12 +244,12 @@ export function* inspectIntakeCollectionGraphSteps(
       try {
         // Always decode each incoming reference, even when the subtree was already visited.
         const node = decodeIntakeTreeNode(source(ref.hash), ref, identity);
-        const seen = scratch.readSeen.get(ref.hash, kind);
+        const seen = scratch.seen(ref.hash, kind);
         if (seen) {
-          if (seen.ref !== JSON.stringify(ref)) invalid('historical reference disagreement');
+          if (!same(seen.ref, ref)) invalid('historical reference disagreement');
           return Number(seen.bytes);
         }
-        scratch.markVisited.run(prefix + 'node:' + ref.hash);
+        markVisited(prefix + 'node:' + ref.hash);
         let ownBytes = Buffer.byteLength(node.value);
         let maxSequence = 0;
         if (kind === 'directory') {
@@ -209,18 +277,10 @@ export function* inspectIntakeCollectionGraphSteps(
             if (!descriptor.root) {
               if (descriptor.bytes !== 0) invalid('empty referenced collection bytes');
             } else {
-              const prior = scratch.readNested.get(descriptor.root.hash, descriptor.kind);
-              if (
-                prior &&
-                (prior.ref !== JSON.stringify(descriptor.root) || prior.bytes !== descriptor.bytes)
-              )
+              const prior = scratch.nested(descriptor.root.hash, descriptor.kind);
+              if (prior && (!same(prior.ref, descriptor.root) || prior.bytes !== descriptor.bytes))
                 invalid('referenced collection disagreement');
-              scratch.insertNested.run(
-                descriptor.root.hash,
-                descriptor.kind,
-                JSON.stringify(descriptor.root),
-                descriptor.bytes,
-              );
+              scratch.enqueue(descriptor.root, descriptor.kind, descriptor.bytes);
             }
           }
           if (value.kind === 'bytes') {
@@ -244,9 +304,7 @@ export function* inspectIntakeCollectionGraphSteps(
           if (result.storageSequence > selected.storageSequence)
             invalid('future collection receipt');
           yield* walk(result.logical.root, 'directory');
-          const prior = scratch.readReceipt.get(node.key);
-          if (prior && prior.value !== node.value) invalid('conflicting historical receipt');
-          scratch.insertReceipt.run(node.key, node.value);
+          if (canonicalReceipt(node.key) !== node.value) invalid('conflicting historical receipt');
         } else {
           const value = parseIntakeCollectionHistory(node.value, identity);
           const sequence = Number(node.key);
@@ -255,7 +313,7 @@ export function* inspectIntakeCollectionGraphSteps(
           if (node.key !== ordered(sequence) || sequence > selected.storageSequence)
             invalid('history sequence');
           const legacy = legacyPrevious(value.previous);
-          const previous = !legacy ? (value.previous as IntakeCollectionHead | null) : null;
+          const previous = !legacy ? (value.previous as IntakeCollectionHeadV4 | null) : null;
           if (legacy) {
             if (sequence !== 1) invalid('legacy bridge sequence');
             yield* validateLegacy(legacy);
@@ -264,14 +322,14 @@ export function* inspectIntakeCollectionGraphSteps(
           }
           if ((previous?.storageSequence ?? 0) !== sequence - 1)
             invalid('history previous sequence');
-          if (previous) enqueue(previous);
+          if (previous && !same(previous, headAt(sequence - 1)))
+            invalid('conflicting historical selection');
           if (Number(value.logical.domainVersion) < (previous?.logical.domainVersion ?? 0))
             invalid('history domain version');
           yield* walk(value.logical.root as IntakeTreeRoot, 'directory');
           yield* walk(value.builds as IntakeTreeRoot, 'directory');
-          const prior = scratch.readHistory.get(sequence);
-          if (prior && prior.value !== node.value) invalid('conflicting historical transition');
-          scratch.insertHistory.run(sequence, node.value);
+          if (canonicalHistory(sequence) !== node.value)
+            invalid('conflicting historical transition');
         }
         if (kind === 'bytes' || kind === 'sequence') {
           const index = Number(node.key);
@@ -282,23 +340,15 @@ export function* inspectIntakeCollectionGraphSteps(
         integer(bytes);
         for (const child of [node.left, node.right])
           if (child)
-            maxSequence = Math.max(
-              maxSequence,
-              Number(scratch.readMaxSequence.get(child.hash, kind)!.max_sequence),
-            );
-        scratch.insertSeen.run(ref.hash, kind, JSON.stringify(ref), bytes, maxSequence);
+            maxSequence = Math.max(maxSequence, scratch.seen(child.hash, kind)!.maxSequence);
+        scratch.remember(ref, kind, bytes, maxSequence);
         return bytes;
       } finally {
         depth--;
       }
     }
-    enqueue(selected);
-    for (;;) {
-      const next = db
-        .prepare('SELECT sequence,raw FROM graph_heads WHERE done=0 ORDER BY sequence DESC LIMIT 1')
-        .get();
-      if (!next) break;
-      const head = parseIntakeCollectionHead(next.raw, identity)!;
+    for (let sequence = base?.storageSequence ?? 0; sequence >= 1; sequence--) {
+      const head = headAt(sequence);
       yield* walk(head.logical.root, 'directory');
       yield* walk(head.builds, 'directory');
       yield* walk(head.receipts, 'receipts');
@@ -309,51 +359,79 @@ export function* inspectIntakeCollectionGraphSteps(
         [head.receipts, 'receipts'],
         [head.history, 'history'],
       ] as const) {
-        if (
-          !ref ||
-          Number(scratch.readMaxSequence.get(ref.hash, kind)!.max_sequence) > head.storageSequence
-        )
+        if (!ref || scratch.seen(ref.hash, kind)!.maxSequence > head.storageSequence)
           invalid('historical future evidence');
       }
       if (head.history?.first !== ordered(1) || head.history.last !== ordered(head.storageSequence))
         invalid('historical sequence coverage');
-      const eventRow = scratch.readHistory.get(head.storageSequence);
+      const eventRow = canonicalHistory(head.storageSequence);
       if (!eventRow) invalid('missing historical transition');
-      const event = JSON.parse(String(eventRow.value));
+      const event = JSON.parse(eventRow);
       if (!same(event.logical, head.logical) || !same(event.builds, head.builds))
         invalid('historical selection agreement');
-      db.prepare('UPDATE graph_heads SET done=1 WHERE sequence=?').run(head.storageSequence);
+    }
+    if (selected.format === LOG_COLLECTION_FORMAT) {
+      const verification = rebuildIntakeLogSnapshotSteps(rawHead, identity, logSource, {
+        assertCurrent: checkpoint,
+        lookupBaseOperation(head, operationId) {
+          if (!base || !same(head, base)) invalid('log base selection disagreement');
+          const receipt = createIntakeTree(identity, source, new Map()).get(
+            base.receipts,
+            operationId,
+          );
+          return receipt === undefined
+            ? { kind: 'absent' }
+            : {
+                kind: 'receipt',
+                identity,
+                receipt: parseIntakeCollectionReceipt(receipt, identity, operationId),
+              };
+        },
+        *onEventSteps(event) {
+          // The codec authenticates each full previous head and transition. The
+          // collection owner authenticates all referenced graphs, including roots
+          // that no longer occur in the selected logical/build view.
+          yield* walk(event.transition.previous.logical.root, 'directory');
+          yield* walk(event.transition.previous.builds, 'directory');
+          yield* walk(event.receipt.result.logical.root, 'directory');
+          yield* walk(event.transition.builds, 'directory');
+        },
+      });
+      try {
+        for (;;) {
+          const next = verification.next();
+          if (next.done) {
+            disposeIntakeLogSnapshot(next.value);
+            break;
+          }
+          yield;
+        }
+      } finally {
+        verification.return(undefined as never);
+      }
     }
     for (;;) {
-      const next = db
-        .prepare('SELECT hash,kind,ref,bytes FROM graph_nested WHERE done=0 LIMIT 1')
-        .get();
+      const next = scratch.nextNested();
       if (!next) break;
-      const ref = JSON.parse(String(next.ref)) as IntakeTreeRef,
-        kind = String(next.kind) as Kind;
+      const { ref, kind } = next;
       if ((yield* walk(ref, kind)) !== next.bytes) invalid('referenced collection byte summary');
       if (kind !== 'map' && (ref.first !== ordered(0) || ref.last !== ordered(ref.count - 1)))
         invalid('referenced collection sequence coverage');
-      db.prepare('UPDATE graph_nested SET done=1 WHERE hash=? AND kind=?').run(
-        next.hash,
-        next.kind,
-      );
+      scratch.finishNested(ref, kind);
     }
-    if (
-      Number(db.prepare('SELECT count(*) n FROM graph_history').get()!.n) !==
-        selected.storageSequence ||
-      Number(db.prepare('SELECT count(*) n FROM graph_receipts').get()!.n) !==
-        selected.storageSequence
-    )
-      invalid('historical evidence coverage');
-    for (const row of db.prepare('SELECT sequence,value FROM graph_history').iterate()) {
+    // Root counts are checked by the V4 head parser. Every history key is in
+    // 1..sequence, and each receipt below must bind that distinct sequence;
+    // together these prove exact canonical history/receipt membership.
+    for (let sequence = 1; sequence <= (base?.storageSequence ?? 0); sequence++) {
       yield;
-      const event = JSON.parse(String(row.value));
-      const receipt = scratch.readReceipt.get(event.operationId);
-      if (!receipt) invalid('missing historical receipt');
-      const result = JSON.parse(String(receipt.value)).result;
+      const rawEvent = canonicalHistory(sequence);
+      if (!rawEvent) invalid('historical evidence coverage');
+      const event = JSON.parse(rawEvent);
+      const rawReceipt = canonicalReceipt(event.operationId);
+      if (!rawReceipt) invalid('missing historical receipt');
+      const result = JSON.parse(rawReceipt).result;
       if (
-        result.storageSequence !== row.sequence ||
+        result.storageSequence !== sequence ||
         !same(result.logical, event.logical) ||
         result.changed !==
           (legacyPrevious(event.previous)
@@ -362,98 +440,113 @@ export function* inspectIntakeCollectionGraphSteps(
       )
         invalid('receipt history agreement');
     }
-    scratch.markVisited.run(prefix + 'head');
+    markVisited(prefix + 'head');
     if (
       db
-        .prepare(
+        ?.prepare(
           'SELECT 1 FROM source LEFT JOIN visited ON source.key=visited.key WHERE source.prefix=? AND visited.key IS NULL LIMIT 1',
         )
         .get(prefix)
     )
       invalid('unselected copy contribution');
-    if (validateRepresentation) yield* validateRepresentation(selected, legacyReplay);
+    if (validateRepresentation) {
+      yield* validateRepresentation(selected, legacyReplay);
+      // External representation work can yield or revoke its source scope.
+      // Seal that boundary before validation succeeds or copying starts.
+      checkpoint();
+    }
     if (!targetProfileId) return;
+    if (!db) invalid('copy graph requires a manifest');
+    const preparedValue = db.prepare('SELECT value FROM prepared WHERE key=?');
     const target = { ...identity, profileId: targetProfileId },
       targetPrefix = intakeNamespace(target);
-    const copiedBytes = (ref: IntakeTreeRoot, kind: CopyKind) =>
-      ref
-        ? Number(
-            db.prepare('SELECT bytes FROM graph_copy WHERE hash=? AND kind=?').get(ref.hash, kind)!
-              .bytes,
-          )
-        : 0;
+    const context = (kind: CopyKind, builds: IntakeTreeRoot) =>
+      kind === 'inventory' || kind === 'build-directory' ? (builds?.hash ?? 'empty') : '';
+    const copiedBytes = (
+      ref: IntakeTreeRoot,
+      kind: CopyKind,
+      builds: IntakeTreeRoot = selected.builds,
+    ) => (ref ? scratch.copied(ref.hash, kind, context(kind, builds))!.bytes : 0);
     function rebindDescriptor(descriptor: IntakeCollectionDescriptor): IntakeCollectionDescriptor {
       const copied = descriptor.root
-        ? db
-            .prepare('SELECT ref FROM graph_copy WHERE hash=? AND kind=?')
-            .get(descriptor.root.hash, descriptor.kind)
+        ? scratch.copied(descriptor.root.hash, descriptor.kind)
         : undefined;
       if (descriptor.root && !copied) throw new CopyDependency(descriptor.root, descriptor.kind);
       return {
         ...descriptor,
-        root: copied ? (JSON.parse(String(copied.ref)) as IntakeTreeRef) : null,
+        root: copied?.ref ?? null,
         bytes: copiedBytes(descriptor.root, descriptor.kind),
       };
     }
-    const sourceCollection = (name: string) =>
+    const sourceCollection = (builds: IntakeTreeRoot, name: string) =>
       parseIntakeCollectionDescriptor(
-        createIntakeTree(identity, source, new Map()).get(selected.builds, name),
+        createIntakeTree(identity, source, new Map()).get(builds, name),
       ) ?? null;
     class CopyDependency extends Error {
       readonly ref: IntakeTreeRef;
-      readonly kind: Kind;
-      constructor(ref: IntakeTreeRef, kind: Kind) {
+      readonly kind: CopyKind;
+      readonly builds: IntakeTreeRoot;
+      constructor(ref: IntakeTreeRef, kind: CopyKind, builds: IntakeTreeRoot = selected.builds) {
         super('referenced collection copy dependency');
         this.ref = ref;
         this.kind = kind;
+        this.builds = builds;
       }
     }
-    function* rebindSelected(ref: IntakeTreeRoot, kind: CopyKind): Generator<void, IntakeTreeRoot> {
+    let reboundLegacyHead: Head | undefined;
+    function copiedRoot(
+      ref: IntakeTreeRoot,
+      kind: CopyKind,
+      builds = selected.builds,
+    ): IntakeTreeRoot {
       if (!ref) return null;
-      db.prepare('INSERT INTO graph_copy_stack(hash,kind,ref) VALUES(?,?,?)').run(
-        ref.hash,
-        kind,
-        JSON.stringify(ref),
-      );
+      const row = scratch.copied(ref.hash, kind, context(kind, builds));
+      if (!row) throw new CopyDependency(ref, kind, builds);
+      return row.ref;
+    }
+    function copiedHead(head: IntakeCollectionHeadV4): IntakeCollectionHeadV4 {
+      return {
+        ...head,
+        identity: target,
+        logical: { ...head.logical, root: copiedRoot(head.logical.root, 'directory') },
+        builds: copiedRoot(head.builds, 'build-directory', head.builds),
+        receipts: copiedRoot(head.receipts, 'receipts'),
+        history: copiedRoot(head.history, 'history'),
+      };
+    }
+    function* rebindSelected(
+      ref: IntakeTreeRoot,
+      kind: CopyKind,
+      builds = selected.builds,
+    ): Generator<void, IntakeTreeRoot> {
+      if (!ref) return null;
+      scratch.push(ref, kind, context(kind, builds), builds);
       let result: IntakeTreeRoot = null;
       for (;;) {
-        const next = db
-          .prepare('SELECT position,ref,kind FROM graph_copy_stack ORDER BY position DESC LIMIT 1')
-          .get();
+        const next = scratch.top();
         if (!next) return result;
         try {
-          result = yield* rebind(
-            JSON.parse(String(next.ref)) as IntakeTreeRef,
-            String(next.kind) as CopyKind,
-          );
-          db.prepare('DELETE FROM graph_copy_stack WHERE position=?').run(next.position);
+          result = yield* rebind(next.ref, next.kind, next.builds);
+          scratch.pop();
         } catch (error) {
           if (!(error instanceof CopyDependency)) throw error;
-          if (
-            db
-              .prepare('SELECT 1 FROM graph_copy_stack WHERE hash=? AND kind=?')
-              .get(error.ref.hash, error.kind)
-          )
-            invalid('cyclic referenced collection');
-          db.prepare('INSERT INTO graph_copy_stack(hash,kind,ref) VALUES(?,?,?)').run(
-            error.ref.hash,
-            error.kind,
-            JSON.stringify(error.ref),
-          );
+          scratch.push(error.ref, error.kind, context(error.kind, error.builds), error.builds);
         }
       }
     }
-    function* rebind(ref: IntakeTreeRoot, kind: CopyKind): Generator<void, IntakeTreeRoot> {
+    function* rebind(
+      ref: IntakeTreeRoot,
+      kind: CopyKind,
+      builds: IntakeTreeRoot,
+    ): Generator<void, IntakeTreeRoot> {
       checkpoint();
       yield;
       if (!ref) return null;
-      const old = db
-        .prepare('SELECT ref FROM graph_copy WHERE hash=? AND kind=?')
-        .get(ref.hash, kind);
-      if (old) return JSON.parse(String(old.ref)) as IntakeTreeRef;
+      const old = scratch.copied(ref.hash, kind, context(kind, builds));
+      if (old) return old.ref;
       const node = decodeIntakeTreeNode(source(ref.hash), ref, identity);
-      const left = yield* rebind(node.left, kind),
-        right = yield* rebind(node.right, kind);
+      const left = yield* rebind(node.left, kind, builds),
+        right = yield* rebind(node.right, kind, builds);
       let value = node.value;
       if (kind === 'directory' || kind === 'build-directory') {
         const descriptor = parseIntakeCollectionDescriptor(value)!;
@@ -465,8 +558,8 @@ export function* inspectIntakeCollectionGraphSteps(
           invalid('inventory registry collection kind');
         value = JSON.stringify({
           ...descriptor,
-          root: yield* rebind(descriptor.root, childKind),
-          bytes: copiedBytes(descriptor.root, childKind),
+          root: yield* rebind(descriptor.root, childKind, builds),
+          bytes: copiedBytes(descriptor.root, childKind, builds),
         });
       } else if (kind === 'map' || kind === 'sequence' || kind === 'inventory') {
         const stored = parseIntakeStoredValue(value);
@@ -474,29 +567,66 @@ export function* inspectIntakeCollectionGraphSteps(
           if (stored.kind !== 'inline') invalid('inventory registry value');
           value = JSON.stringify({
             kind: 'inline',
-            text: copyInventory!(stored.text, node.key, sourceCollection, rebindDescriptor),
+            text: copyInventory!(
+              stored.text,
+              node.key,
+              (name) => sourceCollection(builds, name),
+              (descriptor) => {
+                try {
+                  return rebindDescriptor(descriptor);
+                } catch (error) {
+                  if (error instanceof CopyDependency)
+                    throw new CopyDependency(error.ref, error.kind, builds);
+                  throw error;
+                }
+              },
+            ),
           });
         }
         if (stored.kind === 'bytes')
-          value = JSON.stringify({ ...stored, root: yield* rebind(stored.root, 'bytes') });
+          value = JSON.stringify({ ...stored, root: yield* rebind(stored.root, 'bytes', builds) });
         else if (stored.kind === 'collection') {
           const descriptor = stored.descriptor;
-          if (
-            descriptor.root &&
-            !db
-              .prepare('SELECT 1 FROM graph_copy WHERE hash=? AND kind=?')
-              .get(descriptor.root.hash, descriptor.kind)
-          )
-            throw new CopyDependency(descriptor.root, descriptor.kind);
+          if (descriptor.root && !scratch.copied(descriptor.root.hash, descriptor.kind))
+            throw new CopyDependency(descriptor.root, descriptor.kind, builds);
           value = JSON.stringify({ ...stored, descriptor: rebindDescriptor(descriptor) });
         }
+      } else if (kind === 'receipts') {
+        const receipt = parseIntakeCollectionReceipt(value, identity, node.key);
+        value = JSON.stringify({
+          ...receipt,
+          result: {
+            ...receipt.result,
+            logical: {
+              ...receipt.result.logical,
+              root: yield* rebind(receipt.result.logical.root, 'directory', builds),
+            },
+          },
+        });
+      } else if (kind === 'history') {
+        const event = parseIntakeCollectionHistory(value, identity),
+          legacy = legacyPrevious(event.previous);
+        if (legacy && !reboundLegacyHead) invalid('missing rebound legacy bridge');
+        value = JSON.stringify({
+          ...event,
+          previous: legacy
+            ? { format: 'health-intake-legacy-v3', head: reboundLegacyHead }
+            : event.previous
+              ? copiedHead(event.previous as IntakeCollectionHeadV4)
+              : null,
+          logical: {
+            ...event.logical,
+            root: yield* rebind(event.logical.root, 'directory', builds),
+          },
+          builds: yield* rebind(event.builds, 'build-directory', event.builds),
+        });
       }
       const raw = JSON.stringify({ ...node, identity: target, value, left, right });
       const result = { ...ref, hash: digest(raw) };
       decodeIntakeTreeNode(raw, result, target);
       // Shared subtrees may be referenced by more than one collection.
       const key = targetPrefix + 'node:' + result.hash;
-      const existing = db.prepare('SELECT value FROM prepared WHERE key=?').get(key);
+      const existing = preparedValue.get(key);
       if (existing && existing.value !== raw) invalid('copy graph conflict');
       if (!existing) manifest.put('prepared', key, raw);
       let ownBytes = Buffer.byteLength(value);
@@ -509,13 +639,87 @@ export function* inspectIntakeCollectionGraphSteps(
               ? Buffer.byteLength(JSON.stringify(stored.descriptor))
               : stored.bytes;
       } else if (kind === 'bytes') ownBytes = Buffer.from(value, 'base64').length;
-      db.prepare('INSERT INTO graph_copy VALUES(?,?,?,?)').run(
+      scratch.rememberCopy(
         ref.hash,
         kind,
-        JSON.stringify(result),
-        ownBytes + copiedBytes(node.left, kind) + copiedBytes(node.right, kind),
+        context(kind, builds),
+        result,
+        ownBytes + copiedBytes(node.left, kind, builds) + copiedBytes(node.right, kind, builds),
       );
       return result;
+    }
+    if (selected.format === LOG_COLLECTION_FORMAT) {
+      if (legacyHead) {
+        if (!legacyReplay) invalid('missing copy legacy value');
+        reboundLegacyHead = yield* legacyReplay.rebindSteps(target, (key, value) =>
+          manifest.put('prepared', key, value),
+        );
+      }
+      const rebinding = rebindIntakeLogSteps(rawHead, identity, logSource, target, {
+        assertCurrent: checkpoint,
+        lookupBaseOperation(head, operationId) {
+          if (!base || !same(head, base)) invalid('log base selection disagreement');
+          const receipt = createIntakeTree(identity, source, new Map()).get(
+            base.receipts,
+            operationId,
+          );
+          return receipt === undefined
+            ? { kind: 'absent' }
+            : {
+                kind: 'receipt',
+                identity,
+                receipt: parseIntakeCollectionReceipt(receipt, identity, operationId),
+              };
+        },
+        *rebindBaseSteps() {
+          // Earlier V4 selections must be rebound first: transition values retain
+          // their complete previous head, including its receipt/history roots.
+          for (let sequence = 1; sequence <= base!.storageSequence; sequence++) {
+            const head = headAt(sequence);
+            yield* rebindSelected(head.logical.root, 'directory', head.builds);
+            yield* rebindSelected(head.builds, 'build-directory', head.builds);
+            yield* rebindSelected(head.receipts, 'receipts', head.builds);
+            yield* rebindSelected(head.history, 'history', head.builds);
+          }
+          return JSON.stringify(copiedHead(base!));
+        },
+        *rebindEventSteps(event) {
+          return {
+            logical: {
+              ...event.receipt.result.logical,
+              root: yield* rebindSelected(
+                event.receipt.result.logical.root,
+                'directory',
+                event.transition.builds,
+              ),
+            },
+            builds: yield* rebindSelected(
+              event.transition.builds,
+              'build-directory',
+              event.transition.builds,
+            ),
+          };
+        },
+        write(hash, raw) {
+          const key = targetPrefix + 'node:' + hash,
+            existing = preparedValue.get(key);
+          if (existing && existing.value !== raw) invalid('copy log conflict');
+          if (!existing) manifest.put('prepared', key, raw);
+        },
+      });
+      try {
+        for (;;) {
+          const next = rebinding.next();
+          if (next.done) {
+            manifest.put('prepared', targetPrefix + 'head', next.value);
+            break;
+          }
+          yield;
+        }
+      } finally {
+        rebinding.return(undefined as never);
+      }
+      return;
     }
     const logical = {
       ...selected.logical,
@@ -529,9 +733,7 @@ export function* inspectIntakeCollectionGraphSteps(
       sequence = 1;
     const pages = createIntakeTree(
       target,
-      (hash) =>
-        db.prepare('SELECT value FROM prepared WHERE key=?').get(targetPrefix + 'node:' + hash)
-          ?.value,
+      (hash) => preparedValue.get(targetPrefix + 'node:' + hash)?.value,
       new Map(),
     );
     if (legacyHead) {
@@ -540,10 +742,7 @@ export function* inspectIntakeCollectionGraphSteps(
         manifest.put('prepared', key, value),
       );
       previous = { format: 'health-intake-legacy-v3', head: rebound };
-      const first = parseIntakeCollectionHead(
-        db.prepare('SELECT raw FROM graph_heads WHERE sequence=1').get()!.raw,
-        identity,
-      )!;
+      const first = headAt(1);
       const bridgeLogical = {
         ...first.logical,
         root: yield* rebindSelected(first.logical.root, 'directory'),
@@ -635,7 +834,26 @@ export function* inspectIntakeCollectionGraphSteps(
     });
     parseIntakeCollectionHead(head, target);
     manifest.put('prepared', targetPrefix + 'head', head);
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    legacyReplay?.close();
+    let cleanupFailed = false,
+      cleanupError: unknown;
+    try {
+      legacyReplay?.close();
+    } catch (error) {
+      cleanupFailed = true;
+      cleanupError = error;
+    }
+    try {
+      scratch.close();
+    } catch (error) {
+      if (!cleanupFailed) {
+        cleanupFailed = true;
+        cleanupError = error;
+      }
+    }
+    if (!failed && cleanupFailed) throw cleanupError;
   }
 }

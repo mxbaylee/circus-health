@@ -365,6 +365,10 @@ export interface ReportMemberSnapshotWriter {
     member: MemberInput,
     value: Occurrence,
   ): Promise<ReportSourceMemberHeader>;
+  /** Ordered discoveries, with bounded checkpoints and barriers for existing or streamed members. */
+  includeOrdinaryOccurrences(
+    items: Iterable<{ member: MemberInput; value: Occurrence }>,
+  ): Promise<void>;
   occurrence(
     member: ReportSourceMemberHeader,
     value: Occurrence,
@@ -512,12 +516,64 @@ export async function createReportMemberSnapshot(
     previous?.snapshotId,
     previous ? undefined : [...baseEntries, ...(seededFirst?.entries ?? [])],
   );
-  let closed = false;
+  let closed = false,
+    bulkActive = false,
+    ordinaryOperations = 0;
+  const idle = () => {
+    if (bulkActive) throw Error('Report member batch is pending');
+  };
+  const publicOperation =
+    <Args extends unknown[], Result>(operation: (...args: Args) => Promise<Result>) =>
+    async (...args: Args): Promise<Result> => {
+      idle();
+      ordinaryOperations++;
+      try {
+        return await operation(...args);
+      } finally {
+        ordinaryOperations--;
+      }
+    };
+  const publicRead = <Result>(operation: () => Result): Result => {
+    idle();
+    ordinaryOperations++;
+    try {
+      return operation();
+    } finally {
+      ordinaryOperations--;
+    }
+  };
   const active = () => {
     catalog.assertCurrent();
     if (closed) throw Error('Report snapshot is complete');
   };
   const reader = () => reportMemberSnapshotReader(store, snapshotId);
+  const publicReader = () =>
+    new Proxy(reader(), {
+      get(target, key, receiver) {
+        idle();
+        const value: unknown = Reflect.get(target, key, receiver);
+        if (typeof value !== 'function') return value;
+        return (...args: unknown[]) => {
+          idle();
+          const result: unknown = publicRead(() => Reflect.apply(value, target, args));
+          if (result && typeof result === 'object' && Symbol.iterator in result) {
+            return (function* () {
+              const iterator = (result as Iterable<unknown>)[Symbol.iterator]();
+              try {
+                while (true) {
+                  const next = publicRead(() => iterator.next());
+                  if (next.done) return;
+                  yield next.value;
+                }
+              } finally {
+                publicRead(() => iterator.return?.());
+              }
+            })();
+          }
+          return result;
+        };
+      },
+    });
   const appendCanonicalOccurrence = async (
     member: ReportSourceMemberHeader,
     pieces: Iterable<string>,
@@ -607,19 +663,76 @@ export async function createReportMemberSnapshot(
     }
     return occurrence(await include(member), value);
   };
+  const includeOrdinaryOccurrences: ReportMemberSnapshotWriter['includeOrdinaryOccurrences'] =
+    async (items) => {
+      idle();
+      if (ordinaryOperations) throw Error('Report member operation is pending');
+      bulkActive = true;
+      try {
+        active();
+        let pending: { key: string; value: string }[] = [],
+          total = counts(store);
+        const identities = new Set<string>();
+        const flush = async () => {
+          if (!pending.length) return;
+          active();
+          await store.putMany(pending);
+          const stored = counts(store);
+          if (
+            stored.memberCount !== total.memberCount ||
+            stored.occurrenceCount !== total.occurrenceCount
+          )
+            throw Error('Report member batch count mismatch');
+          pending = [];
+          identities.clear();
+          total = stored;
+        };
+        for (const { member, value } of items) {
+          active();
+          const identity = schemaKey(member.candidateId, member.candidateVersionId);
+          const planned =
+            !identities.has(identity) &&
+            !reader().member(member.candidateId, member.candidateVersionId)
+              ? planOrdinaryOccurrence(member, value, total)
+              : undefined;
+          if (!planned) {
+            await flush();
+            await includeOrdinaryOccurrence(member, value);
+            total = counts(store);
+            continue;
+          }
+          if (pending.length + planned.entries.length > 64) {
+            await flush();
+            // Keep the already serialized item; external inputs may change during the await.
+          }
+          pending.push(...planned.entries);
+          identities.add(identity);
+          total = {
+            memberCount: total.memberCount + 1,
+            occurrenceCount: total.occurrenceCount + 1,
+          };
+        }
+        await flush();
+      } finally {
+        bulkActive = false;
+      }
+    };
   return {
     seededFirstOccurrence: Boolean(seededFirst),
-    reader,
-    appendCanonicalOccurrence,
-    include,
-    includeOrdinaryOccurrence,
-    occurrence,
-    async finish() {
+    reader() {
+      return publicRead(publicReader);
+    },
+    appendCanonicalOccurrence: publicOperation(appendCanonicalOccurrence),
+    include: publicOperation(include),
+    includeOrdinaryOccurrence: publicOperation(includeOrdinaryOccurrence),
+    includeOrdinaryOccurrences,
+    occurrence: publicOperation(occurrence),
+    finish: publicOperation(async () => {
       active();
       const reference = reader().reference;
       await catalog.publish(snapshotId, store);
       closed = true;
       return reference;
-    },
+    }),
   };
 }

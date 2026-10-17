@@ -12,7 +12,7 @@ import {
   vaultRecordCertificates,
   type VaultRecordCertificate,
 } from '../vault-record-certificates.ts';
-import type { IntakeTreeRoot } from '../intake-state-tree.ts';
+import { createIntakeTree, type IntakeTreeRoot } from '../intake-state-tree.ts';
 import { intakeWorkCounters, withIntakeWork } from '../intake-work-accounting.ts';
 import { MAX_CERTIFICATE_DELTA_CHUNK_BYTES } from '../contributor-certificate-delta.ts';
 
@@ -1289,6 +1289,67 @@ test('batch owner checks surround actual writes and never expose a root after ca
       'no membership root was written or returned',
     );
     assert.throws(() => codec.get(null, value.entity, value.recordId), /owner refused/);
+  } finally {
+    sql.close();
+  }
+});
+
+test('certificate page accounting is an exact visible subset of unchanged aggregate tree work', () => {
+  const sql = new DatabaseSync(':memory:');
+  try {
+    sql.exec(VAULT_CERTIFICATE_SCHEMA);
+    const nonce = 'fictional-accounting',
+      profileId = 'fictional-profile';
+    const hash = (raw: string) => createHash('sha256').update(raw).digest('hex');
+    const codec = vaultRecordCertificates(sql, profileId, nonce, () => {});
+    const value: VaultRecordCertificate = {
+      entity: 'people',
+      recordId: '["fictional-person"]',
+      versionId: 'fictional-version',
+      deleted: 0,
+      preimage: { hash: 'd'.repeat(64), bytes: 16 },
+      fields: [],
+    };
+    const root = withIntakeWork(sql, 'warm', () => codec.put(null, value).root);
+    const generated = intakeWorkCounters(sql).warm;
+    assert.ok(generated.collectionPreparedBytes > 0);
+    assert.equal(generated.vaultCertificatePagePreparedBytes, generated.collectionPreparedBytes);
+    assert.equal(
+      generated.vaultCertificatePagePeakPreparedBytes,
+      generated.collectionPeakPreparedBytes,
+    );
+    withIntakeWork(sql, 'warm', () =>
+      assert.deepEqual(codec.getPrivate(root, value.entity, value.recordId), value),
+    );
+    const certificate = intakeWorkCounters(sql).warm;
+    assert.equal(certificate.collectionNodeReads, 1);
+    assert.equal(certificate.vaultCertificatePageReads, certificate.collectionNodeReads);
+    assert.equal(certificate.vaultCertificatePageReadBytes, certificate.collectionReadBytes);
+    let selectedReads = 0,
+      selectedBytes = 0;
+    const selected = createIntakeTree(
+      { profileId, intakeId: nonce, sourceHash: hash(nonce) },
+      (digest) => {
+        const raw = sql.prepare('SELECT raw FROM certificate_pages WHERE hash=?').get(digest)!
+          .raw as string;
+        selectedReads++;
+        selectedBytes += Buffer.byteLength(raw);
+        return raw;
+      },
+      new Map(),
+    );
+    withIntakeWork(sql, 'warm', () =>
+      selected.get(root, hash(JSON.stringify([value.entity, value.recordId]))),
+    );
+    const combined = intakeWorkCounters(sql).warm;
+    assert.equal(combined.collectionNodeReads, certificate.collectionNodeReads + selectedReads);
+    assert.equal(combined.collectionReadBytes, certificate.collectionReadBytes + selectedBytes);
+    assert.equal(combined.vaultCertificatePageReads, certificate.vaultCertificatePageReads);
+    assert.equal(combined.collectionNodeReads - combined.vaultCertificatePageReads, selectedReads);
+    assert.equal(
+      combined.collectionReadBytes - combined.vaultCertificatePageReadBytes,
+      selectedBytes,
+    );
   } finally {
     sql.close();
   }

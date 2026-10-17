@@ -15,6 +15,16 @@ import { disposableSqlite } from './disposable-sqlite.ts';
 import type { StatementSync } from 'node:sqlite';
 import type { DatabaseSync } from 'node:sqlite';
 import {
+  createEncryptedCanonicalIndex,
+  type IntakeEncryptedCanonicalOptions,
+} from './intake-json-canonical-encrypted.ts';
+import type {
+  CanonicalIndex,
+  CanonicalByteSpool,
+  CanonicalNodeRow as NodeRow,
+  CanonicalTrieRow as TrieRow,
+} from './intake-json-canonical-index.ts';
+import {
   withIntakeWork,
   recordIntakeWork,
   recordIntakePeak,
@@ -99,9 +109,9 @@ export interface IntakeJsonCanonicalOptions {
 }
 
 declare const scratchBrand: unique symbol;
-/** A caller-owned private scratch set (spool files plus SQLite index) that
+/** A caller-owned private scratch set (spools plus a typed or SQLite index) that
  * consecutive preparations reuse instead of creating and removing their own.
- * Each preparation starts from emptied tables and truncated spools; a closed
+ * Each preparation starts from empty indexes and reset spools; a closed
  * preparation's handles and pieces still refuse to read. The caller closes it. */
 export interface IntakeJsonCanonicalScratch {
   readonly [scratchBrand]: true;
@@ -196,9 +206,47 @@ class ScratchSet {
     }
   }
 }
-const scratchSets = new WeakMap<IntakeJsonCanonicalScratch, ScratchSet>();
-export function createIntakeJsonCanonicalScratch(): IntakeJsonCanonicalScratch {
-  const set = new ScratchSet();
+class EncryptedScratchSet {
+  readonly data: ReturnType<typeof createEncryptedCanonicalIndex>;
+  private readonly current: () => void;
+  busy = false;
+  closed = false;
+  uses = 0;
+  constructor(options: IntakeEncryptedCanonicalOptions) {
+    this.current = options.assertCurrent;
+    this.data = createEncryptedCanonicalIndex(options);
+  }
+  check() {
+    if (this.closed) throw Error('JSON canonical scratch is closed');
+    try {
+      this.current();
+    } catch (error) {
+      try {
+        this.close();
+      } catch {}
+      throw error;
+    }
+  }
+  acquire(_mode: 'canonical' | 'stringify') {
+    if (this.closed) throw Error('JSON canonical scratch is closed');
+    if (this.busy) throw Error('JSON canonical scratch is in use');
+    this.check();
+    this.data.reset();
+    this.busy = true;
+    this.uses++;
+  }
+  release() {
+    this.busy = false;
+  }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.data.close();
+  }
+}
+type CanonicalScratchSet = ScratchSet | EncryptedScratchSet;
+const scratchSets = new WeakMap<IntakeJsonCanonicalScratch, CanonicalScratchSet>();
+function scratchHandle(set: CanonicalScratchSet): IntakeJsonCanonicalScratch {
   const scratch = Object.freeze({
     get uses() {
       return set.uses;
@@ -213,6 +261,18 @@ export function createIntakeJsonCanonicalScratch(): IntakeJsonCanonicalScratch {
   }) as unknown as IntakeJsonCanonicalScratch;
   scratchSets.set(scratch, set);
   return scratch;
+}
+export function createIntakeJsonCanonicalScratch(): IntakeJsonCanonicalScratch {
+  return scratchHandle(new ScratchSet());
+}
+/** Explicit encrypted opt-in, bound to one selected authority and current scope.
+ * The caller must close this shared set in finally, after closing preparations.
+ * Immutable superseded ciphertext remains counted until that close (no pruning).
+ * Existing factories and default metrics are unchanged. */
+export function createEncryptedIntakeJsonCanonicalScratch(
+  options: IntakeEncryptedCanonicalOptions,
+): IntakeJsonCanonicalScratch {
+  return scratchHandle(new EncryptedScratchSet(options));
 }
 
 /** The same parser with explicit work boundaries for off-host replay drivers. */
@@ -235,9 +295,11 @@ export function* prepareIntakeJsonCanonicalSteps(
   try {
     for (const _ of engine.prepare()) {
       void _;
+      engine.checkProvider();
       options.assertRunning?.();
       engine.work.yields++;
       yield;
+      engine.checkProvider();
       options.assertRunning?.();
     }
     options.assertRunning?.();
@@ -268,9 +330,11 @@ export function* prepareIntakeJsonTreeSteps(
   try {
     for (const _ of engine.prepareTree()) {
       void _;
+      engine.checkProvider();
       options.assertRunning?.();
       engine.work.yields++;
       yield;
+      engine.checkProvider();
       options.assertRunning?.();
     }
     options.assertRunning?.();
@@ -301,21 +365,6 @@ export async function prepareIntakeJsonCanonical(
 type SqlValue = string | number | null | Uint8Array;
 /** Parse and emit traversal state of one value. Kind, parent, trie and raw
  * columns never change once parsing ends; the rest is traversal state. */
-interface NodeRow {
-  id: number;
-  kind: IntakeJsonCanonicalKind | 'root';
-  parent: number;
-  state: string;
-  n: number;
-  key: number;
-  trie: number;
-  raw_start: number;
-  raw_bytes: number;
-  out_start: number;
-  cursor: number;
-  emitted: number;
-  phase: number;
-}
 const NODE_COLUMNS = [
   'id',
   'kind',
@@ -331,17 +380,6 @@ const NODE_COLUMNS = [
   'emitted',
   'phase',
 ] as const;
-interface TrieRow {
-  id: number;
-  parent: number;
-  chunk: Uint8Array | number;
-  object: number;
-  value: number | null;
-  first_order: number;
-  key_number: number;
-  raw_start: number;
-  raw_bytes: number;
-}
 /** Immutable facts of one prepared value, carried by its handle. */
 interface PreparedValue {
   id: number;
@@ -381,8 +419,8 @@ function chunkBytes(units: Uint16Array, length: number): Buffer {
   for (let at = 0; at < length; at++) bytes.writeUInt16BE(units[at]!, at * 2);
   return bytes;
 }
-function nameChunk(name: string, start: number): Buffer {
-  const length = Math.min(KEY_CHUNK, name.length - start),
+function nameChunk(name: string, start: number, units = KEY_CHUNK): Buffer {
+  const length = Math.min(units, name.length - start),
     bytes = Buffer.allocUnsafe(length * 2);
   for (let at = 0; at < length; at++) bytes.writeUInt16BE(name.charCodeAt(start + at), at * 2);
   return bytes;
@@ -460,6 +498,45 @@ class Spool {
     }
   }
 }
+class EncryptedSpool {
+  private sealed = -1;
+  private readonly spool: CanonicalByteSpool;
+  private readonly work: IntakeJsonCanonicalWork;
+  constructor(spool: CanonicalByteSpool, work: IntakeJsonCanonicalWork) {
+    this.spool = spool;
+    this.work = work;
+    work.maxBufferBytes = Math.max(work.maxBufferBytes, BUFFER);
+  }
+  get length() {
+    return this.spool.length();
+  }
+  append(text: string) {
+    this.appendBytes(Buffer.from(text));
+  }
+  appendBytes(bytes: Uint8Array) {
+    const before = Math.floor(this.length / 4096);
+    this.spool.appendBytes(bytes);
+    this.work.scratchWrittenBytes += (Math.floor(this.length / 4096) - before) * 4096;
+  }
+  flush() {
+    const length = this.length;
+    this.spool.flush();
+    if (this.sealed !== length) this.work.scratchWrittenBytes += length % 4096;
+    this.sealed = length;
+  }
+  *read(start: number, bytes: number): Generator<Buffer> {
+    this.flush();
+    while (bytes) {
+      const count = Math.min(BUFFER, bytes),
+        value = this.spool.read(start, count);
+      this.work.scratchReadBufferAllocations++;
+      this.work.scratchReadBytes += value.length;
+      yield value;
+      start += count;
+      bytes -= count;
+    }
+  }
+}
 class CanonicalEngine {
   readonly work: IntakeJsonCanonicalWork = {
     inputCodeUnits: 0,
@@ -475,12 +552,14 @@ class CanonicalEngine {
     yields: 0,
     keyIndexRows: 0,
   };
-  private set: ScratchSet;
+  private set: CanonicalScratchSet;
   /** Set when the scratch belongs to the caller and outlives this preparation. */
-  private shared?: ScratchSet;
-  private scratch: ReturnType<typeof disposableSqlite>;
-  private raw: Spool;
-  private output: Spool;
+  private shared?: CanonicalScratchSet;
+  private scratch?: ReturnType<typeof disposableSqlite>;
+  private index?: CanonicalIndex;
+  private keyChunkUnits = KEY_CHUNK;
+  private raw: Spool | EncryptedSpool;
+  private output: Spool | EncryptedSpool;
   private statements: Map<string, StatementSync>;
   private handles = new WeakMap<IntakeJsonCanonicalHandle, PreparedValue>();
   // Recently used node rows, at most ROW_CACHE of them, plus at most BATCH
@@ -533,7 +612,7 @@ class CanonicalEngine {
     this.assertRunning = assertRunning;
     this.onWork = onWork;
     this.iterator = pieces[Symbol.iterator]();
-    let set: ScratchSet | undefined;
+    let set: CanonicalScratchSet | undefined;
     try {
       if (shared) {
         set = scratchSets.get(shared);
@@ -548,16 +627,25 @@ class CanonicalEngine {
       throw error;
     }
     this.set = set;
-    this.scratch = set.scratch;
-    this.statements = set.statements;
-    this.raw = new Spool(set.rawFd, this.work);
-    this.output = new Spool(set.outputFd, this.work);
+    if (set instanceof EncryptedScratchSet) {
+      this.index = set.data.index;
+      this.keyChunkUnits = 128;
+      this.statements = new Map();
+      this.raw = new EncryptedSpool(set.data.raw, this.work);
+      this.output = new EncryptedSpool(set.data.output, this.work);
+    } else {
+      this.scratch = set.scratch;
+      this.statements = set.statements;
+      this.raw = new Spool(set.rawFd, this.work);
+      this.output = new Spool(set.outputFd, this.work);
+    }
   }
   private statement(sql: string) {
     this.work.sqliteCalls++;
     this.quantum++;
     let statement = this.statements.get(sql);
     if (!statement) {
+      if (!this.scratch) throw Error('SQL unavailable for encrypted JSON provider');
       statement = this.scratch.db.prepare(sql);
       this.statements.set(sql, statement);
     }
@@ -584,6 +672,29 @@ class CanonicalEngine {
     }
     values.length = 0;
   }
+  private writeOrdinalRows(kind: 'children' | 'outs' | 'members', values: SqlValue[]) {
+    if (!this.index) {
+      const columns = {
+        children: 'parent,ordinal,value',
+        outs: 'id,start,bytes',
+        members: 'object,ordinal,trie',
+      };
+      this.writeRows(`INSERT INTO ${kind}(${columns[kind]})`, 3, values);
+      return;
+    }
+    for (let at = 0; at < values.length; at += BATCH * 3) {
+      const rows: Array<[number, number, number]> = [];
+      for (let i = at; i < Math.min(values.length, at + BATCH * 3); i += 3)
+        rows.push([Number(values[i]), Number(values[i + 1]), Number(values[i + 2])]);
+      this.quantum++;
+      if (kind === 'children')
+        this.index.children(rows.map(([parent, ordinal, value]) => ({ parent, ordinal, value })));
+      else if (kind === 'outs')
+        this.index.outs(rows.map(([id, start, bytes]) => ({ id, start, bytes })));
+      else this.index.members(rows.map(([object, ordinal, trie]) => ({ object, ordinal, trie })));
+    }
+    values.length = 0;
+  }
   private rememberNode(row: NodeRow) {
     this.nodeRows.delete(row.id);
     this.nodeRows.set(row.id, row);
@@ -597,6 +708,13 @@ class CanonicalEngine {
   /** One multi-row upsert per BATCH changed rows. Kind and parent never change. */
   private writeNodes(rows: NodeRow[]) {
     for (const row of rows) this.spilledNodes.delete(row.id);
+    if (this.index) {
+      for (let at = 0; at < rows.length; at += BATCH) {
+        this.quantum++;
+        this.index.nodes(rows.slice(at, at + BATCH));
+      }
+      return;
+    }
     this.writeRows(
       'INSERT INTO nodes(' + NODE_COLUMNS.join(',') + ')',
       NODE_COLUMNS.length,
@@ -622,7 +740,9 @@ class CanonicalEngine {
       this.dirtyNodes.add(id);
       this.quantum++;
     } else {
-      const value = this.get('SELECT * FROM nodes WHERE id=?', id);
+      const value = this.index
+        ? (this.quantum++, this.index.node(id))
+        : this.get('SELECT * FROM nodes WHERE id=?', id);
       if (!value) throw Error('Missing JSON node');
       row = { ...(value as unknown as NodeRow) };
     }
@@ -654,7 +774,13 @@ class CanonicalEngine {
   private updateNode(id: number, apply: (row: NodeRow) => void, sql: string, ...args: SqlValue[]) {
     const row = this.nodeRows.get(id) ?? this.spilledNodes.get(id);
     if (!row) {
-      this.run(sql, ...args);
+      if (this.index) {
+        const current = this.index.node(id);
+        if (!current) throw Error('Missing JSON node');
+        apply(current);
+        this.index.nodes([current]);
+        this.quantum++;
+      } else this.run(sql, ...args);
       return;
     }
     this.quantum++;
@@ -664,7 +790,9 @@ class CanonicalEngine {
   private trie(id: number): TrieRow {
     const pending = this.pendingTrie.get(id);
     if (pending) return pending;
-    const value = this.get('SELECT * FROM trie WHERE id=?', id);
+    const value = this.index
+      ? (this.quantum++, this.index.trie(id))
+      : this.get('SELECT * FROM trie WHERE id=?', id);
     if (!value) throw Error('Missing JSON key');
     return value as unknown as TrieRow;
   }
@@ -680,6 +808,11 @@ class CanonicalEngine {
     this.work.keyIndexRows += rows.length;
     this.pendingTrie.clear();
     this.pendingEdges.clear();
+    if (this.index) {
+      this.quantum++;
+      this.index.tries(rows);
+      return;
+    }
     this.writeRows(
       'INSERT INTO trie(id,parent,chunk,object,value,first_order,key_number,raw_start,raw_bytes)',
       9,
@@ -761,8 +894,10 @@ class CanonicalEngine {
         return { id: known, fresh: false };
       }
       if (!names) {
-        const row = this.get('SELECT id FROM trie WHERE parent=? AND chunk=?', parent, chunk);
-        if (row) return { id: Number(row.id), fresh: false };
+        const id = this.index
+          ? (this.quantum++, this.index.edge(parent, chunk))
+          : this.get('SELECT id FROM trie WHERE parent=? AND chunk=?', parent, chunk)?.id;
+        if (id !== undefined) return { id: Number(id), fresh: false };
       }
     }
     const id = this.nextTrieId++;
@@ -803,7 +938,7 @@ class CanonicalEngine {
     const pending: string[] = [];
     let pendingUnits = 0,
       chunkUnits = 0;
-    const chunk = key ? new Uint16Array(KEY_CHUNK) : undefined;
+    const chunk = key ? new Uint16Array(this.keyChunkUnits) : undefined;
     const keyChunk = () => {
       const first = terminal === key!.root;
       const edge = this.keyEdge(
@@ -876,7 +1011,7 @@ class CanonicalEngine {
       } else if (char.charCodeAt(0) < 32) this.fail();
       if (key) {
         chunk![chunkUnits++] = char.charCodeAt(0);
-        if (chunkUnits === KEY_CHUNK) keyChunk();
+        if (chunkUnits === this.keyChunkUnits) keyChunk();
         if (!/^\d$/.test(char) || keyDigits >= 10 || (keyDigits === 1 && keyNumber === 0))
           numeric = false;
         if (numeric) keyNumber = keyNumber * 10 + Number(char);
@@ -904,16 +1039,21 @@ class CanonicalEngine {
           row.raw_start = start;
           row.raw_bytes = bytes;
         }
-      } else if (this.trie(terminal).first_order < 0)
+      } else if (this.trie(terminal).first_order < 0) {
         // An existing prefix node that becomes a name for the first time.
-        this.run(
-          'UPDATE trie SET first_order=?,key_number=?,raw_start=?,raw_bytes=? WHERE id=?',
-          key.order,
-          keyNumberValue,
-          start,
-          bytes,
-          terminal,
-        );
+        if (this.index) {
+          this.quantum++;
+          this.index.terminal(terminal, key.order, keyNumberValue, start, bytes);
+        } else
+          this.run(
+            'UPDATE trie SET first_order=?,key_number=?,raw_start=?,raw_bytes=? WHERE id=?',
+            key.order,
+            keyNumberValue,
+            start,
+            bytes,
+            terminal,
+          );
+      }
     }
     return { start, bytes, terminal };
   }
@@ -998,12 +1138,15 @@ class CanonicalEngine {
     else if (parent.kind === 'array') {
       this.pendingChildren.push(parent.id, parent.n, id);
       if (this.pendingChildren.length >= BATCH * 3)
-        this.writeRows('INSERT INTO children(parent,ordinal,value)', 3, this.pendingChildren);
+        this.writeOrdinalRows('children', this.pendingChildren);
     } else {
       // The last value of a repeated name replaces the earlier one.
       const row = this.pendingTrie.get(parent.key);
       if (row) row.value = id;
-      else this.run('UPDATE trie SET value=? WHERE id=?', id, parent.key);
+      else if (this.index) {
+        this.quantum++;
+        this.index.value(parent.key, id);
+      } else this.run('UPDATE trie SET value=? WHERE id=?', id, parent.key);
     }
     this.updateNode(
       parent.id,
@@ -1133,7 +1276,7 @@ class CanonicalEngine {
     // Every index row and node is now on disk; emit and readers join them.
     this.writeTrie();
     this.objectNames.clear();
-    this.writeRows('INSERT INTO children(parent,ordinal,value)', 3, this.pendingChildren);
+    this.writeOrdinalRows('children', this.pendingChildren);
     this.writeAllNodes();
   }
   private *nextKey(root: number, last: number): Generator<void, TrieRow | undefined> {
@@ -1143,21 +1286,25 @@ class CanonicalEngine {
       if (this.due()) yield;
       const row = this.trie(current);
       if (consider && row.value !== null) return row;
-      const child = this.get('SELECT id FROM trie WHERE parent=? ORDER BY chunk LIMIT 1', current);
-      if (child) {
-        current = Number(child.id);
+      const child = this.index
+        ? (this.quantum++, this.index.firstEdge(current))
+        : this.get('SELECT id FROM trie WHERE parent=? ORDER BY chunk LIMIT 1', current)?.id;
+      if (child !== undefined) {
+        current = Number(child);
         consider = true;
         continue;
       }
       while (current !== root) {
         const at = this.trie(current),
-          sibling = this.get(
-            'SELECT id FROM trie WHERE parent=? AND chunk>? ORDER BY chunk LIMIT 1',
-            at.parent,
-            at.chunk,
-          );
-        if (sibling) {
-          current = Number(sibling.id);
+          sibling = this.index
+            ? (this.quantum++, this.index.nextEdge(at.parent, at.chunk))
+            : this.get(
+                'SELECT id FROM trie WHERE parent=? AND chunk>? ORDER BY chunk LIMIT 1',
+                at.parent,
+                at.chunk,
+              )?.id;
+        if (sibling !== undefined) {
+          current = Number(sibling);
           consider = true;
           break;
         }
@@ -1206,15 +1353,31 @@ class CanonicalEngine {
             },
     }));
   }
+  private indexedEmit(rows: Array<{ cursor: number; value: number }>, keys: boolean): EmitChild[] {
+    return rows.map((row) => {
+      const key = keys ? this.trie(row.value) : undefined,
+        value = this.node(key ? key.value! : row.value);
+      return {
+        cursor: row.cursor,
+        value: value.id,
+        kind: value.kind as IntakeJsonCanonicalKind,
+        raw_start: value.raw_start,
+        raw_bytes: value.raw_bytes,
+        key: key ? { id: key.id, raw_start: key.raw_start, raw_bytes: key.raw_bytes } : undefined,
+      };
+    });
+  }
   private *nextChild(node: NodeRow): Generator<void, EmitChild | undefined> {
     if (node.kind === 'array')
       return this.nextPaged(node, (cursor) =>
-        this.emitRows(
-          `SELECT c.ordinal AS cursor,c.value,n.kind,n.raw_start,n.raw_bytes FROM children c
+        this.index
+          ? (this.quantum++, this.indexedEmit(this.index.childPage(node.id, cursor, BATCH), false))
+          : this.emitRows(
+              `SELECT c.ordinal AS cursor,c.value,n.kind,n.raw_start,n.raw_bytes FROM children c
            JOIN nodes n ON n.id=c.value WHERE c.parent=? AND c.ordinal>? ORDER BY c.ordinal LIMIT ${BATCH}`,
-          node.id,
-          cursor,
-        ),
+              node.id,
+              cursor,
+            ),
       );
     if (this.mode === 'canonical') {
       const key = yield* this.nextKey(node.trie, node.cursor);
@@ -1231,13 +1394,29 @@ class CanonicalEngine {
       };
     }
     const members = (where: string, order: string) => (cursor: number) =>
-      this.emitRows(
-        `SELECT t.${order} AS cursor,t.id AS key_id,t.raw_start AS key_start,t.raw_bytes AS key_bytes,
+      this.index
+        ? (this.quantum++,
+          this.indexedEmit(
+            this.index
+              .terminalPage(
+                node.id,
+                cursor,
+                order === 'key_number' ? 'numeric' : 'insertion',
+                BATCH,
+              )
+              .map((row) => ({
+                cursor: order === 'key_number' ? row.key_number : row.first_order,
+                value: row.id,
+              })),
+            true,
+          ))
+        : this.emitRows(
+            `SELECT t.${order} AS cursor,t.id AS key_id,t.raw_start AS key_start,t.raw_bytes AS key_bytes,
            t.value,n.kind,n.raw_start,n.raw_bytes FROM trie t JOIN nodes n ON n.id=t.value
          WHERE t.object=? AND t.value IS NOT NULL AND ${where} AND t.${order}>? ORDER BY t.${order} LIMIT ${BATCH}`,
-        node.id,
-        cursor,
-      );
+            node.id,
+            cursor,
+          );
     if (node.phase === 0) {
       const child = this.nextPaged(node, members('t.key_number>=0', 'key_number'));
       if (child) return child;
@@ -1259,8 +1438,7 @@ class CanonicalEngine {
   }
   private recordOut(id: number, start: number, bytes: number) {
     this.pendingOuts.push(id, start, bytes);
-    if (this.pendingOuts.length >= BATCH * 3)
-      this.writeRows('INSERT INTO outs(id,start,bytes)', 3, this.pendingOuts);
+    if (this.pendingOuts.length >= BATCH * 3) this.writeOrdinalRows('outs', this.pendingOuts);
   }
   private *emitScalar(id: number, start: number, bytes: number): Generator<void> {
     const outStart = this.output.length;
@@ -1315,7 +1493,7 @@ class CanonicalEngine {
       if (child.key) {
         this.pendingMembers.push(current, node.emitted, child.key.id);
         if (this.pendingMembers.length >= BATCH * 3)
-          this.writeRows('INSERT INTO members(object,ordinal,trie)', 3, this.pendingMembers);
+          this.writeOrdinalRows('members', this.pendingMembers);
         for (const piece of this.raw.read(child.key.raw_start, child.key.raw_bytes)) {
           this.output.appendBytes(piece);
           this.quantum += piece.length;
@@ -1326,12 +1504,12 @@ class CanonicalEngine {
       if (child.kind === 'object' || child.kind === 'array') current = child.value;
       else yield* this.emitScalar(child.value, child.raw_start, child.raw_bytes);
     }
-    this.writeRows('INSERT INTO outs(id,start,bytes)', 3, this.pendingOuts);
-    this.writeRows('INSERT INTO members(object,ordinal,trie)', 3, this.pendingMembers);
+    this.writeOrdinalRows('outs', this.pendingOuts);
+    this.writeOrdinalRows('members', this.pendingMembers);
     this.pages.clear();
     this.output.flush();
     this.work.outputBytes = this.output.length;
-    this.scratch.db.exec('COMMIT');
+    this.scratch?.db.exec('COMMIT');
   }
   private setCursor(id: number, cursor: number) {
     this.updateNode(
@@ -1354,6 +1532,15 @@ class CanonicalEngine {
     };
   }
   private prepared(id: number, treeOnly = false): PreparedValue {
+    if (this.index) {
+      this.quantum++;
+      const node = this.index.node(id),
+        span = treeOnly
+          ? node && { start: node.raw_start, bytes: node.raw_bytes }
+          : this.index.out(id);
+      if (!node || !span || node.kind === 'root') throw Error('Unselected JSON node');
+      return { id: node.id, kind: node.kind, trie: node.trie, ...span };
+    }
     const row = this.get(
       treeOnly
         ? 'SELECT n.id,n.kind,n.trie,n.raw_start AS start,n.raw_bytes AS bytes FROM nodes n WHERE n.id=?'
@@ -1378,6 +1565,24 @@ class CanonicalEngine {
         return known ?? undefined;
       }
     }
+    if (this.index) {
+      let current: number | undefined = object.trie;
+      for (let at = 0; at < name.length && current !== undefined; at += this.keyChunkUnits) {
+        current = this.index.edge(current, nameChunk(name, at, this.keyChunkUnits));
+        this.quantum++;
+      }
+      const terminal = current === undefined ? undefined : this.index.trie(current),
+        value =
+          terminal?.value === null || terminal?.value === undefined
+            ? undefined
+            : this.prepared(terminal.value, treeOnly);
+      if (memo !== undefined) {
+        this.fieldValues.set(memo, value ?? null);
+        if (this.fieldValues.size > ROW_CACHE)
+          this.fieldValues.delete(this.fieldValues.keys().next().value!);
+      }
+      return value;
+    }
     const value = treeOnly
       ? 'SELECT n.id,n.kind,n.trie,n.raw_start AS start,n.raw_bytes AS bytes FROM trie t JOIN nodes n ON n.id=t.value WHERE '
       : `SELECT n.id,n.kind,n.trie,o.start,o.bytes FROM trie t JOIN nodes n ON n.id=t.value
@@ -1385,9 +1590,9 @@ class CanonicalEngine {
     let current = object.trie,
       row: Record<string, unknown> | undefined;
     if (!name.length) row = this.get(value + 't.id=?', current);
-    for (let at = 0; at < name.length; at += KEY_CHUNK) {
-      const chunk = nameChunk(name, at);
-      if (at + KEY_CHUNK >= name.length) {
+    for (let at = 0; at < name.length; at += this.keyChunkUnits) {
+      const chunk = nameChunk(name, at, this.keyChunkUnits);
+      if (at + this.keyChunkUnits >= name.length) {
         row = this.get(value + 't.parent=? AND t.chunk=?', current, chunk);
         break;
       }
@@ -1409,11 +1614,15 @@ class CanonicalEngine {
   }
   *prepareTree(): Generator<void> {
     yield* this.parse();
-    this.scratch.db.exec('COMMIT');
+    this.scratch?.db.exec('COMMIT');
   }
   private check() {
     if (this.closed) throw Error('JSON canonical preparation is closed');
     this.assertRunning?.();
+    this.checkProvider();
+  }
+  checkProvider() {
+    if (this.set instanceof EncryptedScratchSet) this.set.check();
   }
   private handle(value: PreparedValue): IntakeJsonCanonicalHandle {
     const handle = Object.freeze({}) as IntakeJsonCanonicalHandle;
@@ -1436,6 +1645,43 @@ class CanonicalEngine {
         this.check();
         cursor = Number(row.cursor);
         yield row;
+      }
+      if (rows.length < BATCH) return;
+    }
+  }
+  private *indexedPages(
+    read: (after: number) => Array<{ cursor: number; value: number }>,
+    keys: boolean,
+    treeOnly: boolean,
+  ): Generator<Record<string, unknown>> {
+    let after = -1;
+    for (;;) {
+      this.check();
+      this.quantum++;
+      const rows = read(after);
+      for (const row of rows) {
+        this.check();
+        after = row.cursor;
+        const key = keys ? this.trie(row.value) : undefined,
+          prepared = this.prepared(key ? key.value! : row.value, treeOnly);
+        yield {
+          ...prepared,
+          cursor: row.cursor,
+          ...(key
+            ? {
+                name_start: key.raw_start,
+                name_bytes: key.raw_bytes,
+                name_id: key.id,
+                name_parent: key.parent,
+                name_chunk:
+                  key.parent > 0 &&
+                  key.chunk instanceof Uint8Array &&
+                  key.chunk.length <= FIELD_MEMO_NAME_UNITS * 2
+                    ? key.chunk
+                    : undefined,
+              }
+            : {}),
+        };
       }
       if (rows.length < BATCH) return;
     }
@@ -1473,6 +1719,26 @@ class CanonicalEngine {
       ? 'n.id,n.kind,n.trie,n.raw_start AS start,n.raw_bytes AS bytes FROM nodes n'
       : 'n.id,n.kind,n.trie,o.start,o.bytes FROM nodes n JOIN outs o ON o.id=n.id';
     const objectRows = function* (object: PreparedValue) {
+      if (engine.index) {
+        if (treeOnly)
+          for (const order of ['numeric', 'insertion'] as const)
+            yield* engine.indexedPages(
+              (after) =>
+                engine.index!.terminalPage(object.id, after, order, BATCH).map((row) => ({
+                  cursor: order === 'numeric' ? row.key_number : row.first_order,
+                  value: row.id,
+                })),
+              true,
+              true,
+            );
+        else
+          yield* engine.indexedPages(
+            (after) => engine.index!.memberPage(object.id, after, BATCH),
+            true,
+            false,
+          );
+        return;
+      }
       const columns = `t.raw_start AS name_start,t.raw_bytes AS name_bytes,
         t.id AS name_id,t.parent AS name_parent,
         CASE WHEN t.parent>0 AND length(t.chunk)<=${FIELD_MEMO_NAME_UNITS * 2}
@@ -1506,6 +1772,15 @@ class CanonicalEngine {
       *arrayItems(handle) {
         const array = engine.handleValue(handle);
         if (array.kind !== 'array') throw Error('JSON array iteration requires array');
+        if (engine.index) {
+          for (const row of engine.indexedPages(
+            (after) => engine.index!.childPage(array.id, after, BATCH),
+            false,
+            treeOnly,
+          ))
+            yield engine.handle(engine.preparedRow(row));
+          return;
+        }
         for (const row of engine.paged(
           `SELECT c.ordinal AS cursor,${joined} JOIN children c ON c.value=n.id
            WHERE c.parent=? AND c.ordinal>? ORDER BY c.ordinal LIMIT ${BATCH}`,

@@ -9,6 +9,7 @@ import { ensureProfileDirectories } from '../profile-storage.ts';
 import * as intake from '../intake.ts';
 import {
   acceptIntakeReportSelection,
+  acceptIntakeReportSelectionAsync,
   getIntakeReportAcceptance,
 } from '../intake-report-acceptance.ts';
 import { attachRecordDurability, rebuildRecordDatabase } from '../record-versions.ts';
@@ -347,7 +348,7 @@ for (const boundary of ['before_head', 'after_head'] as const)
   });
 
 for (const stale of [false, true])
-  test(`partial selections sharing an explicit comparison destination commit together (stale: ${stale})`, (t) => {
+  test(`partial selections sharing an explicit comparison destination commit together (stale: ${stale})`, async (t) => {
     const f = fixture(t);
     const destination = f.upload('shared-destination', '4.50');
     acceptIntakeReportSelection(f.db, f.root, f.profileId, {
@@ -378,11 +379,13 @@ for (const stale of [false, true])
     );
     if (stale) blocks[1]!.selections[0]!.selectionReviewToken = 'stale-selected-authority';
     blocks.push(f.block(unrelated.item.id));
-    const receipt = acceptIntakeReportSelection(f.db, f.root, f.profileId, {
-      operationId: randomUUID(),
-      mode: 'partial-v1',
-      blocks,
-    }).receipt;
+    const receipt = (
+      await acceptIntakeReportSelectionAsync(f.db, f.root, f.profileId, {
+        operationId: randomUUID(),
+        mode: 'partial-v1',
+        blocks,
+      })
+    ).receipt;
     assert.equal(receipt.atomic, false);
     if (receipt.atomic) throw new Error('Expected partial receipt');
     assert.deepEqual(

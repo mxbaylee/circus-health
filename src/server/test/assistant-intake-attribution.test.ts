@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase } from '../database.ts';
@@ -33,7 +33,7 @@ import {
 } from '../intake-attribution.ts';
 
 test('native addressed attribution matches legacy arithmetic without checkpoint collections and exports explicit omissions', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'fictional-native-attribution-')),
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'fictional-native-attribution-'))),
     profile = 'fictional',
     db = openDatabase(ensureProfileDirectories(root, profile).database, profile);
   attachPersonalDurability(db, { root, profileId: profile });
@@ -85,11 +85,11 @@ test('native addressed attribution matches legacy arithmetic without checkpoint 
   for (let page = 1; page <= 3; page++) {
     const scope = { sourceFileId: host.id, memberId: null, page },
       a = recordAttributionRead(old, String(page), scope, 20, 4),
-      b = recordNativeAttributionRead(host, checkpoint, String(page), scope, 20, 4);
+      b = await recordNativeAttributionRead(host, checkpoint, String(page), scope, 20, 4);
     assert.deepEqual(b, a);
     keys.push(b.scopeKey!);
     acknowledgeAttributionRead(old, a.scopeKey!);
-    acknowledgeNativeAttributionRead(host, checkpoint, b.scopeKey!);
+    await acknowledgeNativeAttributionRead(host, checkpoint, b.scopeKey!);
   }
   for (const request of [
     { keys, failed: false, usage: { inputTokens: 100, outputTokens: 20, cachedInputTokens: 40 } },
@@ -130,7 +130,7 @@ test('native addressed attribution matches legacy arithmetic without checkpoint 
   const extraKeys = Array.from({ length: 60 }, (_, index) => `fictional-extra-${index}`),
     operationId = randomUUID();
   store.commitMaintenance(
-    store.prepare(store.openView(), {
+    await store.prepareAsync(store.openView(), {
       operationId,
       requestDigest: createHash('sha256').update(operationId).digest('hex'),
       domainVersion: host.version,
@@ -179,7 +179,7 @@ test('native addressed attribution matches legacy arithmetic without checkpoint 
   const largeKey = 'fictional-large-scope',
     largeId = randomUUID();
   store.commitMaintenance(
-    store.prepare(store.openView(), {
+    await store.prepareAsync(store.openView(), {
       operationId: largeId,
       requestDigest: createHash('sha256').update(largeId).digest('hex'),
       domainVersion: host.version,
@@ -205,18 +205,40 @@ test('native addressed attribution matches legacy arithmetic without checkpoint 
   checkpoint.sessionId = host.sessionId;
   assert.equal(transactions(), beforeCancellation, 'canceled update makes no publication');
   const beforeConcurrent = transactions();
-  const changed = new Promise<void>((resolve) =>
-    setImmediate(() => {
-      recordNativeAttributionRead(host, checkpoint, 'fictional-concurrent-window', {
-        sourceFileId: host.id,
-        memberId: null,
-        page: 100,
-      });
-      resolve();
+  const beforeLogical = store.binding(store.openView())!.logical;
+  const beforeContext = {
+    sessionId: checkpoint.sessionId,
+    version: host.version,
+    reference: structuredClone(checkpoint.attribution),
+  };
+  const changed = new Promise<void>((resolve, reject) =>
+    setImmediate(async () => {
+      try {
+        await recordNativeAttributionRead(host, checkpoint, 'fictional-concurrent-window', {
+          sourceFileId: host.id,
+          memberId: null,
+          page: 100,
+        });
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
     }),
   );
   const stale = startNativeAttributionRequest(host, checkpoint, []);
+  // Genuine async admission can fence this concurrent candidate before its
+  // collection guard observes the other accepted write. Keep the exact owner
+  // expiry cases and the original one-publication oracle below.
+  const refused = assert.rejects(
+    stale,
+    /attribution changed during preparation|legacy bridge original read authority changed|Contributor original staging owner changed/i,
+  );
   await changed;
-  await assert.rejects(stale, /attribution changed during preparation/i);
+  await refused;
+  assert.deepEqual(store.binding(store.openView())!.logical, beforeLogical);
+  assert.deepEqual(
+    { sessionId: checkpoint.sessionId, version: host.version, reference: checkpoint.attribution },
+    beforeContext,
+  );
   assert.equal(transactions() - beforeConcurrent, 1, 'stale update adds no second publication');
 });

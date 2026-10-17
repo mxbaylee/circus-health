@@ -202,20 +202,24 @@ export async function prepareLegacyReadingTargets(
     const build = 'reading.reindex.' + randomUUID(),
       operationId = randomUUID();
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId,
-        requestDigest: createHash('sha256').update(operationId).digest('hex'),
-        domainVersion: intakeSourceVersion(context.db, context.intakeId).rawVersion,
-        changes: [
-          {
-            area: 'builds',
-            collection: build,
-            op: 'adoptCollection',
-            fromArea: 'builds',
-            fromCollection: old.name,
-          },
-        ],
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId,
+          requestDigest: createHash('sha256').update(operationId).digest('hex'),
+          domainVersion: intakeSourceVersion(context.db, context.intakeId).rawVersion,
+          changes: [
+            {
+              area: 'builds',
+              collection: build,
+              op: 'adoptCollection',
+              fromArea: 'builds',
+              fromCollection: old.name,
+            },
+          ],
+        },
+        assertCurrent,
+      ),
     );
     const writer = createEnvelopeBuildWriter(
       context.db,
@@ -294,20 +298,24 @@ export async function prepareLegacyReadingTargets(
     assertCurrent();
     const publication = randomUUID();
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId: publication,
-        requestDigest: createHash('sha256').update(publication).digest('hex'),
-        domainVersion: intakeSourceVersion(context.db, context.intakeId).rawVersion,
-        changes: [
-          {
-            area: 'builds',
-            collection: old.name,
-            op: 'adoptCollection',
-            fromArea: 'builds',
-            fromCollection: build,
-          },
-        ],
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId: publication,
+          requestDigest: createHash('sha256').update(publication).digest('hex'),
+          domainVersion: intakeSourceVersion(context.db, context.intakeId).rawVersion,
+          changes: [
+            {
+              area: 'builds',
+              collection: old.name,
+              op: 'adoptCollection',
+              fromArea: 'builds',
+              fromCollection: build,
+            },
+          ],
+        },
+        assertCurrent,
+      ),
     );
     return { changed: true };
   } finally {
@@ -472,20 +480,24 @@ export async function importLegacyReadingCheckpoint(
     current();
     const operationId = randomUUID();
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId,
-        requestDigest: createHash('sha256').update(operationId).digest('hex'),
-        domainVersion: intakeSourceVersion(db, intakeId).rawVersion,
-        changes: [
-          {
-            area: 'builds',
-            collection: name,
-            op: 'adoptCollection',
-            fromArea: 'builds',
-            fromCollection: build,
-          },
-        ],
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId,
+          requestDigest: createHash('sha256').update(operationId).digest('hex'),
+          domainVersion: intakeSourceVersion(db, intakeId).rawVersion,
+          changes: [
+            {
+              area: 'builds',
+              collection: name,
+              op: 'adoptCollection',
+              fromArea: 'builds',
+              fromCollection: build,
+            },
+          ],
+        },
+        current,
+      ),
     );
     return { imported: true };
   } finally {
@@ -532,20 +544,24 @@ export async function prepareLegacyReadingUpdate(
   current();
   if (!deferredAdoption)
     collections.commitMaintenance(
-      collections.prepare(collections.openView(), {
-        operationId,
-        requestDigest: createHash('sha256').update(operationId).digest('hex'),
-        domainVersion: intakeSourceVersion(context.db, context.intakeId).rawVersion,
-        changes: [
-          {
-            area: 'builds',
-            collection: build,
-            op: 'adoptCollection',
-            fromArea: 'builds',
-            fromCollection: old.name,
-          },
-        ],
-      }),
+      await collections.prepareAsync(
+        collections.openView(),
+        {
+          operationId,
+          requestDigest: createHash('sha256').update(operationId).digest('hex'),
+          domainVersion: intakeSourceVersion(context.db, context.intakeId).rawVersion,
+          changes: [
+            {
+              area: 'builds',
+              collection: build,
+              op: 'adoptCollection',
+              fromArea: 'builds',
+              fromCollection: old.name,
+            },
+          ],
+        },
+        current,
+      ),
     );
   const writer = createEnvelopeBuildWriter(
     context.db,

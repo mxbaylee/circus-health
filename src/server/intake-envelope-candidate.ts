@@ -89,6 +89,9 @@ export function createPrivateEnvelopeCandidate(input: {
   readOriginal: (hash: string) => unknown;
   readOriginalDescriptor?: (area: 'logical' | 'builds', name: string) => string | undefined;
   assertOriginal: () => void;
+  /** One synchronous original-read boundary; never a publication or roster lifetime.
+   * Sealing may update only its own disposable traversal state inside this scope. */
+  readOriginalScope?: <T>(read: () => T) => T;
 }) {
   if (input.descriptor.kind !== 'map') invalid('private envelope requires map');
   const identity = { ...input.identity },
@@ -111,6 +114,8 @@ export function createPrivateEnvelopeCandidate(input: {
     finalBuilds: IntakeTreeRoot | null = input.originalBuilds ?? null,
     expectedTotal = 0n,
     roster: PrivateEnvelopeNodeRoster | undefined;
+  let activeRead: { poisoned: boolean } | undefined;
+  let activeSealSlice: { poisoned: boolean } | undefined;
   try {
     signingKey = createSecretKey(key);
     scratch.db.exec(
@@ -187,10 +192,113 @@ export function createPrivateEnvelopeCandidate(input: {
       )
         invalid('private envelope workspace changed');
     };
+    const refuseReadReentry = () => {
+      const active = activeRead ?? activeSealSlice;
+      if (active) {
+        active.poisoned = true;
+        invalid('reentrant private envelope read');
+      }
+    };
+    const closeWorkspace = () => {
+      if (closed) return;
+      closed = true;
+      cache.clear();
+      verifiedScratch.clear();
+      signingKey = undefined;
+      key.fill(0);
+      scratch.close();
+    };
     const check = () => {
+      refuseReadReentry();
       checkScratch();
       input.assertOriginal();
       checkScratch();
+    };
+    const readBounded = <T>(read: () => T): T => {
+      refuseReadReentry();
+      const scope = { poisoned: false };
+      activeRead = scope;
+      let succeeded = false;
+      const consume = () => {
+        checkScratch();
+        const result = read();
+        if (
+          result &&
+          (typeof result === 'object' || typeof result === 'function') &&
+          ('then' in result || 'next' in result)
+        )
+          invalid('private envelope read must finish synchronously');
+        checkScratch();
+        if (scope.poisoned) invalid('poisoned private envelope read');
+        return result;
+      };
+      try {
+        const result = input.readOriginalScope
+          ? input.readOriginalScope(consume)
+          : (() => {
+              input.assertOriginal();
+              const result = consume();
+              input.assertOriginal();
+              return result;
+            })();
+        if (
+          result &&
+          (typeof result === 'object' || typeof result === 'function') &&
+          ('then' in result || 'next' in result)
+        )
+          invalid('private envelope read must finish synchronously');
+        checkScratch();
+        if (scope.poisoned) invalid('poisoned private envelope read');
+        succeeded = true;
+        return result;
+      } finally {
+        activeRead = undefined;
+        if (!succeeded) {
+          try {
+            closeWorkspace();
+          } catch {
+            // Preserve the read refusal after revoking this workspace.
+          }
+        }
+      }
+    };
+    // Only the two internal seal traversals enter this boundary. No caller,
+    // iterator or promise can escape it, and every host yield ends the scope.
+    // The original owner seals its real source/SQL/physical authority at entry
+    // and exit; our scratch changes remain separately accounted and checked.
+    const sealSlice = <T>(consume: (checkNode: () => void) => T): T => {
+      if (!input.readOriginalScope || input.db.isTransaction) return consume(check);
+      refuseReadReentry();
+      const scope = { poisoned: false };
+      activeSealSlice = scope;
+      const checkNode = () => {
+        checkScratch();
+        if (scope.poisoned) invalid('poisoned private envelope seal');
+      };
+      try {
+        const result = input.readOriginalScope(() => {
+          checkNode();
+          const result = consume(checkNode);
+          if (
+            result &&
+            (typeof result === 'object' || typeof result === 'function') &&
+            ('then' in result || 'next' in result)
+          )
+            invalid('private envelope seal must finish synchronously');
+          checkNode();
+          return result;
+        });
+        if (
+          result &&
+          (typeof result === 'object' || typeof result === 'function') &&
+          ('then' in result || 'next' in result)
+        )
+          invalid('private envelope seal must finish synchronously');
+        checkNode();
+        return result;
+      } finally {
+        activeSealSlice = undefined;
+      }
     };
     const activeSigningKey = () => {
       if (closed || !signingKey) invalid('private envelope workspace changed');
@@ -261,59 +369,59 @@ export function createPrivateEnvelopeCandidate(input: {
     const store: EnvelopeCellReader = Object.freeze({
       check,
       get(name: string) {
-        check();
-        const raw = tree().get(descriptor(input.collection)!.root, name);
-        check();
-        return raw === undefined ? undefined : exposed(raw);
+        return readBounded(() => {
+          const raw = tree().get(descriptor(input.collection)!.root, name);
+          return raw === undefined ? undefined : exposed(raw);
+        });
       },
       range(after: string, items: number, bytes: number, prefix?: string) {
-        check();
-        integer(items, 1);
-        integer(bytes, 1);
-        if (items > 100 || bytes > 256 * 1024) invalid('private envelope range budget');
-        const result: Array<{ key: string; value: string | IntakeByteValue }> = [];
-        let used = 0,
-          complete = true;
-        for (const row of tree().entries(descriptor(input.collection)!.root, after)) {
-          if (prefix && !row.key.startsWith(prefix)) {
-            if (row.key > prefix) break;
-            continue;
+        return readBounded(() => {
+          integer(items, 1);
+          integer(bytes, 1);
+          if (items > 100 || bytes > 256 * 1024) invalid('private envelope range budget');
+          const result: Array<{ key: string; value: string | IntakeByteValue }> = [];
+          let used = 0,
+            complete = true;
+          for (const row of tree().entries(descriptor(input.collection)!.root, after)) {
+            if (prefix && !row.key.startsWith(prefix)) {
+              if (row.key > prefix) break;
+              continue;
+            }
+            const size = Buffer.byteLength(row.key) + Buffer.byteLength(row.value);
+            if (result.length === items || used + size > bytes) {
+              complete = false;
+              break;
+            }
+            used += size;
+            result.push({ key: row.key, value: exposed(row.value) });
           }
-          const size = Buffer.byteLength(row.key) + Buffer.byteLength(row.value);
-          if (result.length === items || used + size > bytes) {
-            complete = false;
-            break;
-          }
-          used += size;
-          result.push({ key: row.key, value: exposed(row.value) });
-        }
-        if (!complete && !result.length) invalid('private range item budget');
-        check();
-        return { items: result, complete };
+          if (!complete && !result.length) invalid('private range item budget');
+          return { items: result, complete };
+        });
       },
       chunks(value: IntakeByteValue, after?: string, bytes = 4096) {
-        check();
-        integer(bytes, 1);
-        if (bytes > 256 * 1024) invalid('private byte range budget');
-        const chunks: Buffer[] = [];
-        let used = 0,
-          complete = true,
-          last = after;
-        for (const row of tree().entries(bytesFor(value).root, after)) {
-          const chunk = Buffer.from(row.value, 'base64');
-          if (!chunk.length || chunk.length > 4096 || chunk.toString('base64') !== row.value)
-            invalid('private byte representation');
-          if (chunks.length === 64 || used + chunk.length > bytes) {
-            complete = false;
-            break;
+        return readBounded(() => {
+          integer(bytes, 1);
+          if (bytes > 256 * 1024) invalid('private byte range budget');
+          const chunks: Buffer[] = [];
+          let used = 0,
+            complete = true,
+            last = after;
+          for (const row of tree().entries(bytesFor(value).root, after)) {
+            const chunk = Buffer.from(row.value, 'base64');
+            if (!chunk.length || chunk.length > 4096 || chunk.toString('base64') !== row.value)
+              invalid('private byte representation');
+            if (chunks.length === 64 || used + chunk.length > bytes) {
+              complete = false;
+              break;
+            }
+            used += chunk.length;
+            chunks.push(chunk);
+            last = row.key;
           }
-          used += chunk.length;
-          chunks.push(chunk);
-          last = row.key;
-        }
-        if (!complete && !chunks.length) invalid('private byte item budget');
-        check();
-        return { chunks, complete, after: complete ? null : (last ?? null) };
+          if (!complete && !chunks.length) invalid('private byte item budget');
+          return { chunks, complete, after: complete ? null : (last ?? null) };
+        });
       },
       byteBinding(value: IntakeByteValue) {
         check();
@@ -323,7 +431,10 @@ export function createPrivateEnvelopeCandidate(input: {
     return Object.freeze({
       store,
       check,
-      readNode: read,
+      readNode(hash: string) {
+        refuseReadReentry();
+        return read(hash);
+      },
       descriptor() {
         check();
         return structuredClone(descriptor(input.collection)!);
@@ -439,6 +550,7 @@ export function createPrivateEnvelopeCandidate(input: {
         check();
       },
       *readerCoverageRows(): Generator<PrivateReaderCoverageRow> {
+        refuseReadReentry();
         checkScratch();
         for (const row of readerTransitions.iterate(retainedPass)) {
           const selected = [row.source, row.after, row.before, retainedPass];
@@ -450,6 +562,7 @@ export function createPrivateEnvelopeCandidate(input: {
           )
             invalid('private reader transition signature');
           yield { kind: 'transition', sourceId: row.source, before: row.before, after: row.after };
+          refuseReadReentry();
           checkScratch();
         }
         for (const row of readerEffects.iterate(retainedPass)) {
@@ -471,6 +584,7 @@ export function createPrivateEnvelopeCandidate(input: {
             key: row.key,
             value: row.value,
           };
+          refuseReadReentry();
           checkScratch();
         }
       },
@@ -719,71 +833,96 @@ export function createPrivateEnvelopeCandidate(input: {
             if (final.root) queue(final.root);
             advance();
             let count = 0,
-              bytes = 0,
-              work = 0,
-              workBytes = 0;
+              bytes = 0;
             for (;;) {
-              check();
-              const row = queued.get();
-              if (!row) break;
-              const ref = JSON.parse(row.ref as string) as IntakeTreeRef,
-                original = input.readOriginal(ref.hash),
-                raw = own(ref.hash);
-              if (original !== undefined) {
-                decodeIntakeTreeNode(original, ref, identity);
-                if (raw !== undefined && original !== raw) invalid('private original collision');
-              } else {
-                if (raw === undefined) invalid('private missing descendant');
-                const node = decodeIntakeTreeNode(raw, ref, identity);
-                for (const child of [node.left, node.right, ...embedded(node.value)])
-                  if (child) queue(child);
-                retain.run(ref.hash);
-                count++;
-                bytes += Buffer.byteLength(raw);
-                integer(count);
-                integer(bytes);
-                workBytes += Buffer.byteLength(raw);
-              }
-              done.run(ref.hash);
-              advance();
-              if (++work === 64 || workBytes >= 64 * 1024) {
-                await yieldHost();
-                checkpoint();
-                work = 0;
-                workBytes = 0;
-              }
+              const complete = sealSlice((checkNode) => {
+                let work = 0,
+                  workBytes = 0;
+                for (;;) {
+                  checkNode();
+                  const row = queued.get();
+                  if (!row) return true;
+                  const ref = JSON.parse(row.ref as string) as IntakeTreeRef,
+                    original = input.readOriginal(ref.hash),
+                    raw = own(ref.hash);
+                  checkNode();
+                  if (original !== undefined) {
+                    decodeIntakeTreeNode(original, ref, identity);
+                    if (raw !== undefined && original !== raw)
+                      invalid('private original collision');
+                  } else {
+                    if (raw === undefined) invalid('private missing descendant');
+                    const node = decodeIntakeTreeNode(raw, ref, identity);
+                    for (const child of [node.left, node.right, ...embedded(node.value)])
+                      if (child) queue(child);
+                    retain.run(ref.hash);
+                    count++;
+                    bytes += Buffer.byteLength(raw);
+                    integer(count);
+                    integer(bytes);
+                    workBytes += Buffer.byteLength(raw);
+                  }
+                  done.run(ref.hash);
+                  advance();
+                  if (++work === 64 || workBytes >= 64 * 1024) return false;
+                }
+              });
+              if (complete) break;
+              await yieldHost();
+              checkpoint();
             }
+            const verifyRow = (row: Record<string, unknown>) => {
+              const raw = row.raw as string,
+                ref = JSON.parse(row.ref as string) as IntakeTreeRef;
+              if (row.signature !== sign(row.hash as string, raw, row.ref as string))
+                invalid('private roster signature');
+              decodeIntakeTreeNode(raw, ref, identity);
+              return { hash: row.hash as string, raw, ref };
+            };
             const rows = function* () {
               check();
               let seen = 0,
                 size = 0;
               for (const row of retained.iterate()) {
                 check();
-                const raw = row.raw as string,
-                  ref = JSON.parse(row.ref as string) as IntakeTreeRef;
-                if (row.signature !== sign(row.hash as string, raw, row.ref as string))
-                  invalid('private roster signature');
-                decodeIntakeTreeNode(raw, ref, identity);
+                const value = verifyRow(row);
                 seen++;
-                size += Buffer.byteLength(raw);
-                yield { hash: row.hash as string, raw, ref };
+                size += Buffer.byteLength(value.raw);
+                yield value;
               }
               if (seen !== count || size !== bytes) invalid('private roster count');
               check();
             };
             const digest = createHash('sha256');
-            work = 0;
-            workBytes = 0;
-            for (const row of rows()) {
-              digest.update(row.hash).update(row.raw);
-              workBytes += Buffer.byteLength(row.raw);
-              if (++work === 64 || workBytes >= 64 * 1024) {
+            let seen = 0,
+              size = 0;
+            const digestRows = retained.iterate();
+            try {
+              for (;;) {
+                const complete = sealSlice((checkNode) => {
+                  let work = 0,
+                    workBytes = 0;
+                  for (;;) {
+                    checkNode();
+                    const next = digestRows.next();
+                    if (next.done) return true;
+                    const row = verifyRow(next.value);
+                    checkNode();
+                    seen++;
+                    size += Buffer.byteLength(row.raw);
+                    digest.update(row.hash).update(row.raw);
+                    workBytes += Buffer.byteLength(row.raw);
+                    if (++work === 64 || workBytes >= 64 * 1024) return false;
+                  }
+                });
+                if (complete) break;
                 await yieldHost();
                 checkpoint();
-                work = 0;
-                workBytes = 0;
               }
+            } finally {
+              digestRows.return?.();
             }
+            if (seen !== count || size !== bytes) invalid('private roster count');
             checkpoint();
             sealed = true;
             sealedSelection = selection;
@@ -838,13 +977,8 @@ export function createPrivateEnvelopeCandidate(input: {
         });
       },
       close() {
-        if (closed) return;
-        closed = true;
-        cache.clear();
-        verifiedScratch.clear();
-        signingKey = undefined;
-        key.fill(0);
-        scratch.close();
+        refuseReadReentry();
+        closeWorkspace();
       },
     });
   } catch (error) {

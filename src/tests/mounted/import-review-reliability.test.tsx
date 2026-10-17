@@ -8,7 +8,10 @@ import {
   ImportPersonChoice,
   personSelectionReady,
 } from '../../app/features/import/ImportPersonChoice';
-import { SavedRecordDestinationLink } from '../../app/features/import/SavedRecordDestinations';
+import {
+  SavedRecordDestinationLink,
+  SavedRecordPeople,
+} from '../../app/features/import/SavedRecordDestinations';
 import { replaceProfiles, selectProfile } from '../../app/data/profile';
 import type { IntakeAcceptedRecord } from '../../shared/intake';
 import {
@@ -121,10 +124,13 @@ it('names same-name owners distinctly in failed outcomes and falls back without 
   const profile = { id: 'fictional-outcome-profile', name: 'Fictional Self', placebo: true };
   replaceProfiles([profile]);
   selectProfile(profile);
+  let peopleAttempts = 0;
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () =>
-      Response.json({
+    vi.fn(async () => {
+      if (++peopleAttempts === 1)
+        return Response.json({ error: { message: 'Fictional lookup failure' } }, { status: 400 });
+      return Response.json({
         data: [
           {
             noteId: 'one-note',
@@ -143,8 +149,8 @@ it('names same-name owners distinctly in failed outcomes and falls back without 
             relationship: 'Parent',
           },
         ],
-      }),
-    ),
+      });
+    }),
   );
   const receipt: IntakePartialAcceptanceReceipt = {
     version: 1,
@@ -177,6 +183,7 @@ it('names same-name owners distinctly in failed outcomes and falls back without 
     </MemoryRouter>,
   );
   expect(acceptanceSummary(receipt)).toBe('0 saved, 2 need review');
+  await userEvent.click(await screen.findByRole('button', { name: 'Retry person details' }));
   await waitFor(() =>
     expect(
       screen.getByRole('link', { name: /Fictional result 0.*Rowan Meadow.*1980-01-01.*Sibling/ }),
@@ -185,6 +192,7 @@ it('names same-name owners distinctly in failed outcomes and falls back without 
   expect(
     screen.getByRole('link', { name: /Fictional result 1.*Rowan Meadow.*1950-01-01.*Parent/ }),
   ).toBeVisible();
+  expect(peopleAttempts).toBe(2);
   view.rerender(
     <MemoryRouter>
       <ImportAcceptanceOutcomes
@@ -209,3 +217,171 @@ it('names same-name owners distinctly in failed outcomes and falls back without 
     'Person not confirmed',
   );
 });
+
+it('shows current person corrections and exact alike-name identities with one People read for many saved links', async () => {
+  const profile = { id: 'fictional-many-saved', name: 'Fictional Self', placebo: true };
+  replaceProfiles([profile]);
+  selectProfile(profile);
+  const people = [
+    {
+      noteId: 'fictional-younger-note',
+      personId: 'fictional-younger',
+      version: 1,
+      fullName: 'Rowan Meadow',
+      birthDate: '1980-01-01',
+      relationship: 'Sibling',
+    },
+    {
+      noteId: 'fictional-older-note',
+      personId: 'fictional-older',
+      version: 1,
+      fullName: 'Rowan Meadow',
+      birthDate: '1980-01-01',
+      relationship: 'Sibling',
+    },
+  ];
+  let resolveOwner!: (response: Response) => void;
+  const unresolved = new Promise<Response>((resolve) => {
+    resolveOwner = resolve;
+  });
+  const fetcher = vi.fn(async (input) => {
+    const url = String(input);
+    if (url.endsWith('/record-ownership/people')) return Response.json({ data: people });
+    if (url.includes('id=fictional-destination-0')) return unresolved;
+    if (url.includes('/record-owner?'))
+      return Response.json({ data: { personId: 'fictional-older' } });
+    throw Error('Unexpected route: ' + url);
+  });
+  vi.stubGlobal('fetch', fetcher);
+  const records = Array.from({ length: 20 }, (_, index): IntakeAcceptedRecord => ({
+    recordId: `fictional-source-${index}`,
+    entityId: `fictional-destination-${index}`,
+    kind: 'observation',
+    title: `Fictional marker ${index}`,
+    optical: false,
+    outcome: 'added',
+    identityAttribution: {
+      assignedPerson: { personId: 'patient' },
+    } as IntakeAcceptedRecord['identityAttribution'],
+  }));
+  const { SavedRecordDestinations } =
+    await import('../../app/features/import/SavedRecordDestinations');
+  render(
+    <MemoryRouter>
+      <SavedRecordDestinations records={records} />
+    </MemoryRouter>,
+  );
+  expect(
+    screen.getByText('Fictional marker 0').closest('[data-saved-record-id]'),
+  ).toHaveTextContent('Checking person');
+  expect(screen.queryByRole('link', { name: /Fictional marker 0/ })).toBeNull();
+  expect(
+    screen.getByText('Fictional marker 0').closest('[data-saved-record-id]'),
+  ).not.toHaveTextContent('Self');
+  await act(async () => {
+    resolveOwner(Response.json({ data: { personId: 'fictional-younger' } }));
+  });
+  await waitFor(() =>
+    expect(
+      screen.getByRole('link', {
+        name: /Fictional marker 0.*Rowan Meadow.*DOB 1980-01-01.*Sibling.*fictional-younger/,
+      }),
+    ).toHaveAttribute(
+      'href',
+      '/tests?result=fictional-destination-0&visibility=all&personId=fictional-younger',
+    ),
+  );
+  expect(
+    screen.getByRole('link', { name: /Fictional marker 1Rowan.*fictional-older/ }),
+  ).toHaveAttribute(
+    'href',
+    '/tests?result=fictional-destination-1&visibility=all&personId=fictional-older',
+  );
+  expect(
+    fetcher.mock.calls.filter(([url]) => String(url).endsWith('/record-ownership/people')),
+  ).toHaveLength(1);
+});
+
+it.each(['shared list', 'standalone'] as const)(
+  'retries failed person details without changing exact saved destinations (%s)',
+  async (mode) => {
+    const profile = { id: 'fictional-people-retry', name: 'Fictional Self', placebo: true };
+    replaceProfiles([profile]);
+    selectProfile(profile);
+    let peopleRequests = 0;
+    const people = ['younger', 'older'].map((suffix, index) => ({
+      noteId: `fictional-${suffix}-note`,
+      personId: `fictional-${suffix}`,
+      version: 1,
+      fullName: 'Rowan Meadow',
+      birthDate: index ? '1950-01-01' : '1980-01-01',
+      relationship: index ? 'Parent' : 'Sibling',
+    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input) => {
+        const url = String(input);
+        if (url.endsWith('/record-ownership/people')) {
+          peopleRequests++;
+          return peopleRequests === 1
+            ? Response.json(
+                { error: { message: 'Fictional unavailable details' } },
+                { status: 400 },
+              )
+            : Response.json({ data: people });
+        }
+        if (url.includes('/record-owner?'))
+          return Response.json({
+            data: { personId: url.includes('id=older') ? 'fictional-older' : 'fictional-younger' },
+          });
+        throw Error('Unexpected route: ' + url);
+      }),
+    );
+    const record = (entityId: string): IntakeAcceptedRecord => ({
+      recordId: `fictional-source-${entityId}`,
+      entityId,
+      kind: 'observation',
+      title: `Fictional ${entityId} result`,
+      optical: false,
+      outcome: 'added',
+    });
+    render(
+      <MemoryRouter>
+        {mode === 'shared list' ? (
+          <SavedRecordPeople>
+            <SavedRecordDestinationLink record={record('younger')} />
+            <SavedRecordDestinationLink record={record('older')} />
+          </SavedRecordPeople>
+        ) : (
+          <SavedRecordDestinationLink record={record('younger')} />
+        )}
+      </MemoryRouter>,
+    );
+    const retry = await screen.findByRole('button', { name: 'Retry person details' });
+    const link = await screen.findByRole('link', {
+      name: /Fictional younger result.*Person details unavailable/,
+    });
+    expect(link).toHaveAttribute(
+      'href',
+      '/tests?result=younger&visibility=all&personId=fictional-younger',
+    );
+    expect(retry.closest('a')).toBeNull();
+    expect(peopleRequests).toBe(1);
+    await userEvent.click(retry);
+    await waitFor(() =>
+      expect(
+        screen.getByRole('link', {
+          name: /Fictional younger result.*Rowan Meadow.*1980-01-01.*Sibling/,
+        }),
+      ).toHaveAttribute('href', link.getAttribute('href')),
+    );
+    if (mode === 'shared list')
+      expect(
+        screen.getByRole('link', {
+          name: /Fictional older result.*Rowan Meadow.*1950-01-01.*Parent/,
+        }),
+      ).toHaveAttribute('href', '/tests?result=older&visibility=all&personId=fictional-older');
+    expect(screen.queryByRole('button', { name: 'Retry person details' })).toBeNull();
+    expect(peopleRequests).toBe(2);
+  },
+);

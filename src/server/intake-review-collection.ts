@@ -1640,7 +1640,15 @@ export function collectionWorkflowReviewScope(input: {
       );
     },
     *competingBoundaryUnrepairedWork(group, operationId, target) {
-      const state = input.readCacheState?.();
+      const state = receiptState();
+      // The complete identity policy cannot produce a competing claim without
+      // a printed anchor and subject on this selected boundary. Authenticate
+      // the selected view even when no optional cache-state hook is supplied,
+      // then avoid decoding every unrelated header for each unprinted record.
+      if (!group.report?.anchor || !group.report.subject?.text.trim()) {
+        if (receiptState() !== state) throw Error('Selected competing identity boundary changed');
+        return false;
+      }
       if (state !== competingState) {
         noCompetingBoundary.clear();
         competingState = state;

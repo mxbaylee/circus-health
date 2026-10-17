@@ -38,6 +38,11 @@ import {
   type ReviewDraftResolutionPolicy,
 } from './intake-review-draft-selection.ts';
 import { disposableSqlite } from './disposable-sqlite.ts';
+import { registerReviewCanonicalValue } from './intake-review-question-state.ts';
+import {
+  prepareIntakeJsonCanonicalSteps,
+  intakeJsonCanonicalWorkObserver,
+} from './intake-json-canonical.ts';
 
 const FORMAT = 'health-intake-review-draft-history-v1';
 const PREFIX = { resolutions: 'r:', corrections: 'c:' } as const;
@@ -388,11 +393,45 @@ export function* readNativeReviewDraftWork(
     const policy = readLegacyDraftPolicyWitnesses(context!.db, context!.source, view, record, {
       bytes: Math.max(0, bytes - headerBytes),
     });
-    return yield* bindReviewDraftResolutionsWork(
+    const selected = yield* bindReviewDraftResolutionsWork(
       { ...draft, history, resolutions: [], resolutionScope: 'policy_witnesses' },
       policy.policy,
       Math.max(0, bytes - headerBytes),
     );
+    // Adoption only changes presentation. Preserve the complete inline legacy
+    // commitment, including nonwitness resolutions, corrections, absent fields
+    // and unknown literals, rather than hashing the new history descriptor.
+    registerReviewCanonicalValue(selected, function* () {
+      const assertCurrent = () => {
+        view.address(record);
+      };
+      const work = prepareIntakeJsonCanonicalSteps(view.recordChunks(record), {
+        preserveNumbers: true,
+        assertRunning: assertCurrent,
+        onWork: intakeJsonCanonicalWorkObserver(context!.db),
+      });
+      try {
+        for (;;) {
+          const next = work.next();
+          if (next.done) {
+            try {
+              for (const piece of next.value.chunks()) {
+                assertCurrent();
+                yield piece;
+              }
+              assertCurrent();
+            } finally {
+              next.value.close();
+            }
+            return;
+          }
+          yield '';
+        }
+      } finally {
+        work.return(undefined as never);
+      }
+    });
+    return selected;
   }
   // History counts are host metadata. The clinical literal decoder deliberately
   // preserves numeric source lexemes as raw JSON objects; use the addressed
